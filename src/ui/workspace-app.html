@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>QuayMesh Task Card</title>
+<link rel="stylesheet" href="./workspace-app.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="i-chev" viewBox="0 0 24 24">
+      <path d="m6 9 6 6 6-6" />
+    </symbol>
+    <symbol id="i-run" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="9" opacity=".25" />
+      <path d="M21 12a9 9 0 0 0-9-9" />
+    </symbol>
+    <symbol id="i-ok" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="9" />
+      <path d="m8 12 3 3 5-6" />
+    </symbol>
+    <symbol id="i-fail" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="9" />
+      <path d="m9 9 6 6M15 9l-6 6" />
+    </symbol>
+    <symbol id="i-warn" viewBox="0 0 24 24">
+      <path d="M12 3 2 20h20z" />
+      <path d="M12 10v4M12 17h.01" />
+    </symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24">
+      <rect x="6" y="6" width="12" height="12" rx="2" />
+    </symbol>
+    <symbol id="i-max" viewBox="0 0 24 24">
+      <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" />
+    </symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24">
+      <rect x="9" y="9" width="12" height="12" rx="2" />
+      <path d="M5 15V5a2 2 0 0 1 2-2h8" />
+    </symbol>
+  </svg>
+<article class="card" id="card" data-status="running" aria-labelledby="title">
+    <header class="hd" id="hd">
+      <span class="st-ic" id="stIc" aria-hidden="true"></span>
+      <div class="hd-m">
+        <div class="l1">
+          <h2 class="title" id="title"></h2><span class="ws" id="ws"></span>
+        </div>
+        <div class="l2"><span class="act" id="act"></span><span class="stats" id="stats"></span></div>
+      </div>
+      <div class="hd-r">
+        <span class="meta"><time class="clock mono" id="clock"></time><span class="prog mono" id="prog"></span></span>
+        <button class="ib" id="importHostFile" type="button" hidden aria-label="从 ChatGPT 文件库导入文件到当前工作区" title="从 ChatGPT 文件库导入到当前工作区">导入</button>
+        <span id="acts"></span>
+        <button class="ib" id="toggle" data-act="toggle" aria-expanded="false" aria-controls="details" aria-label="展开详情"><svg
+            class="i chev">
+            <use href="#i-chev" />
+          </svg></button>
+      </div>
+    </header>
+    <div class="bar" id="bar"><i></i></div>
+    <div class="details" id="details" hidden>
+      <div class="tabs" role="tablist" id="tabs" aria-label="任务详情">
+        <button class="tab" role="tab" id="t-changes" data-act="tab" data-tab="changes" aria-controls="p-changes"><span
+            class="lbl">修改</span><span class="cnt" id="n-changes"></span></button>
+        <button class="tab" role="tab" id="t-commands" data-act="tab" data-tab="commands" aria-controls="p-commands"><span
+            class="lbl">命令</span><span class="cnt" id="n-commands"></span></button>
+        <button class="tab" role="tab" id="t-agents" data-act="tab" data-tab="agents" aria-controls="p-agents"><span
+            class="lbl">代理</span><span class="cnt" id="n-agents"></span></button>
+        <button class="tab" role="tab" id="t-context" data-act="tab" data-tab="context" aria-controls="p-context"><span
+            class="lbl">上下文</span></button>
+        <span class="ind" id="ind"></span>
+      </div>
+      <div class="panel" role="tabpanel" id="p-changes" aria-labelledby="t-changes" tabindex="0"></div>
+      <div class="panel" role="tabpanel" id="p-commands" aria-labelledby="t-commands" tabindex="0" hidden></div>
+      <div class="panel" role="tabpanel" id="p-agents" aria-labelledby="t-agents" tabindex="0" hidden></div>
+      <div class="panel" role="tabpanel" id="p-context" aria-labelledby="t-context" tabindex="0" hidden></div>
+    </div>
+    <div class="sr" aria-live="polite" id="live"></div>
+  </article>
+<script type="module" src="./workspace-app.tsx"></script>
+</body>
+</html>

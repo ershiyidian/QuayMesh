@@ -1,0 +1,19 @@
+{
+  "release": "0.1.0",
+  "node": "24.21.0",
+  "easytier": {
+    "version": "2.7.0",
+    "rust": "1.95",
+    "archive": "third_party/sources/easytier-2.7.0.zip",
+    "directory": "EasyTier-main"
+  },
+  "tunnel": {
+    "version": "0.0.15",
+    "go": "1.27.0",
+    "archive": "third_party/sources/tunnel-client-0.0.15.zip",
+    "directory": "tunnel-client-master"
+  },
+  "egress": {
+    "mode": "configured-executable"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "desktop",
+  "nickname": "Windows worker",
+  "clusterFile": "./cluster.json",
+  "secretsFile": "./secrets.desktop.env",
+  "capabilities": {
+    "worker": true,
+    "consoleRelay": true,
+    "desktopUi": true
+  },
+  "network": {
+    "externalAccess": true
+  },
+  "mesh": {
+    "address": "10.42.0.3",
+    "mode": "no-tun"
+  },
+  "roots": [
+    {
+      "id": "projects",
+      "nickname": "Projects",
+      "path": "~/projects"
+    }
+  ]
+}

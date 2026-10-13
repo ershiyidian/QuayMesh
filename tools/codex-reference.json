@@ -1,0 +1,38 @@
+{
+  "codexVersion": "0.157.0",
+  "sourceRevision": "00c972ed5d6ff6499317fd41b7f23605b8e6850d",
+  "generatedAt": "2026-09-27T16:45:43.968Z",
+  "protocolGenerator": {
+    "executable": "codex",
+    "args": {
+      "generateTs": [
+        "app-server",
+        "generate-ts",
+        "--out",
+        "<DIR>"
+      ],
+      "generateJsonSchema": [
+        "app-server",
+        "generate-json-schema",
+        "--out",
+        "<DIR>"
+      ]
+    }
+  },
+  "sources": {
+    "applyPatchParser": "codex-rs/apply-patch/src/parser.rs",
+    "applyPatchApply": "codex-rs/apply-patch/src/file_update.rs",
+    "processSemantics": "codex-rs/app-server/src/request_processors/process_exec_processor.rs",
+    "subagentSemantics": "codex-rs/app-server/src/request_processors/thread_lifecycle.rs"
+  },
+  "adoptedBehavior": [
+    "patch grammar",
+    "process start/poll/input/result semantics",
+    "non-overlapping delegation and native continuation"
+  ],
+  "intentionallyDifferent": [
+    "workspace_id needed by multi-machine QuayMesh",
+    "async task lifecycle independent from ChatGPT turn",
+    "application-only monitoring and recovery-table projection"
+  ]
+}

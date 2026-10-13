@@ -1,0 +1,920 @@
+{
+  "$id": "urn:quaymesh:core-config:1",
+  "title": "QuayMesh configuration",
+  "description": "Versioned configuration for a local QuayMesh MCP server.",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "default": "urn:quaymesh:core-config:1",
+      "type": "string",
+      "format": "uri"
+    },
+    "configVersion": {
+      "type": "number",
+      "const": 1
+    },
+    "server": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "host": {
+          "default": "127.0.0.1",
+          "type": "string",
+          "minLength": 1
+        },
+        "port": {
+          "default": 7676,
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "publicBaseUrl": {
+          "default": null,
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "uri"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "allowedHosts": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "trustProxy": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "federation": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "nodeId": {
+          "default": "desktop",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "nickname": {
+          "default": "我的电脑",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "capabilities": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "coordinator": {
+              "default": false,
+              "type": "boolean"
+            },
+            "worker": {
+              "default": true,
+              "type": "boolean"
+            },
+            "discovery": {
+              "default": false,
+              "type": "boolean"
+            },
+            "egress": {
+              "default": false,
+              "type": "boolean"
+            },
+            "meshRelay": {
+              "default": false,
+              "type": "boolean"
+            },
+            "desktopUi": {
+              "default": false,
+              "type": "boolean"
+            },
+            "consoleRelay": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        "coordinatorId": {
+          "default": "cloud",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "membershipFile": {
+          "type": "string"
+        },
+        "statusFile": {
+          "type": "string"
+        },
+        "socksProxy": {
+          "type": "string",
+          "format": "uri"
+        },
+        "priority": {
+          "default": 0,
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "host": {
+          "default": "127.0.0.1",
+          "type": "string",
+          "minLength": 1
+        },
+        "port": {
+          "default": 7680,
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "ingressPort": {
+          "default": 7677,
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "tokenEnv": {
+          "default": "QUAYMESH_CLUSTER_TOKEN",
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "tokenFile": {
+          "type": "string"
+        },
+        "tls": {
+          "type": "object",
+          "properties": {
+            "cert": {
+              "type": "string",
+              "minLength": 1
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1
+            },
+            "ca": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "cert",
+            "key"
+          ],
+          "additionalProperties": false
+        },
+        "peers": {
+          "default": [],
+          "maxItems": 32,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+              },
+              "nickname": {
+                "type": "string",
+                "maxLength": 120
+              },
+              "url": {
+                "default": "",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "roots": {
+          "default": [],
+          "maxItems": 256,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+              },
+              "nickname": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": {
+                "default": "",
+                "type": "string",
+                "maxLength": 2000
+              },
+              "tags": {
+                "default": [],
+                "maxItems": 32,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 80
+                }
+              },
+              "enabled": {
+                "default": true,
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "id",
+              "nickname",
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "heartbeatMs": {
+          "default": 5000,
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 60000
+        },
+        "rpcTimeoutMs": {
+          "default": 120000,
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 600000
+        },
+        "egress": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "default": false,
+              "type": "boolean"
+            },
+            "listenPort": {
+              "default": 17890,
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "mihomoConfig": {
+              "type": "string"
+            },
+            "proxyUrl": {
+              "default": "http://127.0.0.1:7890",
+              "type": "string",
+              "format": "uri"
+            },
+            "controllerUrl": {
+              "type": "string",
+              "format": "uri"
+            },
+            "controllerSecretEnv": {
+              "default": "MIHOMO_SECRET",
+              "type": "string"
+            },
+            "probeUrl": {
+              "default": "https://www.gstatic.com/generate_204",
+              "type": "string",
+              "format": "uri"
+            },
+            "probeIntervalMs": {
+              "default": 15000,
+              "type": "integer",
+              "minimum": 3000,
+              "maximum": 300000
+            },
+            "recoveryDelayMs": {
+              "default": 30000,
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 300000
+            },
+            "inheritProxy": {
+              "default": true,
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "network": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "externalAccess": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "workspaces": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "allowedRoots": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "worktreeRoot": {
+          "default": "~/.quaymesh/worktrees",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "storage": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "stateDir": {
+          "default": "~/.local/share/quaymesh",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "tools": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "mode": {
+          "default": "codex",
+          "type": "string",
+          "enum": [
+            "claude",
+            "codex"
+          ]
+        },
+        "commandProfiles": {
+          "default": {},
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "description": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300
+              },
+              "executable": {
+                "type": "string",
+                "minLength": 1
+              },
+              "args": {
+                "default": [],
+                "maxItems": 128,
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "workingDirectory": {
+                "type": "string"
+              },
+              "reads": {
+                "default": [],
+                "maxItems": 64,
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "writes": {
+                "default": [],
+                "maxItems": 64,
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "resources": {
+                "default": [],
+                "maxItems": 16,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512
+                }
+              }
+            },
+            "required": [
+              "description",
+              "executable"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "dangerouslySkipCommandReview": {
+          "default": false,
+          "description": "Owner opt-in to advertise MCP shell tools as not requiring destructive-command review. Commands still run with the local user's authority, and remote hosts may enforce independent confirmation.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ui": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "console": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "mcpIngress": {
+          "type": "object",
+          "properties": {
+            "nodeId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "url": {
+              "type": "string",
+              "format": "uri"
+            },
+            "label": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 120
+            }
+          },
+          "required": [
+            "nodeId"
+          ],
+          "additionalProperties": false
+        },
+        "allowRemote": {
+          "default": false,
+          "type": "boolean"
+        },
+        "sessionTtlSeconds": {
+          "default": 2592000,
+          "type": "integer",
+          "minimum": 300,
+          "maximum": 2592000
+        }
+      },
+      "additionalProperties": false
+    },
+    "artifacts": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "maxFileBytes": {
+          "default": 104857600,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": false
+    },
+    "skills": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "paths": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "agentDir": {
+          "default": "~/.codex",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "subagents": {
+      "default": {
+        "enabled": false,
+        "instructions": "on-demand",
+        "providers": []
+      },
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "instructions": {
+          "default": "on-demand",
+          "type": "string",
+          "enum": [
+            "on-demand",
+            "preload"
+          ]
+        },
+        "providers": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "enum": [
+                      "codex",
+                      "claude",
+                      "cursor",
+                      "copilot",
+                      "grok"
+                    ]
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "model": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "effort": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "reasoningLimits": {
+                    "maxItems": 32,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "model": {
+                          "type": "string",
+                          "pattern": "^[a-z0-9][a-z0-9._-]*$"
+                        },
+                        "maxEffort": {
+                          "type": "string",
+                          "enum": [
+                            "none",
+                            "minimal",
+                            "low",
+                            "medium",
+                            "high",
+                            "xhigh",
+                            "max",
+                            "ultra"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "model",
+                        "maxEffort"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "writeMode": {
+                    "type": "string",
+                    "enum": [
+                      "read_only",
+                      "allowed",
+                      "full_access"
+                    ]
+                  },
+                  "readOnlyDefaults": {
+                    "type": "object",
+                    "properties": {
+                      "model": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "effort": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "historyHandoff": {
+                    "description": "Owner opt-in for a traced fresh-thread handoff only after Codex explicitly rejects paginated history resume.",
+                    "type": "string",
+                    "enum": [
+                      "disabled",
+                      "verified-unsupported"
+                    ]
+                  },
+                  "env": {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                    },
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "command": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S"
+                  }
+                },
+                "required": [
+                  "id",
+                  "enabled"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "enum": [
+                      "opencode",
+                      "pi"
+                    ]
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "model": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "effort": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "reasoningLimits": {
+                    "maxItems": 32,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "model": {
+                          "type": "string",
+                          "pattern": "^[a-z0-9][a-z0-9._-]*$"
+                        },
+                        "maxEffort": {
+                          "type": "string",
+                          "enum": [
+                            "none",
+                            "minimal",
+                            "low",
+                            "medium",
+                            "high",
+                            "xhigh",
+                            "max",
+                            "ultra"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "model",
+                        "maxEffort"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "writeMode": {
+                    "type": "string",
+                    "enum": [
+                      "read_only",
+                      "allowed",
+                      "full_access"
+                    ]
+                  },
+                  "readOnlyDefaults": {
+                    "type": "object",
+                    "properties": {
+                      "model": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "effort": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "historyHandoff": {
+                    "description": "Owner opt-in for a traced fresh-thread handoff only after Codex explicitly rejects paginated history resume.",
+                    "type": "string",
+                    "enum": [
+                      "disabled",
+                      "verified-unsupported"
+                    ]
+                  },
+                  "env": {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                    },
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": [
+                  "id",
+                  "enabled"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "maxConcurrentAgents": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "maxConcurrentReaders": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8
+        },
+        "queueWaitMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 900000
+        },
+        "maxNewSessionsPerWorkItem": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "sharedResources": {
+          "maxItems": 16,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
+          }
+        }
+      },
+      "required": [
+        "enabled",
+        "providers"
+      ],
+      "additionalProperties": false
+    },
+    "logging": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "level": {
+          "default": "info",
+          "type": "string",
+          "enum": [
+            "silent",
+            "error",
+            "warn",
+            "info",
+            "debug"
+          ]
+        },
+        "format": {
+          "default": "json",
+          "type": "string",
+          "enum": [
+            "json",
+            "pretty"
+          ]
+        },
+        "requests": {
+          "default": true,
+          "type": "boolean"
+        },
+        "assets": {
+          "default": false,
+          "type": "boolean"
+        },
+        "toolCalls": {
+          "default": true,
+          "type": "boolean"
+        },
+        "shellCommands": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "oauth": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "resourceAliases": {
+          "default": [],
+          "description": "Exact additional OAuth resource URLs representing this MCP server, such as a user-owned tunnel endpoint.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uri"
+          }
+        },
+        "accessTokenTtlSeconds": {
+          "default": 3600,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "refreshTokenTtlSeconds": {
+          "default": 2592000,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "scopes": {
+          "default": [
+            "quaymesh"
+          ],
+          "minItems": 1,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "allowedResourceUrls": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uri",
+            "description": "Exact resource URL: HTTPS, or HTTP on localhost, 127.0.0.1, or [::1]."
+          }
+        },
+        "allowedRedirectHosts": {
+          "default": [
+            "chatgpt.com",
+            "localhost",
+            "127.0.0.1"
+          ],
+          "minItems": 1,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "configVersion"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,30 @@
+export const REPLY_BYTES = 48 * 1024;
+// Native MCP image blocks are binary media; the 48 KiB limit only applies to text/JSON.
+export const IMAGE_BYTES = 8 * 1024 * 1024;
+
+export function resultSummary(value: Record<string, unknown>): string {
+  if (typeof value.error === "string") return value.error;
+  if (Array.isArray(value.entries)) return `已返回 ${value.entries.length} 项；详细内容见结构化结果。`;
+  if (value.unchanged === true) return "内容没有变化。";
+  if (value.operation_id) return `操作 ${value.operation_id}${value.operation_state ? `：${value.operation_state}` : ""}。`;
+  return "结果已返回，详细内容见结构化结果。";
+}
+
+export function jsonReply<T extends Record<string, unknown>>(value: T, summary = resultSummary(value)) {
+  return {content:[{type:"text" as const,text:summary}],structuredContent:value};
+}
+export const replyBytes = (value: Record<string, unknown>) => Buffer.byteLength(JSON.stringify(jsonReply(value)),"utf8");
+
+// 返回偏移使用 Unicode 码点，避免把一个字符分成两半。
+export function textPage(text: string, offset = 0, budget = 12 * 1024) {
+  const points = Array.from(text);
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > points.length) throw new Error("Invalid response offset.");
+  let low = 0, high = Math.min(points.length - offset,budget);
+  while (low < high) {
+    const n = Math.ceil((low+high)/2);
+    if (Buffer.byteLength(JSON.stringify(points.slice(offset,offset+n).join(""))) <= budget) low = n;
+    else high = n-1;
+  }
+  return {text:points.slice(offset,offset+low).join(""),offset,
+    nextOffset:offset+low<points.length ? offset+low : null,totalCodePoints:points.length};
+}

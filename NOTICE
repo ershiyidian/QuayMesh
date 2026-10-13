@@ -1,0 +1,48 @@
+QuayMesh
+
+QuayMesh includes source derived from DevSpace:
+https://github.com/Waishnav/devspace
+
+The development lineage also includes TaskQuay:
+https://github.com/wrfgup/taskquay
+
+Upstream copyright: Copyright (c) 2026 Waishnav.
+The original MIT copyright and permission notice is retained in LICENSE.
+QuayMesh contributions are distributed under MIT.
+
+OpenAI Codex
+------------
+
+QuayMesh includes TypeScript adaptations of OpenAI Codex 0.157.0,
+source revision 00c972ed5d6ff6499317fd41b7f23605b8e6850d, under Apache-2.0.
+
+Source files:
+- codex-rs/apply-patch/src/parser.rs
+- codex-rs/apply-patch/src/file_update.rs
+- codex-rs/app-server/src/request_processors/process_exec_processor.rs
+- codex-rs/app-server/src/request_processors/thread_lifecycle.rs
+
+Source and adaptation details are recorded in tools/codex-reference.json.
+
+Pi
+--
+
+Parts of the Pi integration are adapted from
+@earendil-works/pi-coding-agent 0.80.3, under MIT.
+https://github.com/earendil-works/pi.git
+Package directory: packages/coding-agent
+
+Integration files:
+- src/pi-tools.ts
+- src/local-agent-pi.ts
+- src/local-agent-pi-sandbox.ts
+
+Network components
+------------------
+
+EasyTier is distributed under LGPL-3.0.
+OpenAI tunnel-client is distributed under Apache-2.0.
+Their corresponding source archives and license texts are included in
+third_party/.
+
+See THIRD_PARTY_NOTICES.md for component and dependency attribution.

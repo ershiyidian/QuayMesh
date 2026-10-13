@@ -1,0 +1,156 @@
+import type { WorkLedger } from "../work-ledger.js";
+import { workspaceHandle, parseWorkspaceHandle } from "../federation/routing.js";
+import { dayAt, type Query } from "./query.js";
+import { WorkbenchError, type Run } from "./types.js";
+
+export interface PageBoundary {
+  value: number;
+  id: string;
+  direction: "next" | "previous";
+  offset: number;
+  at: number;
+}
+
+export function decodeBoundary(cursor?: string): PageBoundary | null {
+  if (!cursor || cursor === "0") return null;
+  const value: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+  const b = value as Partial<PageBoundary> | null;
+  if (!b || !Number.isFinite(b.value) || typeof b.id !== "string" || !Number.isSafeInteger(b.offset)
+    || b.offset! < 0 || !Number.isFinite(b.at) || !["next", "previous"].includes(b.direction ?? "")) {
+    throw new WorkbenchError("任务分页游标无效，请从第一页重新读取", 400, "invalid_cursor");
+  }
+  return b as PageBoundary;
+}
+
+export function runSortValue(run: Run, query: Query, at: number): number {
+  return query.sort === "tokens" ? run.usage.total ?? -1
+    : query.sort === "duration" ? (run.finishedAt ?? at) - run.startedAt : run.startedAt;
+}
+
+export function compareRuns(a: Run, b: Run, query: Query, at: number): number {
+  const delta = runSortValue(a, query, at) - runSortValue(b, query, at);
+  return (query.sort === "oldest" ? delta : -delta) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+export function pageCursor(run: Run, query: Query, at: number, offset: number, direction: PageBoundary["direction"]): string {
+  return Buffer.from(JSON.stringify({ value: runSortValue(run, query, at), id: run.id, at, offset, direction })).toString("base64url");
+}
+
+// SQLite 完成筛选、排序和计数，只把当前页的工作 ID 交给详情转换。
+export function runQuery(ledger: WorkLedger, nodeId: string, projectIds: string[], query: Query, at: number) {
+  const db = ledger.db;
+  const allowed = projectIds.length ? `r.project_id IN (${projectIds.map(() => "?").join(",")})` : "0";
+  const prefix = workspaceHandle(nodeId, "");
+  const sql = `WITH base AS (
+    SELECT r.*,COALESCE(t.title,s.title,i.title) title,p.root,p.name project_name,?||r.id reference,
+      l.session_id,l.task_id,l.member_id,
+      t.state task_state,t.result_status task_result,t.finished_at task_finished_at,
+      CASE WHEN l.run_id=(SELECT run_id FROM qm_run_links WHERE member_id=l.member_id AND task_id IS l.task_id ORDER BY rowid DESC LIMIT 1) THEN 1 ELSE 0 END latest,
+      CASE WHEN EXISTS(SELECT 1 FROM console_operations o WHERE o.run_id=r.id AND o.status IN ('running','starting'))
+        OR EXISTS(SELECT 1 FROM console_executions e WHERE e.run_id=r.id AND e.status IN ('running','starting')) THEN 1 ELSE 0 END working,
+      CASE WHEN EXISTS(SELECT 1 FROM console_operations o WHERE o.run_id=r.id AND o.status='queued')
+        OR EXISTS(SELECT 1 FROM console_executions e WHERE e.run_id=r.id AND e.status='queued') THEN 1 ELSE 0 END queued,
+      CASE WHEN EXISTS(SELECT 1 FROM console_operations o WHERE o.run_id=r.id AND o.status IN ('unknown','reconciliation_required'))
+        OR EXISTS(SELECT 1 FROM console_executions e WHERE e.run_id=r.id AND e.status IN ('unknown','reconciliation_required')) THEN 1 ELSE 0 END unresolved,
+      CASE WHEN EXISTS(SELECT 1 FROM console_operations o WHERE o.run_id=r.id AND o.status='failed')
+        OR EXISTS(SELECT 1 FROM console_executions e WHERE e.run_id=r.id AND e.status IN ('failed','stopped','cancelled')) THEN 1 ELSE 0 END failed_child,
+      (SELECT SUM(json_extract(e.delta,'$.totalTokens')) FROM console_executions e WHERE e.run_id=r.id) tokens,
+      k.files_json archived_files
+    FROM console_work_runs r JOIN console_work_items i ON i.id=r.item_id
+      JOIN console_projects p ON p.id=r.project_id
+      LEFT JOIN qm_run_links l ON l.run_id=r.id
+      LEFT JOIN qm_session_members m ON m.id=l.member_id
+      LEFT JOIN qm_sessions s ON s.id=l.session_id
+      LEFT JOIN qm_tasks t ON t.id=l.task_id
+      LEFT JOIN qm_run_checkpoints k ON k.run_id=r.id
+    WHERE ${allowed} AND (l.run_id IS NULL OR m.node_id=?)
+  ), classified AS (
+    SELECT *,CASE
+      WHEN working=1 THEN 'running'
+      WHEN status='running' AND queued=1 THEN 'queued'
+      WHEN task_result='completed' THEN 'completed'
+      WHEN task_result='failed' THEN 'failed'
+      WHEN task_result='cancelled' THEN 'cancelled'
+      WHEN status IN ('completed','failed','cancelled') THEN status
+      WHEN task_state='closed' THEN 'ended'
+      WHEN status IN ('interrupted','reconciliation_required') THEN 'interrupted_recoverable'
+      WHEN status='running' AND unresolved=1 THEN 'unknown'
+      WHEN status='running' AND latest=1 THEN 'waiting' ELSE status END execution,
+      CASE WHEN task_state='closed' AND EXISTS(
+        SELECT 1 FROM qm_task_snapshots snap WHERE snap.task_id=base.task_id AND snap.member_id=base.member_id AND json_array_length(snap.files_json)>0
+      ) THEN 1 WHEN task_id IS NOT NULL AND EXISTS(
+        SELECT 1 FROM qm_task_file_changes f JOIN qm_task_change_baselines b
+          ON b.task_id=f.task_id AND b.member_id=f.member_id AND b.latest_ref=f.version_ref
+        WHERE f.task_id=base.task_id AND f.member_id=base.member_id
+      ) THEN 1 WHEN task_id IS NULL AND latest=1 AND EXISTS(
+        SELECT 1 FROM qm_file_changes f
+        JOIN qm_change_baselines b ON b.session_id=f.session_id AND b.member_id=f.member_id AND b.latest_ref=f.version_ref
+        WHERE f.member_id=base.member_id
+      ) THEN 1
+        WHEN json_array_length(archived_files)>0 THEN 1
+        WHEN EXISTS(SELECT 1 FROM console_operations o,json_each(o.evidence) j WHERE o.run_id=base.id AND json_extract(j.value,'$.label')='console.changes') THEN 1 ELSE 0 END changed
+    FROM base
+  ), states AS (
+    SELECT *,CASE WHEN execution='interrupted_recoverable' THEN 'interrupted'
+      WHEN execution!='completed' THEN execution
+      WHEN task_result='completed' AND status!='completed' THEN 'done'
+      WHEN acceptance='pending' THEN 'review' WHEN acceptance='passed' THEN 'accepted'
+      WHEN acceptance='failed' THEN 'rejected' ELSE 'done' END stage,
+      CAST(ROUND((julianday(created_at)-2440587.5)*86400000) AS INTEGER) started_ms,
+      CAST(ROUND((julianday(CASE WHEN execution IN ('running','queued','stopping','waiting') THEN finished_at ELSE COALESCE(task_finished_at,finished_at) END)-2440587.5)*86400000) AS INTEGER) finished_ms
+    FROM classified
+  )`;
+  // 占位参数按照 SQL 中出现的顺序排列。
+  const ordered = [prefix, ...projectIds, nodeId];
+  const where: string[] = [];
+  const filters: Array<string | number> = [];
+  const condition = (expression: string, value?: string | number) => { where.push(expression); if (value !== undefined) filters.push(value); };
+  if (query.project) {
+    const project = parseWorkspaceHandle(query.project);
+    if (project && project.node !== nodeId) condition("0");
+    condition("project_id=?", project?.local ?? query.project);
+  }
+  if (query.root) condition("root=?", query.root);
+  if (query.session) condition("session_id=?", query.session);
+  if (query.changed) condition("changed=1");
+  if (query.execution) condition("execution=?", query.execution);
+  if (query.attention) condition("execution IN ('failed','unknown') OR (execution='interrupted_recoverable' AND (unresolved=1 OR failed_child=1))");
+  if (query.q?.trim()) condition("instr(lower(title||' '||id||' '||reference||' '||project_name),?)>0", query.q.trim().toLocaleLowerCase());
+  if (query.date || query.finishedDay) {
+    const zone = query.tz || "UTC";
+    dayAt(at, zone);
+    db.function("workbench_day", { deterministic: true }, (value: unknown) => typeof value === "number" ? dayAt(value, zone) : null);
+    if (query.date) condition("workbench_day(started_ms)=?", query.date);
+    if (query.finishedDay) condition("workbench_day(finished_ms)=?", query.finishedDay);
+  }
+  const days = Number(query.days ?? 7);
+  if (days) condition(`(started_ms>=? OR execution IN ('running','queued','stopping','waiting')${query.attention ? " OR execution='interrupted_recoverable'" : ""})`, at - days * 86400000);
+  const filter = where.length ? where.join(" AND ") : "1";
+  const scope = `${sql}, scoped AS (SELECT * FROM states WHERE ${filter})`;
+  const values = [...ordered, ...filters];
+  const counts = Object.fromEntries((db.prepare(`${scope} SELECT stage,COUNT(*) count FROM scoped GROUP BY stage`).all(...values) as Array<{ stage: string; count: number }>).map((row) => [row.stage, row.count]));
+  counts.all = Object.values(counts).reduce((a, b) => a + b, 0);
+  const selected = query.status ? "stage=?" : "1";
+  const selectedValues = query.status ? [...values, query.status] : values;
+  const selectedSql = `${scope}, selected AS (SELECT * FROM scoped WHERE ${selected})`;
+  const total = query.status ? counts[query.status] ?? 0 : counts.all;
+  return { sql: selectedSql, params: selectedValues, total, counts };
+}
+
+export function selectRunPage(ledger: WorkLedger, nodeId: string, projectIds: string[], query: Query) {
+  const boundary = decodeBoundary(query.cursor);
+  const at = boundary?.at ?? Date.now();
+  const base = runQuery(ledger, nodeId, projectIds, query, at);
+  const limit = Math.min(100, Math.max(1, Number(query.limit ?? 25)));
+  const ascending = query.sort === "oldest";
+  const reverse = boundary?.direction === "previous";
+  const sort = query.sort === "tokens" ? "COALESCE(tokens,-1)" : query.sort === "duration" ? `COALESCE(finished_ms,${at})-started_ms` : "started_ms";
+  const sign = ascending !== reverse ? ">" : "<";
+  const tieSign = reverse ? "<" : ">";
+  const condition = boundary ? `(sort_key${sign}? OR (sort_key=? AND reference${tieSign}?))` : "1";
+  const values = [...base.params, ...(boundary ? [boundary.value, boundary.value, boundary.id] : []), limit];
+  const rows = ledger.db.prepare(`${base.sql}, ordered AS (SELECT *,${sort} sort_key FROM selected)
+    SELECT id,sort_key FROM ordered WHERE ${condition}
+    ORDER BY sort_key ${ascending !== reverse ? "ASC" : "DESC"},reference ${reverse ? "DESC" : "ASC"} LIMIT ?`).all(...values) as Array<{ id: string; sort_key: number }>;
+  return { ids: rows.map((row) => row.id), total: base.total, counts: base.counts, at, limit, offset: boundary?.offset ?? 0 };
+}

@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "quaymesh",
+  "coordinator": {
+    "id": "cloud",
+    "address": "10.42.0.1",
+    "apiPort": 7681,
+    "mcpPort": 7676,
+    "peerPort": 7680
+  },
+  "mesh": {
+    "networkName": "quaymesh",
+    "secretEnv": "QUAYMESH_MESH_SECRET",
+    "peers": [
+      "udp://203.0.113.10:11010"
+    ]
+  },
+  "discovery": {
+    "tunnelIdEnv": "QUAYMESH_TUNNEL_ID",
+    "apiKeyEnv": "QUAYMESH_TUNNEL_API_KEY",
+    "localPort": 17676,
+    "healthPort": 8080
+  },
+  "egress": {
+    "priorities": {}
+  }
+}

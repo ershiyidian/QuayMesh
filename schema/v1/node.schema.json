@@ -1,0 +1,275 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    },
+    "nickname": {
+      "type": "string",
+      "minLength": 1
+    },
+    "clusterFile": {
+      "type": "string",
+      "minLength": 1
+    },
+    "secretsFile": {
+      "type": "string",
+      "minLength": 1
+    },
+    "stateDir": {
+      "type": "string",
+      "minLength": 1
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "coordinator": {
+          "type": "boolean"
+        },
+        "worker": {
+          "type": "boolean"
+        },
+        "discovery": {
+          "type": "boolean"
+        },
+        "egress": {
+          "type": "boolean"
+        },
+        "meshRelay": {
+          "type": "boolean"
+        },
+        "desktopUi": {
+          "type": "boolean"
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "externalAccess": {
+          "type": "boolean"
+        },
+        "inheritProxy": {
+          "type": "boolean"
+        },
+        "proxyUrl": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "mesh": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "mode": {
+          "enum": [
+            "tun",
+            "no-tun"
+          ]
+        },
+        "address": {
+          "type": "string",
+          "minLength": 1
+        },
+        "listeners": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "rpcPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "socksPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      },
+      "required": [
+        "address"
+      ]
+    },
+    "components": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "easytier": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executable": {
+              "type": "string",
+              "minLength": 1
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "configFile": {
+              "type": "string",
+              "minLength": 1
+            },
+            "environment": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "tunnel": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executable": {
+              "type": "string",
+              "minLength": 1
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "configFile": {
+              "type": "string",
+              "minLength": 1
+            },
+            "environment": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "egress": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executable": {
+              "type": "string",
+              "minLength": 1
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "configFile": {
+              "type": "string",
+              "minLength": 1
+            },
+            "environment": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "roots": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+          },
+          "nickname": {
+            "type": "string",
+            "minLength": 1
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "required": [
+          "id",
+          "path"
+        ]
+      }
+    },
+    "core": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tools": {
+          "type": "object"
+        },
+        "subagents": {
+          "type": "object"
+        },
+        "skills": {
+          "type": "object"
+        },
+        "artifacts": {
+          "type": "object"
+        },
+        "logging": {
+          "type": "object"
+        }
+      }
+    },
+    "adminPort": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "peerPort": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "corePort": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "nodeRuntime": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "id",
+    "mesh"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:quaymesh:node:1",
+  "title": "QuayMesh 节点配置"
+}

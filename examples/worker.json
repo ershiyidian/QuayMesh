@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "worker",
+  "nickname": "Linux worker",
+  "clusterFile": "./cluster.json",
+  "secretsFile": "./secrets.worker.env",
+  "capabilities": {
+    "worker": true,
+    "consoleRelay": true
+  },
+  "network": {
+    "externalAccess": true
+  },
+  "mesh": {
+    "address": "10.42.0.2",
+    "mode": "no-tun"
+  },
+  "roots": [
+    {
+      "id": "projects",
+      "nickname": "Projects",
+      "path": "~/projects"
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+node_modules/
+dist/
+.build/
+.releases/
+releases/
+.planning/
+.quaymesh/
+.quaymesh-dev/
+.vs/
+apps/**/bin/
+apps/**/obj/
+**/TestResults/
+*.user
+*.suo
+*.log
+.env
+secrets.env
+auth.json
+owner.json
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.key
+*.token
+test-results/
+playwright-report/
+coverage/
+site/
+__pycache__/
+
+# 私有部署资料
+Todo.md
+QuayMesh-Deployment-Tools.zip
+deploy-tools/
+
+# 组件构建产物
+components/
+
+# Local configuration and publication work
+.env.*
+!.env.example
+secrets.*.env
+*.pfx
+*.p12
+*.pem
+public-build/

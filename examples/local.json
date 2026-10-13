@@ -1,0 +1,51 @@
+{
+  "cluster": {
+    "schemaVersion": 1,
+    "id": "quaymesh-local",
+    "coordinator": {
+      "id": "local",
+      "address": "127.0.0.1"
+    },
+    "mesh": {
+      "networkName": "quaymesh-local",
+      "peers": [
+        "udp://127.0.0.1:11010"
+      ]
+    },
+    "discovery": {
+      "localPort": 17676
+    }
+  },
+  "nodes": [
+    {
+      "schemaVersion": 1,
+      "id": "local",
+      "nickname": "Local workspace",
+      "capabilities": {
+        "coordinator": true,
+        "worker": true,
+        "consoleRelay": true
+      },
+      "network": {
+        "externalAccess": true
+      },
+      "consoleSettings": {
+        "egress": {
+          "enabled": false
+        }
+      },
+      "mesh": {
+        "enabled": false,
+        "address": "127.0.0.1",
+        "mode": "tun"
+      },
+      "roots": [
+        {
+          "id": "projects",
+          "nickname": "Projects",
+          "path": "~/quaymesh-projects"
+        }
+      ]
+    }
+  ]
+}

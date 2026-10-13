@@ -1,0 +1,636 @@
+import { activityTimes, latestActivity } from "./activity.js";
+import { join } from "node:path";
+import { ExecutionState, ReviewState, HostState } from "./types.js";
+import type {
+  AgentSummary,
+  CommandSummary,
+  FileSummary,
+  InstructionSummary,
+  SessionEvent,
+  SessionId,
+  SessionMember,
+  SessionRecord,
+  SkillSummary,
+  Snapshot,
+  TaskRecord,
+} from "./types.js";
+import type { SessionStore } from "./store.js";
+
+export interface ProjectionReadResult {
+  unchanged: boolean;
+  snapshot?: Snapshot;
+  rev?: number;
+}
+
+export interface ProjectionRevertEligibility {
+  allowed: boolean;
+  reason: string | null;
+  revision: number;
+}
+
+const PAGE_ROWS = 50;
+
+export class SessionProjector {
+  private readonly scheduled = new Map<string, Promise<void>>();
+  private closed = false;
+
+  constructor(
+    private readonly store: SessionStore,
+    private readonly stateDir: string,
+    private readonly consoleUrl: string | null = null,
+    private readonly revertEligibility?: (sessionId: SessionId, memberId: string, taskId?: string) => Promise<ProjectionRevertEligibility>,
+    private readonly localNodeId?: string,
+  ) {}
+
+  schedule(sessionId: SessionId, memberId: string, taskId?: string): void {
+    if (this.closed) return;
+    const selectedTask = taskId ?? this.store.currentTask(sessionId)?.id;
+    const key = JSON.stringify([sessionId,memberId,selectedTask??null]);
+    if (this.scheduled.has(key)) return;
+    let observedRevision = -1;
+    let successful = false;
+    const pending = Promise.resolve()
+      .then(() => this.materialize(sessionId, memberId, selectedTask))
+      .then(snapshot => { observedRevision=snapshot.rev;successful=true; })
+      .catch(error => { this.store.markProjectionError(sessionId,memberId,error instanceof Error?error.message:String(error)); throw error; })
+      .finally(() => {
+        this.scheduled.delete(key);
+        const newer=selectedTask ? this.store.getTask(selectedTask).revision>observedRevision : this.hasPendingSnapshot(sessionId,memberId);
+        if (!this.closed && successful && newer) {
+          this.schedule(sessionId, memberId, selectedTask);
+        }
+      });
+    this.scheduled.set(key, pending);
+    void pending.catch(()=>{});
+  }
+
+  async materialize(sessionId: SessionId, memberId: string, taskId?: string): Promise<Snapshot> {
+    const session = this.store.getSession(sessionId);
+    const member = this.store.getMember(sessionId, memberId);
+    const memberRevisionBefore = member.revision;
+    const task = taskId ? this.store.getTask(taskId) : null;
+    if (task && task.session_id !== sessionId) throw new Error(`TASK_SESSION_MISMATCH: ${task.id}`);
+    const revisionBefore = task?.revision ?? member.revision;
+    const events = task ? this.store.eventsForTask(task.id) : this.store.eventsForSession(sessionId);
+    const metadata = this.store.openingMetadata(sessionId,memberId);
+    const files = this.store.fileSummaries(sessionId, memberId, task?.id).map(({ patchRef: _patchRef, versionRef: _versionRef, ...file }) => file);
+    const commands = this.commands(events, member.id);
+    const agents = this.agents(events, member.id);
+    const instructions = this.instructions(sessionId, member.id, task?.id);
+    const skills = this.skills(sessionId, member.id, task?.id);
+    const executionState = session.execution_state;
+    const localMember = this.localNodeId === undefined || member.node_id === this.localNodeId;
+    const revert = !localMember
+      ? { allowed: false, reason: "remote_member", revision: member.revision }
+      : this.revertEligibility
+      ? await this.revertEligibility(sessionId, memberId, task?.id)
+      : {
+          allowed: files.length > 0 && files.every((file) => file.revertible && file.coverage === "session_owned"),
+          reason: files.length > 0 && files.every((file) => file.revertible && file.coverage === "session_owned") ? null : "not_eligible",
+          revision: member.revision,
+        };
+    const notices: string[] = [];
+    if (!revert.allowed && revert.reason) notices.push(`Revert unavailable: ${revert.reason}`);
+    if(task?.closure_reason==="superseded")notices.push("上一请求已归档，未收到明确交付结果");
+    if(task?.change_summary_state==="incomplete")notices.push(`文件变化摘要未完整取得${task.change_summary_error?`：${task.change_summary_error}`:""}`);
+    const runningCommand=commands.find(command=>command.status==="run"||command.status==="queued")??null;
+    const lastCommand=[...commands].sort((a,b)=>(b.endedAt??b.startedAt??0)-(a.endedAt??a.startedAt??0))[0]??null;
+    const activity=activityTimes(events,member.id);
+    const lastOperation=latestActivity(events,member.id);
+
+    const snapshot: Snapshot = {
+      sessionId,
+      taskId: task?.id ?? null,
+      taskState:task?.state,
+      taskResult:task?.result_status,
+      lastOperation,
+      lastActivityAt:activity.lastModelToolAt??activity.lastExecutionActivityAt,
+      lastModelToolAt:activity.lastModelToolAt,
+      lastExecutionActivityAt:activity.lastExecutionActivityAt,
+      lastOutputAt:activity.lastOutputAt,
+      serverNow:Date.now(),
+      currentCommand:runningCommand??lastCommand,
+      runningCommand,
+      lastCommand,
+      closureReason:task?.closure_reason??null,
+      archivedAt:task?.archived_at?Date.parse(task.archived_at):null,
+      deliveryEndedAt:task?.delivery_ended_at?Date.parse(task.delivery_ended_at):null,
+      sourceKind:task?.source_kind??"legacy_unknown",
+      changeSummary:{state:task?.change_summary_state??"not_started",error:task?.change_summary_error??null},
+      rev: revisionBefore,
+      changeRev: memberRevisionBefore,
+      title: task?.title ?? session.title,
+      status: task?.state === "closed" ? task.result_status === "completed" ? "done" : task.result_status === "failed" ? "failed" : "idle" : outerStatus(session),
+      execution_status: executionState,
+      review_status: session.review_state,
+      host_status: session.host_state,
+      startedAt: Date.parse(task?.created_at ?? session.created_at),
+      endedAt: task ? (task.delivery_ended_at ? Date.parse(task.delivery_ended_at) : null)
+        : executionState === ExecutionState.idle ? Date.parse(session.last_activity_at) : null,
+      observedAt: Date.now(),
+      consoleUrl: this.consoleUrl,
+      workspace: {
+        id: member.id,
+        node_id: member.node_id,
+        workspace_id: member.workspace_id,
+        online: member.online,
+        observedAt: Date.parse(member.last_observed_at),
+        root: member.root,
+        sourceRoot: member.source_root,
+        branch: typeof metadata?.branch === "string" ? metadata.branch : null,
+        baseRef: typeof metadata?.baseRef === "string" ? metadata.baseRef : null,
+        baseSha: typeof metadata?.baseSha === "string" ? metadata.baseSha : null,
+        dirtySource: typeof metadata?.dirtySource === "boolean" ? metadata.dirtySource : null,
+        mode: member.mode === "worktree" ? "worktree" : "local",
+      },
+      workspaces: session.members,
+      files,
+      commands,
+      agents,
+      instructions,
+      skills,
+      totals: { files: files.length, commands: commands.length, agents: agents.filter((agent) => agent.role !== "main").length },
+      cursors: { files: null, commands: null, agents: null },
+      capabilities: {
+        refresh: true,
+        revert: revert.allowed && revert.revision === memberRevisionBefore,
+        continue: agents.some((agent) => agent.result_available || agent.state === "working" || agent.state === "queued"),
+        open_file: files.length > 0,
+      },
+      notices,
+    };
+    const currentTask = task && session.current_task_id === task.id && task.state === "active";
+    if (task && this.store.getTask(task.id).revision === revisionBefore) {
+      this.store.taskData.putProjection(task.id,memberId,revisionBefore,snapshot);
+    }
+    if ((!task || currentTask) && this.store.memberRevision(memberId) === memberRevisionBefore) {
+      this.store.putSnapshot(sessionId, memberId, memberRevisionBefore, snapshot);
+    }
+    return snapshot;
+  }
+
+  async readTask(taskId: string, sinceRev: number, memberId?: string, cursor?: string): Promise<ProjectionReadResult> {
+    const task = this.store.getTask(taskId);
+    const session = this.store.getSession(task.session_id);
+    if (task.revision === sinceRev && !cursor) return { unchanged: true, rev: task.revision };
+
+    if (task.state === "closed") {
+      const frozen = this.store.taskSnapshots(task.id);
+      const selected = memberId ? frozen.filter((item) => item.memberId === memberId) : frozen;
+      if (memberId && selected.length === 0) throw new Error(`TASK_MEMBER_NOT_FOUND: ${memberId}`);
+      const current = await Promise.all(selected.map(async item => {
+        const member=this.store.getMember(session.id,item.memberId);
+        const cached=this.store.taskData.projection(task.id,item.memberId);
+        const events=this.store.eventsForTask(task.id).filter(event=>event.member_id===item.memberId);
+        const changed=events.some(event=>Date.parse(event.timestamp)>item.snapshot.observedAt);
+        if(changed && (this.localNodeId===undefined||member.node_id===this.localNodeId))return this.materialize(session.id,item.memberId,task.id);
+        return cached && cached.revision>item.revision ? cached.snapshot : item.snapshot;
+      }));
+      const snapshot = this.aggregateTaskSnapshot(task, session, current, this.store.taskMemberIds(task.id));
+      return { unchanged: false, snapshot: pageSnapshot(snapshot, cursor), rev: task.revision };
+    }
+
+    const taskMembers = this.store.taskMemberIds(task.id);
+    if (memberId && !session.members.some((member) => member.id === memberId)) throw new Error(`MEMBER_NOT_IN_SESSION: ${memberId}`);
+    const selectedIds = memberId ? [memberId] : taskMembers;
+    const snapshots = await Promise.all(selectedIds.map(async (id) => {
+      const member=this.store.getMember(session.id,id);
+      const cached = this.store.taskData.projection(task.id, id);
+      const local=this.localNodeId===undefined || member.node_id===this.localNodeId;
+      if(local) return cached?.revision===task.revision ? cached.snapshot : this.materialize(session.id,id,task.id);
+      if(cached)return {...cached.snapshot,workspace:cached.snapshot.workspace ? {...cached.snapshot.workspace,online:member.online,observedAt:Date.parse(member.last_observed_at)} : null,
+        host_status:member.online?HostState.connected:HostState.disconnected,workspaces:session.members};
+      const empty=emptySnapshot(this.store,session.id,id,member.revision,member.root,member.source_root,member.mode,this.consoleUrl);
+      return {...empty,taskId:task.id,title:task.title,notices:[...empty.notices,"尚未取得所属节点的任务数据"]};
+    }));
+    const snapshot = this.aggregateTaskSnapshot(task, session, snapshots, taskMembers);
+    return { unchanged: false, snapshot: pageSnapshot(snapshot, cursor), rev: task.revision };
+  }
+
+  private aggregateTaskSnapshot(task: TaskRecord, session: SessionRecord, snapshots: Snapshot[], taskMemberIds: string[]): Snapshot {
+    const membersById = new Map((task.state === "closed" ? snapshots.flatMap(item=>item.workspaces) : session.members).map((member) => [member.id, member]));
+    const members = [...new Set(taskMemberIds)].flatMap((id) => membersById.get(id) ? [membersById.get(id)!] : []);
+    const files = snapshots.flatMap((snapshot) => snapshot.files);
+    const commands = snapshots.flatMap((snapshot) => snapshot.commands);
+    const agents = snapshots.flatMap((snapshot) => snapshot.agents);
+    const instructions = snapshots.flatMap((snapshot) => snapshot.instructions);
+    const skills = snapshots.flatMap((snapshot) => snapshot.skills);
+    const notices = snapshots.flatMap((snapshot) => snapshot.notices);
+    const lastOperation=snapshots.map(snapshot=>snapshot.lastOperation).filter((item):item is NonNullable<Snapshot["lastOperation"]>=>Boolean(item))
+      .sort((a,b)=>(b.endedAt ?? b.startedAt)-(a.endedAt ?? a.startedAt))[0] ?? null;
+    const active=commands.some(command=>command.status==="run"||command.status==="queued")
+      ||agents.some(agent=>agent.state==="working"||agent.state==="queued");
+    const runningCommand=commands.find(command=>command.status==="run"||command.status==="queued")??null;
+    const lastCommand=[...commands].sort((a,b)=>(b.endedAt??b.startedAt??0)-(a.endedAt??a.startedAt??0))[0]??null;
+    const lastModelToolAt=maxTime(snapshots.map(snapshot=>snapshot.lastModelToolAt));
+    const lastExecutionActivityAt=maxTime(snapshots.map(snapshot=>snapshot.lastExecutionActivityAt));
+    const lastOutputAt=maxTime(snapshots.map(snapshot=>snapshot.lastOutputAt));
+    const finalization=this.store.taskData.finalization(task.id);
+    if(finalization&&!finalization.completed_at)notices.push(finalization.error?`任务结束尚未确认：${finalization.error}`:"正在确认各节点的任务结果");
+    if(task.closure_reason==="superseded")notices.push("上一请求已归档，未收到明确交付结果");
+    if(task.change_summary_state==="incomplete")notices.push(`文件变化摘要未完整取得${task.change_summary_error?`：${task.change_summary_error}`:""}`);
+    if (members.length === 0) notices.push("No workspace has been used in this task yet.");
+    else if (members.length > 1) notices.push(`Showing ${members.length} workspaces in this task.`);
+    return {
+      sessionId: session.id,
+      taskId: task.id,
+      taskState:task.state,
+      taskResult:task.result_status,
+      lastOperation,
+      lastActivityAt:lastModelToolAt??lastExecutionActivityAt,
+      lastModelToolAt,
+      lastExecutionActivityAt,
+      lastOutputAt,
+      serverNow:Date.now(),
+      currentCommand:runningCommand??lastCommand,
+      runningCommand,
+      lastCommand,
+      closureReason:task.closure_reason??null,
+      archivedAt:task.archived_at?Date.parse(task.archived_at):null,
+      deliveryEndedAt:task.delivery_ended_at?Date.parse(task.delivery_ended_at):null,
+      sourceKind:task.source_kind??"legacy_unknown",
+      changeSummary:{state:task.change_summary_state??"not_started",error:task.change_summary_error??null},
+      rev: task.revision,
+      changeRev: snapshots.length === 1 ? snapshots[0]?.changeRev ?? null : null,
+      title: task.title,
+      status: active ? "running" : task.state === "closed" ? task.result_status === "completed" ? "done" : task.result_status === "failed" ? "failed" : "idle" : outerStatus(session),
+      execution_status: task.state === "closed" ? (task.result_status === "failed" ? ExecutionState.failed : ExecutionState.idle) : session.execution_state,
+      review_status: task.state === "closed" ? snapshots[0]?.review_status ?? session.review_state : session.review_state,
+      // A member-scoped Task card reports the selected Worker's current
+      // connectivity. The aggregate conversation state can still be unknown.
+      host_status: snapshots.length === 1 ? snapshots[0]!.host_status : session.host_state,
+      startedAt: Date.parse(task.created_at),
+      endedAt: task.delivery_ended_at
+        ? Date.parse(task.delivery_ended_at)
+        : null,
+      observedAt: task.state === "closed" ? Math.max(Date.parse(task.created_at),...snapshots.map(item=>item.observedAt)) : Date.now(),
+      consoleUrl: this.consoleUrl,
+      workspace: snapshots.length === 1 ? snapshots[0]?.workspace ?? null : null,
+      workspaces: members,
+      files,
+      commands,
+      agents,
+      instructions,
+      skills,
+      totals: { files: files.length, commands: commands.length, agents: agents.filter((agent) => agent.role !== "main").length },
+      cursors: { files: null, commands: null, agents: null },
+      capabilities: {
+        refresh: task.state === "active" || active || Boolean(finalization&&!finalization.completed_at),
+        revert: task.state === "active" && snapshots.length === 1 && Boolean(snapshots[0]?.capabilities.revert),
+        continue: task.state === "active" && agents.some((agent) => agent.result_available || agent.state === "working" || agent.state === "queued"),
+        open_file: files.length > 0,
+      },
+      notices: [...new Set(notices)],
+    };
+  }
+
+  async readSession(sessionId: SessionId, sinceRev: number, cursor?: string): Promise<ProjectionReadResult> {
+    const session = this.store.getSession(sessionId);
+    const rev = this.sessionRevision(session);
+    if (rev === sinceRev && !cursor) return { unchanged: true, rev };
+    const snapshot = await this.sessionSnapshot(session, rev);
+    return { unchanged: false, snapshot: pageSnapshot(snapshot, cursor), rev };
+  }
+
+  private sessionRevision(session: SessionRecord): number {
+    return session.members.reduce((total, member) => total + this.store.memberRevision(member.id), session.revision);
+  }
+
+  private async sessionSnapshot(session: SessionRecord, rev: number): Promise<Snapshot> {
+    const members = session.members;
+    const files: FileSummary[] = [];
+    const commands: CommandSummary[] = [];
+    const agents: AgentSummary[] = [];
+    const instructions: InstructionSummary[] = [];
+    const skills: SkillSummary[] = [];
+    for (const member of members) {
+      const stored = await this.workspaceView(session.id, member);
+      files.push(...stored.files);
+      commands.push(...stored.commands);
+      agents.push(...stored.agents);
+      instructions.push(...stored.instructions);
+      skills.push(...stored.skills);
+    }
+    const primary = members.length === 1 ? (await this.workspaceView(session.id, members[0]!)).workspace : null;
+    const notices: string[] = [];
+    if (members.length === 0) notices.push("No workspace is open in this session yet.");
+    else if (members.length > 1) notices.push(`Showing ${members.length} workspaces in this session.`);
+    return {
+      sessionId: session.id,
+      rev,
+      title: session.title,
+      status: outerStatus(session),
+      execution_status: session.execution_state,
+      review_status: session.review_state,
+      host_status: session.host_state,
+      startedAt: Date.parse(session.created_at),
+      endedAt: session.execution_state === ExecutionState.idle ? Date.parse(session.last_activity_at) : null,
+      observedAt: Date.now(),
+      consoleUrl: this.consoleUrl,
+      workspace: primary,
+      workspaces: members,
+      files,
+      commands,
+      agents,
+      instructions,
+      skills,
+      totals: {
+        files: files.length,
+        commands: commands.length,
+        agents: agents.filter((agent) => agent.role !== "main").length,
+      },
+      cursors: { files: null, commands: null, agents: null },
+      capabilities: {
+        refresh: true,
+        revert: false,
+        continue: agents.some((agent) => agent.result_available || agent.state === "working" || agent.state === "queued"),
+        open_file: files.length > 0,
+      },
+      notices,
+    };
+  }
+
+  private async workspaceView(sessionId: SessionId, member: SessionMember): Promise<Snapshot> {
+    const stored = this.store.getSnapshot(sessionId, member.id).snapshot;
+    if (stored) return stored;
+    return this.materialize(sessionId, member.id);
+  }
+  read(sessionId: SessionId, memberId: string, sinceRev: number, cursor?: string): ProjectionReadResult {
+    const stored = this.store.getSnapshot(sessionId, memberId);
+    const members = this.store.getMembers(sessionId);
+    const member = members.find(item => item.id === memberId);
+    if (!member) throw new Error(`MEMBER_NOT_IN_SESSION: ${memberId}`);
+    if (!stored.snapshot) {
+      const empty = emptySnapshot(this.store, sessionId, member.id, member.revision, member.root, member.source_root, member.mode, this.consoleUrl);
+      return { unchanged: false, snapshot: pageSnapshot(empty, cursor), rev: member.revision };
+    }
+    const membershipChanged = JSON.stringify(stored.snapshot.workspaces.map((member) => [member.id, member.online]))
+      !== JSON.stringify(members.map((member) => [member.id, member.online]));
+    if (stored.revision === sinceRev && !cursor && !membershipChanged) return { unchanged: true, rev: stored.revision };
+    return {
+      unchanged: false,
+      // A stored remote snapshot can precede a transport disconnect by hours.
+      // Never mask current member presence behind its old host_status field.
+      snapshot: pageSnapshot({ ...stored.snapshot, workspaces: members,
+        host_status:member.online ? HostState.connected : HostState.disconnected,
+        workspace:stored.snapshot.workspace ? {...stored.snapshot.workspace,
+          online:member.online,observedAt:Date.parse(member.last_observed_at)} : null,
+      }, cursor),
+      rev: stored.revision,
+    };
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+    await Promise.allSettled([...this.scheduled.values()]);
+    this.scheduled.clear();
+  }
+
+  private hasPendingSnapshot(sessionId: SessionId, memberId: string): boolean {
+    const stored = this.store.getSnapshot(sessionId, memberId);
+    return stored.revision < this.store.memberRevision(memberId);
+  }
+
+  private commands(events: SessionEvent[], memberId: string): CommandSummary[] {
+    const records = new Map<string, CommandSummary>();
+    for (const event of events) {
+      if (event.member_id !== memberId) continue;
+      if (event.type !== "operation_started" && event.type !== "operation_finished") continue;
+      const operationId = String(event.payload.operation_id ?? event.source_id);
+      const existing = records.get(operationId);
+      if (!existing && event.payload.kind !== "command") continue;
+      const isFinished = event.type === "operation_finished";
+      if (!isFinished && existing?.endedAt !== null && existing?.endedAt !== undefined) continue;
+      const status = isFinished ? String(event.payload.status ?? "unknown") : "running";
+      const commandStatus = mapCommandStatus(status);
+      const startedAt = existing?.startedAt ?? (event.type === "operation_started" ? Date.parse(event.timestamp) : null);
+      const endedAt = isFinished ? Date.parse(event.timestamp) : null;
+      const resultRef = typeof event.payload.output_ref === "string" ? event.payload.output_ref : existing?.output_ref ?? operationId;
+      records.set(operationId, {
+        id: operationId,
+        operation_id: operationId,
+        member_id: memberId,
+        cmd: String(event.payload.label ?? event.payload.kind ?? existing?.cmd ?? "command"),
+        agent: String(event.payload.agent ?? event.payload.agent_id ?? existing?.agent ?? "host"),
+        status: commandStatus,
+        startedAt,
+        endedAt,
+        exitCode: event.payload.exit_code === null || event.payload.exit_code === undefined
+          ? existing?.exitCode ?? null
+          : Number(event.payload.exit_code),
+        signal: event.payload.signal === null || event.payload.signal === undefined
+          ? existing?.signal ?? null
+          : String(event.payload.signal),
+        attempt: existing?.attempt ?? null,
+        supersededBy: existing?.supersededBy ?? null,
+        summary: event.payload.error_message === null || event.payload.error_message === undefined
+          ? existing?.summary ?? null
+          : String(event.payload.error_message),
+        output_ref: resultRef,
+        output_available: event.payload.output_available === true || existing?.output_available === true,
+      });
+    }
+    return [...records.values()];
+  }
+
+  private agents(events: SessionEvent[], memberId: string): AgentSummary[] {
+    const records = new Map<string, AgentSummary>();
+    for (const event of events) {
+      if (event.member_id !== memberId || event.type !== "agent_changed") continue;
+      const payload = event.payload;
+      const id = String(payload.agent_id ?? payload.agentId ?? event.source_id);
+      const previous = records.get(id);
+      const state = String(payload.state ?? previous?.state ?? "unknown");
+      const resultRef = payload.result_ref === null || payload.result_ref === undefined
+        ? previous?.result_ref ?? null
+        : String(payload.result_ref);
+      records.set(id, {
+        id,
+        member_id: memberId,
+        role: payload.role === "main" ? "main" : previous?.role ?? "subagent",
+        name: String(payload.name ?? payload.agent_name ?? previous?.name ?? "subagent"),
+        provider: String(payload.provider ?? previous?.provider ?? "unknown"),
+        model: payload.model === null || payload.model === undefined ? previous?.model ?? null : String(payload.model),
+        effort: payload.effort === null || payload.effort === undefined ? previous?.effort ?? null : String(payload.effort),
+        state: mapAgentState(state),
+        task: String(payload.task ?? previous?.task ?? ""),
+        tokens: payload.tokens === null || payload.tokens === undefined ? previous?.tokens ?? null : Number(payload.tokens),
+        usage_quality: payload.usage_quality === "complete" ? "complete" : payload.usage_quality === "partial" ? "partial" : payload.usage_quality === "not_used" ? "not_used" : previous?.usage_quality ?? "unavailable",
+        startedAt: typeof payload.started_at === "string" ? Date.parse(payload.started_at) : previous?.startedAt ?? Date.parse(event.timestamp),
+        endedAt: ["completed", "failed", "cancelled", "done"].includes(state) ? Date.parse(event.timestamp) : previous?.endedAt ?? null,
+        steps: Array.isArray(payload.steps) ? payload.steps.flatMap((step) => normalizeStep(step)) : previous?.steps ?? null,
+        result_available: payload.result_available === true,
+        result_ref: resultRef,
+      });
+    }
+    return [...records.values()];
+  }
+
+  private instructions(sessionId: SessionId, memberId: string, taskId?: string): InstructionSummary[] {
+    const merged=new Map<string,InstructionSummary>();
+    for(const row of this.store.contextReads(sessionId,memberId,taskId).filter(item=>item.kind==="instruction")) {
+      const candidate:InstructionSummary={
+        path:row.path,
+        status:row.state==="loaded"||row.state==="read"?"loaded":"available",
+        actor_id:row.actor_id,
+        source:row.actor_id==="host"?"workspace":"nested",
+        observed_at:row.observed_at??null,
+        content_ref:row.content_ref,
+      };
+      const previous=merged.get(row.path);
+      if(!previous||previous.status==="available"&&candidate.status==="loaded")merged.set(row.path,candidate);
+    }
+    return [...merged.values()];
+  }
+
+  private skills(sessionId: SessionId, memberId: string, taskId?: string): SkillSummary[] {
+    return this.store
+      .contextReads(sessionId, memberId, taskId)
+      .filter((row) => row.kind === "skill")
+      .map((row) => ({
+        name: row.path.split(/[\\/]/).filter(Boolean).at(-2) ?? row.path,
+        description: null,
+        path: row.path,
+        actor_id: row.actor_id,
+        state: row.state === "read" ? "read" : "available",
+        uses: row.read_count > 0 ? row.read_count : null,
+      }));
+  }
+}
+
+function maxTime(values:Array<number|null|undefined>):number|null {
+  const finite=values.filter((value):value is number=>typeof value==="number"&&Number.isFinite(value));
+  return finite.length?Math.max(...finite):null;
+}
+
+function mapCommandStatus(status: string): CommandSummary["status"] {
+  if (status === "succeeded") return "ok";
+  if (status === "failed") return "fail";
+  if (status === "cancelled") return "cancelled";
+  if (status === "accepted" || status === "queued") return "queued";
+  if (status === "running") return "run";
+  return "unknown";
+}
+
+function normalizeStep(value: unknown): Array<{ label: string; state: "done" | "cur" | "todo" }> {
+  if (typeof value === "string") return [{ label: value, state: "todo" }];
+  if (!value || typeof value !== "object") return [];
+  const record = value as Record<string, unknown>;
+  const label = record.label;
+  const state = record.state;
+  if (typeof label !== "string") return [];
+  return [{ label, state: state === "done" || state === "cur" ? state : "todo" }];
+}
+
+function mapAgentState(state: string): AgentSummary["state"] {
+  if (state === "running" || state === "working") return "working";
+  if (state === "completed" || state === "done") return "done";
+  if (state === "failed") return "failed";
+  if (state === "cancelled" || state === "stopped") return "cancelled";
+  if (state === "queued" || state === "starting") return "queued";
+  return "unknown";
+}
+
+function pageSnapshot(snapshot: Snapshot, cursor?: string): Snapshot {
+  const decoded = decodeCursor(cursor);
+  const files = pageRows(snapshot.files, decoded.files, (row) => row.id);
+  const commands = pageRows(snapshot.commands, decoded.commands, (row) => row.id, (row) => row.status === "run" || row.status === "queued" || row.id === snapshot.currentCommand?.id);
+  const agents = pageRows(snapshot.agents, decoded.agents, (row) => row.id, (row) => row.state === "working" || row.state === "queued" || row.result_available);
+  return {
+    ...snapshot,
+    files: files.rows,
+    commands: commands.rows,
+    agents: agents.rows,
+    cursors: {
+      files: files.nextCursor ? encodeCursor({ files: files.nextCursor }) : null,
+      commands: commands.nextCursor ? encodeCursor({ commands: commands.nextCursor }) : null,
+      agents: agents.nextCursor ? encodeCursor({ agents: agents.nextCursor }) : null,
+    },
+  };
+}
+
+function pageRows<T>(
+  rows: T[],
+  cursor: string | null,
+  idOf: (row: T) => string,
+  keepActive: (row: T) => boolean = () => false,
+): { rows: T[]; nextCursor: string | null } {
+  const start = cursor ? rows.findIndex((row) => idOf(row) === cursor) + 1 : 0;
+  const page = rows.slice(start, start + PAGE_ROWS);
+  const visible = new Map(page.map((row) => [idOf(row), row]));
+  for (const row of rows) if (keepActive(row)) visible.set(idOf(row), row);
+  const next = start + page.length < rows.length ? idOf(page.at(-1)!) : null;
+  return { rows: [...visible.values()], nextCursor: next };
+}
+
+function encodeCursor(cursor: { files?: string; commands?: string; agents?: string }): string {
+  return JSON.stringify(cursor);
+}
+
+function decodeCursor(cursor?: string): { files: string | null; commands: string | null; agents: string | null } {
+  if (!cursor) return { files: null, commands: null, agents: null };
+  if (cursor.length > 4096) throw new Error("SNAPSHOT_CURSOR_INVALID");
+  const parsed = JSON.parse(cursor) as { files?: unknown; commands?: unknown; agents?: unknown };
+  return {
+    files: typeof parsed.files === "string" ? parsed.files : null,
+    commands: typeof parsed.commands === "string" ? parsed.commands : null,
+    agents: typeof parsed.agents === "string" ? parsed.agents : null,
+  };
+}
+
+function outerStatus(session: SessionRecord): Snapshot["status"] {
+  if (session.execution_state === ExecutionState.active) return "running";
+  if (session.execution_state === ExecutionState.failed) return "failed";
+  if (session.review_state === ReviewState.passed) return "done";
+  return "idle";
+}
+function emptySnapshot(
+  store: SessionStore,
+  sessionId: SessionId,
+  memberId: string,
+  revision: number,
+  root: string,
+  sourceRoot: string | null,
+  mode: "checkout" | "worktree",
+  consoleUrl: string | null,
+): Snapshot {
+  const session = store.getSession(sessionId);
+  const member = store.getMember(sessionId, memberId);
+  return {
+    sessionId,
+    rev: revision,
+    title: session.title,
+    status: outerStatus(session),
+    execution_status: session.execution_state,
+    review_status: session.review_state,
+    host_status: session.host_state,
+    startedAt: Date.parse(session.created_at),
+    endedAt: session.execution_state === ExecutionState.idle ? Date.parse(session.last_activity_at) : null,
+    observedAt: Date.now(),
+    consoleUrl,
+    workspace: {
+      id: memberId,
+      node_id: member.node_id,
+      workspace_id: member.workspace_id,
+      online: member.online,
+      observedAt: Date.parse(member.last_observed_at),
+      root,
+      sourceRoot,
+      branch: null,
+      baseRef: null,
+      baseSha: null,
+      dirtySource: null,
+      mode: mode === "worktree" ? "worktree" : "local",
+    },
+    workspaces: session.members,
+    files: [],
+    commands: [],
+    agents: [],
+    instructions: [],
+    skills: [],
+    totals: { files: 0, commands: 0, agents: 0 },
+    cursors: { files: null, commands: null, agents: null },
+    capabilities: { refresh: true, revert: false, continue: false, open_file: false },
+    notices: ["Snapshot is being prepared."],
+  };
+}

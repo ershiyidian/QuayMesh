@@ -1,0 +1,475 @@
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, join, relative, resolve } from "node:path";
+import { createPatch } from "diff";
+import { git, getGitEligibility } from "../git.js";
+import { createWorkingTreeSnapshot } from "../review-checkpoints.js";
+import { isPathInsideRoot } from "../roots.js";
+import { textPage } from "../bounded-reply.js";
+import type { FileSummary, SessionId, SessionMember } from "./types.js";
+import type { SessionStore } from "./store.js";
+import { beginWrite, finishWrite, memberFile, ownershipPath, readFileState, readOwnedFiles, sameFileState, type WriteEvidence } from "./write-evidence.js";
+
+interface GitNumstat {
+  additions: number | null;
+  removals: number | null;
+  path: string;
+  from: string | null;
+  status: "A" | "M" | "D" | "R";
+}
+
+interface OrdinaryBaselineFile {
+  path: string;
+  existed: boolean;
+  binary: boolean;
+  contentRef: string;
+}
+
+interface OrdinaryBaseline {
+  version: 1;
+  files: OrdinaryBaselineFile[];
+}
+
+export class SessionChangeCollector {
+  private readonly metadataWrites = new Map<string, Promise<void>>();
+  private readonly pending = new Map<string, Promise<void>>();
+  private readonly dirty = new Map<string, Set<string> | null>();
+  private onCaptured?: (sessionId: string, memberId: string, taskId?: string) => Promise<void> | void;
+  private closed = false;
+  private readonly captureErrors = new Map<string, Error>();
+
+  constructor(
+    private readonly store: SessionStore,
+    private readonly stateDir: string,
+  ) {}
+
+  setCaptureListener(listener: (sessionId: string, memberId: string, taskId?: string) => Promise<void> | void): void {
+    this.onCaptured = listener;
+  }
+
+  async prepareWrite(member: SessionMember, paths: string[], cwd = member.root, taskId?: string): Promise<WriteEvidence[]> {
+    await this.ensureBaseline(member, paths, cwd, taskId);
+    return beginWrite(member.root, paths, cwd);
+  }
+
+  async recordWrite(member: SessionMember, evidence: WriteEvidence[], taskId?: string): Promise<void> {
+    const path=ownershipPath(this.stateDir,this.sessionIdFor(member.id),member.id,taskId);
+    await this.writeMetadata(path,()=>finishWrite(member.root,path,evidence));
+  }
+
+  private writeMetadata(key: string, write: () => Promise<void>): Promise<void> {
+    const previous=this.metadataWrites.get(key);
+    const next=(previous ? previous.then(write,write) : write()).finally(()=>{
+      if(this.metadataWrites.get(key)===next)this.metadataWrites.delete(key);
+    });
+    this.metadataWrites.set(key,next);
+    return next;
+  }
+
+  async flush(): Promise<void> {
+    while (this.metadataWrites.size) await Promise.all([...this.metadataWrites.values()]);
+    while (this.pending.size) await Promise.all([...this.pending.values()]);
+    if (this.captureErrors.size) throw new AggregateError([...this.captureErrors.values()], "文件改动捕获失败");
+  }
+
+  async flushTask(memberId: string, taskId?: string): Promise<void> {
+    const key = JSON.stringify([memberId, taskId ?? null]);
+    const sessionId = this.sessionIdFor(memberId);
+    const metadataKeys = [JSON.stringify([memberId, taskId ?? null, "baseline"]),
+      ownershipPath(this.stateDir, sessionId, memberId, taskId)];
+    for (;;) {
+      const writes = metadataKeys.flatMap(value => this.metadataWrites.get(value) ?? []);
+      if (!writes.length) break;
+      await Promise.all(writes);
+    }
+    while (this.pending.has(key)) await this.pending.get(key);
+    const error = this.captureErrors.get(key);
+    if (error) throw error;
+  }
+
+  async ensureBaseline(
+    member: SessionMember,
+    knownPaths: string[],
+    workingDirectory = member.root,
+    taskId?: string,
+  ): Promise<void> {
+    const key=JSON.stringify([member.id,taskId??null,"baseline"]);
+    return this.writeMetadata(key,()=>this.ensureBaselineNow(member,knownPaths,workingDirectory,taskId));
+  }
+
+  private async ensureBaselineNow(member: SessionMember, knownPaths: string[], workingDirectory: string, taskId?: string): Promise<void> {
+    const eligibility = await getGitEligibility(workingDirectory);
+    if (eligibility.ok && eligibility.gitRoot) {
+      const existing = this.store.getChangeBaseline(this.sessionIdFor(member.id), member.id, eligibility.gitRoot, taskId);
+      if (existing) return;
+      const parent = eligibility.hasHead
+        ? (await git(eligibility.gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim()
+        : undefined;
+      const snapshot = await createWorkingTreeSnapshot(
+        eligibility.gitRoot,
+        parent,
+        quaymeshSnapshotExcludes(eligibility.gitRoot, member.root),
+      );
+      this.store.putChangeBaseline({
+        session_id: this.sessionIdFor(member.id),
+        member_id: member.id,
+        repo_root: eligibility.gitRoot,
+        baseline_ref: snapshot,
+        latest_ref: snapshot,
+        coverage: "session_owned",
+      }, taskId);
+      return;
+    }
+
+    const baselinePath = this.ordinaryBaselinePath(member, taskId);
+    const existing = await readFile(baselinePath, "utf8").then((value) => JSON.parse(value) as OrdinaryBaseline).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    const files: OrdinaryBaselineFile[] = existing?.files ?? [];
+    for (const path of knownPaths) {
+      const absolute = resolve(workingDirectory, path);
+      if (!isPathInsideRoot(absolute, member.root)) continue;
+      const relativePath = relative(member.root, absolute).replaceAll("\\", "/");
+      if (files.some((file) => file.path === relativePath)) continue;
+      const nested = await getGitEligibility(dirname(absolute));
+      if (nested.ok && nested.gitRoot) {
+        await this.ensureBaselineNow(member, [], nested.gitRoot, taskId);
+        continue;
+      }
+      const content = await readFile(absolute).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return null;
+        throw error;
+      });
+      const contentRef = await this.writeEvidence(member, `baseline-${digest(absolute)}`, content, taskId);
+      files.push({ path: relativePath, existed: content !== null,
+        binary: content !== null && content.includes(0), contentRef });
+    }
+    await mkdir(dirname(baselinePath), { recursive: true, mode: 0o700 });
+    const pending = `${baselinePath}.pending-${process.pid}-${Date.now()}`;
+    await writeFile(pending, JSON.stringify({ version: 1, files } satisfies OrdinaryBaseline), "utf8");
+    await rename(pending, baselinePath);
+    this.store.putChangeBaseline({
+      session_id: this.sessionIdFor(member.id),
+      member_id: member.id,
+      repo_root: member.root,
+      baseline_ref: `ordinary:${digest(files)}`,
+      latest_ref: `ordinary:${digest(files)}`,
+      coverage: "partial",
+    }, taskId);
+  }
+
+  markDirty(memberId: string, paths: string[] = [], taskId?: string): void {
+    if (this.closed) return;
+    const key = JSON.stringify([memberId, taskId ?? null]);
+    const previous = this.dirty.get(key);
+    this.dirty.set(key, !paths.length || previous === null ? null
+      : new Set([...(previous ?? []), ...paths]));
+    if (this.pending.has(key)) return;
+    const capture = Promise.resolve().then(async () => {
+      while (this.dirty.has(key)) {
+        const paths = this.dirty.get(key);
+        this.dirty.delete(key);
+        await this.capture(memberId, taskId, paths ? [...paths] : undefined);
+      }
+      this.captureErrors.delete(key);
+    }).catch(error => {
+      this.captureErrors.set(key, error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    }).finally(() => { this.pending.delete(key); });
+    this.pending.set(key, capture);
+    void capture.catch(() => {});
+  }
+
+  async capture(memberId: string, taskId?: string, changedPaths?: string[]): Promise<void> {
+    const { sessionId, member } = this.store.memberOwner(memberId);
+    const baselines = this.store.changeBaselines(sessionId, memberId, taskId);
+    if (baselines.length === 0) return;
+    const previous = JSON.stringify(this.readSummaries(sessionId, memberId, taskId));
+    const files: Array<FileSummary & { patchRef: string; versionRef: string }> = [];
+    for (const baseline of baselines) {
+      if (baseline.repo_root === member.root && baseline.baseline_ref.startsWith("ordinary:")) {
+        files.push(...await this.captureOrdinary(sessionId, member, baseline.baseline_ref, taskId));
+      } else {
+        const scoped = changedPaths?.map(path => resolve(member.root, path))
+          .filter(path => isPathInsideRoot(path, baseline.repo_root))
+          .map(path => relative(baseline.repo_root, path).replaceAll("\\", "/"));
+        if (scoped && !scoped.length) continue;
+        files.push(...await this.captureGit(sessionId, member, baseline.repo_root,
+          baseline.baseline_ref, baseline.latest_ref, taskId, scoped));
+      }
+    }
+    const versions = new Map<string, Array<FileSummary & { patchRef: string }>>();
+    for (const file of files) {
+      const group = versions.get(file.versionRef) ?? [];
+      group.push(file);
+      versions.set(file.versionRef, group);
+    }
+    for (const [version, group] of versions) this.store.replaceFileSummaries(sessionId, member.id, version, group, taskId);
+    const current = JSON.stringify(this.readSummaries(sessionId, memberId, taskId));
+    if (current === previous) return;
+    this.store.appendEvent({
+      session_id: sessionId,
+      task_id: taskId ?? null,
+      member_id: memberId,
+      type: "file_changed",
+      source_id: `capture-${randomUUID()}`,
+      timestamp: new Date().toISOString(),
+      payload: {},
+    });
+    await this.onCaptured?.(sessionId, memberId, taskId);
+  }
+
+  async fileDiff(sessionId: SessionId, fileId: string, hash: string, taskId?: string): Promise<{ file: FileSummary; patch: string }> {
+    const records = this.store.fileSummariesForSession(sessionId, taskId);
+    const record = records.find((entry) => entry.id === fileId);
+    if (!record) throw new Error(`FILE_NOT_FOUND: ${fileId}`);
+    if (record.hash !== hash) throw new Error(`FILE_VERSION_STALE: ${fileId}`);
+    const { patchRef: _patchRef, versionRef: _versionRef, ...file } = record;
+    return { file, patch: await readFile(record.patchRef, "utf8") };
+  }
+
+  async fileDiffForTask(taskId: string, sessionId: SessionId, fileId: string, hash: string): Promise<{ file: FileSummary; patch: string }> {
+    const task = this.store.getTask(taskId);
+    if (task.session_id !== sessionId) throw new Error(`TASK_SESSION_MISMATCH: ${taskId}`);
+    if (task.state === "active") return this.fileDiff(sessionId, fileId, hash, taskId);
+    const records = this.store.taskSnapshots(taskId).flatMap((snapshot) => snapshot.files);
+    const record = records.find((entry) => entry.id === fileId);
+    if (!record) throw new Error(`FILE_NOT_FOUND: ${fileId}`);
+    if (record.hash !== hash) throw new Error(`FILE_VERSION_STALE: ${fileId}`);
+    const { patchRef: _patchRef, versionRef: _versionRef, ...file } = record;
+    return { file, patch: await readFile(record.patchRef, "utf8") };
+  }
+
+  async patch(sessionId: SessionId, memberId: string, cursor?: string, taskId?: string): Promise<{ patch: string; nextCursor: string | null }> {
+    const files = this.store.fileSummaries(sessionId, memberId, taskId);
+    const sections = await Promise.all(files.map(async (file) => {
+      const content = await readFile(file.patchRef, "utf8");
+      return `# ${file.path}\n${content}`;
+    }));
+    const combined = sections.join("\n");
+    const offset = cursor ? Number(cursor) : 0;
+    const page = textPage(combined, offset);
+    return { patch: page.text, nextCursor: page.nextOffset === null ? null : String(page.nextOffset) };
+  }
+
+  async patchForTask(taskId: string, sessionId: SessionId, memberId: string, cursor?: string): Promise<{ patch: string; nextCursor: string | null }> {
+    const task = this.store.getTask(taskId);
+    if (task.session_id !== sessionId) throw new Error(`TASK_SESSION_MISMATCH: ${taskId}`);
+    if (task.state === "active") return this.patch(sessionId, memberId, cursor, taskId);
+    const frozen = this.store.getTaskSnapshot(taskId, memberId);
+    if (!frozen) throw new Error(`TASK_MEMBER_NOT_FOUND: ${memberId}`);
+    const sections = await Promise.all(frozen.files.map(async (file) => `# ${file.path}\n${await readFile(file.patchRef, "utf8")}`));
+    const page = textPage(sections.join("\n"), cursor ? Number(cursor) : 0);
+    return { patch: page.text, nextCursor: page.nextOffset === null ? null : String(page.nextOffset) };
+  }
+
+  readSummaries(sessionId: SessionId, memberId: string, taskId?: string): FileSummary[] {
+    return this.store.fileSummaries(sessionId, memberId, taskId).map(({ patchRef: _patchRef, versionRef: _versionRef, ...file }) => file);
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+    await this.flush();
+    this.pending.clear();
+    this.dirty.clear();
+  }
+
+  private async captureGit(
+    sessionId: SessionId,
+    member: SessionMember,
+    repoRoot: string,
+    baselineRef: string,
+    previousRef: string,
+    taskId?: string,
+    changedPaths?: string[],
+  ): Promise<Array<FileSummary & { patchRef: string; versionRef: string }>> {
+    const current = await createWorkingTreeSnapshot(
+      repoRoot,
+      baselineRef,
+      quaymeshSnapshotExcludes(repoRoot, member.root),
+      changedPaths ? { previousRef, paths: changedPaths } : undefined,
+    );
+    const diffBase = ["diff", "--find-renames", baselineRef, current];
+    const numstat = parseNumstat((await git(repoRoot, [
+      ...diffBase, "--numstat", "-z",
+    ], { maxBuffer: 50 * 1024 * 1024 })).stdout);
+    const nameStatus = parseNameStatus((await git(repoRoot, [
+      ...diffBase, "--name-status", "-z",
+    ], { maxBuffer: 50 * 1024 * 1024 })).stdout);
+    for (const entry of numstat) {
+      const status = nameStatus.get(entry.path);
+      if (status) {
+        entry.status = status.status;
+        entry.from = status.from;
+      }
+    }
+    const files: Array<FileSummary & { patchRef: string; versionRef: string }> = [];
+    const owned = await readOwnedFiles(ownershipPath(this.stateDir, sessionId, member.id, taskId));
+    for (const entry of numstat) {
+      const absolute = resolve(repoRoot, entry.path);
+      if (!isPathInsideRoot(absolute, member.root)) continue;
+      const displayPath = relative(member.root, absolute).replaceAll("\\", "/");
+      const proof = owned[displayPath];
+      const fromPath = entry.from ? relative(member.root, resolve(repoRoot, entry.from)).replaceAll("\\", "/") : null;
+      const fromProof = fromPath ? owned[fromPath] : undefined;
+      const canRevert = Boolean(proof?.safe && sameFileState(proof.after, await readFileState(absolute))
+        && (!fromPath || fromProof?.safe && sameFileState(fromProof.after, await readFileState(resolve(member.root, fromPath)))));
+      const patchArgs = ["diff", "--binary", "--no-color", baselineRef, current, "--", entry.path];
+      if (entry.from) patchArgs.push(entry.from);
+      const patch = (await git(repoRoot, patchArgs, { maxBuffer: 50 * 1024 * 1024 })).stdout;
+      const binary = entry.additions === null || entry.removals === null || patch.includes("GIT binary patch");
+      const patchRef = await this.writeEvidence(member, `patch-${current}-${digest(entry.path)}`, Buffer.from(patch, "utf8"), taskId);
+      files.push({
+        id: `file_${digest([sessionId, member.id, displayPath]).slice(0, 24)}`,
+        member_id: member.id,
+        status: entry.status,
+        path: displayPath,
+        from: fromPath,
+        additions: entry.additions,
+        removals: entry.removals,
+        hash: digest([current, entry.path, patch]),
+        large: Buffer.byteLength(patch) > 1024 * 1024,
+        binary,
+        coverage: canRevert ? "session_owned" : "partial",
+        revertible: canRevert,
+        patchRef,
+        versionRef: current,
+      });
+    }
+    this.store.putChangeBaseline({
+      session_id: sessionId,
+      member_id: member.id,
+      repo_root: repoRoot,
+      baseline_ref: baselineRef,
+      latest_ref: current,
+      coverage: "session_owned",
+    }, taskId);
+    return files;
+  }
+
+  private async captureOrdinary(sessionId: SessionId, member: SessionMember, baselineRef: string, taskId?: string): Promise<Array<FileSummary & { patchRef: string; versionRef: string }>> {
+    const baseline = JSON.parse(await readFile(this.ordinaryBaselinePath(member, taskId), "utf8")) as OrdinaryBaseline;
+    const files: Array<FileSummary & { patchRef: string; versionRef: string }> = [];
+    const owned = await readOwnedFiles(ownershipPath(this.stateDir, sessionId, member.id, taskId));
+    for (const before of baseline.files) {
+      const absolute = resolve(member.root, before.path);
+      const current = await readFile(absolute).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return null;
+        throw error;
+      });
+      const previous = before.existed ? await readFile(before.contentRef) : null;
+      if (previous === null && current === null) continue;
+      if (previous !== null && current !== null && previous.equals(current)) continue;
+      const version = digest([previous?.toString("base64") ?? null, current?.toString("base64") ?? null]);
+      const proof = owned[before.path];
+      const canRevert = Boolean(proof?.safe && sameFileState(proof.after, await readFileState(absolute)));
+      const binary = before.binary || (current?.includes(0) ?? false);
+      const oldText = previous?.toString("utf8") ?? "";
+      const newText = current?.toString("utf8") ?? "";
+      const patch = binary ? "" : createPatch(before.path, oldText, newText, "baseline", "current");
+      const additions = binary ? null : countPatchLines(patch, "+");
+      const removals = binary ? null : countPatchLines(patch, "-");
+      const patchRef = await this.writeEvidence(member, `ordinary-patch-${digest(before.path)}-${version}`, Buffer.from(patch, "utf8"), taskId);
+      files.push({
+        id: `file_${digest([sessionId, member.id, before.path]).slice(0, 24)}`,
+        member_id: member.id,
+        status: previous === null ? "A" : current === null ? "D" : "M",
+        path: before.path,
+        from: null,
+        additions,
+        removals,
+        hash: version,
+        large: (current?.length ?? 0) > 1024 * 1024,
+        binary,
+        coverage: canRevert ? "session_owned" : "partial",
+        revertible: canRevert,
+        patchRef,
+        versionRef: `ordinary:${member.root}:${version}`,
+      });
+    }
+    const versionRef = `ordinary:${digest(files)}`;
+    this.store.putChangeBaseline({
+      session_id: sessionId,
+      member_id: member.id,
+      repo_root: member.root,
+      baseline_ref: baselineRef,
+      latest_ref: versionRef,
+      coverage: "partial",
+    }, taskId);
+    return files.map((file) => ({ ...file, versionRef }));
+  }
+
+  private sessionIdFor(memberId: string): SessionId {
+    return this.store.memberOwner(memberId).sessionId;
+  }
+
+  private ordinaryBaselinePath(member: SessionMember, taskId?: string): string {
+    return join(this.stateDir, "session-file-baselines", this.sessionIdFor(member.id), member.id, ...(taskId ? [taskId] : []), "baseline.json");
+  }
+
+  private async writeEvidence(member: SessionMember, name: string, content: Buffer | null, taskId?: string): Promise<string> {
+    const directory = join(this.stateDir, "session-evidence", this.sessionIdFor(member.id), member.id, ...(taskId ? [taskId] : []));
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const path = join(directory, `${name}.bin`);
+    await writeFile(path, content ?? Buffer.alloc(0), { mode: 0o600 });
+    return path;
+  }
+}
+
+function parseNumstat(output: string): GitNumstat[] {
+  const fields = output.split("\0").filter(Boolean);
+  const files: GitNumstat[] = [];
+  for (let index = 0; index < fields.length;) {
+    const header = fields[index++]!;
+    const [add, remove, inlinePath] = header.split("\t");
+    if (inlinePath) {
+      files.push({ additions: statNumber(add), removals: statNumber(remove), path: inlinePath, from: null, status: "M" });
+      continue;
+    }
+    const previous = fields[index++];
+    const path = fields[index++];
+    if (!path) continue;
+    files.push({ additions: statNumber(add), removals: statNumber(remove), path, from: previous ?? null, status: "M" });
+  }
+  return files;
+}
+
+function parseNameStatus(output: string): Map<string, { status: "A" | "M" | "D" | "R"; from: string | null }> {
+  const fields = output.split("\0").filter(Boolean);
+  const files = new Map<string, { status: "A" | "M" | "D" | "R"; from: string | null }>();
+  for (let index = 0; index < fields.length;) {
+    const statusField = fields[index++]!;
+    const statusCode = statusField[0];
+    if (statusCode === "R" || statusCode === "C") {
+      const from = fields[index++];
+      const path = fields[index++];
+      if (!path) continue;
+      files.set(path, { status: "R", from: from ?? null });
+      continue;
+    }
+    const path = fields[index++];
+    if (!path) continue;
+    const status = statusCode === "A" || statusCode === "D" ? statusCode : "M";
+    files.set(path, { status, from: null });
+  }
+  return files;
+}
+
+function statNumber(value: string | undefined): number | null {
+  if (!value || value === "-") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function countPatchLines(patch: string, prefix: string): number {
+  return patch.split(/\r?\n/u).filter((line) => line.startsWith(prefix) && !line.startsWith(`${prefix}${prefix}${prefix}`)).length;
+}
+
+function digest(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+function quaymeshSnapshotExcludes(repoRoot: string, workspaceRoot: string): string[] {
+  const relativePath = relative(repoRoot, join(workspaceRoot, ".quaymesh")).replaceAll("\\", "/");
+  return relativePath && relativePath !== ".." && !relativePath.startsWith("../") ? [relativePath] : [];
+}
