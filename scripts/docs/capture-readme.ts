@@ -9,6 +9,7 @@ import { createRealTestServer, freePort, structured } from "../../test/session-c
 import { translateScreenshot } from "./screenshot-language.js";
 
 const output = resolve("docs/assets/screenshots");
+const showcase = resolve("docs/assets/showcase");
 const debugOutput = resolve(".quaymesh", "docs-screenshots");
 const demoTemp = process.env.QUAYMESH_DOCS_TEMP ?? join(tmpdir(), "quaymesh-readme-demo");
 const originalTemp = process.env.TEMP;
@@ -97,6 +98,14 @@ async function visibleChinese(page: Page): Promise<string[]> {
 async function capture(page: Page, label: string, contentOnly = false) {
   const original = await visibleChinese(page);
   const target = label === "fleet" ? page.locator(".node-grid") : contentOnly ? page.locator("#view") : page;
+  // 保留完整截图用于放大，README 展示只截取功能内容，保证正文宽度下仍能读清文字。
+  const showcaseClips: Record<string, { x: number; y: number; width: number; height: number }> = {
+    overview: { x: 195, y: 55, width: 1225, height: 565 },
+    changes: { x: 519, y: 53, width: 906, height: 293 },
+    commands: { x: 520, y: 53, width: 905, height: 257 },
+    sessions: { x: 195, y: 45, width: 1225, height: 410 },
+    workspaces: { x: 195, y: 48, width: 1225, height: 365 },
+  };
   const screenshotOptions = label === "task-detail"
     ? { clip: { x: 0, y: 0, width: 1440, height: 585 } }
     : label === "changes"
@@ -110,11 +119,27 @@ async function capture(page: Page, label: string, contentOnly = false) {
     path: resolve(output, "zh-CN", label + ".png"),
     animations: "disabled", ...screenshotOptions,
   });
+  if (showcaseClips[label]) {
+    await page.screenshot({
+      path: resolve(showcase, "zh-CN", label + ".png"),
+      animations: "disabled", clip: showcaseClips[label],
+    });
+  } else if (label === "fleet") {
+    await target.screenshot({ path: resolve(showcase, "zh-CN", label + ".png"), animations: "disabled" });
+  }
   untranslated[label] = await translateScreenshot(page);
   await target.screenshot({
     path: resolve(output, "en", label + ".png"),
     animations: "disabled", ...screenshotOptions,
   });
+  if (showcaseClips[label]) {
+    await page.screenshot({
+      path: resolve(showcase, "en", label + ".png"),
+      animations: "disabled", clip: showcaseClips[label],
+    });
+  } else if (label === "fleet") {
+    await target.screenshot({ path: resolve(showcase, "en", label + ".png"), animations: "disabled" });
+  }
   // 完整重新载入原始界面，保证下一张中文截图不保留英语标签。
   await page.reload({ waitUntil: "domcontentloaded" });
   await delay(400);
@@ -125,6 +150,8 @@ async function main() {
   await mkdir(demoTemp, { recursive: true });
   await mkdir(resolve(output, "zh-CN"), { recursive: true });
   await mkdir(resolve(output, "en"), { recursive: true });
+  await mkdir(resolve(showcase, "zh-CN"), { recursive: true });
+  await mkdir(resolve(showcase, "en"), { recursive: true });
   await mkdir(debugOutput, { recursive: true });
 
   const workerPort = await freePort();

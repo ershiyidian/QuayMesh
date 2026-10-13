@@ -26,44 +26,46 @@ QuayMesh 通过 MCP（模型上下文协议），将 AI 助手连接到 Windows 
 
 ## 界面展示
 
-<table>
-  <tr>
-    <td width="50%" valign="top">
-      <a href="docs/assets/screenshots/zh-CN/overview.png"><img src="docs/assets/screenshots/zh-CN/overview.png" width="100%" alt="运行总览与最近完成的工作"></a>
-      <strong>查看任务进度</strong><br>
-      在同一页面查看运行中的任务、最近完成的工作和机器状态。
-    </td>
-    <td width="50%" valign="top">
-      <a href="docs/assets/screenshots/zh-CN/changes.png"><img src="docs/assets/screenshots/zh-CN/changes.png" width="100%" alt="代码改动与文件差异查看器"></a>
-      <strong>检查文件改动</strong><br>
-      逐个查看已保存的文件差异，并找到对应的执行记录。
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top">
-      <a href="docs/assets/screenshots/zh-CN/commands.png"><img src="docs/assets/screenshots/zh-CN/commands.png" width="100%" alt="命令执行记录和已保存的终端输出"></a>
-      <strong>读取命令输出</strong><br>
-      查看具体命令及执行结果，随时返回历史任务继续检查。
-    </td>
-    <td width="50%" valign="top">
-      <a href="docs/assets/screenshots/zh-CN/sessions.png"><img src="docs/assets/screenshots/zh-CN/sessions.png" width="100%" alt="一段对话中完成的多个任务记录"></a>
-      <strong>整理对话与任务</strong><br>
-      在会话中集中查看每次请求对应的任务及结果。
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top">
-      <a href="docs/assets/screenshots/zh-CN/fleet.png"><img src="docs/assets/screenshots/zh-CN/fleet.png" width="100%" alt="已连接的协调节点与执行节点"></a>
-      <strong>管理多台机器</strong><br>
-      查看节点在线状态、职责、资源使用情况与网络连接。
-    </td>
-    <td width="50%" valign="top">
-      <a href="docs/assets/screenshots/zh-CN/workspaces.png"><img src="docs/assets/screenshots/zh-CN/workspaces.png" width="100%" alt="工作区根目录及项目列表"></a>
-      <strong>浏览工作区</strong><br>
-      按节点查找项目目录，并查看工作区的完整路径。
-    </td>
-  </tr>
-</table>
+### 在总览中查看工作进度
+
+集中查看当前任务、最近完成的工作以及机器状态。
+
+[![QuayMesh 运行总览，包含任务和节点状态](docs/assets/showcase/zh-CN/overview.png)](docs/assets/screenshots/zh-CN/overview.png)
+
+### 查看每一处文件改动
+
+打开任务保存的代码差异，逐行检查修改结果。
+
+[![QuayMesh 文件差异查看器，展示具体代码改动](docs/assets/showcase/zh-CN/changes.png)](docs/assets/screenshots/zh-CN/changes.png)
+
+### 管理已连接的机器
+
+查看协调节点和执行节点的在线状态与资源使用情况。
+
+[![QuayMesh 已连接的协调节点和执行节点](docs/assets/showcase/zh-CN/fleet.png)](docs/assets/screenshots/zh-CN/fleet.png)
+
+### 按工作区浏览项目
+
+查看各个节点提供的项目目录和所在位置。
+
+[![QuayMesh 工作区列表与项目目录](docs/assets/showcase/zh-CN/workspaces.png)](docs/assets/screenshots/zh-CN/workspaces.png)
+
+<details>
+<summary><strong>查看更多界面：命令输出与会话历史</strong></summary>
+
+#### 命令输出
+
+打开任务执行过的命令，查看保存下来的终端输出。
+
+[![任务对应的命令执行记录和终端输出](docs/assets/showcase/zh-CN/commands.png)](docs/assets/screenshots/zh-CN/commands.png)
+
+#### 会话与任务
+
+查看同一段对话中完成的多项任务。
+
+[![QuayMesh 会话与多个任务记录](docs/assets/showcase/zh-CN/sessions.png)](docs/assets/screenshots/zh-CN/sessions.png)
+
+</details>
 
 ## 核心能力
 

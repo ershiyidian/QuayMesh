@@ -26,46 +26,46 @@ A task keeps its workspaces, command output, file changes, and agent threads tog
 
 ## Explore the console
 
-<table>
-  <tr>
-    <td width="50%" valign="top">
-      <a href="docs/assets/screenshots/en/overview.png"><img src="docs/assets/screenshots/en/overview.png" width="100%" alt="Overview with activity and completed work"></a>
-      <strong>See the work in progress</strong><br>
-      Find active tasks, recent completions, and machine activity in a single view.
-    </td>
-    <td width="50%" valign="top">
-      <a href="docs/assets/screenshots/en/changes.png"><img src="docs/assets/screenshots/en/changes.png" width="100%" alt="File changes and code diff viewer"></a>
-      <strong>Inspect every file change</strong><br>
-      Open saved file differences and follow the command that produced them.
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top">
-      <a href="docs/assets/screenshots/en/commands.png"><img src="docs/assets/screenshots/en/commands.png" width="100%" alt="Saved terminal command and its execution output"></a>
-      <strong>Read saved command output</strong><br>
-      Follow command results from the task and revisit them later.
-    </td>
-    <td width="50%" valign="top">
-      <a href="docs/assets/screenshots/en/sessions.png"><img src="docs/assets/screenshots/en/sessions.png" width="100%" alt="Conversation history with completed tasks"></a>
-      <strong>Keep conversations organized</strong><br>
-      Review the tasks completed within each conversation.
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top">
-      <a href="docs/assets/screenshots/en/fleet.png"><img src="docs/assets/screenshots/en/fleet.png" width="100%" alt="Connected coordinator and worker nodes"></a>
-      <strong>Manage connected machines</strong><br>
-      View each node's status, role, resources, and network connections.
-    </td>
-    <td width="50%" valign="top">
-      <a href="docs/assets/screenshots/en/workspaces.png"><img src="docs/assets/screenshots/en/workspaces.png" width="100%" alt="Workspace roots and discovered projects"></a>
-      <strong>Find your workspaces</strong><br>
-      Browse project roots on their owning nodes, with the full path available when needed.
-    </td>
-  </tr>
-</table>
+### Your work at a glance
 
-<sub>The English screenshots display translated console labels. The examples were captured from real local tasks and connected nodes.</sub>
+Follow active tasks, recent results, and machine activity in one view.
+
+[![QuayMesh overview showing completed work and machine activity](docs/assets/showcase/en/overview.png)](docs/assets/screenshots/en/overview.png)
+
+### Inspect the exact changes
+
+Open the saved code diff for any task, down to individual lines.
+
+[![Code changes in QuayMesh with highlighted added lines](docs/assets/showcase/en/changes.png)](docs/assets/screenshots/en/changes.png)
+
+### Keep your machines connected
+
+See the coordinator and workers together, including their status and resource usage.
+
+[![QuayMesh connected coordinator and worker nodes](docs/assets/showcase/en/fleet.png)](docs/assets/screenshots/en/fleet.png)
+
+### Find projects across workspaces
+
+Browse the project directories each node makes available.
+
+[![Workspace directory list with two projects and their locations](docs/assets/showcase/en/workspaces.png)](docs/assets/screenshots/en/workspaces.png)
+
+<details>
+<summary><strong>More views: command output and conversation history</strong></summary>
+
+#### Saved command output
+
+Reopen the commands executed for a task and read their retained output.
+
+[![Command execution and saved terminal output](docs/assets/showcase/en/commands.png)](docs/assets/screenshots/en/commands.png)
+
+#### Conversations and tasks
+
+Follow multiple tasks from the same conversation.
+
+[![Conversation with its completed tasks](docs/assets/showcase/en/sessions.png)](docs/assets/screenshots/en/sessions.png)
+
+</details>
 
 ## What you can do
 
