@@ -18,7 +18,52 @@ QuayMesh 通过 MCP（模型上下文协议），将 AI 助手连接到 Windows 
 
 每个任务集中保存工作区、命令输出、文件变更和代理线程。浏览器控制台与 Windows 桌面应用展示同一份任务记录。
 
-![QuayMesh 控制台，展示实际运行的本地工作区与任务记录](docs/assets/console.png)
+<a href="docs/assets/screenshots/zh-CN/task-detail.png">
+  <img src="docs/assets/screenshots/zh-CN/task-detail.png" alt="QuayMesh 任务详情，展示执行记录、活动时间线与工作区" width="100%">
+</a>
+
+<p align="center"><sub>每个任务的操作、文件变化和执行结果都可以集中查看。</sub></p>
+
+## 界面展示
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/assets/screenshots/zh-CN/overview.png"><img src="docs/assets/screenshots/zh-CN/overview.png" width="100%" alt="运行总览与最近完成的工作"></a>
+      <strong>查看任务进度</strong><br>
+      在同一页面查看运行中的任务、最近完成的工作和机器状态。
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/assets/screenshots/zh-CN/changes.png"><img src="docs/assets/screenshots/zh-CN/changes.png" width="100%" alt="代码改动与文件差异查看器"></a>
+      <strong>检查文件改动</strong><br>
+      逐个查看已保存的文件差异，并找到对应的执行记录。
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/assets/screenshots/zh-CN/commands.png"><img src="docs/assets/screenshots/zh-CN/commands.png" width="100%" alt="命令执行记录和已保存的终端输出"></a>
+      <strong>读取命令输出</strong><br>
+      查看具体命令及执行结果，随时返回历史任务继续检查。
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/assets/screenshots/zh-CN/sessions.png"><img src="docs/assets/screenshots/zh-CN/sessions.png" width="100%" alt="一段对话中完成的多个任务记录"></a>
+      <strong>整理对话与任务</strong><br>
+      在会话中集中查看每次请求对应的任务及结果。
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/assets/screenshots/zh-CN/fleet.png"><img src="docs/assets/screenshots/zh-CN/fleet.png" width="100%" alt="已连接的协调节点与执行节点"></a>
+      <strong>管理多台机器</strong><br>
+      查看节点在线状态、职责、资源使用情况与网络连接。
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/assets/screenshots/zh-CN/workspaces.png"><img src="docs/assets/screenshots/zh-CN/workspaces.png" width="100%" alt="工作区根目录及项目列表"></a>
+      <strong>浏览工作区</strong><br>
+      按节点查找项目目录，并查看工作区的完整路径。
+    </td>
+  </tr>
+</table>
 
 ## 核心能力
 
