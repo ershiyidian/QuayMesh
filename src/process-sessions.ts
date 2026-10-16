@@ -370,6 +370,11 @@ export class ProcessSessionManager {
     this.outputSink = sink;
   }
 
+  activeOperationIds(): string[] {
+    return [...new Set([...this.sessions.values()].flatMap(session => session.running
+      ? [session.sessionOperationId,session.workOperationId].filter((id):id is string=>Boolean(id)) : []))];
+  }
+
   findOperation(operationId: string): ProcessOperationHandle | null {
     for (const session of this.sessions.values()) {
       if (session.sessionOperationId !== operationId) continue;
@@ -904,8 +909,7 @@ export class ProcessSessionManager {
         await callback(finish);
       } catch (error) {
         this.record(session, "process_session_finish_callback_failed", diagnosticError(error), "error");
-        session.failure = diagnosticError(error);
-        session.disposition = "reconciliation_required";
+        // 退出与持久输出已确认；投影/归档失败由协调器补齐，保留真实执行结果。
       }
     }
     session.resolveExit();

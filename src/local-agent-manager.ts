@@ -145,6 +145,7 @@ export class LocalAgentManager {
   private readonly ledger: WorkLedger;
   private accepting = true;
   private closePromise?: Promise<void>;
+  private readonly observationTimer: ReturnType<typeof setInterval>;
 
   constructor(options: LocalAgentManagerOptions) {
     this.store = options.store;
@@ -157,6 +158,12 @@ export class LocalAgentManager {
     this.allowedRoots = options.allowedRoots;
     this.logger = options.logger;
     this.subagents = options.subagents;
+    this.observationTimer=setInterval(()=>{
+      for(const [agentId,turn] of this.activeTurns){
+        if(!turn.control||turn.control.isAlive())this.ledger.observeAgent(agentId);
+      }
+    },5000);
+    this.observationTimer.unref();
   }
 
   reconcileActiveRuns(message?: string): BetterResult<number, AgentStoreError> {
@@ -380,6 +387,7 @@ export class LocalAgentManager {
   async close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.accepting = false;
+    clearInterval(this.observationTimer);
     for (const controller of this.queuedTurns.values()) controller.abort();
     const turns = Array.from(this.activeTurns.values(), (turn) => turn.completion);
     this.closePromise = (async () => {
@@ -827,13 +835,14 @@ export class LocalAgentManager {
     error: LocalAgentError,
     startedAt: number,
   ): void {
+    const cancelled = error.code === 'PROVIDER_CANCELLED';
     const persisted = this.store.finishTurnResult(record.id, turnId, {
-      status: "failed",
+      status: cancelled ? "stopped" : "failed",
       error: error.message,
       errorCode: error.code,
       errorRetryable: error.retryable,
     });
-    this.log("error", "agent_run_failed", {
+    this.log(cancelled ? "info" : "error", cancelled ? "agent_run_cancelled" : "agent_run_failed", {
       provider: record.provider,
       agentId: record.id,
       providerSessionIdPrefix: record.providerSessionId?.slice(0, 8),

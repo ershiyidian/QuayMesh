@@ -75,3 +75,18 @@ test("重启只清除服务退出暂停，维护暂停保持", async t => {
   await rm(root, { recursive: true, force: true });
 });
 
+
+
+test("长期出口连接不冒充任务，维护仍等待真实工作并拒绝新出口",async t=>{
+  const root=await mkdtemp(join(tmpdir(),"quaymesh-egress-admission-"));
+  const coordinator=new ExecutionCoordinator(join(root,"state"));
+  t.after(()=>{coordinator.close();return rm(root,{recursive:true,force:true});});
+  const channel=coordinator.beginWork({kind:"egress",blocking:false});
+  assert.equal(coordinator.admissionStatus().idle,true);
+  const job=coordinator.beginWork({kind:"tool"});
+  coordinator.pause("release cutover");
+  assert.equal(coordinator.admissionStatus().idle,false);
+  assert.throws(()=>coordinator.beginWork({kind:"egress",blocking:false}),/release cutover/);
+  job.release();assert.equal(coordinator.admissionStatus().idle,true);
+  channel.release();coordinator.resume();
+});

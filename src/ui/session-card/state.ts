@@ -5,6 +5,7 @@ import type {
   InstructionSummary,
   Snapshot,
 } from "../../session/types.js";
+import { sameExecutionObservation } from "../../execution-observation.js";
 import type { DiffRow } from "./diff.js";
 
 export type CardTab = "changes" | "commands" | "agents" | "context";
@@ -122,9 +123,16 @@ export function applySnapshot(
   if (previous && previous.sessionId !== next.sessionId) {
     throw new Error(`SESSION_CARD_IDENTITY_CHANGED: ${previous.sessionId} -> ${next.sessionId}`);
   }
-  if (previous && previous.workspace?.id === next.workspace?.id && next.rev < previous.rev) {
+  if (previous?.taskId && next.taskId && previous.taskId !== next.taskId) {
+    throw new Error(`SESSION_CARD_TASK_CHANGED: ${previous.taskId} -> ${next.taskId}`);
+  }
+  if (previous && previous.workspace?.id === next.workspace?.id && next.rev <= previous.rev) {
+    const observation=next.rev===previous.rev && next.executionObservation &&
+      next.executionObservation.observedAt >= (previous.executionObservation?.observedAt??0) ? next.executionObservation : previous.executionObservation;
+    const changed=!sameExecutionObservation(previous.executionObservation,observation);
+    if(observation)state.snapshot={...previous,executionObservation:observation};
     return {
-      snapshot: false,
+      snapshot: changed,
       files: false,
       commands: false,
       agents: false,

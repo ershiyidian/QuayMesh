@@ -1,4 +1,5 @@
 import { registerCheckpointTool } from "./session/checkpoints.js";
+import { CARD_RESOURCES, type CardVersion, snapshotForCard } from './session/card-contract.js';
 import { registerOperationTools } from "./tool-surfaces/operations.js";
 import { createFederation } from "./federation/integration.js";
 import { WorkRunReconciler } from "./work-run-reconciler.js";
@@ -9,7 +10,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { ConflictingToolAliasError, normalizeCachedToolCall } from "./mcp-cached-arguments.js";
 import { workspaceOutputSchema } from "./workspace-bootstrap.js";
 import {currentInvocation} from "./session/invocations.js";
-import { textPage, REPLY_BYTES, IMAGE_BYTES, jsonReply } from "./bounded-reply.js";
+import { textPage, REPLY_BYTES, IMAGE_BYTES, jsonReply, compatibleToolReceipt } from "./bounded-reply.js";
 import { argumentFingerprint } from "./mcp-request-diagnostics.js";
 import { ensureDesktopProject } from "./codex-projects.js";
 import { WorkLedger as ProjectWorkLedger } from "./work-ledger.js";
@@ -76,8 +77,10 @@ import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { conversationScopeIdFromRequestMeta, sessionRequestIdentity } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { createRuntimeControlServer, type RuntimeControlRequest } from "./runtime-control.js";
-import { ServerDiagnostics, diagnosticError } from "./server-diagnostics.js";
+import { ServerDiagnostics, diagnosticError, httpDiagnosticRequestId } from "./server-diagnostics.js";
 import { traceMcpRequest } from "./mcp-request-diagnostics.js";
+import { registerReadDiagnostics } from './read-diagnostics.js';
+import {taskReference} from './console-workbench/task-aggregation.js';
 import { formatPathForPrompt } from "./skills.js";
 import { QUAYMESH_VERSION } from "./version.js";
 import { createWorkspaceStore } from "./workspace-store.js";
@@ -234,8 +237,15 @@ function requestLogFields(req: Request, config: ServerConfig): Record<string, un
 }
 
 // 聊天卡片在构建期合并成单个自包含 HTML，脚本与样式随 MCP 资源一起返回。
-function workspaceAppHtml(): string {
-  return readFileSync(fileURLToPath(new URL("../dist/ui-card/workspace-app.html", import.meta.url)), "utf8");
+function workspaceAppHtml(version: CardVersion): string {
+  const html = readFileSync(fileURLToPath(new URL("../dist/ui-card/workspace-app.html", import.meta.url)), "utf8");
+  return html.replace('</head>', `<meta name="quaymesh-card-version" content="${version}">\n</head>`);
+}
+
+function taskConsoleUrl(config:ServerConfig,taskId:string):string {
+  const url=new URL('/console/',config.publicBaseUrl);
+  url.hash='/tasks?'+new URLSearchParams({run:taskReference(taskId)});
+  return url.href;
 }
 
 function appCsp(_config: ServerConfig): {
@@ -310,15 +320,14 @@ function registerMcpSurface(
 
   if (sessionRuntime) {
     sessionRuntime.registerAppTools(registrationTarget as unknown as Parameters<SessionRuntime["registerAppTools"]>[0]);
+    registerReadDiagnostics(registrationTarget, config);
   }
 
   if (config.uiEnabled) {
-    for (const [name, uri] of [
-      ["QuayMesh Session Card", WORKSPACE_APP_URI],
-    ] as const) {
+    for (const {version, uri} of CARD_RESOURCES) {
       registerAppResource(
         registrationTarget,
-        name,
+        `QuayMesh Session Card ${version}`,
         uri,
         {
           description: "Interactive QuayMesh workspace session card.",
@@ -328,7 +337,7 @@ function registerMcpSurface(
           contents: [{
             uri,
             mimeType: RESOURCE_MIME_TYPE,
-            text: workspaceAppHtml(),
+            text: workspaceAppHtml(version),
             _meta: { ui: { csp: appCsp(config), availableDisplayModes:["inline","fullscreen"] } },
           }],
         }),
@@ -368,7 +377,7 @@ function registerMcpSurface(
         workspaces: z.array(z.unknown()),
       },
       ...workspaceAppDescriptorMeta(config),
-      annotations: { readOnlyHint: false },
+      annotations: { readOnlyHint:false, destructiveHint:true, idempotentHint:true, openWorldHint:false },
     },
     async ({ title, request_key, source_task_id }, extra) => {
       if (!sessionRuntime) throw new Error("SESSION_RUNTIME_UNAVAILABLE");
@@ -381,13 +390,14 @@ function registerMcpSurface(
       );
       const projection = await sessionRuntime.projector.readTask(task.id, -1);
       return {
-        content: [{ type: "text", text: "QuayMesh task " + task.id + " started in session " + session.id + ": " + task.title }],
+        content: [{ type: "text", text: "QuayMesh task " + task.id + " started in session " + session.id + ": " + task.title
+          + "\n" + taskConsoleUrl(config,task.id) }],
         _meta: {
           quaymesh: {
             session_id: session.id,
             task_id: task.id,
             snapshot_ref: "task:" + task.id,
-            snapshot: projection.snapshot,
+            snapshot: projection.snapshot ? snapshotForCard(projection.snapshot) : undefined,
             capabilities: { refresh: true, revert: false, continue: false, open_file: false },
           },
         },
@@ -418,12 +428,12 @@ function registerMcpSurface(
       summary:z.string().min(1).max(4000),
     },
     outputSchema:{task_id:z.string(),state:z.literal("closed"),result_status:z.string()},
-    annotations:{readOnlyHint:false},
+    annotations:{readOnlyHint:false,destructiveHint:true,idempotentHint:true,openWorldHint:false},
   },async({task_id,status,summary},extra)=>{
     if(!sessionRuntime)throw new Error("SESSION_RUNTIME_UNAVAILABLE");
     const owner=sessionRequestIdentity(extra).owner_id;
     const task=await sessionRuntime.service.finishTask(owner,task_id,status,summary);
-    return {content:[{type:"text",text:summary}],structuredContent:{task_id,state:task.state,result_status:task.result_status}};
+    return {content:[{type:"text",text:summary+'\n'+task_id+'\n'+taskConsoleUrl(config,task_id)}],structuredContent:{task_id,state:task.state,result_status:task.result_status}};
   });
 
   modelTarget.registerTool(
@@ -451,7 +461,7 @@ function registerMcpSurface(
           .describe("Worktree base; default HEAD."),
       },
       outputSchema: workspaceOutputSchema,
-      annotations: { readOnlyHint: false },
+      annotations: { readOnlyHint:false, destructiveHint:true, openWorldHint:false },
     },
     async ({ path, mode, base_ref, create_directory }, extra) => {
       const { _meta } = extra;
@@ -569,7 +579,7 @@ function registerMcpSurface(
                   snapshot_ref: currentTaskId
                     ? `task:${currentTaskId}:member:${sessionOpen.member.id}`
                     : `session:${sessionOpen.session.id}:member:${sessionOpen.member.id}`,
-                  snapshot: initialSnapshot,
+                  snapshot: initialSnapshot ? snapshotForCard(initialSnapshot) : undefined,
                   capabilities: { refresh: true, revert: true, continue: true, open_file: true },
                 },
               }
@@ -630,7 +640,7 @@ function registerMcpSurface(
         session_id: z.string().optional().describe("Existing session."),
       },
       outputSchema: workspaceOutputSchema,
-      annotations: { readOnlyHint: false },
+      annotations: { readOnlyHint:false, destructiveHint:true, openWorldHint:false },
     },
     async ({ path, mode, base_ref, create_directory, session_id }, extra) => {
       if (!sessionRuntime) throw new Error("SESSION_RUNTIME_UNAVAILABLE");
@@ -711,7 +721,7 @@ function registerMcpSurface(
       },
       outputSchema: resultOutputSchema({result_sha256: z.string().optional(),
         response_page: z.object({offset:z.number(),next_offset:z.number().nullable(),total_code_points:z.number()}).optional()}),
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint:true, destructiveHint:false, openWorldHint:false },
     },
     async ({ workspace_id, response_offset, ...input }) => {
       const startedAt = performance.now();
@@ -935,19 +945,22 @@ function withSessionToolRecording(
               : name === "bash" ? String(input.command ?? input.cmd ?? name) : name,
           input,
           affectsFiles,
-          ...(!forwarded && ["exec_command", "apply_patch"].includes(name) ? {
-            replyWaitMs: name === "exec_command" ? Math.max(1000, Math.min(5000, Number(input.yield_time_ms ?? 2000) + 1000)) : 2000,
+          ...(["exec_command", "bash", "apply_patch", "write", "edit", "write_stdin"].includes(name) ? {
+            replyWaitMs: name === "exec_command" || name === "bash"
+              ? Math.max(1000, Math.min(5000, Number(input.yield_time_ms ?? 2000) + 1000)) : 2000,
             pendingResult: (context: import("./session/types.js").InvocationContext) => {
               const saved = runtime.store.findInvocationByOperation(context.owner_id, context.operation_id!);
               const envelope = saved?.result_json ? JSON.parse(saved.result_json) : null;
               if (envelope?.kind === "result") return envelope.value;
               const message = "操作已接收，准备或执行仍在继续。请按 operation_id 查询状态，无需重新提交。";
-              return jsonReply({ operation_id: context.operation_id!, result: message,
-                accepted: true, running: true, state: saved?.state ?? "accepted",
-                effect: saved?.effect ?? "not_started", poll_after_ms: 2000,
+              const phase = forwarded ? "dispatching" : saved?.effect === "not_started" ? "preparing" : "running";
+              return {...jsonReply({ operation_id: context.operation_id!, result: "",
+                accepted: true, running: true,
+                state: forwarded ? "accepted" : saved?.state ?? "accepted",
+                effect: forwarded ? "unknown" : saved?.effect ?? "not_started", poll_after_ms: 2000,
                 next_action: { tool: "workspace_context", arguments: {
                   workspace_id: workspaceId, action: "status", operation_id: context.operation_id,
-                } } }, message);
+                } } }, message), _meta: {quaymesh: {phase}}};
             },
           } : {}),
           beforeWrite: async (context) => {
@@ -1017,7 +1030,7 @@ function withSessionToolRecording(
               }
             }
           },
-        });
+        }).then(compatibleToolReceipt);
       };
       const recordedHandler = (input: any, extra: any) => recordOperation(input, extra, async () => handler(input, extra));
       return (server.registerTool as any)(name, definition, markSessionRecordedTool(
@@ -1120,6 +1133,10 @@ export function createServer(
     return adapter.server;
   }, {
     legacy: "stateless",
+    // 立即建立现代 MCP SSE 响应，避免长任务在等待首字节时被中间节点中止。
+    responseMode: "sse",
+    // SDK 自带 SSE 注释心跳。复用标准实现，避免与传输层同时写流。
+    keepAliveMs: 5_000,
     onerror: logMcpHandlerError,
   });
   const mcpNodeHandler = toNodeHandler(mcpHandler, {
@@ -1132,7 +1149,7 @@ export function createServer(
 
   const healthLog = new Map<string,{count:number;started:number;maxMs:number}>();
   app.use((req, res, next) => {
-    const requestId = randomUUID();
+    const requestId = (req as Request & { [httpDiagnosticRequestId]?: string })[httpDiagnosticRequestId] ?? randomUUID();
     const startedAt = performance.now();
     res.locals.requestId = requestId;
 

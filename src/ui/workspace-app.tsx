@@ -5,6 +5,7 @@ import {
   applyHostStyleVariables,
 } from "@modelcontextprotocol/ext-apps";
 import type { Snapshot } from "../session/types.js";
+import {CARD_RESOURCES, WORKSPACE_APP_VERSION} from '../session/card-contract.js';
 import { createCardController, type CardController } from "./session-card/controller.js";
 import { snapshotFromSchema } from "./session-card/snapshot.js";
 import { createMcpSource, type SessionCardSource } from "./session-card/source.js";
@@ -38,6 +39,7 @@ let bootstrap: Bootstrap | null = null;
 let pendingResult: unknown = null;
 let tornDown = false;
 let hostDisplayMode: "inline" | "fullscreen" = "inline";
+const resourceVersion = CARD_RESOURCES.find(item => item.version === document.querySelector<HTMLMetaElement>('meta[name="quaymesh-card-version"]')?.content)?.version ?? WORKSPACE_APP_VERSION;
 const getHostFiles=()=>(window as typeof window & {openai?:HostFileLibrary}).openai;
 
 const previewMode=window.parent===window&&(location.protocol==="file:"||new URLSearchParams(location.search).get("preview")==="1");
@@ -49,7 +51,6 @@ function bootPreview():void{
   source=createPreviewSource();
   state=createCardState();
   state.connection="static";
-  void source.widgetStage("mount",{displayMode:"inline",visible:true});
   applySnapshot(state,previewSnapshot);
   let nextController:CardController|null=null;
   view=createCardView(document,state,intent=>dispatchCardIntent(intent,nextController));
@@ -59,7 +60,7 @@ function bootPreview():void{
 
 async function boot(): Promise<void> {
   app = new App(
-    { name: "quaymesh-session-card", version: "3.0.0" },
+    { name: "quaymesh-session-card", version: resourceVersion },
     { availableDisplayModes: ["inline", "fullscreen"] },
     { autoResize: true },
   );
@@ -151,8 +152,14 @@ function receiveBootstrap(result: unknown): void {
   try {
     applyBootstrap(result);
   } catch (error) {
+    const consoleUrl=state?.snapshot?.consoleUrl??null;
     disposeCard();
     renderStartupError(messageOf(error));
+    if(consoleUrl&&/^https?:\/\//.test(consoleUrl)) {
+      const link=document.createElement("a");link.textContent="打开 Console 查看已保存的任务";
+      link.href=consoleUrl;link.target="_blank";link.rel="noopener noreferrer";
+      document.getElementById("card")?.append(link);
+    }
   }
 }
 
@@ -170,8 +177,7 @@ function applyBootstrap(result: unknown): void {
   }
   if (bootstrap && bootstrap.sessionId === next.sessionId && bootstrap.taskId === next.taskId) {
     if (next.initialSnapshot && state) {
-      applySnapshot(state, next.initialSnapshot);
-      view?.render();
+      if(applySnapshot(state, next.initialSnapshot).snapshot)view?.render();
     }
     return;
   }
@@ -179,8 +185,7 @@ function applyBootstrap(result: unknown): void {
   bootstrap = next;
   if (!app) throw new Error("SESSION_CARD_APP_MISSING");
   if (!next.initialSnapshot) renderStartupState("正在读取任务…");
-  source = createMcpSource(app, next.sessionId, next.taskId, next.initialSnapshot);
-  void source.widgetStage("mount",{displayMode:"inline",visible:true});
+  source = createMcpSource(app, next.sessionId, next.taskId, next.initialSnapshot, resourceVersion);
   state = createCardState();
   state.hostDisplayMode = hostDisplayMode;
   state.connection = "connecting";

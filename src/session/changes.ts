@@ -270,9 +270,21 @@ export class SessionChangeCollector {
 
   async close(): Promise<void> {
     this.closed = true;
-    await this.flush();
-    this.pending.clear();
-    this.dirty.clear();
+    const errors:unknown[]=[];
+    for(const pending of [this.metadataWrites,this.pending]){
+      while(pending.size){
+        const results=await Promise.allSettled([...pending.values()]);
+        for(const result of results)if(result.status==="rejected")errors.push(result.reason);
+      }
+    }
+    // 差异归档失败属于交付附加信息；关闭时保存错误并释放资源，不能留下半关闭 Core。
+    for(const [key,error] of this.captureErrors){
+      const [memberId,taskId]=JSON.parse(key) as [string,string|null];
+      if(taskId)this.store.setTaskChangeSummary(taskId,"incomplete",error.message);
+      console.error(JSON.stringify({event:"session_change_capture_failed",memberId,taskId,error:error.message}));
+    }
+    for(const error of errors)console.error(JSON.stringify({event:"session_change_flush_failed",error:error instanceof Error?error.message:String(error)}));
+    this.captureErrors.clear();this.pending.clear();this.metadataWrites.clear();this.dirty.clear();this.onCaptured=undefined;
   }
 
   private async captureGit(

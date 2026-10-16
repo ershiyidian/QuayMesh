@@ -1,3 +1,4 @@
+import { executionObservationSchema } from "../session/schema.js";
 import { createHash } from "node:crypto";
 import { sessionRequestIdentity } from "../request-meta.js";
 import type { SessionProjector } from "../session/projection.js";
@@ -27,6 +28,7 @@ export class SessionFeed {
   private readonly disposeStore: () => void;
   private readonly disposeSettlements: Array<() => void> = [];
   private closed = false;
+  private readonly observationTimer: ReturnType<typeof setInterval>;
 
   constructor(
     private readonly runtime: FederationRuntime,
@@ -34,6 +36,8 @@ export class SessionFeed {
     private readonly projector: SessionProjector,
     private readonly service: SessionService,
   ) {
+    this.observationTimer=setInterval(()=>this.publishObservations(),10_000);
+    this.observationTimer.unref();
     this.disposeStore = store.onChange((change) => {
       const member = store.getMember(change.sessionId, change.memberId);
       if (member.node_id !== runtime.localId) return;
@@ -247,6 +251,7 @@ export class SessionFeed {
       if((snapshot.taskId??undefined)!==received.task_id)throw new Error("TASK_SNAPSHOT_ID_MISMATCH");
       this.store.putRemoteSnapshot(session.id,member.id,received.revision,snapshot);
     }
+    if(update.task_id&&received.observation)this.store.taskData.observeProjection(update.task_id,member.id,received.observation);
     if(!update.task_id)this.store.setMemberRevision(member.id,received.revision);
     this.store.setMemberPresence(member.id,true,received.observed_at);
     subscription.lastRevision=Math.max(subscription.lastRevision,received.revision);
@@ -325,12 +330,28 @@ export class SessionFeed {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    clearInterval(this.observationTimer);
     this.disposeStore();
     for (const dispose of this.disposeSettlements) dispose();
     for (const timer of this.pendingPublishes.values()) clearTimeout(timer);
     this.pendingPublishes.clear();
     this.subscriptions.clear();
     this.subscribers.clear();
+  }
+
+  private publishObservations(): void {
+    if(this.closed)return;
+    for(const [key,peers] of this.subscribers){
+      const [sessionId,memberId,taskId]=JSON.parse(key) as [string,string,string|null];
+      if(!taskId||!peers.size)continue;
+      const task=this.store.findTask(taskId),session=this.store.findSession(sessionId),member=this.store.findMember(sessionId,memberId);
+      if(!task||!session||!member||member.node_id!==this.runtime.localId)continue;
+      const observation=this.projector.observeTask(taskId,memberId);
+      if(task.state==='closed'&&!observation.activeOperationIds.length&&!observation.preparingOperationIds.length&&!observation.staleOperationIds.length)continue;
+      const update:SessionFeedUpdate={owner_id:session.owner_id,node_id:this.runtime.localId,session_id:sessionId,member_id:memberId,
+        task_id:taskId,revision:task.revision,observed_at:new Date(observation.observedAt).toISOString(),observation};
+      for(const peer of peers)this.runtime.transport.links.get(peer)?.notify('session.feed.update',update);
+    }
   }
 
   private publishLocalChange(sessionId: string, memberId: string, revision: number, taskId?: string): void {
@@ -511,6 +532,7 @@ function validateUpdate(value: unknown): asserts value is SessionFeedUpdate {
   ) {
     throw new Error("SESSION_FEED_UPDATE_INVALID");
   }
+  if(update.observation!==undefined)executionObservationSchema.parse(update.observation);
 }
 
 function subscriptionKey(sessionId:string,memberId:string,taskId?:string):string {return JSON.stringify([sessionId,memberId,taskId??null]);}

@@ -3,7 +3,7 @@ import type { Request, Response } from "express";
 
 type RecordEvent = (event: string, fields: Record<string, unknown>, level?: "info" | "warn" | "error") => void;
 const methods = new Set(["initialize", "server/discover", "tools/list", "tools/call", "resources/list", "resources/read", "resources/templates/list", "notifications/initialized", "ping"]);
-const tools = new Set(["open_workspace", "attach_workspace", "read", "workspace_context", "spawn_agent", "followup_agent", "send_message", "wait_agent", "interrupt_agent", "list_agents",  "exec_command", "write_stdin", "apply_patch", "write", "edit", "bash",
+const tools = new Set(["open_workspace", "attach_workspace", "read", "read_diagnostics", "workspace_context", "spawn_agent", "followup_agent", "send_message", "wait_agent", "interrupt_agent", "list_agents",  "exec_command", "write_stdin", "apply_patch", "write", "edit", "bash",
   "start_session","finish_task","workspace_catalog","read_output","cancel_command","checkpoint_task","download_artifact","copy_artifact","qm_widget_stage",
   "qm_session","qm_file_diff","qm_command_output","qm_command_outputs","qm_instruction","qm_patch","qm_revert","qm_file_url","qm_session_continue"]);
 const actions = new Set(["list","capture","search","status","recovery","start","observe","cancel"]);
@@ -12,6 +12,18 @@ const object = (value: unknown): Record<string, any> => value !== null && typeof
 const known = (value: unknown, allowed: Set<string>) => typeof value === "string" && allowed.has(value) ? value : "other";
 const identity = (value: unknown, prefix: string) => typeof value === "string"
   && new RegExp(`^(?:qm:[A-Za-z0-9_-]+:)?${prefix}_[a-f0-9]{6,64}$`).test(value) ? value : undefined;
+
+export function diagnosticOwnerHash(owner: string): string {
+  return createHash('sha256').update(owner).digest('hex');
+}
+
+// HTTP、JSON-RPC 和工具结果分别判定；未检查的大响应保留未知状态。
+export function mcpExchangeOutcome(row: Record<string, unknown>): 'transport_error' | 'protocol_error' | 'tool_error' | 'success' | 'uninspected' {
+  if (row.aborted === true || typeof row.httpStatus === 'number' && row.httpStatus >= 400) return 'transport_error';
+  if (typeof row.rpcErrorCode === 'number') return 'protocol_error';
+  if (row.toolError === true) return 'tool_error';
+  return row.resultInspection === 'inspected' ? 'success' : 'uninspected';
+}
 
 export function argumentFingerprint(args: Record<string, any>): string {
   const normalize = (value: any): any => Array.isArray(value) ? value.map(normalize)
@@ -41,15 +53,27 @@ export function traceMcpRequest(req: Request, res: Response, requestId: string, 
       ? createHash("sha256").update(JSON.stringify(session)).digest("hex").slice(0, 24) : undefined };
   const started = performance.now(), limit = 64 * 1024;
   let bytes = 0, capturedBytes = 0, done = false;
+  let headersAt: number | undefined;
+  let firstByteAt: number | undefined;
   const chunks: Buffer[] = [], hash = createHash("sha256");
   const capture = (chunk: unknown, encoding?: unknown) => {
     if (chunk === undefined || chunk === null) return;
     const value = typeof chunk === "string" ? Buffer.from(chunk, typeof encoding === "string" ? encoding as BufferEncoding : "utf8")
       : Buffer.isBuffer(chunk) ? chunk : chunk instanceof Uint8Array ? Buffer.from(chunk) : undefined;
     if (!value) return;
+    if (value.length && firstByteAt === undefined) firstByteAt = performance.now();
     bytes += value.length; hash.update(value);
     if (bytes <= limit) { chunks.push(Buffer.from(value)); capturedBytes += value.length; }
     else { chunks.length = 0; capturedBytes = 0; }
+  };
+  const writeHead = res.writeHead, flushHeaders = res.flushHeaders;
+  res.writeHead = function (this: Response, ...args: any[]) {
+    if (headersAt === undefined) headersAt = performance.now();
+    return (writeHead as (...values: any[]) => Response).apply(this, args);
+  } as Response["writeHead"];
+  res.flushHeaders = function (this: Response) {
+    if (headersAt === undefined) headersAt = performance.now();
+    return flushHeaders.call(this);
   };
   const write = res.write, end = res.end;
   res.write = function (this: Response, ...args: any[]) { capture(args[0], args[1]); return (write as any).apply(this, args); } as Response["write"];
@@ -72,6 +96,7 @@ export function traceMcpRequest(req: Request, res: Response, requestId: string, 
           const structured = object(payload.structuredContent);
           const content = Array.isArray(payload.content) ? payload.content : [];
           result = { resultInspection: "inspected", rpcErrorCode: Number.isInteger(error.code) ? error.code : undefined,
+            taskId: identity(structured.task_id, "task") ?? context.taskId,
             operationId: identity(structured.operation_id ?? structured.operationId, "op"),
             toolError: payload.isError === true, contentBlocks: content.length,
             textBytes: content.reduce((n: number, block: any) => n + (typeof block?.text === "string" ? Buffer.byteLength(block.text) : 0), 0),
@@ -93,12 +118,18 @@ export function traceMcpRequest(req: Request, res: Response, requestId: string, 
         } catch { /* No raw malformed response in diagnostics. */ }
       }
     }
+    const outcome = mcpExchangeOutcome({...result,httpStatus:res.statusCode,aborted:!res.writableFinished});
+    const owner = object(req.auth?.extra).owner_id;
     emit("mcp_exchange_finished", { ...context, httpStatus: res.statusCode, aborted: !res.writableFinished,
       transportStatus: res.writableFinished ? "finished" : "aborted", hostAcknowledgment: "unknown",
-      durationMs: Math.round(performance.now() - started), responseBytes: bytes, responseSha256: hash.digest("hex"),
+      outcome, ...(typeof owner === 'string' ? {ownerHash:diagnosticOwnerHash(owner)} : {}),
+      durationMs: Math.round(performance.now() - started),
+      responseHeadersMs: headersAt === undefined ? null : Math.round(headersAt - started),
+      firstResponseByteMs: firstByteAt === undefined ? null : Math.round(firstByteAt - started),
+      responseBytes: bytes, responseSha256: hash.digest("hex"),
       responseFormat: String(res.getHeader("content-type") ?? "").includes("text/event-stream") ? "sse"
         : String(res.getHeader("content-type") ?? "").includes("application/json") ? "json" : "other",
-      ...result }, !res.writableFinished ? "warn" : "info");
+      ...result }, outcome.endsWith('_error') ? "warn" : "info");
     chunks.length = 0;
     res.off("finish", finish); res.off("close", finish);
   };

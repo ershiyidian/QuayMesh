@@ -19,12 +19,29 @@ export interface CardController {
 const MAX_OUTPUT_BATCH=8;
 const MAX_PATCH_BYTES=4*1024*1024;
 
-export function createCardController(state:CardState,view:CardView,source:SessionCardSource,doc:Document=document):CardController {
-  let stopped=false,polling:Promise<void>|null=null,request:AbortController|null=null;
+export function createCardController(state:CardState,renderer:CardView,source:SessionCardSource,doc:Document=document):CardController {
+  let stopped=false,started=false,polling:Promise<void>|null=null,request:AbortController|null=null;
   let timer:ReturnType<typeof setTimeout>|undefined,elapsed:ReturnType<typeof setInterval>|undefined;
   let retryDelay=0,retryAt=0,observer:IntersectionObserver|undefined;
-  let firstSnapshotRecorded=false,lastVisibility: boolean|null=null;
-  const visible=()=>!stopped&&!doc.hidden&&state.inViewport;
+  let firstSnapshotRecorded=false,lastVisibility: boolean|null=null,renderFailed=false;
+  const visible=()=>!stopped&&!renderFailed&&!doc.hidden&&state.inViewport;
+  function draw(action:()=>void):void{
+    if(renderFailed)return;
+    try{action();}catch(error){
+      renderFailed=true;state.connection='error';clearTimeout(timer);clearInterval(elapsed);request?.abort('SESSION_CARD_RENDER_FAILED');
+      const target=doc.getElementById('card');
+      if(target){
+        const title=doc.createElement('strong'),message=doc.createElement('p');
+        title.textContent=state.snapshot?.title??'QuayMesh';message.textContent='卡片显示失败，已保存的执行结果仍可在 Console 查看。';
+        target.replaceChildren(title,message);target.dataset.status='unavailable';
+        const url=state.snapshot?.consoleUrl;
+        if(url&&/^https?:\/\//i.test(url)){const link=doc.createElement('a');link.href=url;link.textContent='打开 Console';link.target='_blank';link.rel='noopener noreferrer';target.append(link);}
+      }
+      state.message=messageOf(error);void recordStage('error');
+    }
+  }
+  const view:CardView={render:()=>draw(()=>renderer.render()),renderPanel:()=>draw(()=>renderer.renderPanel()),
+    renderFooter:()=>draw(()=>renderer.renderFooter()),fillTimers:()=>draw(()=>renderer.fillTimers()),dispose:()=>renderer.dispose()};
 
   function schedule():void {
     clearTimeout(timer);
@@ -42,12 +59,16 @@ export function createCardController(state:CardState,view:CardView,source:Sessio
 
   async function requestSnapshot():Promise<void> {
     request=new AbortController();const signal=request.signal;
+    const previousConnection=state.connection;
     try {
       const next=await source.snapshot(state.snapshot?.rev??-1,signal,state.selectedMemberId??undefined);
       if(signal.aborted||stopped)return;
       state.connection=source.live?"live":"static";state.lastConfirmedAt=Date.now();
-      if(next){applySnapshot(state,next);if(!firstSnapshotRecorded){firstSnapshotRecorded=true;void recordStage("first_snapshot");}}
-      retryDelay=0;retryAt=0;view.render();updateElapsedTimer();
+      const changed=next ? applySnapshot(state,next).snapshot : false;
+      if(next&&!firstSnapshotRecorded){firstSnapshotRecorded=true;void recordStage("first_snapshot");}
+      retryDelay=0;retryAt=0;
+      if(changed)view.render();
+      updateElapsedTimer();
       await refreshOpenCommandOutputs();
     } catch(error) {
       if(!signal.aborted&&!stopped){
@@ -57,7 +78,7 @@ export function createCardController(state:CardState,view:CardView,source:Sessio
         retryAt=Date.now()+(typeof supplied==="number"?Math.max(supplied,retryDelay):retryDelay);
         void recordStage("error");
       }
-    } finally {request=null;if(!stopped)view.renderFooter();}
+    } finally {request=null;if(!stopped&&state.connection!==previousConnection)view.renderFooter();}
   }
 
   function pollOnce():Promise<void> {
@@ -153,6 +174,9 @@ export function createCardController(state:CardState,view:CardView,source:Sessio
   }
   const expanded=()=>{if(state.collapsed)schedule();else void pollOnce();};
   function start():void{
+    if(stopped)throw new Error("SESSION_CARD_CONTROLLER_DISPOSED");
+    if(started)return;
+    started=true;
     view.render();updateElapsedTimer();
     void recordStage("mount");
     void recordStage("initialized");
@@ -162,6 +186,7 @@ export function createCardController(state:CardState,view:CardView,source:Sessio
     visibilityChanged();
   }
   function dispose():void{
+    if(stopped)return;
     void recordStage("teardown");
     stopped=true;clearTimeout(timer);clearInterval(elapsed);observer?.disconnect();request?.abort("SESSION_CARD_DISPOSED");
     doc.removeEventListener("visibilitychange",visibilityChanged);doc.removeEventListener("quaymesh:card-expanded",expanded);

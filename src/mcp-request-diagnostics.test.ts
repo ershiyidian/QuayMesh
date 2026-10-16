@@ -8,7 +8,7 @@ import * as z from "zod/v4";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import { createModernMcpServerAdapter } from "./mcp-modern-server.js";
-import { traceMcpRequest } from "./mcp-request-diagnostics.js";
+import { traceMcpRequest, mcpExchangeOutcome } from "./mcp-request-diagnostics.js";
 
 test("real modern HTTP MCP diagnostics separate schema/tool errors from successful HTTP and omit secrets", async (t) => {
   const rows: Record<string, any>[] = [];
@@ -39,8 +39,10 @@ test("real modern HTTP MCP diagnostics separate schema/tool errors from successf
     return { response, row };
   };
   const success = await call("snapshot"); assert.equal(success.response.status, 200);
+  assert.equal(success.row.outcome, 'success');
   assert.equal(success.row.receiptPresent, true); assert.equal(success.row.toolError, false);
   const failed = await call("finish"); assert.equal(failed.response.status, 200); assert.equal(failed.row.toolError, true);
+  assert.equal(failed.row.outcome, 'tool_error');
   assert.equal(failed.row.toolErrorCode, "WORK_STATE"); assert(failed.row.errorFingerprint);
   const rejected = await call("unknown-secret-action");
   assert(rejected.row.rpcErrorCode || rejected.row.toolError, "Schema rejection must be visible even if no handler ran");
@@ -69,5 +71,13 @@ test("streamed/oversized/aborted responses and logging failures preserve HTTP se
   const finished = rows.filter((row) => row.event === "mcp_exchange_finished");
   assert.equal(finished.length, 3); assert.equal(finished[0]!.resultInspection, "inspected");
   assert.equal(finished[1]!.resultInspection, "over_limit"); assert.equal(finished[1]!.responseBytes, 140000);
+  assert.equal(finished[1]!.outcome, 'uninspected');
+  assert.equal(finished[2]!.outcome, 'transport_error');
   assert.equal(finished[2]!.aborted, true); assert(!JSON.stringify(rows).includes("secret"));
+});
+
+test('HTTP 200 中的资源协议错误不能计作工具成功', () => {
+  assert.equal(mcpExchangeOutcome({httpStatus:200,aborted:false,rpcErrorCode:-32602,toolError:false,resultInspection:'inspected'}), 'protocol_error');
+  assert.equal(mcpExchangeOutcome({httpStatus:200,aborted:false,resultInspection:'over_limit'}), 'uninspected');
+  assert.equal(mcpExchangeOutcome({httpStatus:401,aborted:false,rpcErrorCode:-32001,resultInspection:'inspected'}), 'transport_error');
 });

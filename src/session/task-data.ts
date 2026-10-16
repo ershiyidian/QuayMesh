@@ -27,6 +27,32 @@ export interface TaskFinalization {
 export class TaskDataStore {
   constructor(private readonly db: Database.Database) {}
 
+  operationObservations(taskId: string, memberId: string): Array<{id:string;status:string;effect:string|null;observed_at:string|null}> {
+    return this.db.prepare(`select o.id,o.status,i.effect,o.observed_at from console_operations o
+      join qm_run_links l on l.run_id=o.run_id left join qm_invocations i on i.operation_id=o.id
+      where l.task_id=? and l.member_id=? and o.status in ('starting','queued','running')
+      and (i.finished_at is null or i.state not in ('succeeded','failed','cancelled'))`)
+      .all(taskId,memberId) as Array<{id:string;status:string;effect:string|null;observed_at:string|null}>;
+  }
+
+  observeProjection(taskId: string, memberId: string, observation: import("../execution-observation.js").ExecutionObservation): void {
+    const current=this.projection(taskId,memberId);
+    if(!current || (current.snapshot.executionObservation?.observedAt??-1)>observation.observedAt)return;
+    const snapshot={...current.snapshot,executionObservation:observation};
+    this.db.prepare("update qm_task_projections set snapshot_json=? where task_id=? and member_id=? and source_revision=?")
+      .run(JSON.stringify(snapshot),taskId,memberId,current.revision);
+  }
+
+  pendingFinalizations(limit = 4, after?: Pick<TaskFinalization, "requested_at" | "task_id">): TaskFinalization[] {
+    const read = (cursor?: typeof after) => this.db.prepare(`select f.* from qm_task_finalizations f join qm_tasks t on t.id=f.task_id
+      where f.completed_at is null and t.state='active'
+      ${cursor ? "and (f.requested_at,f.task_id)>(?,?)" : ""}
+      order by f.requested_at,f.task_id limit ?`)
+      .all(...(cursor ? [cursor.requested_at,cursor.task_id,limit] : [limit])) as TaskFinalization[];
+    const batch = read(after);
+    return batch.length || !after ? batch : read();
+  }
+
   requireScope(taskId: string, sessionId: string, memberId?: string): void {
     const task = this.db.prepare("SELECT session_id FROM qm_tasks WHERE id=?").get(taskId) as { session_id: string } | undefined;
     if (!task || task.session_id !== sessionId) throw new Error(`TASK_SESSION_MISMATCH: ${taskId}`);

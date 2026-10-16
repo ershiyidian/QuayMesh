@@ -25,6 +25,7 @@ export interface Run {
   workspaceRevision: number;
   sessionId: string | null;
   taskId: string | null;
+  sourceTaskId?: string | null;
   memberId: string | null;
   usage: Usage;
   diff: { files: number; add: number | null; del: number | null } | null;

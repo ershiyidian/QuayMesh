@@ -3,6 +3,8 @@ import { workspaceHandle, parseWorkspaceHandle } from "../federation/routing.js"
 import { dayAt, type Query } from "./query.js";
 import { WorkbenchError, type Run } from "./types.js";
 
+import { runExecutionStatus } from "../task-view.js";
+
 export interface PageBoundary {
   value: number;
   id: string;
@@ -39,6 +41,10 @@ export function pageCursor(run: Run, query: Query, at: number, offset: number, d
 // SQLite 完成筛选、排序和计数，只把当前页的工作 ID 交给详情转换。
 export function runQuery(ledger: WorkLedger, nodeId: string, projectIds: string[], query: Query, at: number) {
   const db = ledger.db;
+  db.function("quaymesh_execution_status", {deterministic:true},
+    (state: unknown, result: unknown, status: unknown, working: unknown, queued: unknown, unresolved: unknown,progress:unknown) =>
+      runExecutionStatus(state as string|null, result as string|null, String(status), working === 1, queued === 1, unresolved === 1,
+        typeof progress==='string'?Date.parse(progress):null,at));
   const allowed = projectIds.length ? `r.project_id IN (${projectIds.map(() => "?").join(",")})` : "0";
   const prefix = workspaceHandle(nodeId, "");
   const sql = `WITH base AS (
@@ -46,12 +52,14 @@ export function runQuery(ledger: WorkLedger, nodeId: string, projectIds: string[
       l.session_id,l.task_id,l.member_id,
       t.state task_state,t.result_status task_result,t.finished_at task_finished_at,
       CASE WHEN l.run_id=(SELECT run_id FROM qm_run_links WHERE member_id=l.member_id AND task_id IS l.task_id ORDER BY rowid DESC LIMIT 1) THEN 1 ELSE 0 END latest,
-      CASE WHEN EXISTS(SELECT 1 FROM console_operations o WHERE o.run_id=r.id AND o.status IN ('running','starting'))
-        OR EXISTS(SELECT 1 FROM console_executions e WHERE e.run_id=r.id AND e.status IN ('running','starting')) THEN 1 ELSE 0 END working,
-      CASE WHEN EXISTS(SELECT 1 FROM console_operations o WHERE o.run_id=r.id AND o.status='queued')
-        OR EXISTS(SELECT 1 FROM console_executions e WHERE e.run_id=r.id AND e.status='queued') THEN 1 ELSE 0 END queued,
-      CASE WHEN EXISTS(SELECT 1 FROM console_operations o WHERE o.run_id=r.id AND o.status IN ('unknown','reconciliation_required'))
-        OR EXISTS(SELECT 1 FROM console_executions e WHERE e.run_id=r.id AND e.status IN ('unknown','reconciliation_required')) THEN 1 ELSE 0 END unresolved,
+      CASE WHEN EXISTS(SELECT 1 FROM console_operations o WHERE o.run_id=r.id AND o.status IN ('running','starting') AND o.observed_at>='${new Date(at-30_000).toISOString()}')
+        OR EXISTS(SELECT 1 FROM console_executions e WHERE e.run_id=r.id AND e.status IN ('running','starting') AND e.observed_at>='${new Date(at-30_000).toISOString()}') THEN 1 ELSE 0 END working,
+      CASE WHEN EXISTS(SELECT 1 FROM console_operations o WHERE o.run_id=r.id AND o.status='queued' AND o.observed_at>='${new Date(at-30_000).toISOString()}')
+        OR EXISTS(SELECT 1 FROM console_executions e WHERE e.run_id=r.id AND e.status='queued' AND e.observed_at>='${new Date(at-30_000).toISOString()}') THEN 1 ELSE 0 END queued,
+      CASE WHEN EXISTS(SELECT 1 FROM console_operations o WHERE o.run_id=r.id AND (o.status IN ('unknown','reconciliation_required')
+          OR (o.status IN ('running','starting','queued') AND (o.observed_at IS NULL OR o.observed_at<'${new Date(at-30_000).toISOString()}'))))
+        OR EXISTS(SELECT 1 FROM console_executions e WHERE e.run_id=r.id AND (e.status IN ('unknown','reconciliation_required')
+          OR (e.status IN ('running','starting','queued') AND (e.observed_at IS NULL OR e.observed_at<'${new Date(at-30_000).toISOString()}')))) THEN 1 ELSE 0 END unresolved,
       CASE WHEN EXISTS(SELECT 1 FROM console_operations o WHERE o.run_id=r.id AND o.status='failed')
         OR EXISTS(SELECT 1 FROM console_executions e WHERE e.run_id=r.id AND e.status IN ('failed','stopped','cancelled')) THEN 1 ELSE 0 END failed_child,
       (SELECT SUM(json_extract(e.delta,'$.totalTokens')) FROM console_executions e WHERE e.run_id=r.id) tokens,
@@ -65,17 +73,7 @@ export function runQuery(ledger: WorkLedger, nodeId: string, projectIds: string[
       LEFT JOIN qm_run_checkpoints k ON k.run_id=r.id
     WHERE ${allowed} AND (l.run_id IS NULL OR m.node_id=?)
   ), classified AS (
-    SELECT *,CASE
-      WHEN working=1 THEN 'running'
-      WHEN status='running' AND queued=1 THEN 'queued'
-      WHEN task_result='completed' THEN 'completed'
-      WHEN task_result='failed' THEN 'failed'
-      WHEN task_result='cancelled' THEN 'cancelled'
-      WHEN status IN ('completed','failed','cancelled') THEN status
-      WHEN task_state='closed' THEN 'ended'
-      WHEN status IN ('interrupted','reconciliation_required') THEN 'interrupted_recoverable'
-      WHEN status='running' AND unresolved=1 THEN 'unknown'
-      WHEN status='running' AND latest=1 THEN 'waiting' ELSE status END execution,
+    SELECT *,quaymesh_execution_status(task_state,task_result,status,working,queued,unresolved,last_activity_at) execution,
       CASE WHEN task_state='closed' AND EXISTS(
         SELECT 1 FROM qm_task_snapshots snap WHERE snap.task_id=base.task_id AND snap.member_id=base.member_id AND json_array_length(snap.files_json)>0
       ) THEN 1 WHEN task_id IS NOT NULL AND EXISTS(

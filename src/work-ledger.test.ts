@@ -1,3 +1,4 @@
+import {ExecutionCoordinator} from "./execution-coordinator.js";
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
@@ -5,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalAgentStore } from "./local-agent-store.js";
 import { WorkLedger } from "./work-ledger.js";
+import { SessionStore } from "./session/store.js";
 
 test("successful artifact evidence survives failure of the overall acceptance", (t) => {
   const f = fixture(t);
@@ -123,4 +125,83 @@ test("interrupted execution is marked for reconciliation without deleting usage 
   assert.equal(f.ledger.receipt(run.id).usageStatus, "partial");
   assert.equal(f.ledger.receipt(run.id).codexUsage?.totalTokens, 1000);
   assert.equal(f.ledger.reconcileInterruptedExecutions(), 0);
+});
+
+test("已归档任务的历史运行停留在 running 时，安全标记可恢复中断", (t) => {
+  const f = fixture(t);
+  const store = new SessionStore(f.ledger.db);
+  const session = store.createSession("owner", "conversation", "测试会话");
+  const task = store.createTask(session.id, "第一阶段");
+  const run = f.begin(`task-${task.id}-test`);
+  assert.equal(f.ledger.archiveTaskRuns(task.id), 1);
+  assert.equal(f.ledger.run(run.id).status, "interrupted");
+  assert.ok(f.ledger.run(run.id).interrupted_at);
+  assert.equal(f.ledger.archiveTaskRuns(task.id), 0);
+  assert.equal(f.ledger.resume(run.id).status, "running");
+  store.archiveTask(task.id, "superseded");
+  f.ledger.db.prepare("update console_work_runs set lease_expires_at=? where id=?")
+    .run("2020-01-01T00:00:00Z", run.id);
+  assert.equal(f.ledger.reconcileArchivedTaskRuns(), 1);
+  assert.equal(f.ledger.run(run.id).status, "interrupted");
+});
+
+test("旧轮次有正在执行的子操作时，不伪造结束状态", (t) => {
+  const f = fixture(t);
+  const store = new SessionStore(f.ledger.db);
+  const session = store.createSession("owner", "conversation", "进行中任务");
+  const task = store.createTask(session.id, "需要保留运行的任务");
+  const run = f.begin(`task-${task.id}-running`);
+  const operationId = f.ledger.operation({runId:run.id, requestKey:"running-child",kind:"command",label:"真实工作",status:"running"});
+  store.archiveTask(task.id, "superseded");
+  assert.equal(f.ledger.archiveTaskRuns(task.id), 0);
+  assert.equal(f.ledger.run(run.id).status, "running");
+  f.ledger.endOperation(operationId, "completed");
+  assert.equal(f.ledger.archiveTaskRuns(task.id), 1);
+  assert.equal(f.ledger.run(run.id).status, "interrupted");
+});
+
+
+test("读取一百次不续租，不改写执行进展或修订",t=>{
+  const f=fixture(t),run=f.begin("read-does-not-heartbeat");
+  const op=f.ledger.operation({runId:run.id,requestKey:"build",kind:"command",label:"silent",status:"running"});
+  const previous=f.ledger.run(run.id);
+  for(let i=0;i<100;i++)f.ledger.run(run.id);
+  assert.deepEqual(f.ledger.run(run.id),previous);
+  const observed=new Date(Date.now()+1000).toISOString();f.ledger.observeOperations([op],observed);
+  assert.deepEqual(f.ledger.run(run.id),previous);
+  assert.equal(f.ledger.hasConfirmedChild(run.id,Date.parse(observed)+29_000),true);
+  assert.equal(f.ledger.hasConfirmedChild(run.id,Date.parse(observed)+31_000),false);
+  assert.equal(f.ledger.run(run.id).status,"running");
+});
+
+test("同目录另一 Task 的普通命令不阻挡交付，自己的占用仍阻挡",t=>{
+  const f=fixture(t),store=new SessionStore(f.ledger.db),session=store.createSession("owner","claims","claims");
+  const first=store.createTask(session.id,"first"),second=store.createTask(session.id,"second");
+  const member=store.addMember(session.id,"local","ws",f.project,"checkout",null);
+  const a=f.begin(`task-${first.id}-a`),b=f.begin(`task-${second.id}-b`);
+  store.linkRun(session.id,member.id,a.id,first.id);store.linkRun(session.id,member.id,b.id,second.id);
+  const coordinator=new ExecutionCoordinator(f.state);
+  const claim=coordinator.acquire({workspaceRoot:f.project,kind:"command",taskId:second.id,operationId:"op_foreign"});
+  try{
+    assert.equal(f.finish(a.id).executionStatus,"completed");
+    assert.throws(()=>f.finish(b.id),/claims|ownership/);
+    claim.release();
+    assert.equal(f.finish(b.id).executionStatus,"completed");
+  }finally{claim.release();coordinator.close();}
+});
+
+test("执行终态先保存，遗失的操作结束投影可在运行期修复",t=>{
+  const f=fixture(t),store=new SessionStore(f.ledger.db),session=store.createSession("owner","terminal","terminal");
+  const task=store.createTask(session.id,"task"),member=store.addMember(session.id,"local","ws",f.project,"checkout",null);
+  const run=f.begin(`task-${task.id}-terminal`);store.linkRun(session.id,member.id,run.id,task.id);
+  const op=f.ledger.operation({runId:run.id,requestKey:"intent",kind:"command",label:"already failed",status:"running"});
+  store.reserveInvocation({id:"inv_terminal",ownerId:"owner",transportInstanceId:"http",requestId:"1",sessionId:session.id,
+    memberId:member.id,toolName:"exec_command",argumentsJson:"{}"});
+  store.updateInvocation({ownerId:"owner",transportInstanceId:"http",requestId:"1",operationId:op,
+    state:"failed" as any,effect:"not_started",finished:true,responded:true});
+  assert.equal(f.ledger.reconcileTerminalOperations(),1);assert.equal(f.ledger.reconcileTerminalOperations(),0);
+  const row=f.ledger.db.prepare("select status,finished_at from console_operations where id=?").get(op) as any;
+  assert.equal(row.status,"failed");assert.ok(row.finished_at);
+  store.archiveTask(task.id,"superseded");f.ledger.reconcileArchivedTaskRuns();
+  assert.equal(f.ledger.run(run.id).status,"interrupted");
 });

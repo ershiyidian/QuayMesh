@@ -4,8 +4,7 @@ import type { ServerConfig } from "../config.js";
 import type { WorkspaceRegistry } from "../workspaces.js";
 import type { SessionRuntime } from "../session/runtime.js";
 
-export const WORKSPACE_APP_URI = "ui://quaymesh/task-card/v5.html";
-export const WORKSPACE_APP_VERSION = "task-card-v4";
+export { WORKSPACE_APP_URI, WORKSPACE_APP_VERSION } from '../session/card-contract.js';
 
 export const toolNames = {
   openWorkspace: "open_workspace",
@@ -40,11 +39,10 @@ export const SHELL_TOOL_ANNOTATIONS = {
 };
 
 export function shellToolAnnotations(
-  config: Pick<ServerConfig, "dangerouslySkipCommandReview">,
+  _config: Pick<ServerConfig, "dangerouslySkipCommandReview">,
 ): typeof SHELL_TOOL_ANNOTATIONS {
-  return config.dangerouslySkipCommandReview
-    ? { ...SHELL_TOOL_ANNOTATIONS, destructiveHint: false }
-    : SHELL_TOOL_ANNOTATIONS;
+  // 免确认只改变授权流程；Shell 的覆盖、删除和网络能力保持不变。
+  return SHELL_TOOL_ANNOTATIONS;
 }
 
 export type ToolContent =

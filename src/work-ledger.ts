@@ -51,6 +51,7 @@ const countKeys = ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens", 
 const zero = (): TokenCounts => ({ inputTokens: 0, outputTokens: 0, totalTokens: 0 });
 const active = (status: string) => ["starting", "queued", "running"].includes(status);
 export const WORK_RUN_LEASE_MS = 15 * 60 * 1000;
+export const EXECUTION_OBSERVATION_MS = 30_000;
 const leaseExpiry = (at = Date.now()) => new Date(at + WORK_RUN_LEASE_MS).toISOString();
 
 export class WorkFinishBlockedError extends Error {
@@ -154,7 +155,6 @@ export class WorkLedger {
     return row;
   }
   run(runId: string): WorkRunRow {
-    this.reconcileRun(runId);
     return this.rawRun(runId);
   }
   setRunTitle(runId: string, title: string): void {
@@ -182,11 +182,33 @@ export class WorkLedger {
   }
 
   heartbeat(runId: string): void {
-    const at = now();
-    this.db.prepare(`update console_work_runs set
-      last_activity_at=case when status='running' then ? else last_activity_at end,
-      lease_expires_at=case when status='running' then ? else lease_expires_at end where id=?`)
-      .run(at, leaseExpiry(), runId);
+    this.db.prepare("update console_work_runs set lease_expires_at=? where id=? and status='running'")
+      .run(leaseExpiry(), runId);
+  }
+
+  // 仅由拥有内存中执行句柄的监督器调用；观察本身不改变进展、输出或任务修订。
+  observeOperations(operationIds: readonly string[], at = now()): void {
+    if (!operationIds.length) return;
+    this.db.transaction(() => {
+      const update=this.db.prepare("update console_operations set observed_at=? where id=? and status in ('starting','queued','running')");
+      for (const operationId of operationIds) update.run(at,operationId);
+    })();
+  }
+
+  observeAgent(agentId: string, at = now()): void {
+    this.db.prepare("update console_executions set observed_at=? where agent_id=? and status in ('starting','queued','running')").run(at,agentId);
+  }
+
+  hasConfirmedAgent(agentId: string, at = Date.now()): boolean {
+    return Boolean(this.db.prepare("select 1 from console_executions where agent_id=? and status in ('starting','queued','running') and observed_at>=? limit 1")
+      .get(agentId,new Date(at-EXECUTION_OBSERVATION_MS).toISOString()));
+  }
+
+  hasConfirmedChild(runId: string, at = Date.now()): boolean {
+    const after = new Date(at - EXECUTION_OBSERVATION_MS).toISOString();
+    return Boolean(this.db.prepare(`select 1 from console_operations where run_id=? and status in ('starting','queued','running') and observed_at>=?
+      union all select 1 from console_executions where run_id=? and status in ('starting','queued','running') and observed_at>=? limit 1`)
+      .get(runId,after,runId,after));
   }
 
   hasActiveChild(runId: string): boolean {
@@ -200,12 +222,26 @@ export class WorkLedger {
   reconcileRun(runId: string): boolean {
     const row = this.rawRun(runId);
     if (row.status !== "running") return false;
-    if (this.hasActiveChild(runId)) {
-      this.db.prepare("update console_work_runs set lease_expires_at=?,last_activity_at=? where id=? and status='running'").run(leaseExpiry(), now(), runId);
-      return false;
-    }
-    // 用户工作允许长时间停留在等待下一步。资源租约到期只能表达当前没有受管子任务，不能单独证明用户工作已经中断。
-    return false;
+    // 状态查询和定期核对不伪造进展；活性租约由执行所有者续期。
+    const linked = this.db.prepare("select t.state from qm_run_links l join qm_tasks t on t.id=l.task_id where l.run_id=?").get(runId) as {state:string}|undefined;
+    return linked?.state === "closed" ? this.interruptIdleRun(runId) : false;
+  }
+
+  reconcileTerminalOperations(): number {
+    return this.db.transaction(() => {
+      const rows = this.db.prepare(`select o.id,o.run_id,i.state,i.finished_at from console_operations o
+        join qm_invocations i on i.operation_id=o.id
+        where o.status in ('starting','queued','running') and i.finished_at is not null
+        and i.state in ('succeeded','failed','cancelled')`).all() as Array<{id:string;run_id:string;state:string;finished_at:string}>;
+      for (const row of rows) {
+        this.db.prepare("update console_operations set status=?,finished_at=? where id=?")
+          .run(row.state === "succeeded" ? "completed" : row.state, row.finished_at, row.id);
+        this.db.prepare(`update console_work_runs set revision=revision+1,
+          last_activity_at=case when last_activity_at is null or last_activity_at<? then ? else last_activity_at end where id=?`)
+          .run(row.finished_at,row.finished_at,row.run_id);
+      }
+      return rows.length;
+    }).immediate();
   }
 
   reconcileStaleRuns(projectId?: string): number {
@@ -215,6 +251,36 @@ export class WorkLedger {
     let changed = 0;
     for (const row of rows) if (this.reconcileRun(row.id)) changed++;
     return changed;
+  }
+
+  // 任务进入归档/接力状态时，结束已经没有受管子任务的旧卡片计时。
+  // 未确认结束的进程和操作保留原状态，绝不伪造完成或取消结果。
+  archiveTaskRuns(taskId: string): number {
+    let changed = 0;
+    for (const row of this.db.prepare(`select id from console_work_runs
+      where status='running' and substr(run_key,6,37)=? and run_key like 'task-task_%'`).all(taskId) as { id: string }[]) {
+      if (this.interruptIdleRun(row.id)) changed++;
+    }
+    return changed;
+  }
+
+  // 持续回收已经关闭任务的悬挂运行；仍有未闭合子操作时保留核对入口。
+  reconcileArchivedTaskRuns(): number {
+    const rows = this.db.prepare(`select r.id from console_work_runs r
+      left join qm_run_links l on l.run_id=r.id
+      join qm_tasks t on t.id=COALESCE(l.task_id,case when r.run_key like 'task-task_%' then substr(r.run_key,6,37) end)
+      where r.status='running' and t.state='closed'`).all() as { id: string }[];
+    let changed = 0;
+    for (const row of rows) if (this.interruptIdleRun(row.id)) changed++;
+    return changed;
+  }
+
+  private interruptIdleRun(runId: string): boolean {
+    const row = this.rawRun(runId);
+    if (row.status !== "running" || this.hasActiveChild(runId)) return false;
+    const at = now();
+    return this.db.prepare(`update console_work_runs set status='interrupted', interrupted_at=?,
+      lease_expires_at=?,revision=revision+1 where id=? and status='running'`).run(at, at, runId).changes > 0;
   }
 
   resume(runId: string): WorkRunRow {
@@ -247,6 +313,7 @@ export class WorkLedger {
       this.db.prepare(`insert into console_operations(id,run_id,request_key,kind,label,status,evidence,created_at,finished_at) values(?,?,?,?,?,?,?,?,?)`)
         .run(operationId, input.runId, input.requestKey.slice(0, 160), input.kind.slice(0, 64), input.label.slice(0, 200),
           input.status, JSON.stringify(evidence), now(), active(input.status) ? null : now());
+      this.db.prepare("update console_operations set observed_at=? where id=?").run(now(),operationId);
       this.touch(input.runId); return operationId;
     }).immediate();
   }
@@ -271,6 +338,7 @@ export class WorkLedger {
     const executionId = id("exec");
     this.db.prepare(`insert into console_executions(id,run_id,agent_id,provider,status,requested_model,requested_effort,created_at)
       values(?,?,?,?,?,?,?,?)`).run(executionId, run.id, input.agentId, input.provider, "queued", input.model ?? null, input.effort ?? null, now());
+    this.db.prepare("update console_executions set observed_at=? where id=?").run(now(),executionId);
     this.touch(run.id); return executionId;
     }).immediate();
   }
@@ -566,11 +634,20 @@ export class WorkLedger {
       // Keep admission evidence and the terminal write in this immediate transaction.
       // Only a currently active execution can prove foreign ownership. In particular,
       // endExecution precedes release: a completed latest record is not such proof.
-      const claims = this.db.prepare(`select kind, agent_id, checkout_root, acquired_at from execution_claims
-        union all select kind, agent_id, checkout_root, null as acquired_at from execution_waiters where expires_at_ms > ?`)
-        .all(Date.now()) as { kind: string; agent_id: string | null; checkout_root: string; acquired_at: string | null }[];
+      const ownTask = this.db.prepare("select task_id from qm_run_links where run_id=?").get(runId) as {task_id:string|null}|undefined;
+      const claims = this.db.prepare(`select kind,agent_id,checkout_root,acquired_at,task_id,operation_id from execution_claims
+        union all select kind,agent_id,checkout_root,null as acquired_at,task_id,operation_id from execution_waiters where expires_at_ms > ?`)
+        .all(Date.now()) as { kind:string; agent_id:string|null; checkout_root:string; acquired_at:string|null; task_id:string|null; operation_id:string|null }[];
       for (const claim of claims) {
         if (!overlaps(project.root, claim.checkout_root)) continue;
+        // 普通命令与 Agent 都按持久身份归属核对，目录重叠不改变任务所有权。
+        if (ownTask?.task_id && claim.task_id && claim.task_id !== ownTask.task_id &&
+          this.db.prepare("select 1 from qm_tasks where id=?").get(claim.task_id)) continue;
+        if (claim.operation_id) {
+          const operationOwner = this.db.prepare("select run_id from console_operations where id=?").get(claim.operation_id) as {run_id:string}|undefined;
+          if (operationOwner && operationOwner.run_id !== runId &&
+            (!ownTask?.task_id || !this.db.prepare("select 1 from qm_run_links where run_id=? and task_id=?").get(operationOwner.run_id,ownTask.task_id))) continue;
+        }
         const execution = claim.kind === "agent" && claim.agent_id ? this.latestExecution(claim.agent_id) : undefined;
         const owner = execution ? this.run(execution.run_id) : undefined;
         if (execution && owner && owner.id !== runId && owner.status === "running" && active(execution.status)
@@ -606,8 +683,6 @@ export class WorkLedger {
     this.db.prepare("update console_threads set protected=?,revision=revision+1,updated_at=? where id=?").run(protect ? 1 : 0, now(), threadKey);
   }
   listRuns(projectId: string, options: { limit?: number; offset?: number; source?: string; status?: string; after?: string } = {}) {
-    this.reconcileDeadExecutionClaims();
-    this.reconcileStaleRuns(projectId);
     const limit = Math.min(100, Math.max(1, options.limit ?? 50)); const offset = Math.max(0, options.offset ?? 0);
     const rows = this.db.prepare(`select r.*,i.title from console_work_runs r join console_work_items i on r.item_id=i.id
       where r.project_id=? and (?='' or r.status=?) and (?='' or r.created_at>=?)
@@ -630,19 +705,12 @@ export class WorkLedger {
         requestedModel: row.requested_model, requestedEffort: row.requested_effort, createdAt: row.created_at, startedAt: row.created_at, finishedAt: row.finished_at })) };
   }
   projectUsage(projectId: string, after = "") {
-    this.reconcileDeadExecutionClaims();
-    this.reconcileStaleRuns(projectId);
     const rows = this.db.prepare(`select e.* from console_executions e join console_work_runs r on r.id=e.run_id where r.project_id=? and r.created_at>=?`)
       .all(projectId, after) as ExecutionRow[];
     const runs = this.db.prepare("select id,status,acceptance from console_work_runs where project_id=? and created_at>=?").all(projectId, after) as { id: string; status: string; acceptance: string }[];
     const missing = new Set(rows.filter((row) => row.provider === "codex" && ["unavailable", "partial"].includes(executionUsage(row).usageStatus)).map((row) => row.run_id));
-    const liveIds = new Set((this.db.prepare(`select distinct r.id id from console_work_runs r
-      where r.project_id=? and r.status='running' and r.created_at>=? and (
-        exists (select 1 from console_executions e where e.run_id=r.id and e.status in ('starting','queued','running'))
-        or exists (select 1 from console_operations o where o.run_id=r.id and o.status in ('starting','queued','running'))
-        or exists (select 1 from execution_claims c where c.agent_id in (
-          select e.agent_id from console_executions e where e.run_id=r.id))
-      )`).all(projectId, after) as { id: string }[]).map((row) => row.id));
+    const at=Date.now();
+    const liveIds = new Set(runs.filter(run => run.status === "running" && this.hasConfirmedChild(run.id,at)).map(run => run.id));
     return { ...summarizeExecutions(rows), taskCount: runs.length,
       activeTasks: runs.filter((run) => liveIds.has(run.id)).length,
       pendingAcceptance: runs.filter((run) => run.acceptance === "pending").length,

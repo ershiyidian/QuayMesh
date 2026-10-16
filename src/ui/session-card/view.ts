@@ -87,11 +87,13 @@ export function createCardView(doc: Document, state: CardState, onIntent:CardInt
   function renderSummary(snapshot:Snapshot):void {
     const now=cardNow(state),presentation=cardPresentation(snapshot,now);
     card.dataset.status=presentation.status;
-    required<HTMLElement>(doc,"#stIc").innerHTML=statusIcon(presentation.status);
-    required<HTMLElement>(doc,"#title").textContent=snapshot.title;
+    const statusElement=required<HTMLElement>(doc,"#stIc");
+    if(statusElement.dataset.status!==presentation.status){statusElement.innerHTML=statusIcon(presentation.status);statusElement.dataset.status=presentation.status;}
+    setText(required<HTMLElement>(doc,"#title"),snapshot.title);
+    required<HTMLElement>(doc,"#title").title=snapshot.sourceTaskId?`接续任务 ${snapshot.sourceTaskId}`:snapshot.title;
     const workspace=snapshot.workspaces[0];
     const ws=required<HTMLElement>(doc,"#ws");
-    ws.textContent=workspace?`${workspace.node_id}/${shortPath(workspace.root)}`:"等待工作区";
+    setText(ws,workspace?`${snapshot.sourceTaskId?"接续 · ":""}${workspace.node_id}/${shortPath(workspace.root)}`:"等待工作区");
     ws.title=snapshot.workspaces.map(item=>`${item.node_id}: ${item.root}`).join("\n");
     const running=snapshot.runningCommand??snapshot.commands.find(command=>command.status==="run"||command.status==="queued")??null;
     const lastCommand=snapshot.lastCommand??snapshot.currentCommand??null;
@@ -99,25 +101,26 @@ export function createCardView(doc: Document, state: CardState, onIntent:CardInt
     const label=running?.cmd??lastCommand?.cmd??snapshot.lastOperation?.label??presentation.label;
     activity.className=`act${running?" mono":""}${["stalled","failed","unavailable","finalizing","archived"].includes(presentation.status)?" tone":""}`;
     if(presentation.status==="stalled"&&presentation.modelActivityAgeMs!==null)
-      activity.textContent=`${presentation.label} · ${elapsedText(presentation.modelActivityAgeMs)}前 · ${label}`;
+      setText(activity,`${presentation.label} · ${elapsedText(presentation.modelActivityAgeMs)}前 · ${label}`);
     else if(presentation.status==="running")
-      activity.textContent=`$ ${label}${presentation.outputAgeMs!==null?` · 输出 ${elapsedText(presentation.outputAgeMs)}前`:""}`;
-    else activity.textContent=`${presentation.label}${label&&label!==presentation.label?` · ${label}`:""}`;
+      setText(activity,`$ ${label}${presentation.outputAgeMs!==null?` · 输出 ${elapsedText(presentation.outputAgeMs)}前`:""}`);
+    else setText(activity,`${presentation.label}${label&&label!==presentation.label?` · ${label}`:""}`);
     activity.title=label;
     const files=selectedFiles(state),adds=total(files,"additions"),dels=total(files,"removals");
-    required<HTMLElement>(doc,"#stats").innerHTML=`<span class="nf">${snapshot.totals.files} 文件</span><span>${snapshot.totals.commands} 命令</span>${snapshot.totals.agents?`<span>${snapshot.totals.agents} 代理</span>`:""}<span class="add mono">+${adds??"?"}</span><span class="del mono">−${dels??"?"}</span>`;
+    const stats=required<HTMLElement>(doc,"#stats"),statsMarkup=`<span class="nf">${snapshot.totals.files} 文件</span><span>${snapshot.totals.commands} 命令</span>${snapshot.totals.agents?`<span>${snapshot.totals.agents} 代理</span>`:""}<span class="add mono">+${adds??"?"}</span><span class="del mono">−${dels??"?"}</span>`;
+    if(stats.innerHTML!==statsMarkup)stats.innerHTML=statsMarkup;
     const clock=required<HTMLElement>(doc,"#clock");
-    clock.textContent=presentation.taskElapsedMs===null?"—":elapsedText(presentation.taskElapsedMs);
+    setText(clock,presentation.taskElapsedMs===null?"—":elapsedText(presentation.taskElapsedMs));
     const prog=required<HTMLElement>(doc,"#prog");
     const shownCommand=running??lastCommand;
     if(shownCommand?.startedAt!==null&&shownCommand?.startedAt!==undefined){
       delete prog.dataset.commandStart;
-      prog.textContent=`${running?"命令":"最近命令"} ${elapsedText(presentation.commandElapsedMs??0)}`;
+      setText(prog,`${running?"命令":"最近命令"} ${presentation.commandElapsedMs===null?"状态待确认":elapsedText(presentation.commandElapsedMs)}`);
     }
     else if(presentation.modelActivityAgeMs!==null){delete prog.dataset.commandStart;prog.textContent=`最近活动 ${elapsedText(presentation.modelActivityAgeMs)}前`;}
     else {delete prog.dataset.commandStart;prog.textContent="";}
     const bar=required<HTMLElement>(doc,"#bar");
-    bar.classList.toggle("indet",hasBackground(snapshot));
+    bar.classList.toggle("indet",presentation.commandClockDynamic);
     bar.style.setProperty("--p",snapshot.taskResult||snapshot.closureReason?"1":"0");
     if(state.connection==="error"){activity.className="act tone";activity.textContent="界面读取失败，等待重试…";}
   }
@@ -130,7 +133,7 @@ export function createCardView(doc: Document, state: CardState, onIntent:CardInt
     if(snapshot.capabilities.revert&&!hasBackground(snapshot)&&snapshot.totals.files>0){
       parts.push(`<button class="ib${state.revertArmed?" confirm":""}" data-act="revert" aria-label="${state.revertArmed?"确认撤销全部修改":"撤销全部修改"}" title="撤销全部修改">${state.revertArmed?"确认撤销":icon("stop")}</button>`);
     }
-    box.innerHTML=parts.join("");
+    const markup=parts.join("");if(box.innerHTML!==markup)box.innerHTML=markup;
   }
 
   function renderTabs(snapshot:Snapshot):void {
@@ -292,3 +295,5 @@ function $$<T extends Element>(selector:string,root:ParentNode):T[]{return[...ro
 function esc(value:unknown):string{return escapeCode(String(value??""));}
 function errorMessage(error:unknown):string{return error instanceof Error?error.message:String(error);}
 function cardNow(state:CardState):number{const candidate=Date.now()+state.clockOffsetMs;state.lastNowMs=Math.max(state.lastNowMs,candidate);return state.lastNowMs;}
+
+function setText(element:HTMLElement,value:string):void{if(element.textContent!==value)element.textContent=value;}

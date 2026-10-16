@@ -1257,6 +1257,7 @@ export class SessionStore {
       state=COALESCE(
         (SELECT json_extract(e.data_json,'$.status') FROM qm_events e
           WHERE json_extract(e.data_json,'$.operation_id')=i.operation_id AND e.event_type='operation_finished'
+            AND json_extract(e.data_json,'$.status') IN ('succeeded','failed','cancelled')
           ORDER BY e.sequence DESC LIMIT 1),
         (SELECT CASE o.status WHEN 'completed' THEN 'succeeded' WHEN 'failed' THEN 'failed' WHEN 'cancelled' THEN 'cancelled' ELSE 'unknown' END
           FROM console_operations o WHERE o.id=i.operation_id)),

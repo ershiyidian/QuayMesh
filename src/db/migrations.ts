@@ -6,7 +6,7 @@ import { resourceSchema } from "./resource-schema.js";
 import { reliabilitySchema } from "./reliability-schema.js";
 import { taskLifecycleSchema } from "./task-lifecycle-schema.js";
 
-export const LATEST_DATABASE_VERSION = 4;
+export const LATEST_DATABASE_VERSION = 5;
 
 export function migrateDatabase(sqlite: Database.Database): void {
   sqlite.pragma("foreign_keys = ON");
@@ -43,6 +43,11 @@ export function migrateDatabase(sqlite: Database.Database): void {
     if (version === 3) {
       sqlite.exec(taskLifecycleSchema);
       record(4, "quaymesh-task-lifecycle");
+      version = 4;
+    }
+    if (version === 4) {
+      sqlite.exec("ALTER TABLE console_operations ADD COLUMN observed_at TEXT; ALTER TABLE console_executions ADD COLUMN observed_at TEXT;");
+      record(5, "quaymesh-execution-observation");
     }
     // Earlier standalone TaskQuay/Agent stores sometimes retained their own
     // migration history. Their `thinking` value is an actual operator setting;

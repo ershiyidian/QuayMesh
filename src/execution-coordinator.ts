@@ -13,6 +13,7 @@ export interface RuntimeWorkInput {
   operationId?: string;
   taskId?: string;
   allowWhilePaused?: boolean;
+  blocking?: boolean;
 }
 export interface RuntimeWorkLease {
   readonly id: string;
@@ -148,7 +149,7 @@ export class ExecutionCoordinator {
       if (!input.allowWhilePaused) this.assertAccepting();
       this.database.sqlite.prepare(`INSERT INTO qm_runtime_work(id,owner_id,owner_pid,kind,operation_id,task_id,blocking,started_at)
         VALUES(?,?,?,?,?,?,?,?)`).run(id, this.ownerId, process.pid, input.kind, input.operationId ?? null,
-          input.taskId ?? null, input.allowWhilePaused ? 0 : 1, new Date().toISOString());
+          input.taskId ?? null, input.allowWhilePaused || input.blocking === false ? 0 : 1, new Date().toISOString());
     }).immediate();
     let released = false;
     return {

@@ -157,19 +157,30 @@ export class McpRelay {
     const client = target.protocol === "https:" ? https : http;
     const upstream = client.request(target, { method: req.method, headers, agent: this.agent }, (reply) => {
       clearTimeout(headerTimer);
+      if (res.destroyed) { reply.destroy(); return; }
       res.writeHead(reply.statusCode || 502, forwardedHeaders(reply.headers));
       res.flushHeaders();
-      reply.once("error", error => res.destroy(error));
+      // 已有响应头不代表最终结果已送达；上游半途断开要同步终止下游，
+      // 不能留下一个永远等待 SSE 终止消息的 ChatGPT 请求。
+      const interrupted = () => {
+        if (!res.writableFinished && !res.destroyed) res.destroy(new Error("Coordinator 响应流提前结束"));
+      };
+      reply.once("aborted", interrupted);
+      reply.once("close", () => { if (!reply.complete) interrupted(); });
+      reply.once("error", error => { if (!res.destroyed) res.destroy(error); });
       reply.pipe(res);
-      if ((reply.statusCode || 502) < 500) reply.once("end", () => this.onSuccess(`relay:${parsed.pathname}`));
+      if ((reply.statusCode || 502) < 500) res.once("finish", () => {
+        if (reply.complete && !reply.aborted) this.onSuccess(`relay:${parsed.pathname}`);
+      });
     });
     this.requests.add(upstream);
     // 流式响应的等待时间由 MCP 协议控制，这里只限制连接和响应头等待。
-    const headerTimer = setTimeout(() => upstream.destroy(new Error("Coordinator 响应头超时")), parsed.pathname === "/mcp" ? 125000 : 30000);
+    const headerTimer = setTimeout(() => upstream.destroy(new Error("Coordinator 响应头超时")), ["/mcp", "/mcp/"].includes(parsed.pathname) ? 125000 : 30000);
     headerTimer.unref();
     upstream.once("close", () => { clearTimeout(headerTimer); this.requests.delete(upstream); });
     upstream.once("error", (error) => {
       clearTimeout(headerTimer);
+      if (res.destroyed || req.aborted) return;
       this.fail(req,res,error);
     });
     req.once("aborted", () => upstream.destroy());

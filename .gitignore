@@ -22,6 +22,49 @@ owner.json
 *.sqlite-shm
 *.key
 *.token
+# 本机身份文件不应混入源码
+.npmrc
+.pypirc
+.netrc
+# 站点私有配置、凭据、证书和运行数据库；公开模板继续纳入版本管理
+.env.*
+!.env.example
+!*.env.example
+!*.env.*.example
+secrets.*.env
+*.local.env
+*.local.json
+*.local.jsonc
+*.local.yaml
+*.local.yml
+*.local.toml
+*.pem
+*.p12
+*.pfx
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.pid
+*.sock
+/site/
+/state/
+/public-build/
+*.bundle
+*.tmp
+*.bak
+*.orig
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.venv/
+venv/
+.pytest_cache/
+*.pyc
+*.tsbuildinfo
+*.tap
+/docs/source-check.json
 test-results/
 playwright-report/
 coverage/
@@ -30,17 +73,9 @@ __pycache__/
 
 # 私有部署资料
 Todo.md
+/docs/TODO_*.md
 QuayMesh-Deployment-Tools.zip
 deploy-tools/
 
 # 组件构建产物
 components/
-
-# Local configuration and publication work
-.env.*
-!.env.example
-secrets.*.env
-*.pfx
-*.p12
-*.pem
-public-build/

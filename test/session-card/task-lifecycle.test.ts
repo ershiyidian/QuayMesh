@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { createRealTestServer, callOpen, structured } from "./server-fixture.js";
 import { validateSnapshot } from "../../src/session/schema.js";
 import { openDatabase } from "../../src/db/client.js";
@@ -44,8 +45,13 @@ for (const git of [true, false]) {
       assert.ok(baseline.some(row=>(row as {task_id:string}).task_id===first.task_id));
       assert.ok(baseline.some(row=>(row as {task_id:string}).task_id===second.task_id));
     } finally {db.close();}
-    const current = validateSnapshot(structured(await server.client.callTool({name:"qm_session",arguments:{
+    const readCurrent=async()=>validateSnapshot(structured(await server.client.callTool({name:"qm_session",arguments:{
       session_id:opened.session_id,task_id:second.task_id,member_id:opened.member_id,since_rev:-1}})).snapshot);
+    let current=await readCurrent();
+    // 文件写入先完成，差异投影异步发布；验收等实际文件事件，不借用状态查询触发归档。
+    for(let attempt=0;attempt<100&&!current.files.some(file=>file.path==="second-result.txt");attempt++){
+      await delay(50);current=await readCurrent();
+    }
     assert.ok(current.files.some(file=>file.path==="second-result.txt"));
     assert.equal(current.files.some(file=>file.path==="first-result.txt"),false);
     const historical = validateSnapshot(structured(await server.client.callTool({name:"qm_session",arguments:{

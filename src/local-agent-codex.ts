@@ -3,10 +3,11 @@ import { createHash } from "node:crypto";
 import { setTimeout as settle } from "node:timers/promises";
 import { type ChildProcessWithoutNullStreams } from "node:child_process";
 import { join, resolve } from "node:path";
-import { resolveExecutableCommand, mergeEnvironment, spawnCommand as spawn, spawnCommandSync as spawnSync } from "./local-agent-command.js";
+import { executableCommandCandidates, resolveExecutableCommand, mergeEnvironment, spawnCommand as spawn, spawnCommandSync as spawnSync } from "./local-agent-command.js";
 import { createInterface } from "node:readline";
 import {
   AgentProviderExecutionError,
+  AgentProviderCancelledError,
   AgentProviderProtocolError,
   AgentProviderUnavailableError,
   captureAgentProviderResult,
@@ -305,6 +306,10 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
         });
         callbacks?.onProviderFinished?.();
         const parsed = parseCompletedTurn(completed.event.params, completed.items);
+        if (parsed.cancelled) {
+          throw new AgentProviderCancelledError({code:'PROVIDER_CANCELLED',provider:this.provider,
+            operation:'run',retryable:false,cause:completed.event.params,message:'Codex agent turn was interrupted.'});
+        }
         if (parsed.failure) {
           const failure = summarizeCodexFailure(completed.event.params);
           throw new AgentProviderExecutionError({
@@ -809,6 +814,7 @@ function parseCompletedTurn(params: unknown, items: unknown[]): {
   finalResponse: string;
   items: unknown[];
   failure?: string;
+  cancelled: boolean;
 } {
   const turn = asRecord(asRecord(params)?.turn);
   const completedItems = (Array.isArray(turn?.items) ? turn.items : items).slice(-MAX_TURN_ITEMS);
@@ -821,12 +827,12 @@ function parseCompletedTurn(params: unknown, items: unknown[]): {
       finalResponse = record.text;
     }
   }
-  const status = turn?.status;
+  const status = turnStatusType(turn);
   const error = asRecord(turn?.error);
   const failure = status === "failed"
     ? directString(error?.message) ?? "Codex turn failed."
     : undefined;
-  return { finalResponse, items: completedItems, failure };
+  return { finalResponse, items: completedItems, failure, cancelled: status === 'interrupted' };
 }
 
 export function codexAppServerError(message: string, version?: string, stderr?: string): Error {
@@ -838,8 +844,7 @@ export function codexAppServerError(message: string, version?: string, stderr?: 
 }
 
 function commandCandidates(command: string, env: NodeJS.ProcessEnv): string[] {
-  const resolved = resolveExecutableCommand(command, env);
-  return resolved ? [resolved] : [];
+  return executableCommandCandidates(command, env).filter(candidate => resolveExecutableCommand(candidate, env));
 }
 
 function turnMatchesEvent(turn: CodexTurnAccumulator, event: CodexEvent): boolean {

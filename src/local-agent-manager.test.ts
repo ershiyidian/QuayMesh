@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { LocalAgentManager } from "./local-agent-manager.js";
 import {
   AgentProviderExecutionError,
+  AgentProviderCancelledError,
   type AgentProviderError,
 } from "./local-agent-errors.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
@@ -74,6 +75,8 @@ class FakeRuntime implements LocalAgentRuntime {
       return Result.err(providerFailure("provider failed after session creation"));
     }
     if (input.prompt.includes("defect")) throw new TypeError("internal defect");
+    if (input.prompt.includes('provider-cancelled')) return Result.err(new AgentProviderCancelledError({
+      code:'PROVIDER_CANCELLED',provider:'codex',operation:'run',retryable:false,message:'Turn interrupted by requested cancellation.'}));
     if (input.prompt.includes("fail")) return Result.err(providerFailure("provider failed"));
     if (input.prompt.includes("hold")) {
       await new Promise<void>((resolve) => { this.releaseHold = resolve; });
@@ -357,6 +360,9 @@ const failed = unwrap(await manager.start({
 await waitFor(() => getRecord(failed.id).status === "error");
 assert.equal(getRecord(failed.id).error, "provider failed");
 assert.equal(getRecord(failed.id).errorCode, "PROVIDER_EXECUTION_ERROR");
+const cancelledProvider=unwrap(await manager.start({...scope,prompt:'provider-cancelled',target:'reviewer'}));
+await waitFor(()=>getRecord(cancelledProvider.id).status==='stopped');
+assert.equal(getRecord(cancelledProvider.id).errorCode,'PROVIDER_CANCELLED');
 assert.equal(getRecord(failed.id).errorRetryable, false);
 assert.equal(store.getLatestTurn(failed.id)?.status, "failed");
 assert.equal(store.getLatestTurn(failed.id)?.error, "provider failed");

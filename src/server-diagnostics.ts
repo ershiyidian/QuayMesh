@@ -6,6 +6,8 @@ import { errorMonitor } from "node:events";
 import type { Server, IncomingMessage, ServerResponse } from "node:http";
 import { logEvent, shouldLog, type LoggingConfig } from "./logger.js";
 
+export const httpDiagnosticRequestId = Symbol("quaymesh.httpRequestId");
+
 export function diagnosticError(error: unknown): Record<string, unknown> {
   const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
   return {
@@ -84,6 +86,7 @@ export class ServerDiagnostics {
     const error = (failure: Error) => this.record("server_http_error", diagnosticError(failure), "error");
     const request = (req: IncomingMessage, res: ServerResponse) => {
       const requestId = randomUUID();
+      (req as IncomingMessage & { [httpDiagnosticRequestId]?: string })[httpDiagnosticRequestId] = requestId;
       const start = performance.now();
       const path = req.url?.split("?")[0];
       const route = path === "/mcp" || path === "/mcp/" ? "mcp" : "other";

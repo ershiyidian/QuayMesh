@@ -65,6 +65,34 @@ export interface OperationProgressResult {
 
 export class SessionService {
   private stopped = false;
+  private retryingFinalizations: Promise<void> | undefined;
+  private finalizationCursor: { requested_at: string; task_id: string } | undefined;
+
+  retryFinalizations(): Promise<void> {
+    if(this.stopped)return Promise.resolve();
+    if(this.retryingFinalizations)return this.retryingFinalizations;
+    const work=(async()=>{
+      // 按持久顺序轮转，前面的长任务或坏归档不能饿死后续已完成任务。
+      const batch=this.store.taskData.pendingFinalizations(4,this.finalizationCursor);
+      this.finalizationCursor=batch.at(-1);
+      for(const intent of batch) {
+        if(this.stopped)break;
+        const task=this.store.getTask(intent.task_id);
+        if(this.finalizing.has(task.id)||this.finalizingLocal.has(task.id))continue;
+        if(intent.status!=="handed_off"&&(this.localBackground(task.id).length||this.store.taskData.activeWork(task.id)))continue;
+        const owner=this.store.getSession(task.session_id).owner_id;
+        try {
+          if(task.source_kind==="federation_mirror")await this.finishOwnedTask(owner,task.id,intent.status,intent.summary);
+          else await this.finishTask(owner,task.id,intent.status,intent.summary);
+        } catch(error) {
+          // finishTask 已保存精确失败信息，下一轮仅接续原意图，不重执行操作。
+          console.error("QuayMesh 任务收尾仍待处理",task.id,error instanceof Error?error.message:String(error));
+        }
+      }
+    })().finally(()=>{this.retryingFinalizations=undefined;});
+    this.retryingFinalizations=work;
+    return work;
+  }
   private readonly listeners: (() => void)[] = [];
   private readonly pendingRecovery = new Set<Promise<void>>();
   private readonly finalizing = new Map<string, Promise<TaskRecord>>();
@@ -177,7 +205,11 @@ export class SessionService {
   }
 
   private finishLocalRuns(taskId: string, status: TaskFinalStatus, summary: string): void {
-    if(this.ledger&&status!=="handed_off") {
+    if (status === "handed_off") {
+      this.ledger?.archiveTaskRuns(taskId);
+      return;
+    }
+    if(this.ledger) {
       for(const id of this.store.runIdsForTask(taskId)) {
         if(this.ledger.run(id).status==="running")
           this.ledger.finish(id,{status,acceptance:"not_applicable",summary,evidence:[]});
@@ -222,6 +254,8 @@ export class SessionService {
       } catch(error) {remoteError=error instanceof Error?error.message:String(error);}
     }
     await this.captureTask(task,true);
+    // 旧轮次不再接受下一步时，停止没有活跃子任务的 Console 计时。
+    this.ledger?.archiveTaskRuns(task.id);
     if(remoteError)this.store.setTaskChangeSummary(task.id,"incomplete",`TASK_ARCHIVE_REMOTE_PENDING: ${remoteError}`);
     this.store.archiveTask(task.id,"superseded");
   }
@@ -230,6 +264,7 @@ export class SessionService {
     const task=this.store.getTask(taskId);this.store.requireSession(ownerId,task.session_id);
     if(task.state!=="closed"){
       await this.captureTask(task,false);
+      this.ledger?.archiveTaskRuns(task.id);
       this.store.archiveTask(task.id,"superseded");
     }
     return {taskId,nodeId:this.nodeId,backgroundRuns:this.localBackground(taskId),activeWork:this.store.taskData.activeWork(taskId),
@@ -656,6 +691,8 @@ export class SessionService {
       const linkedRuns = this.store.runIdsForMember(sessionId, member.id);
       const currentRunId = linkedRuns[0];
       if (!currentRunId) continue;
+      // 旧阶段的后台工作继续参与活性汇总；旧失败记录不污染当前请求。
+      if (linkedRuns.some(runId => ledger.hasConfirmedChild(runId))) state = ExecutionState.active;
       const linkedAgentIds = new Set(ledger.executions(currentRunId).map((execution) => execution.agent_id));
       const activeAgent = [...linkedAgentIds].some((agentId) => {
         const agent = this.agents?.getById(agentId);
@@ -663,7 +700,8 @@ export class SessionService {
       });
       if (activeAgent) state = ExecutionState.active;
       const currentRun = ledger.run(currentRunId);
-      if (currentRun.status === "running" && ledger.hasActiveChild(currentRunId)) state = ExecutionState.active;
+      if (currentRun.status === "running" && ledger.hasConfirmedChild(currentRunId)) state = ExecutionState.active;
+      else if(ledger.hasActiveChild(currentRunId)&&state!==ExecutionState.active)state=ExecutionState.interrupted;
       if (currentRun.status === "interrupted" || currentRun.status === "reconciliation_required") {
         if (state !== ExecutionState.active) state = ExecutionState.interrupted;
       }
@@ -726,6 +764,8 @@ export class SessionService {
 
   async close(): Promise<void> {
     this.stopped = true;
+    await this.retryingFinalizations;
+    await Promise.allSettled([...this.finalizing.values(),...this.finalizingLocal.values()]);
     for (const dispose of this.listeners) {
       try {
         dispose();

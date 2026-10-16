@@ -46,7 +46,7 @@ test("TK03/R34：辅助变化摘要失败不吞掉已确认交付结果",{timeou
     patch:"*** Begin Patch\n*** Add File: delivered.txt\n+delivered\n*** End Patch"},_meta:meta});
   assert.notEqual(patch.isError,true,JSON.stringify(patch.content));
   // 删除真实 Git 对象库，让后续摘要捕获通过真实 Git 命令失败；交付内容本身已经写入。
-  await rm(join(server.project,".git","objects"),{recursive:true,force:true});
+  await rm(join(server.project,".git","objects"),{recursive:true,force:true,maxRetries:5,retryDelay:100});
   const finish=await server.client.callTool({name:"finish_task",arguments:{task_id:task.task_id,status:"completed",summary:"文件已经交付"},_meta:meta});
   assert.notEqual(finish.isError,true,JSON.stringify(finish.content));
   assert.equal(structured(finish).result_status,"completed");

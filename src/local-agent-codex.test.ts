@@ -81,6 +81,10 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
         output({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "completed", items: [] } } });
         return;
       }
+      if (message.params.input[0].text === "interrupted") {
+        output({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "interrupted", items: [] } } });
+        return;
+      }
       const item = { type: "agentMessage", text: message.params.input[0].text === "policy"
         ? JSON.stringify(message.params.sandboxPolicy)
         : "fake response " + turn };
@@ -152,6 +156,12 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     assert.equal(policy.isOk(), true);
     if (policy.isErr()) throw policy.error;
     assert.deepEqual(JSON.parse(policy.value.finalResponse), { type: "workspaceWrite", networkAccess: true });
+    const interrupted = await runtime.run({prompt:"interrupted",workspaceRoot:"/tmp/project",providerSessionId:first.providerSessionId ?? undefined});
+    assert.equal(interrupted.isErr(), true);
+    if (interrupted.isErr()) {
+      assert.equal(interrupted.error.code, "PROVIDER_CANCELLED");
+      assert.equal(interrupted.error.retryable, false);
+    }
     await runtime.releaseSession("thread_new");
   } finally {
     await runtime.close();

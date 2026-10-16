@@ -171,6 +171,8 @@ export async function createRealTestServer(options: RealTestServerOptions = {}):
       requestInit: { headers: { authorization: "Bearer " + accessToken } },
     });
     await client.connect(transport);
+    // 与宿主一致，先发现工具并注册输出校验器，再开始任何工具调用。
+    await client.listTools();
     return { root, project, secondRoot, config, baseUrl, accessToken, client, running, dispose };
   } catch (error) {
     await dispose();

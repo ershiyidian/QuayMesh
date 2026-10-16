@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "s1",
+  "clusterFile": "./cluster.json",
+  "secretsFile": "./secrets.env",
+  "capabilities": {
+    "worker": true,
+    "discovery": true,
+    "egress": true
+  },
+  "network": {
+    "externalAccess": true,
+    "inheritProxy": false,
+    "proxyUrl": "http://127.0.0.1:7890"
+  },
+  "mesh": {
+    "address": "10.77.0.1",
+    "mode": "no-tun",
+    "listeners": []
+  },
+  "roots": [
+    {
+      "id": "projects",
+      "nickname": "项目",
+      "path": "~/projects"
+    }
+  ]
+}

@@ -35,7 +35,7 @@ export function federatedTools(target: McpRegistrationTarget, runtime: Federatio
             return await recorded(parsed, forwardedExtra, () => runtime.tool(name, parsed, forwardedExtra), { forwarded: true });
           }
           return await runtime.tool(name, parsed, forwardedExtra);
-        } catch (error) { return toolErrorResult(error,{sideEffecting:true,forwarded:true}); }
+        } catch (error) { return toolErrorResult(error,{sideEffecting:definition.annotations?.readOnlyHint !== true,forwarded:true}); }
       });
     }) as McpRegistrationTarget["registerTool"],
   };

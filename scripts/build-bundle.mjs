@@ -57,7 +57,7 @@ if(process.platform==="win32"){
   await run("powershell.exe",["-NoProfile","-ExecutionPolicy","Bypass","-File",join(root,"scripts","build-windows.ps1")]);
 }
 await mkdir(output,{recursive:true});
-for(const name of ["bin","node","dist","schema","components","package.json","pnpm-lock.yaml","pnpm-workspace.yaml","components.lock.json","README.md","README.zh-CN.md","CONTRIBUTING.md","docs","examples","skills","LICENSE","NOTICE","THIRD_PARTY_NOTICES.md","third_party"]){
+for(const name of ["bin","node","dist","schema","components","package.json","pnpm-lock.yaml","pnpm-workspace.yaml","components.lock.json","README.md","docs","examples","skills","LICENSE","NOTICE","THIRD_PARTY_NOTICES.md","third_party"]){
   await cp(join(root,name),join(output,name),{recursive:true,dereference:true});
 }
 await mkdir(join(output,"scripts"),{recursive:true});
@@ -78,10 +78,6 @@ const workspace=parse(await readFile(workspaceFile,"utf8"));
 workspace.nodeLinker="hoisted";
 await writeFile(workspaceFile,stringify(workspace),"utf8");
 await runPnpm(["install","--prod","--frozen-lockfile"],output);
-// 发布包只保留运行文件，移除包含构建目录的包管理器本机记录。
-for (const name of [".modules.yaml", ".pnpm-workspace-state-v1.json"]) {
-  await rm(join(output,"node_modules",name),{force:true});
-}
 const payloadEntries=(await readdir(output)).filter(name=>name!=="release.json"&&name!==".git").sort();
 await writeFile(join(output,"release.json"),JSON.stringify({...release,payloadEntries},null,2)+"\n");
 await run(join(output,"runtime",exe("node")),[join(output,"node","verify-installed.mjs")],output);

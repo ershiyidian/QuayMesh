@@ -11,6 +11,7 @@ export interface TaskIndex {
   key: string;
   sessionId: string | null;
   taskId: string | null;
+  sourceTaskId?: string | null;
   title: string;
   phaseRefs: string[];
   nodeIds: string[];
@@ -61,7 +62,7 @@ export function aggregateTaskIndex(phases: TaskPhaseIndex[]): TaskIndex[] {
     const sessionId = values.find((value) => value.sessionId)?.sessionId ?? null;
     const taskId = values.find((value) => value.taskId)?.taskId ?? null;
     const current = values.filter((value) => value.currentPhase);
-    const stateValues = current.length ? current : values;
+    const stateValues = current.length ? values.filter(value => value.currentPhase || ["running","queued","stopping"].includes(value.executionStatus)) : values;
     const tokenValues = values.map((value) => value.tokens).filter((value): value is number => value !== null);
     return {
       key,
@@ -193,7 +194,7 @@ function mergeTask(group: Run[]): Run {
   const workspaces = [...new Map(group.flatMap(run => run.workspaces ?? [{nodeId:run.nodeId,projectId:run.projectId,
     memberId:run.memberId,name:run.projectName,root:run.root}]).map(value=>[JSON.stringify([value.nodeId,value.root]),value])).values()];
   const currentRuns = group.filter((run) => run.currentPhase !== false);
-  const stateRuns = currentRuns.length ? currentRuns : group;
+  const stateRuns = currentRuns.length ? group.filter(run => run.currentPhase !== false || ["running","queued","stopping"].includes(run.executionStatus)) : group;
   const nodeStates=Object.fromEntries([...new Set(stateRuns.map(run=>run.nodeId))].map(nodeId=>[
     nodeId,aggregateExecution(stateRuns.filter(run=>run.nodeId===nodeId).map(run=>run.executionStatus)),
   ]));
@@ -264,7 +265,7 @@ function isTaskTitle(title: string): boolean {
 }
 
 function aggregateExecution(states: string[]): string {
-  for (const state of ["running", "queued", "stopping", "unknown", "failed", "interrupted_recoverable", "waiting", "cancelled", "completed", "ended"]) {
+  for (const state of ["running", "queued", "stopping", "unknown", "failed", "interrupted_recoverable", "finalizing", "waiting", "stalled", "cancelled", "completed", "ended"]) {
     if (states.includes(state)) return state;
   }
   return states[0] ?? "unknown";

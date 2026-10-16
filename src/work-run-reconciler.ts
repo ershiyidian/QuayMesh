@@ -22,17 +22,21 @@ export class WorkRunReconciler {
   startup(): void {
     const ledger = this.ledger ?? new WorkLedger(this.stateDir);
     this.ledger = ledger;
+    ledger.reconcileTerminalOperations();
     ledger.reconcileInterruptedExecutions();
     ledger.reconcileOrphanedOperations();
     ledger.reconcileDeadExecutionClaims();
     ledger.reconcileStaleRuns();
+    ledger.reconcileArchivedTaskRuns();
   }
 
   tick(): void {
     const ledger = this.ledger ?? new WorkLedger(this.stateDir);
     this.ledger = ledger;
+    ledger.reconcileTerminalOperations();
     ledger.reconcileDeadExecutionClaims();
     ledger.reconcileStaleRuns();
+    ledger.reconcileArchivedTaskRuns();
   }
 
   close(): void {

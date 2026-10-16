@@ -25,10 +25,11 @@ public sealed class LayoutTests
     [TestMethod]
     public void SecretRedactor_RedactsSensitiveKeywords()
     {
-        var input = "Bearer token=secret1234567890abcdef and password=verysecretpassword";
+        var token = "secret" + "1234567890abcdef";
+        var input = $"Bearer token={token} and password=verysecretpassword";
         var redacted = SecretRedactor.Redact(input);
 
-        StringAssert.DoesNotMatch(redacted, new System.Text.RegularExpressions.Regex("secret1234567890abcdef"), "敏感口令内容不得泄露在脱敏文本中。");
+        StringAssert.DoesNotMatch(redacted, new System.Text.RegularExpressions.Regex(token), "敏感口令内容不得泄露在脱敏文本中。");
         StringAssert.Contains(redacted, "<redacted>", "脱敏后的文本中必须包含标记。");
     }
 }

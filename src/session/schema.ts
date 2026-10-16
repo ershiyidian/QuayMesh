@@ -144,8 +144,17 @@ export const skillSchema = z
   })
   .strict();
 
+export const executionObservationSchema = z.object({
+  observedAt: z.number().finite().nonnegative(),
+  activeOperationIds: z.array(z.string().min(1).max(256)).max(4096),
+  preparingOperationIds: z.array(z.string().min(1).max(256)).max(4096),
+  staleOperationIds: z.array(z.string().min(1).max(256)).max(4096),
+}).strict();
+
 export const snapshotSchema = z
   .object({
+    sourceTaskId: id.nullable().optional(),
+    executionObservation: executionObservationSchema.optional(),
     sessionId: id,
     taskId: id.nullable().optional(),
     taskState:z.enum(["active","closed"]).optional(),

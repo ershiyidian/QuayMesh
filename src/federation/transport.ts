@@ -55,6 +55,7 @@ export class PeerLink extends EventEmitter {
   private text = "";
   private closed = false;
   private pingOutstanding = false;
+  private consecutivePingErrors = 0;
   private readonly heartbeat: NodeJS.Timeout;
   constructor(
     readonly peerId: string,
@@ -73,7 +74,9 @@ export class PeerLink extends EventEmitter {
     this.heartbeat = setInterval(() => {
       const now = performance.now();
       const heartbeatMs = owner.config.heartbeatMs;
-      const hardTimeout = Math.max(heartbeatMs * 3, 15_000);
+      // 一次迟到的心跳不得中断当前连接上的全部 RPC。
+      // 允许短暂的调度停顿、网络拥塞和网关瞬时波动。
+      const hardTimeout = Math.max(heartbeatMs * 6, 45_000);
       if (this.pingOutstanding) {
         if (now - this.pingSentAt >= hardTimeout) {
           this.close(`heartbeat_timeout (${Math.round(now - this.pingSentAt)}ms)`);
@@ -91,8 +94,12 @@ export class PeerLink extends EventEmitter {
           this.pingOutstanding = false;
           if (this.closed) return;
           if (error) {
-            this.close(`ping_error: ${error.message}`);
+            this.consecutivePingErrors++;
+            if (session.closed || session.destroyed || this.consecutivePingErrors >= 3) {
+              this.close(`ping_error: ${error.message}`);
+            }
           } else {
+            this.consecutivePingErrors = 0;
             this.latencyMs = duration;
             this.lastSeen = Date.now();
             this.lastSeenAt = performance.now();

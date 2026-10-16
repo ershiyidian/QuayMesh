@@ -1,23 +1,10 @@
 import { cpus, freemem, totalmem, uptime, loadavg, homedir } from "node:os";
 import { execFile } from "node:child_process";
-import koffi from "koffi";
 import { statfs, stat } from "node:fs/promises";
 import { parse, resolve, sep } from "node:path";
 import type { NodeManifest } from "./types.js";
+import { windowsShouldPollGpu } from "./windows-power.js";
 let previousCpu: { idle: number; total: number } | undefined;
-
-// Windows 的 nvidia-smi 会唤醒处于 D3cold 的独显。电池模式下直接使用系统电源状态决定是否采集。
-const windowsPowerStatus = process.platform === "win32"
-  ? koffi.load("kernel32.dll").func("bool GetSystemPowerStatus(_Out_ void *status)")
-  : null;
-
-function shouldSampleNvidia(): boolean {
-  if (!windowsPowerStatus) return true;
-  const state = Buffer.alloc(12);
-  if (!windowsPowerStatus(state)) throw new Error("GetSystemPowerStatus failed");
-  // ACLineStatus: 0=电池，1=外部供电，255=未知。未知状态也避免主动唤醒 GPU。
-  return state.readUInt8(0) === 1;
-}
 
 function sampleCpu(): number | null {
   const current = cpus().reduce((sum, cpu) => ({ idle: sum.idle + cpu.times.idle,
@@ -77,7 +64,12 @@ async function sampleDisks(paths: string[]): Promise<NonNullable<NodeManifest["h
 
 export async function sampleHealth(activeCalls = 0, diskPaths: string[] = []): Promise<NodeManifest["health"]> {
   const cpu = sampleCpu();
-  const gpu = !shouldSampleNvidia() ? { gpus: [], sampled: false } : await new Promise<{ gpus: NodeManifest["health"]["gpus"]; sampled: boolean }>((resolve) => execFile("nvidia-smi", [
+  // Windows hybrid laptops must never get periodic NVML probes, even on AC.
+  // The probes themselves keep an idle dGPU powered on; desktops and Linux
+  // GPU compute nodes retain their ordinary health telemetry.
+  const gpu = !windowsShouldPollGpu()
+    ? { gpus: [], sampled: false }
+    : await new Promise<{ gpus: NodeManifest["health"]["gpus"]; sampled: boolean }>((resolve) => execFile("nvidia-smi", [
     "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits",
   ], { timeout: 2500, windowsHide: true, maxBuffer: 64 * 1024 }, (error, stdout) => {
     if (error) {

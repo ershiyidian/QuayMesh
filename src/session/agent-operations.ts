@@ -100,6 +100,7 @@ export class AgentOperationTracker {
     }
 
     if (record.status === "starting" || record.status === "queued" || record.status === "running") {
+      if(this.options.ledger?.hasConfirmedAgent(identity.agentId))this.options.ledger.observeOperations([identity.operationId]);
       if (!this.closed) this.track(identity);
       return;
     }

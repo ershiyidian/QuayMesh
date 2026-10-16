@@ -1,3 +1,5 @@
+import { executionObservationSchema } from "../../session/schema.js";
+import { WORKSPACE_APP_VERSION, type CardVersion } from '../../session/card-contract.js';
 import type { App } from "@modelcontextprotocol/ext-apps";
 import { snapshotFromSchema } from "./snapshot.js";
 import type { Snapshot } from "../../session/types.js";
@@ -78,12 +80,14 @@ export function createMcpSource(
   sessionId: string,
   taskId: string | undefined,
   initialSnapshot?: Snapshot,
+  resourceVersion: CardVersion = WORKSPACE_APP_VERSION,
 ): SessionCardSource {
   if (!app.getHostCapabilities()?.serverTools) {
     throw new Error("SESSION_CARD_SERVER_TOOLS_REQUIRED");
   }
   let disposed = false;
   let servedInitial = false;
+  let currentSnapshot=initialSnapshot;
   const mountId = crypto.randomUUID();
   let mountSnapshotPending = true;
   let activeMemberId: string | undefined;
@@ -107,7 +111,7 @@ export function createMcpSource(
           arguments: {
             session_id: sessionId,
             ...(taskId ? { task_id: taskId } : {}),
-            ...(activeMemberId ? { member_id: activeMemberId } : {}),
+            ...(activeMemberId && name !== "qm_widget_stage" ? { member_id: activeMemberId } : {}),
             ...args,
           },
         },
@@ -143,15 +147,22 @@ export function createMcpSource(
         servedInitial=true;
         if(sinceRev<0)return initialSnapshot;
       }
-      const result = await call<{ unchanged: boolean; rev?: number; snapshot?: unknown }>(
+      const result = await call<{ unchanged: boolean; rev?: number; snapshot?: unknown; observation?:Snapshot['executionObservation'] }>(
         "qm_session",
-        { since_rev: sinceRev, ...(memberId ? { member_id: memberId } : {}), ...(cursor ? { cursor } : {}),
-          ...(taskId && mountSnapshotPending ? { mount_id: mountId, resource_version: "task-card-v5" } : {}) },
+        { since_rev: sinceRev, resource_version: resourceVersion,
+          ...(memberId ? { member_id: memberId } : {}), ...(cursor ? { cursor } : {}),
+          ...(taskId && mountSnapshotPending ? { mount_id: mountId } : {}) },
         signal,
       );
       mountSnapshotPending = false;
-      if (requestedMemberId !== activeMemberId || result.unchanged) return null;
-      return snapshotFromSchema(result.snapshot);
+      if (requestedMemberId !== activeMemberId) return null;
+      if(result.unchanged){
+        if(!currentSnapshot||!result.observation)return null;
+        currentSnapshot={...currentSnapshot,executionObservation:executionObservationSchema.parse(result.observation)};
+        return currentSnapshot;
+      }
+      currentSnapshot=snapshotFromSchema(result.snapshot);
+      return currentSnapshot;
     },
     fileDiff: (fileId, hash, cursor, signal) => call<FileDiffPage>(
       "qm_file_diff",
@@ -217,7 +228,7 @@ export function createMcpSource(
       if (sent.isError) throw new Error("CONTINUE_MESSAGE_REJECTED");
     },
     async widgetStage(stage,options={}) {
-      await call<{recorded:true}>("qm_widget_stage",{stage,resource_version:"task-card-v4",mount_id:mountId,
+      await call<{recorded:true}>("qm_widget_stage",{stage,resource_version:resourceVersion,mount_id:mountId,
         ...(options.displayMode ? { display_mode:options.displayMode } : {}),
         ...(options.visible===undefined ? {} : { visible:options.visible })});
     },

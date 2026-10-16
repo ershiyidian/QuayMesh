@@ -1,25 +1,28 @@
 {
   "schemaVersion": 1,
   "id": "desktop",
-  "nickname": "Windows worker",
   "clusterFile": "./cluster.json",
-  "secretsFile": "./secrets.desktop.env",
+  "secretsFile": "./secrets.env",
   "capabilities": {
     "worker": true,
-    "consoleRelay": true,
+    "discovery": true,
+    "egress": true,
     "desktopUi": true
   },
   "network": {
-    "externalAccess": true
+    "externalAccess": true,
+    "inheritProxy": false,
+    "proxyUrl": "http://127.0.0.1:7890"
   },
   "mesh": {
-    "address": "10.42.0.3",
-    "mode": "no-tun"
+    "address": "10.77.0.100",
+    "mode": "tun",
+    "listeners": []
   },
   "roots": [
     {
       "id": "projects",
-      "nickname": "Projects",
+      "nickname": "项目",
       "path": "~/projects"
     }
   ]

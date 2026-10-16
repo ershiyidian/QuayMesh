@@ -52,6 +52,18 @@ test("实际 HTTP/2 节点在动态注册后双向读取文件，单次请求超
   await assert.rejects(cloudLink.call("delayed_read",{name:"result.txt"},20),RpcRequestTimeoutError);
   assert.equal(cloudLink.connected,true);
   assert.equal(await cloudLink.call("read_file",{name:"result.txt"}),"QuayMesh 实际文件内容\n");
+  // 真实 HTTP/2 会话偶发一次 ping 失败，不能误杀共享连接及后续调用。
+  const originalPing = cloudLink.session.ping.bind(cloudLink.session);
+  let pingAttempts = 0;
+  cloudLink.session.ping = (callback) => {
+    pingAttempts++;
+    if (pingAttempts === 1) callback(new Error("transient ping loss"));
+    else originalPing(callback);
+  };
+  await until(() => pingAttempts, value => value >= 2);
+  assert.equal(cloudLink.connected, true);
+  assert.equal(await cloudLink.call("read_file",{name:"result.txt"}),"QuayMesh 实际文件内容\n");
+  cloudLink.session.ping = originalPing;
   const file=await cloudLink.openStream("file",{name:"result.txt"});
   file.end();
   const chunks=[];for await(const chunk of file)chunks.push(chunk);

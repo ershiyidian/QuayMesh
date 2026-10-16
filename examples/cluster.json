@@ -1,27 +1,38 @@
 {
   "schemaVersion": 1,
-  "id": "quaymesh",
+  "id": "quaymesh-lab",
   "coordinator": {
     "id": "cloud",
-    "address": "10.42.0.1",
+    "address": "10.77.0.254",
     "apiPort": 7681,
     "mcpPort": 7676,
     "peerPort": 7680
   },
   "mesh": {
-    "networkName": "quaymesh",
+    "networkName": "quaymesh-lab",
     "secretEnv": "QUAYMESH_MESH_SECRET",
     "peers": [
       "udp://203.0.113.10:11010"
     ]
   },
   "discovery": {
+    "resourceUrl": "https://example.invalid/mcp",
     "tunnelIdEnv": "QUAYMESH_TUNNEL_ID",
     "apiKeyEnv": "QUAYMESH_TUNNEL_API_KEY",
+    "channels": [
+      "main",
+      "harpoon"
+    ],
     "localPort": 17676,
     "healthPort": 8080
   },
   "egress": {
-    "priorities": {}
+    "priorities": {
+      "s1": 300,
+      "s2": 250,
+      "desktop": 200
+    },
+    "probeUrl": "https://www.gstatic.com/generate_204",
+    "recoveryDelayMs": 10000
   }
 }

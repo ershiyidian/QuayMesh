@@ -1,3 +1,5 @@
+import { executionObservationSchema } from "./schema.js";
+import { projectionForCard } from './card-contract.js';
 import * as z from "zod/v4";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -95,7 +97,7 @@ export function registerSessionAppTools(
       title:"Record Task Card lifecycle stage",
       description:"Records bounded Task Card delivery stages. It never records chat text, commands, files, or a heartbeat.",
       inputSchema:{
-        session_id:z.string().min(1),task_id:z.string().min(1),
+        session_id:z.string().min(1),task_id:z.string().min(1),member_id:z.string().min(1).optional(),
         stage:z.enum(["mount","initialized","first_snapshot","visible","hidden","teardown","error"]),
         resource_version:z.string().min(1).max(64),mount_id:z.string().uuid().optional(),display_mode:z.string().max(32).optional(),visible:z.boolean().optional(),
       },
@@ -107,6 +109,8 @@ export function registerSessionAppTools(
       const session=dependencies.store.requireSession(ownerId,input.session_id);
       const task=dependencies.store.getTask(input.task_id);
       if(task.session_id!==session.id)throw new Error("TASK_SESSION_MISMATCH");
+      // 已挂载的旧卡片会附带所选工作区；接受已授权身份，不把它当新执行。
+      if(input.member_id&&!dependencies.store.findMember(session.id,input.member_id))throw new Error("MEMBER_NOT_IN_SESSION");
       dependencies.store.recordWidgetStage({taskId:task.id,sessionId:session.id,stage:input.stage,
         resourceVersion:input.resource_version,mountId:input.mount_id,displayMode:input.display_mode,visible:input.visible});
       return jsonReply({recorded:true});
@@ -131,7 +135,7 @@ export function registerSessionAppTools(
         const task = dependencies.store.getTask(input.task_id);
         if (task.session_id !== input.session_id) throw new Error(`TASK_SESSION_MISMATCH: ${input.task_id}`);
         dependencies.store.requireSession(ownerId, input.session_id);
-        const result=await dependencies.projector.readTask(input.task_id, input.since_rev, input.member_id, input.cursor) as unknown as Record<string, unknown>;
+        const result=projectionForCard(await dependencies.projector.readTask(input.task_id, input.since_rev, input.member_id, input.cursor), input.resource_version);
         if(input.mount_id&&input.resource_version){
           dependencies.store.recordWidgetStage({taskId:task.id,sessionId:task.session_id,stage:"mount",
             resourceVersion:input.resource_version,mountId:input.mount_id});
@@ -140,15 +144,15 @@ export function registerSessionAppTools(
               resourceVersion:input.resource_version,mountId:input.mount_id});
           }
         }
-        return jsonReply(result);
+        return jsonReply({...result});
       }
       if (!input.member_id) {
         const session = authorizedSessionRecord(ownerId, input.session_id);
-        return jsonReply(await dependencies.projector.readSession(session.id, input.since_rev, input.cursor) as unknown as Record<string, unknown>);
+        return jsonReply({...projectionForCard(await dependencies.projector.readSession(session.id, input.since_rev, input.cursor), input.resource_version)});
       }
       const authorized = authorizedSession(ownerId, input.session_id);
       const member = memberForRequest(authorized, input.member_id);
-      return jsonReply(dependencies.projector.read(authorized.session.id, member.id, input.since_rev, input.cursor) as unknown as Record<string, unknown>);
+      return jsonReply({...projectionForCard(await dependencies.projector.read(authorized.session.id, member.id, input.since_rev, input.cursor), input.resource_version)});
     },
   );
 
@@ -535,11 +539,12 @@ function findTaskFile(
 
 function sessionOutputSchema() {
   return z.union([
-    z.object({ unchanged: z.literal(true), rev: z.number().int() }),
+    z.object({ unchanged: z.literal(true), rev: z.number().int(), observation:executionObservationSchema.optional() }),
     z.object({
       unchanged: z.literal(false),
       rev: z.number().int(),
       snapshot: z.unknown(),
+      observation:executionObservationSchema.optional(),
     }),
   ]);
 }

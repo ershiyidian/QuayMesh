@@ -3,6 +3,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import { WORKSPACE_APP_URI } from "../../src/tool-surfaces/types.js";
+import {CARD_RESOURCES} from '../../src/session/card-contract.js';
 import { setTimeout as delay } from "node:timers/promises";
 import { callOpen, createRealTestServer, openConversation, structured } from "./server-fixture.js";
 
@@ -25,6 +26,7 @@ const MODEL_NON_AGENT = [
   "open_workspace",
   "attach_workspace",
   "read",
+  "read_diagnostics",
   "workspace_context",
   "apply_patch",
   "exec_command",
@@ -59,9 +61,7 @@ test("enabled UI exposes the real model surface, app-only surface and one card b
   }
 
   const resources = await server.client.listResources();
-  assert.deepEqual(resources.resources.map((resource) => resource.uri), [
-    WORKSPACE_APP_URI,
-  ]);
+  assert.deepEqual(resources.resources.map((resource) => resource.uri), CARD_RESOURCES.map(resource=>resource.uri));
 });
 
 test("first open_workspace then attach_workspace keeps one session with two members", async (t) => {

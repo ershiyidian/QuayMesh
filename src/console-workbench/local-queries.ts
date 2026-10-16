@@ -105,11 +105,11 @@ export function readLocalSessionTitles(config: ServerConfig): { items: SessionTi
   try {
     const rows = ledger.db.prepare(`SELECT id,title,revision,last_activity_at FROM qm_sessions ORDER BY last_activity_at DESC,id`)
       .all() as Array<{ id: string; title: string; revision: number; last_activity_at: string }>;
-    const tasks = ledger.db.prepare('SELECT id,session_id,title,state,result_status,revision,finished_at,last_activity_at FROM qm_tasks').all() as Array<{
-      id:string; session_id:string; title:string; state:string; result_status:string|null; revision:number; finished_at:string|null; last_activity_at:string;
+    const tasks = ledger.db.prepare('SELECT id,session_id,title,state,result_status,revision,finished_at,last_activity_at,source_task_id FROM qm_tasks').all() as Array<{
+      id:string; session_id:string; source_task_id:string|null; title:string; state:string; result_status:string|null; revision:number; finished_at:string|null; last_activity_at:string;
     }>;
     return { authoritative:config.federation?.capabilities.coordinator ?? true,
-      tasks:tasks.map(row=>({id:row.id,sessionId:row.session_id,title:row.title,state:row.state,resultStatus:row.result_status,
+      tasks:tasks.map(row=>({id:row.id,sessionId:row.session_id,sourceTaskId:row.source_task_id,title:row.title,state:row.state,resultStatus:row.result_status,
       revision:row.revision,finishedAt:row.finished_at ? Date.parse(row.finished_at) : null,lastActivityAt:Date.parse(row.last_activity_at)})),
       items: rows.map((row) => ({ id: row.id, title: row.title, revision: row.revision,
       lastActivityAt: Date.parse(row.last_activity_at) })), observedAt: Date.now() };

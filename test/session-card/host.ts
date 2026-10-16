@@ -163,6 +163,7 @@ async function connectBrowserClient(hostState: HostState): Promise<void> {
   });
   const client = new Client({ name: "quaymesh-local-host", version: "1.0.0" });
   await client.connect(transport);
+  await client.listTools();
   hostState.browserClient = client;
 }
 

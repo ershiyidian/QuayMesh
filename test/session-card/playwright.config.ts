@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 
 export default defineConfig({
   testDir: ".",
-  testMatch: ["browser.spec.ts", "reliability-card.spec.ts", "preview.spec.ts"],
+  testMatch: ["browser.spec.ts", "reliability-card.spec.ts", "preview.spec.ts", "lifecycle-card.spec.ts", "contract-upgrade.spec.ts", "historical-card.spec.ts"],
   workers: 1,
   fullyParallel: false,
   retries: 0,

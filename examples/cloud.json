@@ -1,19 +1,18 @@
 {
   "schemaVersion": 1,
   "id": "cloud",
-  "nickname": "Coordinator",
   "clusterFile": "./cluster.json",
-  "secretsFile": "./secrets.cloud.env",
+  "secretsFile": "./secrets.env",
   "capabilities": {
     "coordinator": true,
-    "meshRelay": true,
-    "consoleRelay": true
+    "meshRelay": true
   },
   "network": {
-    "externalAccess": false
+    "externalAccess": false,
+    "inheritProxy": false
   },
   "mesh": {
-    "address": "10.42.0.1",
+    "address": "10.77.0.254",
     "mode": "no-tun",
     "listeners": [
       "udp://0.0.0.0:11010"

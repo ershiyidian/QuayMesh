@@ -160,9 +160,15 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
   const agentOperations = new AgentOperationTracker(agents, service, store, { ledger });
   agentOperations.restore();
   const pendingProcessOperations = new Set<Promise<void>>();
+  const unfinishedProcesses = new Map<string,import("../process-sessions.js").ProcessFinish>();
+  const finalizingProcesses = new Set<string>();
   const closeProcessOperation = (finish: import("../process-sessions.js").ProcessFinish): Promise<void> | undefined => {
-    if (!finish.sessionOperationId) return;
-    const pending = service.finishOperationById(finish.sessionOperationId, {
+    const operationId=finish.sessionOperationId;
+    if (!operationId) return;
+    unfinishedProcesses.set(operationId,finish);
+    if(finalizingProcesses.has(operationId))return;
+    finalizingProcesses.add(operationId);
+    const pending = service.finishOperationById(operationId, {
       status: finish.disposition === "reconciliation_required"
         ? OperationState.unknown
         : finish.cancelled
@@ -176,7 +182,9 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
       error_code: finish.disposition === "reconciliation_required" ? "PROCESS_RECONCILIATION_REQUIRED"
         : finish.disposition === "incomplete_output" ? "OUTPUT_INCOMPLETE" : null,
       error_message: finish.success ? null : finish.signal ? `Process terminated by signal ${finish.signal}.` : `Process exited with code ${finish.exitCode ?? "unknown"}.`,
-    }).finally(() => pendingProcessOperations.delete(pending));
+    }).then(()=>{unfinishedProcesses.delete(operationId);}).finally(() => {
+      pendingProcessOperations.delete(pending);finalizingProcesses.delete(operationId);
+    });
     pendingProcessOperations.add(pending);
     return pending;
   };
@@ -191,6 +199,22 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
     })().finally(() => { retentionWork = undefined; });
     void retentionWork.catch(error => console.error("QuayMesh 输出清理失败", error));
   };
+  const observationTimer=setInterval(()=>{
+    if(closed)return;
+    ledger.observeOperations([...recorder.activeOperationIds(),...options.processSessions?.activeOperationIds()??[]]);
+    store.reconcileFinishedInvocations();
+    ledger.reconcileTerminalOperations();
+    ledger.reconcileArchivedTaskRuns();
+    for(const finish of unfinishedProcesses.values()){
+      const pending=closeProcessOperation(finish);
+      if(pending)void pending.catch(error=>console.error("QuayMesh 进程收尾重试失败",error));
+    }
+  },5000);
+  observationTimer.unref();
+  const finalizationTimer=setInterval(()=>{
+    if(!closed)void service.retryFinalizations().catch(error=>console.error("QuayMesh 收尾协调失败",error));
+  },30_000);
+  finalizationTimer.unref();
   const retentionTimer = setInterval(expireResults, 3600_000);
   retentionTimer.unref();
   expireResults();
@@ -229,6 +253,8 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
     async close() {
       if (closed) return;
       closed = true;
+      clearInterval(observationTimer);
+      clearInterval(finalizationTimer);
       clearInterval(retentionTimer);
       await retentionWork;
       await recorder.close();
@@ -239,12 +265,11 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
       remoteChangeListeners.clear();
       await Promise.allSettled([...pendingProcessOperations]);
       await agentOperations.close();
-      await changes.flush();
       await service.close();
+      await changes.close();
       disposeProjectionUpdates();
       await projector.close();
       await recovery.close();
-      await changes.close();
       await output.close();
       if (ownsExecution) execution.close();
       store.close();

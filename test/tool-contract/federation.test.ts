@@ -5,13 +5,14 @@ import {readFile, writeFile} from "node:fs/promises";
 import {join} from "node:path";
 import {openDatabase} from "../../src/db/client.js";
 import {SessionStore} from "../../src/session/store.js";
-import {SessionToolRecorder} from "../../src/session/tool-recording.js";
+import {SessionToolRecorder, type RecordModelToolInput} from "../../src/session/tool-recording.js";
 import {twoNodes} from "./fixture.js";
 
-test("TC01/02/A02：禁外连协调端声明21工具，远程有key的首次写入与重放只执行一次", {timeout: 60000}, async t => {
+test("TC01/02/A02：禁外连协调端保留执行工具与只读诊断，远程有key的首次写入与重放只执行一次", {timeout: 60000}, async t => {
   const {worker, cloud} = await twoNodes(t);
   const tools = (await cloud.client.listTools()).tools.filter(tool => !(tool._meta?.ui as any)?.visibility?.includes("app"));
-  assert.equal(tools.length, 21);
+  assert.equal(tools.length, 22);
+  assert.ok(tools.some(tool=>tool.name==='read_diagnostics'));
   for (const name of ["spawn_agent","followup_agent","send_message","wait_agent","interrupt_agent","list_agents"]) {
     assert.ok(tools.some(tool => tool.name === name), name);
   }
@@ -85,4 +86,81 @@ test("DP06：转发写操作只记录入口回执，不在协调端执行远程�
     const invocation=store.findKeyedInvocation("owner",session.id,member.id,"remote-key");
     assert.equal(invocation?.state,"succeeded");
   } finally {db.close();await rm(root,{recursive:true,force:true});}
+});
+
+test("远程写请求先交付可恢复回执，完成后按同一 key 重放不会执行第二次", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const root = await mkdtemp(join(tmpdir(), "qm-remote-quick-receipt-"));
+  const db = openDatabase(root);
+  try {
+    const store = new SessionStore(db.sqlite);
+    const session = store.createSession("owner", "conversation", "远程受理回执");
+    const task = store.createTask(session.id, "慢速远程写入", "slow-write");
+    const member = store.upsertRemoteMember({ id: randomUUID(), sessionId: session.id, nodeId: "remote-linux",
+      workspaceId: "remote-ws", root: "/remote-only/project", sourceRoot: null,
+      mode: "checkout", online: true, revision: 0 });
+    const recorder = new SessionToolRecorder(store, {} as any, {} as any, {} as any, {} as any);
+    let finish!: (result: { content: { type: string; text: string }[] }) => void;
+    let invoked = 0;
+    const identity = { owner_id: "owner", conversation_id: "conversation", transport_instance_id: "stable-transport",
+      request_id: "42", task_id: task.id };
+    const args = { workspace_id: "qm:remote-linux:remote-ws", cmd: "do-real-work", operation_key: "same-operation" };
+    type Reply = { content?: { type: string; text: string }[]; accepted?: boolean; operation_id?: string;
+      next_action?: { tool: string; arguments: { action: string; operation_id?: string } } };
+    const options: RecordModelToolInput<Reply> = {
+      identity, workspace_id: args.workspace_id, tool_name: "exec_command", kind: "command",
+      label: "slow command", input: args, affectsFiles: true, replyWaitMs: 30,
+      pendingResult: (context: { operation_id?: string }) => ({
+        accepted: true, operation_id: context.operation_id,
+        next_action: { tool: "workspace_context", arguments: { action: "status", operation_id: context.operation_id } },
+      }),
+      operation: async () => { invoked++; return new Promise<{ content: { type: string; text: string }[] }>(resolve => { finish = resolve; }); },
+    };
+    const accepted = await recorder.recordForwarded(options);
+    assert.equal((accepted as { accepted?: boolean }).accepted, true);
+    assert.ok((accepted as { operation_id?: string }).operation_id?.startsWith("op_"));
+    const pending = store.findKeyedInvocation("owner", session.id, member.id, "same-operation");
+    assert.equal(pending?.state, "running");
+    assert.equal(pending?.operation_id, (accepted as { operation_id?: string }).operation_id);
+    finish({ content: [{ type: "text", text: "modified once" }] });
+    await recorder.close();
+    const saved = store.findKeyedInvocation("owner", session.id, member.id, "same-operation");
+    assert.equal(saved?.state, "succeeded");
+    assert.match(saved?.result_json ?? "", /modified once/);
+    assert.deepEqual(await recorder.recordForwarded(options), { content: [{ type: "text", text: "modified once" }] });
+    assert.equal(invoked, 1);
+  } finally { db.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("前台受理回执之后远程调用失败会持久记录 unknown，不产生未处理拒绝", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const root = await mkdtemp(join(tmpdir(), "qm-remote-lost-receipt-"));
+  const db = openDatabase(root);
+  try {
+    const store = new SessionStore(db.sqlite);
+    const session = store.createSession("owner", "conversation", "断连后失败归档");
+    const task = store.createTask(session.id, "断连执行", "disconnect");
+    const member = store.upsertRemoteMember({ id: randomUUID(), sessionId: session.id, nodeId: "remote-linux",
+      workspaceId: "remote-ws", root: "/remote-only/project", sourceRoot: null,
+      mode: "checkout", online: true, revision: 0 });
+    const recorder = new SessionToolRecorder(store, {} as any, {} as any, {} as any, {} as any);
+    let rejectWork!: (error: Error) => void;
+    const result = await recorder.recordForwarded({
+      identity: { owner_id: "owner", conversation_id: "conversation", transport_instance_id: "transport",
+        request_id: "99", task_id: task.id },
+      workspace_id: "qm:remote-linux:remote-ws", tool_name: "apply_patch", kind: "patch", label: "patch",
+      input: { operation_key: "write-once", patch: "patch-content" }, affectsFiles: true, replyWaitMs: 30,
+      pendingResult: context => ({ accepted: true, operation_id: context.operation_id }),
+      operation: async () => new Promise<{ accepted: boolean; operation_id?: string }>((_resolve, reject) => { rejectWork = reject; }),
+    });
+    assert.equal(result.accepted, true);
+    rejectWork(Object.assign(new Error("remote response lost"), { code: "REQUEST_TIMEOUT" }));
+    await recorder.close();
+    const saved = store.findKeyedInvocation("owner", session.id, member.id, "write-once");
+    assert.equal(saved?.state, "unknown");
+    assert.equal(saved?.effect, "unknown");
+    assert.match(saved?.result_json ?? "", /REQUEST_TIMEOUT/);
+  } finally { db.close(); await rm(root, { recursive: true, force: true }); }
 });

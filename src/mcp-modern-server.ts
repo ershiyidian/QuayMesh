@@ -77,15 +77,11 @@ function wireSchema(value: unknown): StandardSchemaWithJSON {
   }}};
 }
 
-function wireAnnotations(value: unknown): Record<string, unknown> | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const annotations=value as Record<string,unknown>;
-  const defaults:Record<string,boolean>={readOnlyHint:false,destructiveHint:true,idempotentHint:false,openWorldHint:true};
-  const entries=Object.entries(annotations).filter(([key,item])=>{
-    if(annotations.readOnlyHint===true&&["destructiveHint","idempotentHint"].includes(key))return false;
-    return defaults[key]!==item;
-  });
-  return entries.length?Object.fromEntries(entries):undefined;
+function wireAnnotations(value: unknown): Record<string, unknown> {
+  const annotations = value && typeof value === "object" ? value as Record<string,unknown> : {};
+  // 宿主按实际 tools/list 读取能力声明，不能为了压缩报文删掉风险字段。
+  return {readOnlyHint:false, destructiveHint:annotations.readOnlyHint === true ? false : true,
+    openWorldHint:true, ...annotations};
 }
 
 export function createModernMcpServerAdapter(

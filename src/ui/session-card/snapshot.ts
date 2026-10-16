@@ -6,8 +6,10 @@ import {
   type Snapshot,
 } from "../../session/types.js";
 
+const readerSchema = snapshotSchema.strip();
+
 export function snapshotFromSchema(value: unknown): Snapshot {
-  const parsed = snapshotSchema.parse(value);
+  const parsed = readerSchema.parse(value);
   return {
     ...parsed,
     execution_status: executionState(parsed.execution_status),

@@ -1,3 +1,5 @@
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+
 export const REPLY_BYTES = 48 * 1024;
 // Native MCP image blocks are binary media; the 48 KiB limit only applies to text/JSON.
 export const IMAGE_BYTES = 8 * 1024 * 1024;
@@ -12,6 +14,27 @@ export function resultSummary(value: Record<string, unknown>): string {
 
 export function jsonReply<T extends Record<string, unknown>>(value: T, summary = resultSummary(value)) {
   return {content:[{type:"text" as const,text:summary}],structuredContent:value};
+}
+
+// 旧 Worker 的展示说明迁入元数据，保持已声明的模型输出格式。
+export function compatibleToolReceipt(reply: CallToolResult): CallToolResult {
+  const body = reply.structuredContent;
+  const error = body?.error;
+  if (reply.isError && error && typeof error === 'object' && !Array.isArray(error)
+    && (error as Record<string, unknown>).code === 'EXECUTION_CONFLICT') {
+    const {structuredContent: _structuredContent, ...response} = reply;
+    return {...response, _meta:{...reply._meta, quaymesh:{...quaymeshMetadata(reply), error}}};
+  }
+  if (body?.accepted !== true || typeof body.phase !== "string"
+    || !["preparing", "dispatching", "running"].includes(body.phase)) return reply;
+  const {phase, message: _message, ...structuredContent} = body;
+  const quaymesh = quaymeshMetadata(reply);
+  return {...reply, structuredContent, _meta: {...reply._meta, quaymesh: {...quaymesh, phase}}};
+}
+
+function quaymeshMetadata(reply: CallToolResult): Record<string, unknown> {
+  const value = reply._meta?.quaymesh;
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 export const replyBytes = (value: Record<string, unknown>) => Buffer.byteLength(JSON.stringify(jsonReply(value)),"utf8");
 

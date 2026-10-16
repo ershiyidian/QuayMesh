@@ -11,7 +11,7 @@ test("CF09：只读预览历史 roots，有证据但不直接扩大 allowedRoots
   const folder=join(state,"generated","config-10-old","core");await mkdir(folder,{recursive:true});
   await writeFile(join(folder,"config.jsonc"),JSON.stringify({federation:{roots:[
     {id:"main",path:"E:/QuayMesh"},{id:"game",nickname:"game",path:"E:/game",enabled:true},
-    {id:"pc-home",nickname:"pc-home",path:"C:/Users/example",enabled:false},
+    {id:"pc-home",nickname:"pc-home",path:"C:/Users/example-user",enabled:false},
   ]}}));
   const report=await previewWorkspaceRoots(cfg,state);
   assert.equal(report.readOnly,true);assert.equal(report.requiresExplicitApproval,true);

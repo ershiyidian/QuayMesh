@@ -12,6 +12,7 @@ export interface SessionFeedRequest {
 }
 
 export interface SessionFeedUpdate {
+  observation?: import("../execution-observation.js").ExecutionObservation;
   owner_id: string;
   node_id: string;
   session_id: string;

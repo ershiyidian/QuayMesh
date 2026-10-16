@@ -143,7 +143,8 @@ test("a fast terminal callback cannot be overwritten by the earlier running tool
   assert.match(saved.result_json ?? "", /finished before the handler returned/);
 });
 
-test("startup reconciliation repairs a running invocation whose operation already finished", async (t) => {
+for (const precedingStatus of [undefined, OperationState.running]) {
+test(`startup reconciliation repairs a finished operation after ${precedingStatus ?? "no prior event"}`, async (t) => {
   const f = await fixture();
   t.after(() => f.close());
   const context = createInvocationContext(f.identity);
@@ -171,6 +172,14 @@ test("startup reconciliation repairs a running invocation whose operation alread
       label: "Recorded command",
       status: "running",
     });
+    if (precedingStatus) f.store.appendEvent({
+      session_id: f.identity.session.session_id,
+      member_id: f.identity.session.member_id,
+      type: "operation_finished",
+      source_id: "initial-running-receipt",
+      timestamp: new Date().toISOString(),
+      payload: {operation_id: recorded.operation_id!, status: precedingStatus},
+    });
     ledger.endOperation(recorded.operation_id!, "completed");
   } finally {
     ledger.close();
@@ -183,4 +192,5 @@ test("startup reconciliation repairs a running invocation whose operation alread
   assert.ok(repaired.finished_at);
   assert.equal(f.store.reconcileFinishedInvocations(), 0);
 });
+}
 

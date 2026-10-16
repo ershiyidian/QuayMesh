@@ -16,7 +16,10 @@ import type {
 } from "./types.js";
 import type { SessionStore } from "./store.js";
 
+import { mergeExecutionObservations, EXECUTION_OBSERVATION_TTL_MS, type ExecutionObservation } from "../execution-observation.js";
+
 export interface ProjectionReadResult {
+  observation?: ExecutionObservation;
   unchanged: boolean;
   snapshot?: Snapshot;
   rev?: number;
@@ -41,6 +44,28 @@ export class SessionProjector {
     private readonly revertEligibility?: (sessionId: SessionId, memberId: string, taskId?: string) => Promise<ProjectionRevertEligibility>,
     private readonly localNodeId?: string,
   ) {}
+
+  observeTask(taskId: string, memberId?: string): ExecutionObservation {
+    const task=this.store.getTask(taskId),at=Date.now();
+    const ids=memberId?[memberId]:this.store.taskMemberIds(taskId);
+    const values:ExecutionObservation[]=ids.map(id=>{
+      const member=this.store.getMember(task.session_id,id);
+      if(this.localNodeId!==undefined&&member.node_id!==this.localNodeId){
+        const cached=this.store.taskData.projection(taskId,id)?.snapshot;
+        const observation=cached?.executionObservation;
+        if(observation)return member.online?observation:{...observation,observedAt:0};
+        return {observedAt:0,activeOperationIds:cached?.commands.filter(c=>c.status==='run'||c.status==='queued').map(c=>c.operation_id)??[],preparingOperationIds:[],staleOperationIds:[]};
+      }
+      const value:ExecutionObservation={observedAt:at,activeOperationIds:[],preparingOperationIds:[],staleOperationIds:[]};
+      for(const row of this.store.taskData.operationObservations(taskId,id)){
+        if(!row.observed_at||at-Date.parse(row.observed_at)>EXECUTION_OBSERVATION_TTL_MS)value.staleOperationIds.push(row.id);
+        else if(row.effect==='not_started'||row.status==='queued')value.preparingOperationIds.push(row.id);
+        else value.activeOperationIds.push(row.id);
+      }
+      return value;
+    });
+    return mergeExecutionObservations(values,at);
+  }
 
   schedule(sessionId: SessionId, memberId: string, taskId?: string): void {
     if (this.closed) return;
@@ -101,6 +126,7 @@ export class SessionProjector {
     const snapshot: Snapshot = {
       sessionId,
       taskId: task?.id ?? null,
+      ...(task?{sourceTaskId:task.source_task_id??null,executionObservation:this.observeTask(task.id,member.id)}:{}),
       taskState:task?.state,
       taskResult:task?.result_status,
       lastOperation,
@@ -172,7 +198,9 @@ export class SessionProjector {
   async readTask(taskId: string, sinceRev: number, memberId?: string, cursor?: string): Promise<ProjectionReadResult> {
     const task = this.store.getTask(taskId);
     const session = this.store.getSession(task.session_id);
-    if (task.revision === sinceRev && !cursor) return { unchanged: true, rev: task.revision };
+    this.store.taskData.requireScope(taskId,session.id,memberId);
+    const observation=this.observeTask(taskId,memberId);
+    if (task.revision === sinceRev && !cursor) return { unchanged: true, rev: task.revision, observation };
 
     if (task.state === "closed") {
       const frozen = this.store.taskSnapshots(task.id);
@@ -187,7 +215,7 @@ export class SessionProjector {
         return cached && cached.revision>item.revision ? cached.snapshot : item.snapshot;
       }));
       const snapshot = this.aggregateTaskSnapshot(task, session, current, this.store.taskMemberIds(task.id));
-      return { unchanged: false, snapshot: pageSnapshot(snapshot, cursor), rev: task.revision };
+      return { unchanged: false, snapshot: pageSnapshot({...snapshot,executionObservation:observation}, cursor), rev: task.revision, observation };
     }
 
     const taskMembers = this.store.taskMemberIds(task.id);
@@ -204,7 +232,7 @@ export class SessionProjector {
       return {...empty,taskId:task.id,title:task.title,notices:[...empty.notices,"尚未取得所属节点的任务数据"]};
     }));
     const snapshot = this.aggregateTaskSnapshot(task, session, snapshots, taskMembers);
-    return { unchanged: false, snapshot: pageSnapshot(snapshot, cursor), rev: task.revision };
+    return { unchanged: false, snapshot: pageSnapshot({...snapshot,executionObservation:observation}, cursor), rev: task.revision, observation };
   }
 
   private aggregateTaskSnapshot(task: TaskRecord, session: SessionRecord, snapshots: Snapshot[], taskMemberIds: string[]): Snapshot {
@@ -234,6 +262,7 @@ export class SessionProjector {
     return {
       sessionId: session.id,
       taskId: task.id,
+      sourceTaskId:task.source_task_id??null,
       taskState:task.state,
       taskResult:task.result_status,
       lastOperation,

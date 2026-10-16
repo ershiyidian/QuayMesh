@@ -222,6 +222,8 @@ export interface SnapshotCapabilities {
 }
 
 export interface Snapshot {
+  executionObservation?: import("../execution-observation.js").ExecutionObservation;
+  sourceTaskId?: string | null;
   taskState?: "active" | "closed";
   taskResult?: TaskRecord["result_status"];
   lastActivityAt?: number | null;

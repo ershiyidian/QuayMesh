@@ -1,6 +1,9 @@
+import { mergeExecutionObservations } from "../../execution-observation.js";
 import type { CommandSummary, Snapshot } from "../../session/types.js";
 
-export const DEFAULT_SILENCE_WARNING_MS=10*60_000;
+import { taskView, TASK_SILENCE_MS } from "../../task-view.js";
+
+export const DEFAULT_SILENCE_WARNING_MS=TASK_SILENCE_MS;
 
 export type CardStatus="running"|"stalled"|"failed"|"success"|"cancelled"|"handed_off"|"finalizing"|"archived"|"idle"|"unavailable";
 
@@ -16,7 +19,8 @@ export interface CardPresentation {
   commandClockDynamic:boolean;
 }
 
-export function hasBackground(snapshot:Snapshot|null):boolean {
+export function hasBackground(snapshot:Snapshot|null,now=Date.now()):boolean {
+  if(snapshot?.executionObservation){const value=mergeExecutionObservations([snapshot.executionObservation],now);return value.activeOperationIds.length>0||value.preparingOperationIds.length>0;}
   return Boolean(snapshot&&(
     snapshot.commands.some(command=>command.status==="run"||command.status==="queued")
     ||snapshot.agents.some(agent=>agent.state==="working"||agent.state==="queued")
@@ -47,10 +51,15 @@ export function modelActivityAt(snapshot:Snapshot):number|null {
 }
 
 export function cardPresentation(snapshot:Snapshot,now:number,silenceWarningMs=DEFAULT_SILENCE_WARNING_MS):CardPresentation {
-  const background=hasBackground(snapshot);
+  const observation=snapshot.executionObservation&&mergeExecutionObservations([snapshot.executionObservation],now);
+  const background=hasBackground(snapshot,now);
   const finalizationPending=snapshot.notices.some(value=>value.includes("正在确认")||value.includes("结束尚未确认"));
   const modelAt=modelActivityAt(snapshot),executionAt=snapshot.lastExecutionActivityAt??snapshot.lastOperation?.endedAt??snapshot.lastOperation?.startedAt??null;
   const modelAge=age(now,modelAt),executionAge=age(now,executionAt),outputAge=age(now,snapshot.lastOutputAt??null);
+  const shared=taskView({requestState:snapshot.taskState,result:snapshot.taskResult,
+    execution:snapshot.execution_status,active:background,finalizing:finalizationPending,
+    stale:snapshot.host_status==="disconnected"||(!background&&Boolean(observation?.staleOperationIds.length)),lastProgressAt:modelAt,
+    now:now+(TASK_SILENCE_MS-silenceWarningMs)});
   let status:CardStatus,label:string;
   if(snapshot.taskResult==="failed") {status="failed";label="未完成";}
   else if(snapshot.taskResult==="cancelled") {status="cancelled";label="已停止";}
@@ -60,15 +69,20 @@ export function cardPresentation(snapshot:Snapshot,now:number,silenceWarningMs=D
   else if(finalizationPending) {status="finalizing";label="正在确认结束";}
   else if(snapshot.host_status==="disconnected") {status="unavailable";label="节点状态暂不可用";}
   else if(snapshot.status==="failed"||snapshot.execution_status==="failed") {status="failed";label="未完成";}
-  else if(background) {status="running";label="执行中";}
-  else if(modelAge!==null&&modelAge>=silenceWarningMs) {status="stalled";label="长时间无新工具活动，可能中断";}
+  else if(shared.status==="running"||shared.status==="queued") {status="running";label=observation?.preparingOperationIds.length&&!observation.activeOperationIds.length?"准备执行":"执行中";}
+  else if(shared.status==="unknown") {status="unavailable";label="执行状态待确认";}
+  else if(shared.status==="interrupted_recoverable") {status="stalled";label="执行中断，等待接续";}
+  else if(shared.status==="stalled") {status="stalled";label="长时间无新工具活动，可能中断";}
   else {status="idle";label="等待下一步";}
   const command=snapshot.runningCommand??snapshot.lastCommand??snapshot.currentCommand??null;
+  const commandLive=Boolean(command&&(!observation||observation.activeOperationIds.includes(command.operation_id))&&shared.backgroundActive);
+  const commandTime=command?.endedAt!=null||commandLive?commandElapsedMs(command,now):null;
   return {
-    status,label,taskElapsedMs:taskElapsedMs(snapshot,now),commandElapsedMs:commandElapsedMs(command,now),
+    status,label,taskElapsedMs:shared.clockRunning||deliveryEnd(snapshot)!==null?taskElapsedMs(snapshot,now):null,
+    commandElapsedMs:commandTime,
     modelActivityAgeMs:modelAge,executionActivityAgeMs:executionAge,outputAgeMs:outputAge,
-    taskClockDynamic:deliveryEnd(snapshot)===null&&snapshot.closureReason!=="superseded"&&snapshot.closureReason!=="legacy_archive",
-    commandClockDynamic:Boolean(command&&command.startedAt!==null&&command.endedAt===null),
+    taskClockDynamic:shared.clockRunning&&deliveryEnd(snapshot)===null&&snapshot.closureReason!=="superseded"&&snapshot.closureReason!=="legacy_archive",
+    commandClockDynamic:commandLive&&Boolean(command&&command.startedAt!==null&&command.endedAt===null),
   };
 }
 
@@ -77,7 +91,7 @@ export function isFinal(snapshot:Snapshot|null):boolean {
   // Explicit Task delivery is authoritative. An old member snapshot can still
   // contain a stale running command; it must not keep a completed card polling.
   if(snapshot.taskState==="closed"&&snapshot.taskResult&&snapshot.taskResult!=="handed_off")return true;
-  if(hasBackground(snapshot))return false;
+  if(hasBackground(snapshot)||snapshot.executionObservation?.staleOperationIds.length)return false;
   if(snapshot.notices.some(value=>value.includes("正在确认")||value.includes("结束尚未确认")))return false;
   return snapshot.taskState==="closed"||(snapshot.taskState===undefined&&!snapshot.capabilities.refresh);
 }

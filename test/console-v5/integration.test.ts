@@ -7,6 +7,7 @@ import express from "express";
 import { chromium } from "@playwright/test";
 import { createTwoFilesPatch } from "diff";
 import { diffPage } from "../../src/console-workbench/diff.js";
+import { ProcessSessionManager } from "../../src/process-sessions.js";
 import { WorkLedger } from "../../src/work-ledger.js";
 import { workspaceHandle } from "../../src/federation/routing.js";
 import { callOpen, createRealTestServer, structured, freePort } from "../session-card/server-fixture.js";
@@ -14,7 +15,8 @@ import { callOpen, createRealTestServer, structured, freePort } from "../session
 test("Console v5 reads all recorded tasks and renders real file, command and review data", { timeout: 120_000 }, async (t) => {
   const fixture = await createRealTestServer({ prefix: "quaymesh-console-v5-", files: { "AGENTS.md": "使用当前项目的数据。\n" } });
   const ledger = new WorkLedger(fixture.config.stateDir);
-  t.after(async () => { ledger.close(); await fixture.dispose(); });
+  const manager=new ProcessSessionManager({stateDir:fixture.config.stateDir});
+  t.after(async () => { await manager.shutdown(); ledger.close(); await fixture.dispose(); });
   const origin = { entryPoint: "console" as const, evidence: "server_entry" as const };
   const early = ledger.begin({ root: fixture.project, workItemId: "early", runKey: "early", title: "较早开始的工作", origin });
   const oldTime = new Date(Date.now() - 40 * 86400000).toISOString();
@@ -39,6 +41,10 @@ test("Console v5 reads all recorded tasks and renders real file, command and rev
     return value;
   }
 
+  const silent=join(fixture.root,"silent-early.mjs");
+  await writeFile(silent,"setInterval(()=>{},1000);");
+  await manager.start({workspaceId:"early",cwd:fixture.project,workspaceRoot:fixture.project,workRunId:early.id,
+    command:`"${process.execPath}" "${silent}"`,yieldTimeMs:0});
   await t.test("active tasks are independent of recent rows, and pages cover the full history", async () => {
     const overview = await api("overview?tz=Asia%2FShanghai");
     assert.equal(overview.runningCount, 1);
@@ -55,6 +61,8 @@ test("Console v5 reads all recorded tasks and renders real file, command and rev
     assert.equal(olderActive.items[0].localId, early.id);
     assert.equal((await api("runs?days=0&q=" + encodeURIComponent("较早开始"))).total, 1);
   });
+
+  await manager.shutdown();
 
   await t.test("a large saved patch is paged as complete display rows", () => {
     const next = Array.from({ length: 1200 }, (_, index) => `中文代码行 ${index}`).join("\n") + "\n";

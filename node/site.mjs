@@ -11,7 +11,7 @@ export async function createSite({directory,peer,resourceUrl="",tunnelId="",tunn
   catch (error) { if (error.code !== "ENOENT") throw error; }
   if (existingNetwork && !meshSecret) throw new Error("加入已有网络需要提供实际组网密钥");
   const config = inventory?.cluster || {
-    schemaVersion:1,id:"quaymesh",coordinator:{id:"cloud",address:"10.42.0.1"},
+    schemaVersion:1,id:"quaymesh",coordinator:{id:"cloud",address:"10.77.0.254"},
     mesh:{networkName:"quaymesh",peers:peer ? [peer] : []},
     discovery:{resourceUrl:resourceUrl || undefined,channels:["main","harpoon"]},
   };
@@ -20,7 +20,7 @@ export async function createSite({directory,peer,resourceUrl="",tunnelId="",tunn
     {id:cluster.coordinator.id,nickname:"Coordinator",capabilities:{coordinator:true,meshRelay:true},network:{externalAccess:false},
       mesh:{address:cluster.coordinator.address,mode:"no-tun",listeners:["udp://0.0.0.0:11010"]},roots:[]},
     {id:"worker",nickname:"Worker",capabilities:{worker:true,discovery:!!cluster.discovery.resourceUrl},
-      network:{externalAccess:true},mesh:{address:"10.42.0.2",mode:"no-tun"},roots:[]},
+      network:{externalAccess:true,proxyUrl:"http://127.0.0.1:7890"},mesh:{address:"10.77.0.1",mode:"no-tun"},roots:[]},
   ];
   if (!Array.isArray(definitions) || !definitions.length) throw new Error("站点至少需要一个节点");
   const ids = new Set(), addresses = new Set();

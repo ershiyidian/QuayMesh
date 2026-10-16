@@ -19,6 +19,7 @@ import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { createMcpServer, createServer } from "./server.js";
 import { WORKSPACE_APP_URI } from "./tool-surfaces/types.js";
+import {CARD_RESOURCES} from './session/card-contract.js';
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 import { createSessionRuntime, type SessionRuntime } from "./session/runtime.js";
@@ -91,7 +92,7 @@ test("tool modes expose the expected host-facing tool surface", async (t) => {
   }
 });
 
-test("command review opt-in changes only shell destructive annotations", async (t) => {
+test("command review opt-in preserves truthful shell annotations", async (t) => {
   for (const mode of ["codex", "claude"] as const) {
     await t.test(mode, async (nested) => {
       const reviewed = await fixture(nested, {
@@ -110,7 +111,7 @@ test("command review opt-in changes only shell destructive annotations", async (
         const reviewedAnnotations = reviewedTools.find((tool) => tool.name === name)?.annotations;
         const preauthorizedAnnotations = preauthorizedTools.find((tool) => tool.name === name)?.annotations;
         assert.equal(reviewedAnnotations?.destructiveHint, true);
-        assert.equal(preauthorizedAnnotations?.destructiveHint, false);
+        assert.equal(preauthorizedAnnotations?.destructiveHint, true);
         assert.equal(preauthorizedAnnotations?.readOnlyHint, false);
         assert.equal(preauthorizedAnnotations?.idempotentHint, false);
         assert.equal(preauthorizedAnnotations?.openWorldHint, true);
@@ -275,9 +276,7 @@ test("enabled UI exposes the production card, app-only tools and only start_sess
   assert.equal((attach?._meta as { ui?: unknown } | undefined)?.ui, undefined);
 
   const resources = await context.client.listResources();
-  assert.deepEqual(resources.resources.map((resource) => resource.uri), [
-    WORKSPACE_APP_URI,
-  ]);
+  assert.deepEqual(resources.resources.map((resource) => resource.uri), CARD_RESOURCES.map(resource=>resource.uri));
   const read = await context.client.readResource({ uri: WORKSPACE_APP_URI });
   const content = read.contents[0];
   assert.ok(content && "text" in content);
@@ -522,14 +521,14 @@ test("real MCP read records one operation without counting a card read", async (
     name: "open_workspace", arguments: { path: root }, _meta: meta,
   });
   assert.equal(openedResponse.status, 200, await openedResponse.clone().text());
-  const openedBody = await openedResponse.json() as { result?: { structuredContent?: { workspace_id?: string } } };
+  const openedBody = await mcpBody(openedResponse) as { result?: { structuredContent?: { workspace_id?: string } } };
   const workspaceId = openedBody.result?.structuredContent?.workspace_id;
   assert.equal(typeof workspaceId, "string");
   const readResponse = await postModernMcp(localBaseUrl, accessToken, "tools/call", {
     name: "read", arguments: { workspace_id: workspaceId, path: "AGENTS.md" }, _meta: meta,
   });
   assert.equal(readResponse.status, 200, await readResponse.clone().text());
-  const readBody = await readResponse.json() as { result?: { structuredContent?:{result?:string} } };
+  const readBody = await mcpBody(readResponse) as { result?: { structuredContent?:{result?:string} } };
   assert.match(readBody.result?.structuredContent?.result ?? "", /project instructions/);
   const database = openDatabase(join(root, ".state"));
   try {
@@ -570,7 +569,7 @@ test("real MCP keeps conversation sessions isolated and explicit attach session-
     _meta: conversationA,
   });
   assert.equal(firstA.status, 200, await firstA.clone().text());
-  const firstABody = await firstA.json() as {
+  const firstABody = await mcpBody(firstA) as {
     result?: { structuredContent?: { session_id?: string; workspace_id?: string } };
   };
   const sessionA = firstABody.result?.structuredContent?.session_id;
@@ -584,7 +583,7 @@ test("real MCP keeps conversation sessions isolated and explicit attach session-
       "openai/widgetSessionId": "widget-remount-1",
     },
   });
-  const remountedABody = await remountedA.json() as {
+  const remountedABody = await mcpBody(remountedA) as {
     result?: { structuredContent?: { session_id?: string; workspace_id?: string } };
   };
   assert.equal(remountedABody.result?.structuredContent?.session_id, sessionA);
@@ -598,7 +597,7 @@ test("real MCP keeps conversation sessions isolated and explicit attach session-
     arguments: { path: root },
     _meta: conversationB,
   });
-  const firstBBody = await firstB.json() as {
+  const firstBBody = await mcpBody(firstB) as {
     result?: { structuredContent?: { session_id?: string; workspace_id?: string } };
   };
   assert.equal(typeof firstBBody.result?.structuredContent?.session_id, "string");
@@ -611,7 +610,7 @@ test("real MCP keeps conversation sessions isolated and explicit attach session-
     _meta: { "openai/session": "conversation-b" },
   });
   assert.equal(explicitAttach.status, 200, await explicitAttach.clone().text());
-  const explicitAttachBody = await explicitAttach.json() as {
+  const explicitAttachBody = await mcpBody(explicitAttach) as {
     result?: {
       isError?: boolean;
       content?: Array<{ type?: string; text?: string }>;
@@ -626,7 +625,7 @@ test("real MCP keeps conversation sessions isolated and explicit attach session-
     arguments: { path: root },
     _meta: {},
   });
-  const missingConversationBody = await missingConversation.json() as {
+  const missingConversationBody = await mcpBody(missingConversation) as {
     result?: { isError?: boolean; content?: Array<{ type?: string; text?: string }> };
   };
   assert.equal(missingConversationBody.result?.isError, true);
@@ -657,7 +656,7 @@ test("authenticated HTTP normalizes cached tool arguments without relaxing canon
     name: "open_workspace", arguments: { path: root }, _meta: meta,
   });
   assert.equal(opened.status, 200);
-  const body = await opened.json() as { result?: { structuredContent?: { workspace_id?: string } } };
+  const body = await mcpBody(opened) as { result?: { structuredContent?: { workspace_id?: string } } };
   const workspaceId = body.result?.structuredContent?.workspace_id;
   assert.equal(typeof workspaceId, "string");
   const cached = { name: "workspace_context", arguments: { workspaceId, action: "capture",
@@ -667,7 +666,7 @@ test("authenticated HTTP normalizes cached tool arguments without relaxing canon
   await unauthorized.text();
   const read = await postModernMcp(localBaseUrl, accessToken, "tools/call", cached);
   assert.equal(read.status, 200);
-  const readBody = await read.json() as { result?: { isError?: boolean;
+  const readBody = await mcpBody(read) as { result?: { isError?: boolean;
     structuredContent?:{entries?:Array<{lines?:Array<{line:number;text:string}>}>} } };
   assert.equal(readBody.result?.isError, undefined);
   const captured = readBody.result?.structuredContent;
@@ -684,7 +683,7 @@ test("authenticated HTTP normalizes cached tool arguments without relaxing canon
     const rejected = await postModernMcp(localBaseUrl, accessToken, "tools/call", {
       name: "workspace_context", arguments: { workspaceId, action: "capture", files: [file] }, _meta: meta,
     });
-    const invalid = await rejected.json() as { error?: unknown; result?: { isError?: boolean } };
+    const invalid = await mcpBody(rejected) as { error?: unknown; result?: { isError?: boolean } };
     assert(invalid.error || invalid.result?.isError, "Canonical range and strict-key checks must still reject invalid requests");
   }
 });
@@ -710,7 +709,7 @@ test("HTTP endpoint serves modern MCP and stateless legacy clients", async (t) =
     {},
   );
   assert.equal(discovery.status, 200, await discovery.clone().text());
-  const discoveryBody = await discovery.json() as {
+  const discoveryBody = await mcpBody(discovery) as {
     result?: { supportedVersions?: string[] };
   };
   assert.ok(discoveryBody.result?.supportedVersions?.includes("2026-07-28"));
@@ -722,7 +721,7 @@ test("HTTP endpoint serves modern MCP and stateless legacy clients", async (t) =
     {},
   );
   assert.equal(listed.status, 200, await listed.clone().text());
-  const listBody = await listed.json() as {
+  const listBody = await mcpBody(listed) as {
     result?: { tools?: Array<{ name?: string }> };
   };
   assert.ok(listBody.result?.tools?.some((tool) => tool.name === "open_workspace"));
@@ -738,7 +737,7 @@ test("HTTP endpoint serves modern MCP and stateless legacy clients", async (t) =
     },
   );
   assert.equal(called.status, 200, await called.clone().text());
-  const callBody = await called.json() as {
+  const callBody = await mcpBody(called) as {
     result?: { structuredContent?: { workspace_id?: string; agents_files?: unknown[] } };
   };
   const workspaceId = callBody.result?.structuredContent?.workspace_id;
@@ -755,7 +754,7 @@ test("HTTP endpoint serves modern MCP and stateless legacy clients", async (t) =
     },
   );
   assert.equal(repeated.status, 200, await repeated.clone().text());
-  const repeatedBody = await repeated.json() as {
+  const repeatedBody = await mcpBody(repeated) as {
     result?: { structuredContent?: { workspace_id?: string; agents_files?: unknown[] } };
   };
   assert.equal(repeatedBody.result?.structuredContent?.workspace_id, workspaceId);
@@ -763,7 +762,7 @@ test("HTTP endpoint serves modern MCP and stateless legacy clients", async (t) =
 
   const modernTools = await postModernMcp(localBaseUrl, accessToken, "tools/list", {});
   assert.equal(modernTools.status, 200, await modernTools.clone().text());
-  const modernToolsBody = await modernTools.json() as { result?: { tools?: Array<{ name?: string }> } };
+  const modernToolsBody = await mcpBody(modernTools) as { result?: { tools?: Array<{ name?: string }> } };
   const names = modernToolsBody.result?.tools?.map((tool) => tool.name) ?? [];
   assert.ok(names.includes("apply_patch"));
   assert.equal(names.includes("work_task"), false);
@@ -818,7 +817,7 @@ test("stateless MCP gives distinct calls distinct identities when JSON-RPC ids r
     name: "open_workspace", arguments: { path: root }, _meta: meta,
   }, "0");
   assert.equal(opened.status, 200, await opened.clone().text());
-  const openedBody = await opened.json() as { result?: { structuredContent?: { workspace_id?: string } } };
+  const openedBody = await mcpBody(opened) as { result?: { structuredContent?: { workspace_id?: string } } };
   const workspaceId = openedBody.result?.structuredContent?.workspace_id;
   assert.equal(typeof workspaceId, "string");
 
@@ -834,7 +833,7 @@ test("stateless MCP gives distinct calls distinct identities when JSON-RPC ids r
     name: "read", arguments: { workspace_id: workspaceId, path: "distinct-count.txt" }, _meta: meta,
   }, "0");
   assert.equal(read.status, 200, await read.clone().text());
-  const readBody = await read.json() as { result?: { content?: Array<{ type: string; text?: string }> } };
+  const readBody = await mcpBody(read) as { result?: { content?: Array<{ type: string; text?: string }> } };
   assert.match(readBody.result?.content?.map((item) => item.text ?? "").join("\n") ?? "", /x/);
   const secondCommand = await postModernMcp(localBaseUrl, accessToken, "tools/call", {
     name: "exec_command",
@@ -852,7 +851,7 @@ test("stateless MCP replays a real retry inside one MCP session", async (t) => {
     name: "open_workspace", arguments: { path: root }, _meta: meta,
   }, "open-workspace");
   assert.equal(opened.status, 200, await opened.clone().text());
-  const openedBody = await opened.json() as { result?: { structuredContent?: { workspace_id?: string } } };
+  const openedBody = await mcpBody(opened) as { result?: { structuredContent?: { workspace_id?: string } } };
   const workspaceId = openedBody.result?.structuredContent?.workspace_id;
   assert.equal(typeof workspaceId, "string");
 
@@ -884,7 +883,7 @@ test("server shutdown waits for an active MCP tool call", async (t) => {
       _meta: { "openai/session": "shutdown-test" },
     },
   );
-  const openBody = await opened.json() as {
+  const openBody = await mcpBody(opened) as {
     result?: { structuredContent?: { workspace_id?: string } };
   };
   const workspaceId = openBody.result?.structuredContent?.workspace_id;
@@ -929,7 +928,7 @@ test("process completion writes one terminal event and invocation state", async 
   const opened = await postModernMcp(localBaseUrl, accessToken, "tools/call", {
     name: "open_workspace", arguments: { path: root }, _meta: meta,
   });
-  const openedBody = await opened.json() as { result?: { structuredContent?: { workspace_id?: string } } };
+  const openedBody = await mcpBody(opened) as { result?: { structuredContent?: { workspace_id?: string } } };
   const workspaceId = openedBody.result?.structuredContent?.workspace_id;
   assert.equal(typeof workspaceId, "string");
 
@@ -943,7 +942,7 @@ test("process completion writes one terminal event and invocation state", async 
     _meta: meta,
   });
   assert.equal(started.status, 200, await started.clone().text());
-  const startedBody = await started.json() as {
+  const startedBody = await mcpBody(started) as {
     result?: { structuredContent?: { running?: boolean; session_id?: number; operation_id?:string } };
   };
   assert.equal(startedBody.result?.structuredContent?.running, true);
@@ -958,7 +957,7 @@ test("process completion writes one terminal event and invocation state", async 
     _meta: meta,
   });
   assert.equal(finished.status, 200, await finished.clone().text());
-  const finishedBody = await finished.json() as {
+  const finishedBody = await mcpBody(finished) as {
     result?: { structuredContent?: { running?: boolean; exit_code?: number } };
   };
   assert.equal(finishedBody.result?.structuredContent?.running, false);
@@ -1272,6 +1271,16 @@ async function issueTestAccessToken(
   const tokens = await exchange.json() as { access_token?: string };
   assert.ok(tokens.access_token);
   return tokens.access_token;
+}
+
+// 测试读取真实 HTTP 响应；生产已使用 SSE，通知与最终 JSON-RPC 结果分别解析。
+async function mcpBody(response: Response): Promise<Record<string, unknown>> {
+  const text = await response.text();
+  if (!response.headers.get('content-type')?.includes('text/event-stream')) return JSON.parse(text);
+  const messages = text.split(/\r?\n/).filter(line=>line.startsWith('data:')).map(line=>JSON.parse(line.slice(5)));
+  const result = messages.find(message=>message.result !== undefined || message.error !== undefined);
+  assert.ok(result, 'SSE 必须包含最终 JSON-RPC 响应');
+  return result;
 }
 
 function postModernMcp(

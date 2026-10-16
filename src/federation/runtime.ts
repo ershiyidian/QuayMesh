@@ -182,6 +182,7 @@ export class FederationRuntime extends EventEmitter {
     return this.sessionFeed?.routeNodeFor(input);
   }
   routeNode(name: string, input: JsonRecord): string {
+    if (name === 'read_diagnostics') return typeof input.node_id === 'string' ? input.node_id : this.localId;
     if (name === "open_workspace" && typeof input.root_id === "string") {
       return selectRoot(this.nodes(), input.root_id).node.id;
     }
@@ -375,7 +376,7 @@ export class FederationRuntime extends EventEmitter {
     const opensWorkspace = name === "open_workspace" || name === "attach_workspace";
     const args = opensWorkspace ? await this.hooks.prepareOpen(input) : input;
     // 查询原工作区的历史记录无需重新打开已经删除的文件目录。
-    const historical = name === "workspace_context" &&
+    const historical = name === "read_output" || name === "workspace_context" &&
       (args.action === "recovery" || args.action === "status" && args.environment !== true);
     if (typeof args.workspace_id === "string" && !historical) await this.hooks.checkWorkspace(args.workspace_id);
     this.activeCalls++;
@@ -395,7 +396,9 @@ export class FederationRuntime extends EventEmitter {
       return jsonReply(structured);
     }
     let node = this.localId; let args = { ...input };
-    if (name === "open_workspace" && typeof input.root_id === "string") {
+    if (name === 'read_diagnostics' && typeof input.node_id === 'string') {
+      node = input.node_id;
+    } else if (name === "open_workspace" && typeof input.root_id === "string") {
       const selected = selectRoot(this.nodes(), input.root_id); node = selected.node.id; args.root_id = selected.root.id;
     } else if (name === "attach_workspace" && typeof input.root_id === "string") {
       const selected = selectRoot(this.nodes(), input.root_id); node = selected.node.id; args.root_id = selected.root.id;
@@ -439,7 +442,7 @@ export class FederationRuntime extends EventEmitter {
       if (service === "ingress") return dialTcp("127.0.0.1", this.hooks.httpPort);
       if (service === "egress") {
         if (!this.config.capabilities.egress || !this.manifest.egress.healthy) throw new Error("EGRESS_CAPABILITY_UNAVAILABLE");
-        const lease=this.execution.beginWork({kind:"egress"});
+        const lease=this.execution.beginWork({kind:"egress",blocking:false});
         try { return this.trackStream(await lease.run(()=>connectProxy(this.proxyUrl)),lease); }
         catch(error) { lease.release(); throw error; }
       }
@@ -447,7 +450,7 @@ export class FederationRuntime extends EventEmitter {
     }
     const link = this.transport.links.get(node); if (!link) throw new NodeUnavailableError(node);
     if(service!=="egress")return link.openStream(service, metadata);
-    const lease=this.execution.beginWork({kind:"egress"});
+    const lease=this.execution.beginWork({kind:"egress",blocking:false});
     try { return this.trackStream(await lease.run(()=>link.openStream(service,metadata)),lease); }
     catch(error) { lease.release(); throw error; }
   }
@@ -465,7 +468,7 @@ export class FederationRuntime extends EventEmitter {
     }
     if (service === "egress") {
       if (!this.config.capabilities.egress || !this.manifest.egress.healthy) throw new Error("本机 mihomo 出口当前不可用");
-      const lease=this.execution.beginWork({kind:"egress"});
+      const lease=this.execution.beginWork({kind:"egress",blocking:false});
       this.trackStream(stream,lease);
       try { bridge(stream,await lease.run(()=>connectProxy(this.proxyUrl))); }
       catch(error) { lease.release(); throw error; }

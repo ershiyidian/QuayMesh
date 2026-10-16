@@ -1,5 +1,5 @@
 import type { ServerConfig } from "../config.js";
-import { withTaskLifecycle,activeExecution,type TaskLifecycle } from '../console-task-state.js';
+import { withTaskLifecycle,activeExecution,observeSourceStates,type TaskLifecycle } from '../console-task-state.js';
 import type { LocalActions } from './actions.js';
 import type { FederationRuntime } from "../federation/runtime.js";
 import type { ConsoleReply, NodeView } from "../federation/types.js";
@@ -31,7 +31,7 @@ export class WorkbenchFeed {
   }
   invalidate(): void {
     for (const cached of this.cache.values()) {
-      cached.loadedAt = 0;
+      // 失效只触发重取；保留上次真实观察时间供离线界面显示。
       cached.retryAt = 0;
       cached.wait = true;
     }
@@ -59,7 +59,7 @@ export class WorkbenchFeed {
       source: { nodeId: node.id, name: node.nickname, online: node.online, state, observedAt: cached?.loadedAt || null, stale: state === "refreshing" || state === "offline" || state === "error", error } });
     if (!node.online) return previous("offline", "节点离线");
     if (cached?.error && Date.now() < cached.retryAt) return previous("error", cached.error);
-    if (cached && !cached.error && Date.now() - cached.loadedAt < effectiveTtl) return previous("ready", null);
+    if (cached && !cached.wait && !cached.error && Date.now() - cached.loadedAt < effectiveTtl) return previous("ready", null);
     const existing = this.pending.get(key) as Promise<NodeResource<T>> | undefined;
     if (existing) {
       // Do not hold a page refresh on a slow remote request when usable
@@ -125,7 +125,7 @@ export class WorkbenchFeed {
     const limit = Math.min(100, Math.max(1, Number(query.limit ?? 25)));
     const index = await this.collect("/workbench/task-index", () => readLocalTaskIndex(this.config), {}, 1000);
     const titles = await this.sessionTitles();
-    const scoped = filterTaskIndex(applyTaskTitles(aggregateTaskIndex(index.values.flatMap((value) => value.items)), titles.map)
+    const scoped = filterTaskIndex(applyTaskTitles(aggregateTaskIndex(observeSourceStates(index.values.flatMap((value) => value.items),index.sources)), titles.map)
       .map(task=>withTaskLifecycle(task,titles.tasks.get(task.taskId ?? ''))), query, at);
     const counts: Record<string, number> = {};
     for (const task of scoped) {
@@ -154,7 +154,8 @@ export class WorkbenchFeed {
     const authority = new Set<string>();
     for (const source of group.values) for (const task of source.tasks ?? []) {
       const previous=tasks.get(task.id);
-      if (!previous || source.authoritative || !authority.has(task.id) && task.revision > previous.revision) tasks.set(task.id,task);
+      if (!previous || source.authoritative && !authority.has(task.id)
+        || source.authoritative === authority.has(task.id) && task.revision > previous.revision) tasks.set(task.id,task);
       if (source.authoritative) authority.add(task.id);
     }
     return { map: resolveSessionTitles(group.values.flatMap((value) => value.items)),
@@ -164,7 +165,7 @@ export class WorkbenchFeed {
 
   private resolvedRun(task:TaskIndex,detail?:Run):Run {
     const run=detail ?? fallbackTask(task);
-    return {...run,title:task.title,executionStatus:task.executionStatus,acceptanceStatus:task.acceptanceStatus,
+    return {...run,title:task.title,executionStatus:task.executionStatus,acceptanceStatus:task.acceptanceStatus,sourceTaskId:task.sourceTaskId??null,
       finishedAt:task.finishedAt,lastActivityAt:task.lastActivityAt,
       actions:{...run.actions,complete:task.executionStatus==='waiting' && run.actions.complete,
         review:task.executionStatus==='completed' && task.acceptanceStatus==='pending'}};
@@ -245,13 +246,13 @@ export class WorkbenchFeed {
       this.collect("/workbench/task-index", () => readLocalTaskIndex(this.config), {}, 1000),
       this.sessionTitles(),
     ]);
-    const tasks = applyTaskTitles(aggregateTaskIndex(index.values.flatMap((value) => value.items)), titles.map)
+    const tasks = applyTaskTitles(aggregateTaskIndex(observeSourceStates(index.values.flatMap((value) => value.items),index.sources)), titles.map)
       .map(task=>withTaskLifecycle(task,titles.tasks.get(task.taskId ?? '')));
     const activeIndex = tasks.filter(task=>activeExecution(task.executionStatus)).sort((a,b)=>b.lastActivityAt-a.lastActivityAt);
     const visibleActive=[...activeIndex.filter(task=>task.executionStatus!=='queued').slice(0,12),
       ...activeIndex.filter(task=>task.executionStatus==='queued').slice(0,3)];
-    const waitingIndex = tasks.filter(task=>task.executionStatus==='waiting').sort((a,b)=>b.lastActivityAt-a.lastActivityAt);
-    const recentIndex = tasks.filter((task) => !["running", "queued", "stopping", "waiting"].includes(task.executionStatus))
+    const waitingIndex = tasks.filter(task=>['waiting','stalled','finalizing'].includes(task.executionStatus)).sort((a,b)=>b.lastActivityAt-a.lastActivityAt);
+    const recentIndex = tasks.filter((task) => !["running", "queued", "stopping", "waiting", "stalled", "finalizing"].includes(task.executionStatus))
       .sort((a, b) => (b.finishedAt ?? b.lastActivityAt) - (a.finishedAt ?? a.lastActivityAt)).slice(0, 6);
     const attentionIndex = tasks.filter((task) => task.executionStatus === "unknown"
       || task.executionStatus === "interrupted_recoverable" && task.actionableInterruption

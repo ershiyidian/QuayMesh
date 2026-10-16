@@ -38,6 +38,7 @@ const expectedModelTools = [
   "exec_command",
   "write_stdin",
   "read_output",
+  "read_diagnostics",
   "cancel_command",
   "checkpoint_task",
   "spawn_agent",
@@ -189,7 +190,9 @@ try {
   const builtAssets: BuiltAsset[] = [{ path: "dist/ui-card/workspace-app.html", bytes: Buffer.byteLength(builtCard), kind: "other" }];
 
   check("served HTML is the self-contained production card", () => {
-    assert.equal(html.text, builtCard, "served card does not match dist/ui-card/workspace-app.html");
+    const resourceVersion=WORKSPACE_APP_URI.match(/\/v(\d+)\.html$/)?.[1];
+    const expected=builtCard.replace('</head>',`<meta name="quaymesh-card-version" content="task-card-v${resourceVersion}">\n</head>`);
+    assert.equal(html.text, expected, "served card must be the production bundle with its resource contract version");
     assert.doesNotMatch(html.text, /(?:src|href)=["']\.\/assets\//, "card still depends on relative asset files");
     assert.doesNotMatch(html.text, /127\.0\.0\.1|localhost/i, "card contains a loopback address");
     return { path: "dist/ui-card/workspace-app.html", bytes: Buffer.byteLength(builtCard) };

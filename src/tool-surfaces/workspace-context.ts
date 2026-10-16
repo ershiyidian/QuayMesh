@@ -177,8 +177,9 @@ async function statusReply(
           ...(saved.result_ref ? { result_ref: saved.result_ref } : {}) }],
         unknown_effects: saved.effect === "unknown" ? [operationId] : [],
         result_ready: result !== null, result_ref: saved.result_ref,
-        ...(page ? { result_page: { ...page, encoding: "json", next_offset: page.nextOffset } }
-          : result ? { result } : {}),
+        ...(["exec_command","bash"].includes(saved.tool_name)
+          ? page ? {initial_receipt_page:{...page,encoding:"json",next_offset:page.nextOffset}} : result ? {initial_receipt:result} : {}
+          : page ? {result_page:{...page,encoding:"json",next_offset:page.nextOffset}} : result ? {result} : {}),
         ...(envelope && !result ? { error: envelope } : {}),
         created_at: saved.created_at, finished_at: saved.finished_at,
         poll_after_ms: pending ? 2000 : null,

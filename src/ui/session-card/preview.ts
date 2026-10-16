@@ -22,9 +22,9 @@ export const previewSnapshot:Snapshot={
   lastActivityAt:now-11_000,
   consoleUrl:null,
   workspace:{id:"preview-member",node_id:"desktop",workspace_id:"preview-workspace",online:true,observedAt:now,
-    root:"E:\\Projects\\QuayMesh",sourceRoot:null,branch:"master",baseRef:null,baseSha:null,dirtySource:false,mode:"local"},
-  workspaces:[{id:"preview-member",node_id:"desktop",workspace_id:"preview-workspace",root:"E:\\Projects\\QuayMesh",
-    source_root:null,mode:"checkout",first_seen_at:new Date(now-360_000).toISOString(),last_observed_at:new Date(now).toISOString(),online:true,revision:12,recovery_root:"E:\\Projects\\QuayMesh"}],
+    root:"E:\\Chromium-GPT\\QuayMesh",sourceRoot:null,branch:"master",baseRef:null,baseSha:null,dirtySource:false,mode:"local"},
+  workspaces:[{id:"preview-member",node_id:"desktop",workspace_id:"preview-workspace",root:"E:\\Chromium-GPT\\QuayMesh",
+    source_root:null,mode:"checkout",first_seen_at:new Date(now-360_000).toISOString(),last_observed_at:new Date(now).toISOString(),online:true,revision:12,recovery_root:"E:\\Chromium-GPT\\QuayMesh"}],
   files:[
     file("f1","M","src/ui/session-card/view.ts",48,20),
     file("f2","M","src/ui/session-card/controller.ts",32,18),

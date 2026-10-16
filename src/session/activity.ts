@@ -23,7 +23,7 @@ export function activityTimes(events:SessionEvent[],memberId?:string):TaskActivi
     const timestamp=Date.parse(event.timestamp);
     if(!Number.isFinite(timestamp))continue;
     const actor=String(event.payload.actor??"model");
-    if(event.type==="operation_started"||event.type==="operation_finished"||event.type==="context_read") {
+    if(event.type==="operation_started"||event.type==="context_read") {
       if(actor==="model")lastModelToolAt=Math.max(lastModelToolAt??0,timestamp);
     }
     if(event.type==="operation_started"||event.type==="operation_finished"||event.type==="operation_output"||event.type==="agent_changed") {

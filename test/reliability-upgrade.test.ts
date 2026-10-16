@@ -181,7 +181,7 @@ test("实际断开 MCP 客户端后后台命令继续，并可从新连接取结
     if(output.process_done)break;
     await delay(30);
   } while(Date.now()<deadline);
-  assert.equal(output.process_done,true);
+  assert.equal(output.process_done,true,`断连后命令未结束：${JSON.stringify(output)}`);
   assert.equal(output.result,"completed-after-disconnect\n");
 });
 
@@ -271,7 +271,7 @@ test("通信预算继承剩余时间，显式等待与长文件传输保持各�
   assert.equal(toolDeadline("read",{},{[TOOL_DEADLINE_META]:deadline},4000),deadline);
   assert.equal(remainingToolTime(deadline,4000),7000);
   assert.throws(()=>remainingToolTime(deadline,11001),/TOOL_REQUEST_EXPIRED/);
-  assert.equal(toolDeadline("write_stdin",{yield_time_ms:12000},undefined,1000),16000);
+  assert.equal(toolDeadline("write_stdin",{yield_time_ms:12000},undefined,1000),26000);
   assert.equal(toolDeadline("open_workspace",{},undefined,1000),26000);
 });
 

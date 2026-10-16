@@ -104,7 +104,8 @@ test("慢基线准备返回可查受理回执，重试复用原操作且命令�
     const args = { ...f.scope, cmd: `"${process.execPath}" "${script}"`, operation_key: randomUUID(), yield_time_ms: 1000 };
     const result = await within(f.call("exec_command", args), 6000);
     assert.equal(result.accepted, true);
-    assert.equal(result.effect, "not_started");
+    // 入口回执可能先于 worker 回执；实际副作用状态以 worker 查询为准。
+    assert.ok(["unknown","not_started"].includes(result.effect));
     await until(() => exists(f.marker));
     assert.equal(await exists(join(f.worker.project, "count.txt")), false);
     const status = await f.call("workspace_context", { ...f.scope, action: "status", operation_id: result.operation_id });
