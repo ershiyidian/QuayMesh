@@ -7,7 +7,12 @@ const tools = new Set(["open_workspace", "attach_workspace", "read", "read_diagn
   "start_session","finish_task","workspace_catalog","read_output","cancel_command","checkpoint_task","download_artifact","copy_artifact","qm_widget_stage",
   "qm_session","qm_file_diff","qm_command_output","qm_command_outputs","qm_instruction","qm_patch","qm_revert","qm_file_url","qm_session_continue"]);
 const actions = new Set(["list","capture","search","status","recovery","start","observe","cancel"]);
-const errorCodes = new Set(["WORK_STATE", "INVALID_TASK", "AGENT_CONFLICT", "EXECUTION_CONFLICT", "STALE_CONTEXT", "ACCESS_DENIED", "WORKSPACE_NOT_FOUND", "WORKSPACE_MISMATCH", "AGENT_NOT_FOUND"]);
+const errorCodes = new Set(["WORK_STATE", "INVALID_TASK", "AGENT_CONFLICT", "EXECUTION_CONFLICT", "STALE_CONTEXT", "ACCESS_DENIED", "WORKSPACE_NOT_FOUND", "WORKSPACE_MISMATCH", "AGENT_NOT_FOUND",
+  "NODE_ADMISSION_PAUSED", "TASK_SESSION_MISMATCH", "TASK_NOT_FOUND", "INVALID_ARGUMENT", "OPERATION_KEY_INVALID", "REQUEST_ID_REUSED",
+  "REQUEST_TIMEOUT", "RPC_INTERRUPTED", "NODE_UNAVAILABLE", "PROCESS_RECONCILIATION_REQUIRED", "TOOL_EXECUTION_ERROR", "ZOD_ERROR",
+  "ENOENT", "EACCES", "EPERM", "EINVAL", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ECONNABORTED", "EPIPE", "ENOTFOUND"]);
+const effects = new Set(["not_started", "started", "partial", "completed", "unknown"]);
+const retryHints = new Set(["fix_input", "retry_same_key", "query_original", "do_not_retry", "retry_later"]);
 const object = (value: unknown): Record<string, any> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : {};
 const known = (value: unknown, allowed: Set<string>) => typeof value === "string" && allowed.has(value) ? value : "other";
 const identity = (value: unknown, prefix: string) => typeof value === "string"
@@ -104,6 +109,11 @@ export function traceMcpRequest(req: Request, res: Response, requestId: string, 
             structuredTextBytes:typeof structured.result==="string"?Buffer.byteLength(structured.result):0,
             duplicateBodyBytes:typeof structured.result==="string" && content.some((block:any)=>block.type==="text"&&block.text===structured.result)
               ? Buffer.byteLength(structured.result):0 };
+          // Canonical error results carry their code beside plain-text content.
+          // Keep the same metadata-only boundary for untrusted remote results.
+          if (typeof structured.error_code === "string") result.toolErrorCode = known(structured.error_code, errorCodes);
+          if (typeof structured.effect === "string") result.effect = known(structured.effect, effects);
+          if (typeof structured.retry_hint === "string") result.retryHint = known(structured.retry_hint, retryHints);
           // Report only presence of receipt layers; values/errors may be private.
           for (const block of content) {
             if (block?.type !== "text" || typeof block.text !== "string") continue;
@@ -111,7 +121,7 @@ export function traceMcpRequest(req: Request, res: Response, requestId: string, 
               const value = object(JSON.parse(block.text));
               result.operationId = identity(value.operation_id ?? value.operationId, "op") ?? result.operationId;
               result.receiptPresent = result.receiptPresent === true || "completionReceipt" in value || "completionSnapshot" in value || "receipt" in value || "workRunId" in value || "work_run_id" in value;
-              if (typeof value.code === "string") result.toolErrorCode = known(value.code, errorCodes);
+              if (result.toolErrorCode === undefined && typeof value.code === "string") result.toolErrorCode = known(value.code, errorCodes);
               if (typeof value.message === "string" && payload.isError === true) result.errorFingerprint = createHash("sha256").update(value.message).digest("hex").slice(0, 16);
             } catch { /* Non-JSON text is never returned to logs. */ }
           }

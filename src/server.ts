@@ -31,6 +31,7 @@ import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middlew
 import { resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { toNodeHandler } from "@modelcontextprotocol/node";
+import { primeMcpSseResponse } from "./mcp-sse-response.js";
 import {
   registerAppResource,
   registerAppTool,
@@ -1133,13 +1134,15 @@ export function createServer(
     return adapter.server;
   }, {
     legacy: "stateless",
-    // 立即建立现代 MCP SSE 响应，避免长任务在等待首字节时被中间节点中止。
+    // SSE 首帧由响应包装器补充；仅创建 Response 不会立即发出网络字节。
     responseMode: "sse",
     // SDK 自带 SSE 注释心跳。复用标准实现，避免与传输层同时写流。
     keepAliveMs: 5_000,
     onerror: logMcpHandlerError,
   });
-  const mcpNodeHandler = toNodeHandler(mcpHandler, {
+  const mcpNodeHandler = toNodeHandler({
+    fetch: async (request, options) => primeMcpSseResponse(await mcpHandler.fetch(request, options)),
+  }, {
     onerror: logMcpHandlerError,
   });
 

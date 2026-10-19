@@ -9,16 +9,26 @@ import { createMcpHandler } from "@modelcontextprotocol/server";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import { createModernMcpServerAdapter } from "./mcp-modern-server.js";
 import { traceMcpRequest, mcpExchangeOutcome } from "./mcp-request-diagnostics.js";
+import { toolErrorResult } from "./session/outcome.js";
 
 test("real modern HTTP MCP diagnostics separate schema/tool errors from successful HTTP and omit secrets", async (t) => {
   const rows: Record<string, any>[] = [];
   const handler = createMcpHandler(() => {
     const adapter = createModernMcpServerAdapter({ name: "fixture", version: "1" });
-    adapter.registrationTarget.registerTool("work_task", { inputSchema: { action: z.enum(["get", "snapshot", "finish"]), workspaceId: z.string() } }, async ({ action }) => ({
-      isError: action === "finish", content: [{ type: "text", text: JSON.stringify(action === "finish"
-        ? { code: "WORK_STATE", message: "secret-error" }
-        : { workRunId: "run_abcdef", summary: "secret-response", acceptanceStatus: "pending" }) }],
-    }));
+    adapter.registrationTarget.registerTool("work_task", { inputSchema: { action: z.enum(["get", "snapshot", "finish", "structured", "untrusted"]), workspaceId: z.string() } }, async ({ action }) => {
+      if (action === "structured") return toolErrorResult(Object.assign(new Error("secret-timeout-address"), {
+        code: "REQUEST_TIMEOUT",
+      }), { operationId: "op_abcdef", sideEffecting: true });
+      if (action === "untrusted") return {
+        isError: true, content: [{ type: "text" as const, text: "secret-error" }],
+        structuredContent: { error_code: "secret-code", effect: "secret-effect", retry_hint: "secret-retry" },
+      };
+      return {
+        isError: action === "finish", content: [{ type: "text", text: JSON.stringify(action === "finish"
+          ? { code: "WORK_STATE", message: "secret-error" }
+          : { workRunId: "run_abcdef", summary: "secret-response", acceptanceStatus: "pending" }) }],
+      };
+    });
     return adapter.server;
   }, { legacy: "stateless" });
   const app = express(); app.use(express.json());
@@ -44,6 +54,16 @@ test("real modern HTTP MCP diagnostics separate schema/tool errors from successf
   const failed = await call("finish"); assert.equal(failed.response.status, 200); assert.equal(failed.row.toolError, true);
   assert.equal(failed.row.outcome, 'tool_error');
   assert.equal(failed.row.toolErrorCode, "WORK_STATE"); assert(failed.row.errorFingerprint);
+  const structured = await call("structured");
+  assert.equal(structured.row.toolErrorCode, "REQUEST_TIMEOUT");
+  assert.equal(structured.row.effect, "unknown");
+  assert.equal(structured.row.retryHint, "query_original");
+  assert.equal(structured.row.operationId, "op_abcdef");
+  assert.equal(structured.row.outcome, "tool_error");
+  const untrusted = await call("untrusted");
+  assert.equal(untrusted.row.toolErrorCode, "other");
+  assert.equal(untrusted.row.effect, "other");
+  assert.equal(untrusted.row.retryHint, "other");
   const rejected = await call("unknown-secret-action");
   assert(rejected.row.rpcErrorCode || rejected.row.toolError, "Schema rejection must be visible even if no handler ran");
   assert.equal(rejected.row.action, "other");
