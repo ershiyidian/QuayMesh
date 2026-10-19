@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { LocalAgentStore } from "../local-agent-store.js";
 import { OperationState, type AgentId, type SessionId } from "./types.js";
 import type { SessionService } from "./service.js";
@@ -14,6 +15,7 @@ export interface AgentOperationIdentity {
 export interface AgentOperationTrackerOptions {
   intervalMs?: number;
   ledger?: WorkLedger;
+  onError?: (error: unknown, identity: AgentOperationIdentity, retry: { attempt: number; delayMs: number }) => void;
 }
 
 /**
@@ -23,7 +25,8 @@ export interface AgentOperationTrackerOptions {
  */
 export class AgentOperationTracker {
   private readonly timers = new Map<string, NodeJS.Timeout>();
-  private readonly pending = new Set<Promise<void>>();
+  private readonly pending = new Map<string, Promise<void>>();
+  private readonly failures = new Map<string, number>();
   private readonly intervalMs: number;
   private closed = false;
   private readonly observations = new Map<string, string>();
@@ -38,18 +41,37 @@ export class AgentOperationTracker {
   }
 
   restore(): void {
-    for (const identity of this.store.pendingAgentOperations()) this.track(identity);
+    if (this.closed) throw new Error("AGENT_OPERATION_TRACKER_CLOSED");
+    // 身份已经持久化；恢复时先安装后台重试边界，无需再次争取写锁。
+    for (const identity of this.store.pendingAgentOperations()) {
+      if (!this.pending.has(identity.operationId)) this.schedule(identity);
+    }
   }
 
   track(identity: AgentOperationIdentity): void {
     if (this.closed) throw new Error("AGENT_OPERATION_TRACKER_CLOSED");
-    if (this.timers.has(identity.operationId)) return;
+    if (this.timers.has(identity.operationId) || this.pending.has(identity.operationId)) return;
     this.store.rememberAgentOperation(identity);
+    this.schedule(identity);
+  }
+
+  private schedule(identity: AgentOperationIdentity, delayMs = this.intervalMs): void {
+    if (this.closed || this.timers.has(identity.operationId)) return;
     const timer = setTimeout(() => {
       this.timers.delete(identity.operationId);
-      const pending = this.poll(identity).finally(() => this.pending.delete(pending));
-      this.pending.add(pending);
-    }, this.intervalMs);
+      const pending = this.poll(identity).then(() => {
+        this.failures.delete(identity.operationId);
+      }, error => {
+        const attempt = (this.failures.get(identity.operationId) ?? 0) + 1;
+        this.failures.set(identity.operationId, attempt);
+        const retryDelayMs = Math.min(30_000, this.intervalMs * 2 ** Math.min(attempt, 10));
+        // 诊断回调自身失败也不能产生未处理的 Promise 拒绝。
+        try { this.options.onError?.(error, identity, { attempt, delayMs: retryDelayMs }); } catch { /* 继续重试 */ }
+        // 保留持久化操作并持续重试；只重读已有结果，不重新启动提供方工作。
+        this.schedule(identity, retryDelayMs);
+      }).finally(() => { this.pending.delete(identity.operationId); });
+      this.pending.set(identity.operationId, pending);
+    }, delayMs);
     timer.unref?.();
     this.timers.set(identity.operationId, timer);
   }
@@ -58,7 +80,8 @@ export class AgentOperationTracker {
     this.closed = true;
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
-    await Promise.allSettled([...this.pending]);
+    await Promise.allSettled(this.pending.values());
+    this.failures.clear();
     this.observations.clear();
   }
 
@@ -94,14 +117,17 @@ export class AgentOperationTracker {
     };
     const observation = JSON.stringify(payload);
     if (this.observations.get(identity.operationId) !== observation) {
-      await this.service.agentEvent(identity.sessionId, identity.memberId, payload,
+      // 订阅者报错时事件可能已经提交；稳定身份确保重试和重启恢复均不重复追加。
+      const source_id = `agent-operation:${identity.operationId}:${createHash("sha256")
+        .update(JSON.stringify([record.controlRevision, record.updatedAt, observation])).digest("hex")}`;
+      await this.service.agentEvent(identity.sessionId, identity.memberId, { ...payload, source_id },
         this.store.findOperationEvent(identity.operationId)?.task_id ?? undefined);
       this.observations.set(identity.operationId, observation);
     }
 
     if (record.status === "starting" || record.status === "queued" || record.status === "running") {
       if(this.options.ledger?.hasConfirmedAgent(identity.agentId))this.options.ledger.observeOperations([identity.operationId]);
-      if (!this.closed) this.track(identity);
+      this.schedule(identity);
       return;
     }
 

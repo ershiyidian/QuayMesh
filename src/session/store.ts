@@ -677,7 +677,8 @@ export class SessionStore {
       };
     });
 
-    const result = appendTx();
+    // 先取得写锁再读取版本和去重键，避免其他写入提交后无法升级旧 WAL 快照。
+    const result = appendTx.immediate();
     if (result.changed) {
       for (const listener of this.changeListeners) listener({
         sessionId: event.session_id,

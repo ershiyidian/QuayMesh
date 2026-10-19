@@ -2,6 +2,8 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { migrateDatabase } from "../db/migrations.js";
+import { logEvent } from "../logger.js";
+import { diagnosticError } from "../server-diagnostics.js";
 import type { ServerConfig } from "../config.js";
 import { ExecutionCoordinator } from "../execution-coordinator.js";
 import type { ProcessSessionManager } from "../process-sessions.js";
@@ -157,7 +159,14 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
     fail: (operationId, errorCode, exitCode, signal) => output.fail(operationId, errorCode, exitCode, signal),
   });
   if (!agents) throw new Error("SESSION_LOCAL_AGENT_STORE_REQUIRED");
-  const agentOperations = new AgentOperationTracker(agents, service, store, { ledger });
+  const agentOperations = new AgentOperationTracker(agents, service, store, {
+    ledger,
+    onError: (error, identity, retry) => logEvent(config.logging, "error", "agent_operation_poll_failed", {
+      operationId: identity.operationId, agentId: identity.agentId,
+      sessionId: identity.sessionId, memberId: identity.memberId,
+      retryAttempt: retry.attempt, retryDelayMs: retry.delayMs, ...diagnosticError(error),
+    }),
+  });
   agentOperations.restore();
   const pendingProcessOperations = new Set<Promise<void>>();
   const unfinishedProcesses = new Map<string,import("../process-sessions.js").ProcessFinish>();

@@ -3,6 +3,7 @@ import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import Database from "better-sqlite3";
 import { openDatabase } from "../db/client.js";
 import { createInvocationContext, executeRecorded } from "./invocations.js";
 import { RecoveryService } from "./recovery.js";
@@ -70,6 +71,38 @@ test("duplicate event identity does not advance revisions and persistence surviv
     reopened.close();
     await rm(f.directory, { recursive: true, force: true });
   }
+});
+
+test("event append acquires the WAL writer before reading its revision snapshot", async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const session = f.store.createSession("owner-a", "wal-event", "concurrent append");
+  const member = f.store.addMember(session.id, "desktop", "workspace-a", f.root, "checkout", null);
+  const competingWrite = f.database.sqlite.prepare("UPDATE qm_sessions SET revision=revision+1 WHERE id=?");
+  f.database.sqlite.pragma("busy_timeout = 25");
+  let armed = true, competingError: unknown;
+  const connection = new Database(join(f.directory, "state", "quaymesh.sqlite"), {
+    verbose(sql) {
+      if (!armed || typeof sql !== "string" || !sql.includes("SELECT sequence FROM qm_events")) return;
+      armed = false;
+      // currentTask 已读取事务快照；在 appendEvent 写入前让另一连接尝试真实提交。
+      try { competingWrite.run(session.id); } catch (error) { competingError = error; }
+    },
+  });
+  t.after(() => connection.close());
+  connection.pragma("busy_timeout = 5000");
+  const store = new SessionStore(connection);
+  store.appendEvent({
+    session_id: session.id, member_id: member.id, type: "agent_changed",
+    source_id: "contended-observation", timestamp: new Date().toISOString(), payload: {},
+  });
+  assert.equal(armed, false, "the competing writer must actually attempt a write between our reads and write");
+  assert.equal((competingError as { code?: string } | undefined)?.code, "SQLITE_BUSY");
+  assert.equal(store.getSession(session.id).revision, 1);
+  // 事件提交后另一写入可重试成功，两个版本更新均不丢失。
+  competingWrite.run(session.id);
+  assert.equal(store.getSession(session.id).revision, 2);
+  assert.equal(store.eventsForSession(session.id).length, 1);
 });
 
 test("long sessions keep later events and bounded reads return the newest window", async (t) => {
