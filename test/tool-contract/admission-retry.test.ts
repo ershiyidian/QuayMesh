@@ -3,7 +3,6 @@ import test from "node:test";
 import {randomUUID} from "node:crypto";
 import {readFile, writeFile} from "node:fs/promises";
 import {join} from "node:path";
-import {CallToolResultSchema} from "@modelcontextprotocol/sdk/types.js";
 import {openDatabase} from "../../src/db/client.js";
 import {SessionStore} from "../../src/session/store.js";
 import {twoNodes, until} from "./fixture.js";
@@ -11,8 +10,9 @@ import {twoNodes, until} from "./fixture.js";
 test("a refused federated command retries the same operation once after its real claim is released", {timeout: 60000}, async t => {
   const {worker, cloud} = await twoNodes(t);
   const meta = {"openai/session": randomUUID()};
-  // 读取原始错误回执，单独验证准入行为；callTool 的错误 schema 兼容另行覆盖。
-  const raw = (name: string, args: Record<string, unknown>) => cloud.client.request({method: "tools/call", params: {name, arguments: args, _meta: meta}}, CallToolResultSchema);
+  // 先发现输出 schema，再由标准 SDK 校验拒绝和重试回执。
+  await cloud.client.listTools();
+  const raw = (name: string, args: Record<string, unknown>) => cloud.client.callTool({name, arguments: args, _meta: meta});
   assert.notEqual((await raw("start_session", {title: "Admission retry", request_key: randomUUID()})).isError, true);
   const opened = await raw("open_workspace", {root_id: "worker/main"});
   assert.notEqual(opened.isError, true, JSON.stringify(opened));
@@ -56,7 +56,8 @@ test("a refused federated command retries the same operation once after its real
 test("coordinator preserves the operation ID when worker admission rejected before recording any attempt", {timeout: 60000}, async t => {
   const {worker, cloud} = await twoNodes(t);
   const meta = {"openai/session": randomUUID()};
-  const raw = (name: string, args: Record<string, unknown>) => cloud.client.request({method: "tools/call", params: {name, arguments: args, _meta: meta}}, CallToolResultSchema);
+  await cloud.client.listTools();
+  const raw = (name: string, args: Record<string, unknown>) => cloud.client.callTool({name, arguments: args, _meta: meta});
   assert.notEqual((await raw("start_session", {title: "Worker admission", request_key: randomUUID()})).isError, true);
   const opened = await raw("open_workspace", {root_id: "worker/main"});
   assert.notEqual(opened.isError, true, JSON.stringify(opened));
