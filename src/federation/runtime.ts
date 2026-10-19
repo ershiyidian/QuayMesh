@@ -22,6 +22,7 @@ export type { TransferView } from "./transfer-store.js";
 export { isTransientPeerFailure, isIdempotentPeerRequest, dispatchPeerRequest, READ_TOTAL_BUDGET_MS, READ_ATTEMPT_TIMEOUT_MS, MAX_READ_RETRIES } from "./read-retry.js";
 import { toolDeadline, remainingToolTime, TOOL_DEADLINE_META } from "../tool-request-budget.js";
 import { jsonReply } from "../bounded-reply.js";
+import { currentInvocation } from "../session/invocations.js";
 import { dispatchPeerRequest, isTransientPeerFailure } from "./read-retry.js";
 import { dispatchConsoleRequest } from "./console-request.js";
 
@@ -414,8 +415,13 @@ export class FederationRuntime extends EventEmitter {
       if (handle) { node = handle.node; args.workspace_id = handle.local; }
     }
     // Credentials and transport callbacks never become RPC arguments.
-    const trustedInvocation = extra.trustedInvocation as TrustedInvocationEnvelope | undefined
+    const trusted = extra.trustedInvocation as TrustedInvocationEnvelope | undefined
       ?? this.trustedInvocation(name, input, extra);
+    const attempt = currentInvocation();
+    const trustedInvocation = trusted && attempt?.tool_name === name && attempt.owner_id === trusted.owner_id
+      && String(attempt.request_id) === trusted.request_id
+      ? {...trusted, invocation_id: attempt.invocation_id, operation_id: attempt.operation_id}
+      : trusted;
     const identity = safeForwardedContext(extra);
     const deadlineAt=toolDeadline(name,args,extra._meta);
     const context = { _meta: { ...(identity.conversation_id ? { "openai/session": identity.conversation_id } : {}),

@@ -13,7 +13,8 @@ test("初始数据库创建全部工作区、任务和认证表", () => {
   try {
     migrateDatabase(db);
     assert.deepEqual(db.prepare("SELECT version,name FROM qm_schema_migrations").all(),
-      [{version:1,name:"quaymesh-initial"},{version:2,name:"quaymesh-runtime-ownership"},{version:3,name:"quaymesh-durable-results"},{version:4,name:"quaymesh-task-lifecycle"}]);
+      [{version:1,name:"quaymesh-initial"},{version:2,name:"quaymesh-runtime-ownership"},{version:3,name:"quaymesh-durable-results"},{version:4,name:"quaymesh-task-lifecycle"},
+        {version:5,name:"quaymesh-execution-observation"},{version:6,name:"quaymesh-invocation-attempts"}]);
     for (const name of ["workspace_sessions","oauth_clients","console_work_runs","execution_claims",
       "local_agent_sessions","qm_sessions","qm_tasks","qm_task_members","qm_task_snapshots","qm_task_context",
       "qm_runtime_work","qm_runtime_admission","qm_transfers","qm_task_change_baselines","qm_task_file_changes","qm_task_finalizations"]) {
@@ -81,7 +82,7 @@ test("附件版本二数据库增量升级，保留既有任务并创建持久�
     migrateDatabase(db);migrateDatabase(db);
     const row=db.prepare("SELECT title,source_task_id FROM qm_tasks WHERE id=?").get("v2-task") as {title:string;source_task_id:null};
     assert.equal(row.title,"保留原任务");assert.equal(row.source_task_id,null);
-    assert.equal((db.prepare("SELECT COUNT(*) n FROM qm_schema_migrations").get() as {n:number}).n,4);
+    assert.equal((db.prepare("SELECT COUNT(*) n FROM qm_schema_migrations").get() as {n:number}).n,LATEST_DATABASE_VERSION);
     for(const table of ["qm_operation_keys","qm_process_handles","qm_context_results","qm_task_checkpoints"]) {
       assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(table));
     }

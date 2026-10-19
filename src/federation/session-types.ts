@@ -25,6 +25,7 @@ export interface SessionFeedUpdate {
 
 export interface TrustedInvocationEnvelope {
   invocation_id: string;
+  operation_id?: string;
   owner_id: string;
   conversation_id: string | null;
   transport_instance_id: string;

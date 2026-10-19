@@ -38,6 +38,7 @@ export interface TaskOwnerReceipt {
 export interface OperationTicket {
   ticket_id: string;
   operation_id: string;
+  invocation_id?: string;
   session_id: SessionId;
   task_id: string;
   member_id: string;
@@ -487,6 +488,8 @@ export class SessionService {
     if(finalization && !finalization.error)throw new Error(`TASK_FINISHING: ${task.id}`);
     const runId = await this.ensureRun(session, member, { kind, label }, task.id);
     const ledger = this.requireLedger();
+    const attempt = context.operation_id ? this.store.findInvocationByOperation(context.owner_id, context.operation_id) : null;
+    if (attempt && attempt.id !== context.invocation_id) throw new Error("OPERATION_RETRY_SUPERSEDED");
     const operationId = ledger.operation({
       id: context.operation_id,
       runId,
@@ -494,10 +497,12 @@ export class SessionService {
       kind,
       label,
       status: "running",
+      retryOfInvocationId: attempt?.retry_of_invocation_id ?? undefined,
     });
     const ticket: OperationTicket = {
       ticket_id: randomUUID(),
       operation_id: operationId,
+      invocation_id: context.invocation_id,
       session_id: session.id,
       task_id: task.id,
       member_id: member.id,
@@ -514,9 +519,10 @@ export class SessionService {
       task_id: task.id,
       member_id: member.id,
       type: "operation_started",
-      source_id: operationId,
+      source_id: `${operationId}:${context.invocation_id}`,
       timestamp: new Date().toISOString(),
-      payload: { operation_id: operationId, kind, label, run_id: runId, actor: context.actor },
+      payload: { operation_id: operationId, invocation_id: context.invocation_id,
+        retry_of_invocation_id: attempt?.retry_of_invocation_id ?? undefined, kind, label, run_id: runId, actor: context.actor },
     });
 
     return ticket;
@@ -535,10 +541,11 @@ export class SessionService {
     return { revision: snapshot.rev, snapshot, files: this.store.fileSummaries(sessionId, memberId, taskId) };
   }
 
-  async finishOperationById(operationId: string, result: OperationFinishResult): Promise<void> {
+  async finishOperationById(operationId: string, result: OperationFinishResult, invocationId?: string): Promise<void> {
     const event = this.store.findOperationEvent(operationId);
     if (!event) throw new Error(`OPERATION_NOT_FOUND: ${operationId}`);
     const invocation = this.store.findInvocationByOperationId(operationId);
+    if (invocationId && invocation?.id !== invocationId) return;
     if (invocation) {
       this.store.updateInvocation({
         ownerId: invocation.owner_id,
@@ -553,6 +560,7 @@ export class SessionService {
     await this.operationFinished({
       ticket_id: operationId,
       operation_id: operationId,
+      invocation_id: invocation?.id,
       session_id: event.session_id,
       task_id: event.task_id ?? this.store.currentTask(event.session_id)?.id ?? "",
       member_id: event.member_id,
@@ -567,7 +575,7 @@ export class SessionService {
   }
 
   async operationFinished(ticket: OperationTicket, result: OperationFinishResult): Promise<void> {
-    if (this.store.hasOperationFinished(ticket.operation_id)) return;
+    if (this.supersededAttempt(ticket) || this.store.hasOperationFinished(ticket.operation_id, ticket.invocation_id)) return;
     if (result.status === OperationState.accepted || result.status === OperationState.queued || result.status === OperationState.running) {
       this.operationProgress(ticket, { effect: result.effect, result_ref: result.result_ref });
       return;
@@ -586,16 +594,17 @@ export class SessionService {
           reference: JSON.stringify({ error: result.error_message ?? null, effect: result.effect, result_ref: result.result_ref ?? null }),
           outcome: "failed",
         }]
-      : [{ label: "operation_completed", reference: JSON.stringify({ effect: result.effect, result_ref: result.result_ref ?? null }), outcome: "passed" }]);
+      : [{ label: "operation_completed", reference: JSON.stringify({ effect: result.effect, result_ref: result.result_ref ?? null }), outcome: "passed" }], ticket.invocation_id);
     this.store.appendEvent({
       session_id: ticket.session_id,
       task_id: ticket.task_id,
       member_id: ticket.member_id,
       type: "operation_finished",
-      source_id: `${ticket.operation_id}-finish`,
+      source_id: `${ticket.operation_id}${ticket.invocation_id ? `:${ticket.invocation_id}` : ""}-finish`,
       timestamp: new Date().toISOString(),
       payload: {
         operation_id: ticket.operation_id,
+        invocation_id: ticket.invocation_id,
         status: result.status,
         actor: ticket.actor,
         effect: result.effect,
@@ -621,17 +630,18 @@ export class SessionService {
   }
 
   operationProgress(ticket: OperationTicket, result: OperationProgressResult): void {
-    if (this.store.hasOperationFinished(ticket.operation_id)) return;
+    if (this.supersededAttempt(ticket) || this.store.hasOperationFinished(ticket.operation_id, ticket.invocation_id)) return;
     this.store.setExecutionState(ticket.session_id, ExecutionState.active);
     this.store.appendEvent({
       session_id: ticket.session_id,
       task_id: ticket.task_id,
       member_id: ticket.member_id,
       type: "operation_started",
-      source_id: `${ticket.operation_id}-progress`,
+      source_id: `${ticket.operation_id}${ticket.invocation_id ? `:${ticket.invocation_id}` : ""}-progress`,
       timestamp: new Date().toISOString(),
       payload: {
         operation_id: ticket.operation_id,
+        invocation_id: ticket.invocation_id,
         kind: ticket.kind,
         label: ticket.label,
         run_id: ticket.run_id,
@@ -647,6 +657,11 @@ export class SessionService {
 
   operationTransportLost(ticket: OperationTicket): void {
     this.store.updateObservedHostState(ticket.session_id, HostState.disconnected);
+  }
+
+  private supersededAttempt(ticket: OperationTicket): boolean {
+    const current = this.store.findInvocationByOperationId(ticket.operation_id);
+    return Boolean(ticket.invocation_id && current && current.id !== ticket.invocation_id);
   }
 
   async agentEvent(sessionId: SessionId, memberId: string, event: Record<string, unknown>, taskId?: string): Promise<void> {

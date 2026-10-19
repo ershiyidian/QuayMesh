@@ -30,6 +30,7 @@ export class TaskDataStore {
   operationObservations(taskId: string, memberId: string): Array<{id:string;status:string;effect:string|null;observed_at:string|null}> {
     return this.db.prepare(`select o.id,o.status,i.effect,o.observed_at from console_operations o
       join qm_run_links l on l.run_id=o.run_id left join qm_invocations i on i.operation_id=o.id
+        and not exists(select 1 from qm_invocations n where n.retry_of_invocation_id=i.id)
       where l.task_id=? and l.member_id=? and o.status in ('starting','queued','running')
       and (i.finished_at is null or i.state not in ('succeeded','failed','cancelled'))`)
       .all(taskId,memberId) as Array<{id:string;status:string;effect:string|null;observed_at:string|null}>;

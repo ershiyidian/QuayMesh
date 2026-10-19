@@ -326,6 +326,8 @@ export const quaymeshInvocations = sqliteTable(
     toolName: text("tool_name").notNull(),
     argumentsJson: text("arguments_json").notNull(),
     operationId: text("operation_id"),
+    taskId: text("task_id"),
+    retryOfInvocationId: text("retry_of_invocation_id"),
     state: text("state").notNull(),
     effect: text("effect").notNull(),
     resultRef: text("result_ref"),

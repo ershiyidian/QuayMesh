@@ -30,6 +30,7 @@ export interface SessionRequestIdentity {
   transport_instance_id: string;
   request_id: string | number;
   invocation_id?: string;
+  operation_id?: string;
   task_id?: string;
 }
 
@@ -43,6 +44,7 @@ export interface SessionRequestIdentityInput {
   _meta?: unknown;
   trustedInvocation?: {
     invocation_id?: string;
+    operation_id?: string;
     task_id?: string;
     owner_id?: string;
     conversation_id?: string | null;
@@ -86,6 +88,7 @@ export function sessionRequestIdentity(
     transport_instance_id: transportInstanceId,
     request_id: requestId,
     ...(input.trustedInvocation?.invocation_id ? { invocation_id: input.trustedInvocation.invocation_id } : {}),
+    ...(input.trustedInvocation?.operation_id ? { operation_id: input.trustedInvocation.operation_id } : {}),
     ...(input.trustedInvocation?.task_id ? { task_id: input.trustedInvocation.task_id } : {}),
   };
 }

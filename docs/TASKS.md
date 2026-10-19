@@ -59,6 +59,8 @@ Continue from the returned `next_cursor`. `write_stdin` sends input or resizes a
 
 Keep the same `operation_key` when retrying an intended write or command submission. A new key represents a new operation.
 
+When `EXECUTION_CONFLICT` or `NODE_ADMISSION_PAUSED` returns `effect: not_started` and `retry_hint: retry_later`, retry with that key after the blocker clears. A new request can attempt admission again within the original active task and workspace, retaining the same `operation_id` and the original refusal. Concurrent retries share one attempt. Completed, cancelled, partial, unknown, and permanent input errors do not restart the operation. Historical receipts without a provable original task remain queryable and cannot be reassigned to a later task.
+
 ## Work with coding agents
 
 `spawn_agent` starts an agent task and returns its accepted operation. `list_agents` and `wait_agent` expose progress and retained results.

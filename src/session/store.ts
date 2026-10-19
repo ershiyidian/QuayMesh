@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import { canonicalWorkspaceRoot, canonicalPathIdentity } from "../roots.js";
 import { resolve } from "node:path";
 import { TaskDataStore, type ContextReadInput } from "./task-data.js";
+import { retryableAdmission } from "./outcome.js";
 import {
   ExecutionState,
   HostState,
@@ -30,6 +31,8 @@ interface InvocationRow {
   tool_name: string;
   arguments_json: string;
   operation_id: string | null;
+  task_id: string | null;
+  retry_of_invocation_id: string | null;
   state: OperationState;
   effect: "not_started" | "started" | "partial" | "completed" | "unknown";
   result_ref: string | null;
@@ -959,8 +962,10 @@ export class SessionStore {
   }> {
     const rows = this.db
       .prepare(
-        `SELECT operation_id, agent_id, session_id, member_id
+        `SELECT operations.operation_id, operations.agent_id, operations.session_id, operations.member_id
          FROM qm_agent_operations AS operations
+         LEFT JOIN qm_invocations AS current ON current.operation_id=operations.operation_id
+           AND NOT EXISTS(SELECT 1 FROM qm_invocations n WHERE n.retry_of_invocation_id=current.id)
          WHERE NOT EXISTS (
            SELECT 1
            FROM qm_events AS events
@@ -969,8 +974,10 @@ export class SessionStore {
                events.source_id = operations.operation_id || '-finish'
                OR json_extract(events.data_json, '$.operation_id') = operations.operation_id
              )
+             AND (current.id IS NULL OR json_extract(events.data_json,'$.invocation_id')=current.id
+               OR current.retry_of_invocation_id IS NULL AND json_extract(events.data_json,'$.invocation_id') IS NULL)
          )
-         ORDER BY created_at ASC`,
+         ORDER BY operations.created_at ASC`,
       )
       .all() as Array<Record<string, unknown>>;
     return rows.map((row) => ({
@@ -1048,8 +1055,12 @@ export class SessionStore {
       const latestCompleted = this.db
         .prepare(
           `SELECT data_json
-           FROM qm_events
+           FROM qm_events AS e
            WHERE session_id = ? AND member_id = ? AND event_type = 'operation_finished'
+             AND NOT EXISTS(SELECT 1 FROM qm_invocations i
+               WHERE i.operation_id=json_extract(e.data_json,'$.operation_id') AND i.retry_of_invocation_id IS NOT NULL
+                 AND NOT EXISTS(SELECT 1 FROM qm_invocations n WHERE n.retry_of_invocation_id=i.id)
+                 AND COALESCE(json_extract(e.data_json,'$.invocation_id'),'')<>i.id)
            ORDER BY sequence DESC LIMIT 1`,
         )
         .get(sessionId, memberId) as { data_json: string } | undefined;
@@ -1070,10 +1081,14 @@ export class SessionStore {
                  PARTITION BY json_extract(data_json, '$.operation_id')
                  ORDER BY sequence DESC
                ) AS event_rank
-             FROM qm_events
+             FROM qm_events AS e
              WHERE session_id = ? AND member_id = ?
                AND event_type IN ('operation_started', 'operation_finished')
                AND json_extract(data_json, '$.operation_id') IS NOT NULL
+               AND NOT EXISTS(SELECT 1 FROM qm_invocations i
+                 WHERE i.operation_id=json_extract(e.data_json,'$.operation_id') AND i.retry_of_invocation_id IS NOT NULL
+                   AND NOT EXISTS(SELECT 1 FROM qm_invocations n WHERE n.retry_of_invocation_id=i.id)
+                   AND COALESCE(json_extract(e.data_json,'$.invocation_id'),'')<>i.id)
            )
            SELECT
              SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded,
@@ -1179,7 +1194,7 @@ export class SessionStore {
     const row = this.db
       .prepare(
         `SELECT id, owner_id, transport_instance_id, request_id, session_id, member_id, tool_name,
-                arguments_json, operation_id, state, effect, result_ref, result_json, created_at, finished_at, response_at
+                arguments_json, operation_id, task_id, retry_of_invocation_id, state, effect, result_ref, result_json, created_at, finished_at, response_at
          FROM qm_invocations
          WHERE owner_id = ? AND transport_instance_id = ? AND request_id = ?`,
       )
@@ -1191,10 +1206,11 @@ export class SessionStore {
     const row = this.db
       .prepare(
         `SELECT id, owner_id, transport_instance_id, request_id, session_id, member_id, tool_name,
-                arguments_json, operation_id, state, effect, result_ref, result_json, created_at, finished_at, response_at
-         FROM qm_invocations
+                arguments_json, operation_id, task_id, retry_of_invocation_id, state, effect, result_ref, result_json, created_at, finished_at, response_at
+         FROM qm_invocations AS i
          WHERE owner_id = ? AND operation_id = ?
-         ORDER BY created_at DESC LIMIT 1`,
+           AND NOT EXISTS (SELECT 1 FROM qm_invocations n WHERE n.retry_of_invocation_id=i.id)
+         ORDER BY rowid DESC LIMIT 1`,
       )
       .get(ownerId, operationId) as InvocationRow | undefined;
     return row ?? null;
@@ -1204,10 +1220,11 @@ export class SessionStore {
     const row = this.db
       .prepare(
         `SELECT id, owner_id, transport_instance_id, request_id, session_id, member_id, tool_name,
-                arguments_json, operation_id, state, effect, result_ref, result_json, created_at, finished_at, response_at
-         FROM qm_invocations
+                arguments_json, operation_id, task_id, retry_of_invocation_id, state, effect, result_ref, result_json, created_at, finished_at, response_at
+         FROM qm_invocations AS i
          WHERE operation_id = ?
-         ORDER BY created_at DESC LIMIT 1`,
+           AND NOT EXISTS (SELECT 1 FROM qm_invocations n WHERE n.retry_of_invocation_id=i.id)
+         ORDER BY rowid DESC LIMIT 1`,
       )
       .get(operationId) as InvocationRow | undefined;
     return row ?? null;
@@ -1224,22 +1241,40 @@ export class SessionStore {
     argumentsJson: string;
     operationId?: string | null;
     operationKey?: string;
+    taskId?: string;
+    retryOfInvocationId?: string;
   }): InvocationRow {
     return this.db.transaction(() => {
+      const sameRequest = this.findInvocation(input.ownerId, input.transportInstanceId, input.requestId);
+      if (sameRequest) return sameRequest;
+      let previous: InvocationRow | null = null;
       if (input.operationKey) {
         const saved = this.findKeyedInvocation(input.ownerId, input.sessionId, input.memberId, input.operationKey);
-        if (saved) return saved;
+        if (saved) {
+          if (saved.id !== input.retryOfInvocationId || !retryableAdmission(saved)) return saved;
+          const task = saved.task_id ? this.getTask(saved.task_id) : null;
+          if (!task || task.state !== "active" || task.id !== input.taskId || this.taskData.finalization(task.id)
+            || saved.session_id !== input.sessionId || saved.member_id !== input.memberId
+            || saved.tool_name !== input.toolName || saved.arguments_json !== input.argumentsJson
+            || saved.operation_id !== input.operationId) throw new Error("OPERATION_RETRY_SCOPE_MISMATCH");
+          previous = saved;
+        }
       }
       this.db.prepare(`INSERT INTO qm_invocations
         (id,owner_id,transport_instance_id,request_id,session_id,member_id,tool_name,
-         arguments_json,operation_id,state,effect,result_ref,result_json,created_at,finished_at)
-        VALUES(?,?,?,?,?,?,?,?,?,'accepted','not_started',NULL,NULL,?,NULL)`)
+         arguments_json,operation_id,task_id,retry_of_invocation_id,state,effect,result_ref,result_json,created_at,finished_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,'accepted','not_started',NULL,NULL,?,NULL)`)
         .run(input.id,input.ownerId,input.transportInstanceId,input.requestId,input.sessionId,input.memberId,
-          input.toolName,input.argumentsJson,input.operationId ?? null,new Date().toISOString());
+          input.toolName,input.argumentsJson,input.operationId ?? null,input.taskId ?? null,previous?.id ?? null,new Date().toISOString());
       if (input.operationKey) {
         const member = this.getMember(input.sessionId, input.memberId);
-        this.db.prepare("INSERT INTO qm_operation_keys(owner_id,node_id,root,operation_key,invocation_id) VALUES(?,?,?,?,?)")
-          .run(input.ownerId,member.node_id,member.root,input.operationKey,input.id);
+        if (previous) {
+          const switched = this.db.prepare(`UPDATE qm_operation_keys SET invocation_id=?
+            WHERE owner_id=? AND node_id=? AND root=? AND operation_key=? AND invocation_id=?`)
+            .run(input.id,input.ownerId,member.node_id,member.root,input.operationKey,previous.id);
+          if (switched.changes !== 1) throw new Error("OPERATION_RETRY_SUPERSEDED");
+        } else this.db.prepare("INSERT INTO qm_operation_keys(owner_id,node_id,root,operation_key,invocation_id) VALUES(?,?,?,?,?)")
+            .run(input.ownerId,member.node_id,member.root,input.operationKey,input.id);
       }
       return this.findInvocation(input.ownerId,input.transportInstanceId,input.requestId)!;
     }).immediate();
@@ -1258,6 +1293,8 @@ export class SessionStore {
       state=COALESCE(
         (SELECT json_extract(e.data_json,'$.status') FROM qm_events e
           WHERE json_extract(e.data_json,'$.operation_id')=i.operation_id AND e.event_type='operation_finished'
+            AND (json_extract(e.data_json,'$.invocation_id')=i.id
+              OR json_extract(e.data_json,'$.invocation_id') IS NULL AND i.retry_of_invocation_id IS NULL)
             AND json_extract(e.data_json,'$.status') IN ('succeeded','failed','cancelled')
           ORDER BY e.sequence DESC LIMIT 1),
         (SELECT CASE o.status WHEN 'completed' THEN 'succeeded' WHEN 'failed' THEN 'failed' WHEN 'cancelled' THEN 'cancelled' ELSE 'unknown' END
@@ -1265,8 +1302,10 @@ export class SessionStore {
       effect=CASE WHEN (SELECT status FROM console_operations WHERE id=i.operation_id)='reconciliation_required'
         THEN 'unknown' ELSE 'completed' END,
       finished_at=COALESCE((SELECT finished_at FROM console_operations WHERE id=i.operation_id),i.finished_at)
-      WHERE i.state IN ('accepted','queued','running') AND EXISTS(
-        SELECT 1 FROM console_operations o WHERE o.id=i.operation_id AND o.status IN ('completed','failed','cancelled','reconciliation_required')
+      WHERE i.state IN ('accepted','queued','running')
+      AND NOT EXISTS(SELECT 1 FROM qm_invocations n WHERE n.retry_of_invocation_id=i.id) AND EXISTS(
+        SELECT 1 FROM console_operations o WHERE o.id=i.operation_id AND (i.retry_of_invocation_id IS NULL OR o.request_key=i.id)
+          AND o.status IN ('completed','failed','cancelled','reconciliation_required')
       )`).run().changes;
   }
 
@@ -1294,6 +1333,8 @@ export class SessionStore {
     return this.db.transaction(() => {
       const current = this.findInvocation(input.ownerId, input.transportInstanceId, input.requestId);
       if (!current) throw new Error("INVOCATION_NOT_FOUND");
+      // 已被后续尝试取代的记录及其原始错误回执不可改写。
+      if (this.db.prepare("SELECT 1 FROM qm_invocations WHERE retry_of_invocation_id=?").get(current.id)) return current;
       const terminal = ![OperationState.accepted, OperationState.queued, OperationState.running].includes(current.state);
       const final = [OperationState.succeeded,OperationState.failed,OperationState.cancelled].includes(current.state);
       const regresses = input.state !== undefined && input.state !== current.state && (final
@@ -1567,7 +1608,7 @@ export class SessionStore {
          FROM qm_events
          WHERE event_type = 'operation_started'
            AND (source_id = ? OR json_extract(data_json, '$.operation_id') = ?)
-         ORDER BY sequence ASC LIMIT 1`,
+         ORDER BY sequence DESC LIMIT 1`,
       )
       .get(operationId, operationId) as Record<string, unknown> | undefined;
     if (!row) return null;
@@ -1583,15 +1624,19 @@ export class SessionStore {
     };
   }
 
-  hasOperationFinished(operationId: string): boolean {
+  hasOperationFinished(operationId: string, invocationId?: string): boolean {
+    const current = this.findInvocationByOperationId(operationId);
+    const attemptId = invocationId ?? current?.id ?? null;
     return Boolean(this.db
       .prepare(
         `SELECT 1 FROM qm_events
          WHERE event_type = 'operation_finished'
            AND (source_id = ? OR json_extract(data_json, '$.operation_id') = ?)
+           AND (? IS NULL OR json_extract(data_json,'$.invocation_id')=?
+             OR (? AND json_extract(data_json,'$.invocation_id') IS NULL))
          LIMIT 1`,
       )
-      .get(`${operationId}-finish`, operationId));
+      .get(`${operationId}-finish`, operationId, attemptId, attemptId, current?.retry_of_invocation_id ? 0 : 1));
   }
 
   replaceFileSummaries(

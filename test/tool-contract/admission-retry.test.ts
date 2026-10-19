@@ -1,0 +1,81 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {randomUUID} from "node:crypto";
+import {readFile, writeFile} from "node:fs/promises";
+import {join} from "node:path";
+import {CallToolResultSchema} from "@modelcontextprotocol/sdk/types.js";
+import {openDatabase} from "../../src/db/client.js";
+import {SessionStore} from "../../src/session/store.js";
+import {twoNodes, until} from "./fixture.js";
+
+test("a refused federated command retries the same operation once after its real claim is released", {timeout: 60000}, async t => {
+  const {worker, cloud} = await twoNodes(t);
+  const meta = {"openai/session": randomUUID()};
+  // 读取原始错误回执，单独验证准入行为；callTool 的错误 schema 兼容另行覆盖。
+  const raw = (name: string, args: Record<string, unknown>) => cloud.client.request({method: "tools/call", params: {name, arguments: args, _meta: meta}}, CallToolResultSchema);
+  assert.notEqual((await raw("start_session", {title: "Admission retry", request_key: randomUUID()})).isError, true);
+  const opened = await raw("open_workspace", {root_id: "worker/main"});
+  assert.notEqual(opened.isError, true, JSON.stringify(opened));
+  const workspaceId = (opened.structuredContent as any).workspace_id;
+  const script = join(worker.project, "append.mjs");
+  await writeFile(script, "import {appendFileSync} from 'node:fs';appendFileSync('once.txt','once\\n');\n");
+  const key = randomUUID();
+  const args = {workspace_id: workspaceId, cmd: `"${process.execPath}" "${script}"`, yield_time_ms: 2000, operation_key: key};
+  const blocker = worker.running.execution.acquire({workspaceRoot: worker.project, kind: "command", access: "write", operationId: "blocking-command"});
+  t.after(() => blocker.release());
+  const refused = await raw("exec_command", args);
+  assert.equal(refused.isError, true, JSON.stringify(refused));
+  assert.equal((refused.structuredContent as any)?.effect, "not_started", JSON.stringify(refused));
+  assert.equal((refused.structuredContent as any)?.retry_hint, "retry_later");
+  const databases = [cloud, worker].map(server => openDatabase(server.config.stateDir));
+  t.after(() => databases.forEach(db => db.close()));
+  const rows = (index: number) => databases[index]!.sqlite.prepare("SELECT * FROM qm_invocations WHERE json_extract(arguments_json,'$.operation_key')=? ORDER BY rowid").all(key) as any[];
+  const old = [rows(0)[0], rows(1)[0]];
+  assert.ok(old.every(row => row?.effect === "not_started"));
+  assert.equal(old[0].operation_id, old[1].operation_id);
+  blocker.release();
+  const retried = await Promise.all([raw("exec_command", args), raw("exec_command", args)]);
+  for (const result of retried) assert.notEqual(result.isError, true, JSON.stringify(result));
+  await until(() => rows(1).at(-1)?.state === "succeeded");
+  assert.equal(await readFile(join(worker.project, "once.txt"), "utf8"), "once\n");
+  for (const index of [0, 1]) {
+    const attempts = rows(index);
+    assert.equal(attempts.length, 2, JSON.stringify(attempts));
+    assert.deepEqual(attempts[0], old[index], "the original refusal remains immutable");
+    assert.equal(attempts[1].operation_id, old[index].operation_id);
+    assert.equal(attempts[1].state, "succeeded");
+    const store = new SessionStore(databases[index]!.sqlite);
+    assert.equal(store.findInvocationByOperationId(old[index].operation_id)?.id, attempts[1].id);
+  }
+  const replay = await raw("exec_command", args);
+  assert.notEqual(replay.isError, true, JSON.stringify(replay));
+  assert.equal((replay.structuredContent as any).operation_id, old[0].operation_id);
+  assert.equal(await readFile(join(worker.project, "once.txt"), "utf8"), "once\n");
+});
+
+test("coordinator preserves the operation ID when worker admission rejected before recording any attempt", {timeout: 60000}, async t => {
+  const {worker, cloud} = await twoNodes(t);
+  const meta = {"openai/session": randomUUID()};
+  const raw = (name: string, args: Record<string, unknown>) => cloud.client.request({method: "tools/call", params: {name, arguments: args, _meta: meta}}, CallToolResultSchema);
+  assert.notEqual((await raw("start_session", {title: "Worker admission", request_key: randomUUID()})).isError, true);
+  const opened = await raw("open_workspace", {root_id: "worker/main"});
+  assert.notEqual(opened.isError, true, JSON.stringify(opened));
+  const key = randomUUID();
+  const args = {workspace_id: (opened.structuredContent as any).workspace_id, cmd: `"${process.execPath}" -e "console.log('admitted')"`, yield_time_ms: 2000, operation_key: key};
+  worker.running.execution.pause("test pause before tool dispatch");
+  const refused = await raw("exec_command", args);
+  assert.equal(refused.isError, true);
+  assert.equal((refused.structuredContent as any)?.error_code, "NODE_ADMISSION_PAUSED");
+  const databases = [cloud, worker].map(server => openDatabase(server.config.stateDir));
+  t.after(() => databases.forEach(db => db.close()));
+  const rows = (index: number) => databases[index]!.sqlite.prepare("SELECT * FROM qm_invocations WHERE json_extract(arguments_json,'$.operation_key')=? ORDER BY rowid").all(key) as any[];
+  const original = rows(0)[0];
+  assert.equal(rows(1).length, 0);
+  worker.running.execution.resume();
+  const retried = await raw("exec_command", args);
+  assert.notEqual(retried.isError, true, JSON.stringify(retried));
+  assert.equal((retried.structuredContent as any).operation_id, original.operation_id);
+  assert.equal(rows(0).length, 2);
+  assert.equal(rows(1).length, 1);
+  assert.equal(rows(1)[0].operation_id, original.operation_id);
+});

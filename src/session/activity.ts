@@ -1,5 +1,25 @@
 import type { SessionEvent } from "./types.js";
 
+/** 读取时只展示当前尝试，原始事件历史保持完整。 */
+export function currentOperationEvents(events: SessionEvent[]): SessionEvent[] {
+  const retried = new Set<string>(), superseded = new Set<string>(), current = new Map<string, string>();
+  for (const event of events) {
+    if (event.type !== "operation_started" || typeof event.payload.retry_of_invocation_id !== "string") continue;
+    retried.add(String(event.payload.operation_id ?? event.source_id));
+    superseded.add(event.payload.retry_of_invocation_id);
+  }
+  for (const event of events) {
+    if (event.type !== "operation_started" && event.type !== "operation_finished") continue;
+    const id = String(event.payload.operation_id ?? event.source_id), attempt = event.payload.invocation_id;
+    if (retried.has(id) && typeof attempt === "string" && !superseded.has(attempt)) current.set(id, attempt);
+  }
+  return events.filter(event => {
+    if (event.type !== "operation_started" && event.type !== "operation_finished") return true;
+    const id = String(event.payload.operation_id ?? event.source_id);
+    return !current.has(id) || event.payload.invocation_id === current.get(id);
+  });
+}
+
 export interface TaskActivity {
   operation_id:string;
   member_id:string;
@@ -37,7 +57,7 @@ export function activityTimes(events:SessionEvent[],memberId?:string):TaskActivi
 export function latestActivity(events: SessionEvent[], memberId?: string): TaskActivity | null {
   const operations=new Map<string,TaskActivity>();
   let latest:TaskActivity|null=null;
-  for(const event of events) {
+  for(const event of currentOperationEvents(events)) {
     if(memberId && event.member_id!==memberId)continue;
     if(!["operation_started","operation_finished"].includes(event.type))continue;
     const id=String(event.payload.operation_id ?? event.source_id);

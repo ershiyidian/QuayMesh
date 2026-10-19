@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
 import { OperationState, type InvocationContext } from "./types.js";
 import type { SessionStore } from "./store.js";
-import { classifyError, type InvocationEffect } from "./outcome.js";
+import { classifyError, errorEnvelope, errorFromEnvelope, retryableAdmission, type InvocationEffect } from "./outcome.js";
 
 export const requestContextStorage = new AsyncLocalStorage<InvocationContext>();
 
@@ -32,6 +32,7 @@ export interface InvocationTransport {
 export interface InvocationRequest {
   id: string | number;
   invocation_id?: string;
+  operation_id?: string;
   conversation_id?: string | null;
   actor?: "model" | "agent" | "app" | "system";
   tool_name?: string;
@@ -80,6 +81,7 @@ export function createInvocationContext(input: {
     transport_instance_id: input.transport.instance_id,
     request_id: input.request.id,
     invocation_id: input.request.invocation_id ?? randomUUID(),
+    ...(input.request.operation_id ? {operation_id: input.request.operation_id} : {}),
     session_id: input.session.session_id,
     ...(input.session.task_id ? { task_id: input.session.task_id } : {}),
     member_id: input.session.member_id,
@@ -110,45 +112,27 @@ export async function executeRecorded<T>(
     ? Object.fromEntries(Object.entries(data).filter(([key]) =>
       !["workspace_id", "yield_time_ms", "max_output_tokens"].includes(key)))
     : input);
-  const existing = operationKey
-    ? store.findKeyedInvocation(context.owner_id, context.session_id, context.member_id, operationKey)
-    : store.findInvocation(context.owner_id, context.transport_instance_id, requestId);
+  const sameRequest = store.findInvocation(context.owner_id, context.transport_instance_id, requestId);
+  const existing = sameRequest ?? (operationKey
+    ? store.findKeyedInvocation(context.owner_id, context.session_id, context.member_id, operationKey) : null);
+  let retryOf: string | undefined;
   if (existing) {
+    if (context.operation_id && existing.operation_id && context.operation_id !== existing.operation_id) {
+      throw new Error("OPERATION_ID_MISMATCH");
+    }
     context.operation_id = existing.operation_id ?? undefined;
     if (existing.tool_name !== context.tool_name || existing.arguments_json !== argumentsJson) {
       throw new Error("REQUEST_ID_REUSED");
     }
-    if (existing.result_json !== null) {
-      return {
-        replay: true,
-        result: JSON.parse(existing.result_json) as T,
-        invocation_id: existing.id,
-        operation_id: existing.operation_id,
-        state: existing.state,
-        effect: existing.effect,
-        result_ref: existing.result_ref,
-      };
-    }
-    const completed = await waitForInvocationResult(store, existing.owner_id, existing.transport_instance_id, existing.request_id);
-    if (completed?.result_json !== null && completed?.result_json !== undefined) {
-      return {
-        replay: true,
-        result: JSON.parse(completed.result_json) as T,
-        invocation_id: completed.id,
-        operation_id: completed.operation_id,
-        state: completed.state,
-        effect: completed.effect,
-        result_ref: completed.result_ref,
-      };
-    }
-    return {
-      replay: true,
-      invocation_id: existing.id,
-      operation_id: existing.operation_id,
-      state: existing.state,
-      effect: existing.effect,
-      result_ref: existing.result_ref,
-    };
+    if (!sameRequest && operationKey && retryableAdmission(existing)) {
+      const task = existing.task_id ? store.getTask(existing.task_id) : null;
+      if (!task || task.state !== "active" || task.id !== context.task_id
+        || existing.session_id !== context.session_id || existing.member_id !== context.member_id
+        || store.taskData.finalization(task.id)) throw Object.assign(
+          new Error("OPERATION_RETRY_SCOPE_MISMATCH: Retry requires the original active task and workspace member."),
+          {code: "OPERATION_RETRY_SCOPE_MISMATCH", details: {operation_id: existing.operation_id, task_id: existing.task_id}});
+      retryOf = existing.id;
+    } else return replayInvocation<T>(store, existing);
   }
 
   const reserved = store.reserveInvocation({
@@ -160,6 +144,9 @@ export async function executeRecorded<T>(
     memberId: context.member_id,
     toolName: context.tool_name,
     argumentsJson,
+    taskId: context.task_id,
+    operationId: context.operation_id ?? operationIdFrom(context, requestId),
+    retryOfInvocationId: retryOf,
     operationKey,
   });
   if (reserved.id !== context.invocation_id) return executeRecorded(store, context, input, operation);
@@ -181,18 +168,19 @@ export async function executeRecorded<T>(
         invocation_id: cancelled.id, operation_id: cancelled.operation_id,
         state: cancelled.state, effect: cancelled.effect, result_ref: cancelled.result_ref };
     }
-    const message = error instanceof Error ? error.message : String(error);
+    const outcome = classifyError(error, {sideEffecting: operation.sideEffecting ?? false, effectStarted: false});
+    const envelope = errorEnvelope(error, {sideEffecting: operation.sideEffecting ?? false, effectStarted: false});
     store.updateInvocation({
       ownerId: context.owner_id,
       transportInstanceId: context.transport_instance_id,
       requestId,
-      state: OperationState.failed,
-      effect: "not_started",
-      result: { error: message },
+      state: outcome.state,
+      effect: outcome.effect,
+      result: envelope,
       finished: true,
       responded: true,
     });
-    throw error;
+    throw errorFromEnvelope(envelope, error);
   }
   const cancelled = store.findInvocation(context.owner_id, context.transport_instance_id, requestId);
   if (cancelled?.state === OperationState.cancelled && cancelled.result_json !== null) {
@@ -255,21 +243,29 @@ export async function executeRecorded<T>(
         result_ref: saved.result_ref,
       };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
       const outcome=classifyError(error,{sideEffecting:operation.sideEffecting??false,forwarded:operation.forwarded,effectStarted:true});
+      const envelope = errorEnvelope(error, {sideEffecting: operation.sideEffecting ?? false, forwarded: operation.forwarded, effectStarted: true});
       store.updateInvocation({
         ownerId: context.owner_id,
         transportInstanceId: context.transport_instance_id,
         requestId,
         state: outcome.state,
         effect: outcome.effect,
-        result: { error: message,error_code:outcome.code,retry_hint:outcome.retryHint },
+        result: envelope,
         finished: true,
         responded: true,
       });
-      throw error;
+      throw errorFromEnvelope(envelope, error);
     }
   });
+}
+
+async function replayInvocation<T>(store: SessionStore, existing: NonNullable<ReturnType<SessionStore["findInvocation"]>>): Promise<RecordedInvocation<T>> {
+  const saved = existing.result_json !== null ? existing
+    : await waitForInvocationResult(store, existing.owner_id, existing.transport_instance_id, existing.request_id) ?? existing;
+  return {replay: true, ...(saved.result_json !== null ? {result: JSON.parse(saved.result_json) as T} : {}),
+    invocation_id: saved.id, operation_id: saved.operation_id, state: saved.state,
+    effect: saved.effect, result_ref: saved.result_ref};
 }
 
 async function waitForInvocationResult(

@@ -206,7 +206,8 @@ export function readLocalActivity(config: ServerConfig, kind: string, query: { l
     const withHour = filter + ` AND (?='' OR ${hour}=CAST(? AS INTEGER))`;
     const rowParams = [...params, query.hour ?? "", query.hour ?? ""];
     const rows = ledger.db.prepare(`SELECT o.id,o.run_id,o.kind,o.label,o.status,o.created_at,o.finished_at,i.title,
-      (SELECT tool_name FROM qm_invocations WHERE operation_id=o.id ORDER BY created_at DESC LIMIT 1) tool_name
+      (SELECT tool_name FROM qm_invocations i WHERE operation_id=o.id
+        AND NOT EXISTS(SELECT 1 FROM qm_invocations n WHERE n.retry_of_invocation_id=i.id) ORDER BY rowid DESC LIMIT 1) tool_name
       FROM console_operations o JOIN console_work_runs r ON r.id=o.run_id
       JOIN console_work_items i ON i.id=r.item_id WHERE ${withHour} ORDER BY o.created_at DESC,o.id LIMIT ?`).all(...rowParams, query.limit) as Array<OperationRow & { title: string; tool_name: string | null }>;
     const total = (ledger.db.prepare(`SELECT COUNT(*) n FROM console_operations o JOIN console_work_runs r ON r.id=o.run_id JOIN console_work_items i ON i.id=r.item_id WHERE ${withHour}`).get(...rowParams) as { n: number }).n;

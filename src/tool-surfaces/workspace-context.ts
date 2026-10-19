@@ -8,6 +8,7 @@ import type { ToolRegistrationContext } from "./types.js";
 import { jsonReply, replyBytes, REPLY_BYTES, textPage } from "../bounded-reply.js";
 import { currentInvocation } from "../session/invocations.js";
 import type { InvocationContext } from "../session/types.js";
+import { currentOperationEvents } from "../session/activity.js";
 
 const id = z.string().min(1).max(256);
 const fileSelectionSchema = z.object({
@@ -191,7 +192,7 @@ async function statusReply(
   }
   const events = runtime.store.eventsForSession(session.id);
   const byOperation = new Map<string, StatusOperationRow>();
-  for (const event of events) {
+  for (const event of currentOperationEvents(events)) {
     if (event.member_id !== member.id) continue;
     if (event.type !== "operation_started" && event.type !== "operation_finished") continue;
     const id = String(event.payload.operation_id ?? event.source_id);

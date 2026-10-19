@@ -1,4 +1,4 @@
-import { activityTimes, latestActivity } from "./activity.js";
+import { activityTimes, currentOperationEvents, latestActivity } from "./activity.js";
 import { join } from "node:path";
 import { ExecutionState, ReviewState, HostState } from "./types.js";
 import type {
@@ -422,7 +422,7 @@ export class SessionProjector {
 
   private commands(events: SessionEvent[], memberId: string): CommandSummary[] {
     const records = new Map<string, CommandSummary>();
-    for (const event of events) {
+    for (const event of currentOperationEvents(events)) {
       if (event.member_id !== memberId) continue;
       if (event.type !== "operation_started" && event.type !== "operation_finished") continue;
       const operationId = String(event.payload.operation_id ?? event.source_id);

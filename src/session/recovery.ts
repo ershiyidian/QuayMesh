@@ -5,6 +5,7 @@ import { canonicalPathIdentity } from "../roots.js";
 import { validateRecovery } from "./schema.js";
 import type { RecoveryRow, SessionEvent, SessionId } from "./types.js";
 import type { SessionStore } from "./store.js";
+import { currentOperationEvents } from "./activity.js";
 
 const DEFAULT_RECOVERY_ROWS = 5;
 const MAX_DETAIL_ROWS = 20;
@@ -57,7 +58,7 @@ export class RecoveryService {
     if (!row) throw new Error(`RECOVERY_ROW_NOT_FOUND: ${sessionId}`);
     const session = this.store.requireSession(ownerId, sessionId);
     const byOperation = new Map<string, ReturnType<typeof operationFromEvent>>();
-    for (const event of this.store.eventsForSession(sessionId)) {
+    for (const event of currentOperationEvents(this.store.eventsForSession(sessionId))) {
       if (event.type !== "operation_started" && event.type !== "operation_finished") continue;
       const operationId = String(event.payload.operation_id ?? event.source_id);
       byOperation.set(operationId, operationFromEvent(event, operationId, byOperation.get(operationId)));
@@ -75,7 +76,7 @@ export class RecoveryService {
     const ids=new Set(members.map(member=>member.id));
     const events=this.store.eventsForTask(taskId).filter(event=>ids.has(event.member_id));
     const operations=new Map<string,ReturnType<typeof operationFromEvent>>();
-    for(const event of events) {
+    for(const event of currentOperationEvents(events)) {
       if(event.type!=="operation_started" && event.type!=="operation_finished")continue;
       const id=String(event.payload.operation_id ?? event.source_id);
       operations.set(id,operationFromEvent(event,id,operations.get(id)));

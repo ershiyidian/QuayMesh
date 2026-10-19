@@ -7,6 +7,7 @@ import { canonicalWorkspaceRoot } from "./roots.js";
 import type { AgentUsageObservation, TokenCounts } from "./agent-usage.js";
 import { managedSessionTitle } from "./managed-session-title.js";
 import { runChangeSets, runOperations, runPresentation, runTimeline } from "./console-run-data.js";
+import { retryableAdmission } from "./session/outcome.js";
 
 export type UsageQuality = "complete" | "partial" | "unavailable" | "not_used";
 export type WorkOrigin = {
@@ -231,6 +232,8 @@ export class WorkLedger {
     return this.db.transaction(() => {
       const rows = this.db.prepare(`select o.id,o.run_id,i.state,i.finished_at from console_operations o
         join qm_invocations i on i.operation_id=o.id
+          and not exists(select 1 from qm_invocations n where n.retry_of_invocation_id=i.id)
+          and (i.retry_of_invocation_id is null or i.id=o.request_key)
         where o.status in ('starting','queued','running') and i.finished_at is not null
         and i.state in ('succeeded','failed','cancelled')`).all() as Array<{id:string;run_id:string;state:string;finished_at:string}>;
       for (const row of rows) {
@@ -296,11 +299,25 @@ export class WorkLedger {
     }).immediate();
   }
 
-  operation(input: { id?: string; runId: string; requestKey: string; kind: string; label: string; status: string; evidence?: Evidence[] }): string {
+  operation(input: { id?: string; runId: string; requestKey: string; kind: string; label: string; status: string; evidence?: Evidence[]; retryOfInvocationId?: string }): string {
     return this.db.transaction(() => {
       const run = this.run(input.runId);
       if (run.status !== "running") throw new Error("Cannot add operations to a closed work run.");
       const evidence = validateEvidence(input.evidence ?? []);
+      if (input.retryOfInvocationId && input.id) {
+        const refused = this.db.prepare(`SELECT p.state,p.effect,p.result_json FROM qm_invocations i
+          JOIN qm_invocations p ON p.id=i.retry_of_invocation_id JOIN qm_tasks t ON t.id=i.task_id
+          JOIN qm_run_links l ON l.run_id=? AND l.task_id=i.task_id AND l.member_id=i.member_id
+          WHERE i.id=? AND i.operation_id=? AND p.id=? AND i.state='accepted' AND i.effect='not_started'
+            AND t.state='active' AND NOT EXISTS(SELECT 1 FROM qm_invocations n WHERE n.retry_of_invocation_id=i.id)`)
+          .get(input.runId,input.requestKey,input.id,input.retryOfInvocationId) as Parameters<typeof retryableAdmission>[0] | undefined;
+        if (!refused || !retryableAdmission(refused)) throw new Error("OPERATION_RETRY_NOT_ALLOWED");
+        const resumed = this.db.prepare(`UPDATE console_operations SET run_id=?,request_key=?,status=?,evidence=?,finished_at=NULL,observed_at=?
+          WHERE id=? AND request_key=? AND kind=? AND label=? AND status IN ('starting','queued','running','failed')`)
+          .run(input.runId,input.requestKey,input.status,JSON.stringify(evidence),now(),input.id,input.retryOfInvocationId,input.kind.slice(0,64),input.label.slice(0,200));
+        if (resumed.changes) {this.touch(input.runId); return input.id;}
+        if (this.db.prepare("SELECT 1 FROM console_operations WHERE id=?").get(input.id)) throw new Error("OPERATION_RETRY_SUPERSEDED");
+      }
       const previous = this.db.prepare("select * from console_operations where run_id=? and request_key=?")
         .get(input.runId, input.requestKey) as { id: string; kind: string; label: string; status: string; evidence: string } | undefined;
       if (previous) {
@@ -317,11 +334,13 @@ export class WorkLedger {
       this.touch(input.runId); return operationId;
     }).immediate();
   }
-  endOperation(operationId: string, status: "completed" | "failed" | "cancelled" | "reconciliation_required", evidence: Evidence[] = []): void {
+  endOperation(operationId: string, status: "completed" | "failed" | "cancelled" | "reconciliation_required", evidence: Evidence[] = [], requestKey?: string): void {
     const op = this.db.prepare("select run_id,status from console_operations where id=?").get(operationId) as { run_id: string; status: string } | undefined;
     if (!op || !active(op.status)) return;
-    this.db.prepare("update console_operations set status=?, evidence=?, finished_at=? where id=?")
-      .run(status, JSON.stringify(validateEvidence(evidence)), now(), operationId);
+    const updated = this.db.prepare(`update console_operations set status=?, evidence=?, finished_at=? where id=?
+      and status in ('starting','queued','running') and (? is null or request_key=?)`)
+      .run(status, JSON.stringify(validateEvidence(evidence)), now(), operationId, requestKey ?? null, requestKey ?? null);
+    if (!updated.changes) return;
     if (status === "reconciliation_required") this.markRunReconciliationRequired(op.run_id);
     this.touch(op.run_id);
   }

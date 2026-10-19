@@ -12,10 +12,48 @@ export interface ErrorOutcome {
   details?: unknown;
 }
 
+export interface InvocationEnvelope<T> {
+  kind: "result" | "error";
+  value?: T;
+  message?: string;
+  errorCode?: string;
+  errorDetails?: unknown;
+  effect?: InvocationEffect;
+  retryHint?: string;
+}
+
+export function errorEnvelope(error: unknown, options: {sideEffecting: boolean; forwarded?: boolean; effectStarted?: boolean}): InvocationEnvelope<never> {
+  const outcome = classifyError(error, options);
+  return {kind: "error", message: outcome.message, errorCode: outcome.code,
+    effect: outcome.effect, retryHint: outcome.retryHint,
+    ...(outcome.details !== undefined ? {errorDetails: outcome.details} : {})};
+}
+
+export function errorFromEnvelope(envelope: InvocationEnvelope<unknown>, cause?: unknown): Error {
+  return Object.assign(new Error(envelope.message ?? "Tool failed.", cause === undefined ? undefined : {cause}), {
+    code: envelope.errorCode, details: envelope.errorDetails, effect: envelope.effect, retryHint: envelope.retryHint,
+  });
+}
+
+/** 仅明确尚未执行的暂时性准入拒绝允许再次尝试。 */
+export function retryableAdmission(row: {state: OperationState; effect: InvocationEffect; result_json: string | null}): boolean {
+  if (row.state !== OperationState.failed || row.effect !== "not_started" || !row.result_json) return false;
+  const saved = JSON.parse(row.result_json) as InvocationEnvelope<ReturnType<typeof toolErrorResult>>;
+  const error = saved.kind === "error"
+    ? {code: saved.errorCode, effect: saved.effect, hint: saved.retryHint}
+    : saved.kind === "result" && saved.value?.isError === true
+      ? {code: saved.value.structuredContent?.error_code, effect: saved.value.structuredContent?.effect,
+          hint: saved.value.structuredContent?.retry_hint}
+      : null;
+  return error?.effect === "not_started" && error.hint === "retry_later"
+    && (error.code === "EXECUTION_CONFLICT" || error.code === "NODE_ADMISSION_PAUSED");
+}
+
 const NOT_STARTED = new Set([
   "EXECUTION_CONFLICT", "NODE_ADMISSION_PAUSED", "ACCESS_DENIED", "WORKSPACE_NOT_FOUND", "WORKSPACE_MISMATCH",
   "TASK_SESSION_MISMATCH", "TASK_NOT_FOUND", "INVALID_TASK", "INVALID_ARGUMENT", "OPERATION_KEY_INVALID",
   "REQUEST_ID_REUSED", "ENOENT", "EACCES", "EPERM", "EINVAL", "ZOD_ERROR",
+  "OPERATION_RETRY_SCOPE_MISMATCH", "OPERATION_RETRY_NOT_ALLOWED", "OPERATION_RETRY_SUPERSEDED", "OPERATION_ID_MISMATCH",
 ]);
 const UNKNOWN = new Set([
   "REQUEST_TIMEOUT", "RPC_INTERRUPTED", "NODE_UNAVAILABLE", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT",
@@ -48,7 +86,7 @@ export function classifyError(error: unknown, options: { sideEffecting: boolean;
   else effect="not_started";
   const state=effect==="unknown"?OperationState.unknown:OperationState.failed;
   const retryHint:RetryHint=effect==="unknown"?"query_original"
-    : code==="EXECUTION_CONFLICT"||code==="NODE_ADMISSION_PAUSED"?"retry_later"
+    : effect==="not_started"&&(code==="EXECUTION_CONFLICT"||code==="NODE_ADMISSION_PAUSED")?"retry_later"
       : effect==="not_started"?"fix_input"
         : "do_not_retry";
   return {code,state,effect,retryHint,message,...(value.details!==undefined?{details:value.details}:{})};

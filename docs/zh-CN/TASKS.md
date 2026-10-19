@@ -61,6 +61,8 @@ QuayMesh 将一次用户请求涉及的工作区、命令、文件和编程代�
 
 重试同一次写入或命令提交时，继续使用原来的 `operation_key`；新的标识代表新的操作。
 
+如果 `EXECUTION_CONFLICT` 或 `NODE_ADMISSION_PAUSED` 返回 `effect: not_started` 和 `retry_hint: retry_later`，等待占用解除后使用原 key 重试。新请求可以在原来仍活跃的任务和工作区内重新申请执行，保留同一个 `operation_id` 和最初的拒绝记录；并发重试共用一次尝试。已完成、已取消、部分执行、效果未知及永久参数错误不会重新执行。无法证明原任务归属的历史回执仍可查询，但不能转给后来的任务执行。
+
 ## 使用编程代理
 
 `spawn_agent` 创建代理任务并返回已接收的操作。通过 `list_agents` 和 `wait_agent` 查看进度与已保存的结果。

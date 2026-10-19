@@ -10,7 +10,7 @@ import type { WorkspaceRegistry } from "../workspaces.js";
 import { parseWorkspaceHandle } from "../federation/routing.js";
 import { OperationState } from "./types.js";
 import { observesAcceptedWork } from "../tool-admission.js";
-import { classifyError, type InvocationEffect } from "./outcome.js";
+import { classifyError, errorEnvelope, errorFromEnvelope, type InvocationEnvelope } from "./outcome.js";
 import type { ExecutionCoordinator } from "../execution-coordinator.js";
 
 export interface ModelToolIdentity {
@@ -19,6 +19,7 @@ export interface ModelToolIdentity {
   transport_instance_id: string;
   request_id: string | number;
   invocation_id?: string;
+  operation_id?: string;
   task_id?: string;
 }
 
@@ -48,24 +49,6 @@ export interface RecordModelToolInput<T> {
     error_message?: string | null;
     exit_code?: number | null;
   } | null;
-}
-
-interface InvocationEnvelope<T> {
-  kind: "result" | "error";
-  value?: T;
-  message?: string;
-  errorCode?:string;
-  errorDetails?:unknown;
-  effect?:InvocationEffect;
-  retryHint?:string;
-}
-
-function errorEnvelope(error: unknown, options:{sideEffecting:boolean;forwarded?:boolean;effectStarted?:boolean}): InvocationEnvelope<never> {
-  const value=error as {code?:unknown;details?:unknown};
-  const outcome=classifyError(error,options);
-  return {kind:"error",message:error instanceof Error?error.message:String(error),
-    errorCode:outcome.code,effect:outcome.effect,retryHint:outcome.retryHint,
-    ...(value?.details!==undefined?{errorDetails:value.details}:{})};
 }
 
 export class SessionToolRecorder {
@@ -100,6 +83,7 @@ export class SessionToolRecorder {
       request: {
         id: identity.request_id,
         invocation_id: identity.invocation_id,
+        operation_id: identity.operation_id,
         conversation_id: identity.conversation_id,
         actor: "model",
       },
@@ -132,6 +116,7 @@ export class SessionToolRecorder {
       request: {
         id: identity.request_id,
         invocation_id: identity.invocation_id,
+        operation_id: identity.operation_id,
         conversation_id: identity.conversation_id,
         actor: "model",
         tool_name: toolName,
@@ -346,8 +331,7 @@ export class SessionToolRecorder {
 }
 
 function unwrapEnvelope<T>(envelope: InvocationEnvelope<T>): T {
-  if (envelope.kind === "error") throw Object.assign(new Error(envelope.message ?? "Tool failed."),{
-    code:envelope.errorCode,details:envelope.errorDetails,effect:envelope.effect,retryHint:envelope.retryHint,
-  });
+  if (envelope.kind === "error") throw errorFromEnvelope(envelope);
+  if (envelope.kind !== "result") throw new Error("INVOCATION_RESULT_INVALID: Stored receipt has no result or error envelope.");
   return envelope.value as T;
 }
