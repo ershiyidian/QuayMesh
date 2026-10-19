@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { Result, type Result as BetterResult } from "better-result";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -34,6 +36,7 @@ import { WorkLedger } from "../work-ledger.js";
 import { ProcessSessionManager } from "../process-sessions.js";
 import { SqliteWorkspaceStore } from "../workspace-store.js";
 import { WorkspaceRegistry } from "../workspaces.js";
+import { inspectPython } from "../workspace-environment.js";
 import type { ensureDesktopProject } from "../codex-projects.js";
 
 const OWNER_ID = "owner-subagents";
@@ -363,6 +366,66 @@ function latestInvocation(stateDir: string, toolName: string, sessionId: string)
     database.close();
   }
 }
+
+test("只读环境查询不执行解释器或项目的 Python 启动代码", { timeout: 60_000 }, async t => {
+  const f = await fixture(t);
+  const session = await openSession(f.client, f, "conversation-environment");
+  const python = await inspectPython(f.project);
+  if (!("executable" in python)) throw new Error("PYTHON_UNAVAILABLE");
+  const marker = join(f.project, "python-started");
+  await writeFile(join(f.project, "sitecustomize.py"), [
+    "from pathlib import Path",
+    "Path(__file__).with_name('python-started').write_text('executed', encoding='utf-8')",
+  ].join("\n"));
+  const previousPythonPath = process.env.PYTHONPATH;
+  process.env.PYTHONPATH = [f.project, previousPythonPath].filter(Boolean).join(delimiter);
+  t.after(() => {
+    if (previousPythonPath === undefined) delete process.env.PYTHONPATH;
+    else process.env.PYTHONPATH = previousPythonPath;
+  });
+  // 真实解释器先证明该启动代码会写文件，再验证只读 MCP 查询不会启动它。
+  await promisify(execFile)(python.executable, ["-c", "pass"], { cwd: f.project });
+  assert.equal(await readFile(marker, "utf8"), "executed");
+  await rm(marker);
+  for (const requested of [undefined, python.executable]) {
+    const result = await callTool(f.client, "workspace_context", {
+      workspace_id: session.workspaceId, action: "status", environment: true,
+      ...(requested ? { python: requested } : {}),
+    }, "conversation-environment");
+    assert.notEqual(result.isError, true, JSON.stringify(result));
+    const env = structuredContent(result).python as Record<string, any>;
+    await assert.rejects(stat(marker), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+    assert.equal(env.verification, "not_run");
+    assert.ok(env.candidates.includes(env.executable));
+    assert.equal(env.available, undefined);
+    assert.equal(env.version, undefined);
+  }
+  const absent = await callTool(f.client, "workspace_context", {
+    workspace_id: session.workspaceId, action: "status", environment: true,
+    python: join(f.project, "missing-python"),
+  }, "conversation-environment");
+  assert.notEqual(absent.isError, true, JSON.stringify(absent));
+  assert.deepEqual(structuredContent(absent).python, {
+    executable: null, candidates: [], verification: "not_run",
+  });
+});
+
+test("真实 MCP 注解保留代理执行、观察和中断的能力边界", async t => {
+  const f = await fixture(t);
+  const { tools } = await f.client.listTools();
+  const annotations = (name: string) => tools.find(tool => tool.name === name)?.annotations;
+  for (const name of ["spawn_agent", "followup_agent", "send_message"]) {
+    assert.equal(annotations(name)?.readOnlyHint, false, name);
+    assert.equal(annotations(name)?.destructiveHint, true, name);
+    assert.equal(annotations(name)?.openWorldHint, true, name);
+  }
+  for (const name of ["wait_agent", "list_agents", "workspace_context"]) {
+    assert.equal(annotations(name)?.readOnlyHint, true, name);
+    assert.equal(annotations(name)?.openWorldHint, false, name);
+  }
+  assert.equal(annotations("interrupt_agent")?.readOnlyHint, false);
+  assert.equal(annotations("interrupt_agent")?.openWorldHint, false);
+});
 
 test("spawn and followup persist per-agent task names, return wait guidance, and close operations", async (t) => {
   const f = await fixture(t);

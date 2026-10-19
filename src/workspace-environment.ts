@@ -10,6 +10,17 @@ import type {ToolRegistrationContext} from "./tool-surfaces/types.js";
 const execute=promisify(execFile);
 const probe="import json,sys; print(json.dumps({'executable':sys.executable,'version':sys.version.split()[0],'virtualenv':sys.prefix!=sys.base_prefix}))";
 
+function discoverPython(cwd:string,requested?:string,environment=process.env) {
+  const project=[join(cwd,".venv",process.platform==="win32"?"Scripts/python.exe":"bin/python"),
+    join(cwd,"venv",process.platform==="win32"?"Scripts/python.exe":"bin/python")].filter(existsSync);
+  const candidates=requested?[requested.includes("/")||requested.includes("\\")?resolve(cwd,requested):requested]
+    :project.length?project:process.platform==="win32"?["python","py"]:["python3","python"];
+  // 只检查候选文件和 PATH；解释器及其启动代码只能通过显式执行入口运行。
+  const executables=[...new Set(candidates.map(candidate=>resolveExecutableCommand(candidate,environment))
+    .filter((candidate):candidate is string=>candidate!==undefined))];
+  return {executable:executables[0]??null,candidates:executables,verification:"not_run" as const};
+}
+
 export async function inspectPython(cwd:string,requested?:string,environment=process.env) {
   const project=[join(cwd,".venv",process.platform==="win32"?"Scripts/python.exe":"bin/python"),
     join(cwd,"venv",process.platform==="win32"?"Scripts/python.exe":"bin/python")].filter(existsSync);
@@ -41,7 +52,7 @@ export async function workspaceEnvironment(context:ToolRegistrationContext,works
   const runtime=executionContract();
   const analysis=resolve(fileURLToPath(new URL("../scripts/analysis/",import.meta.url)));
   return {workspace_id:workspaceId,node_id:context.config.federation?.nodeId??"local",cwd:workspace.root,
-    platform:runtime.platform,shell:runtime.shell,python:await inspectPython(workspace.root,python),
+    platform:runtime.platform,shell:runtime.shell,python:discoverPython(workspace.root,python),
     worktree:workspace.worktree??null,
     skills:workspace.skills.filter(skill=>!skill.disableModelInvocation)
       .map(skill=>({name:skill.name,path:skill.filePath,description:skill.description})),

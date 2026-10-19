@@ -60,7 +60,8 @@ test("PY03：缺失解释器明确报告，显式解释器错误不切换",{time
 test("PY05/07/09：流式分析与实际MCP脚本重试，报告只执行一次",{timeout:60000},async t=>{
   const f=await fixture(t);
   const env=await f.call("workspace_context",{...f.scope,action:"status",environment:true});
-  assert.equal(env.python.available,true);assert.equal(env.cwd,f.project);assert.ok(env.shell);
+  assert.equal(env.python.verification,"not_run");assert.ok(env.python.candidates.includes(env.python.executable));
+  assert.ok(env.python.executable);assert.equal(env.cwd,f.project);assert.ok(env.shell);
   const input=join(f.project,"large.jsonl"),output=join(f.project,"report.json");
   const line=JSON.stringify({ts:"2026-10-05T00:00:00Z",event:"sample",tool:"read",durationMs:2,responseBytes:6});
   await writeFile(input,(line+"\n").repeat(30000));

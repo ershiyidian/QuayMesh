@@ -177,7 +177,7 @@ export function registerSubagentTools(
       title: "Spawn agent",
       description: "Start a subagent task; return its accepted operation without waiting.",
       inputSchema: spawnAgentSchema,
-      annotations: CONTROL,
+      annotations: { ...CONTROL, openWorldHint: true },
     },
     async (input) => {
       const invocation = currentInvocation();
@@ -213,7 +213,7 @@ export function registerSubagentTools(
       title: "Follow up with agent",
       description: "Continue the same agent thread.",
       inputSchema: followupAgentSchema,
-      annotations: CONTROL,
+      annotations: { ...CONTROL, openWorldHint: true },
     },
     async (input) => {
       const invocation = currentInvocation();
@@ -255,7 +255,7 @@ export function registerSubagentTools(
       title: "Message active agent",
       description: "Send guidance to the exact active turn of a running subagent.",
       inputSchema: sendMessageSchema,
-      annotations: CONTROL,
+      annotations: { ...CONTROL, openWorldHint: true },
     },
     async (input) => {
       const { workspace, scope } = await scopeFor(input.workspace_id);

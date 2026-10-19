@@ -1,8 +1,16 @@
 # Python projects
 
-[Home](../README.md) · [Task operations](TASKS.md)
+[English](PYTHON_WORKFLOW.md) · [简体中文](zh-CN/PYTHON_WORKFLOW.md) · [Home](../README.md) · [Task operations](TASKS.md)
 
 Open the project's workspace on the machine that contains its Python environment. Use the environment's Python executable when running project commands.
+
+## Find an interpreter
+
+Call `workspace_context` with `action: "status"` and `environment: true` to read the workspace's platform, shell, configured command profiles, and Python candidate paths. An optional `python` selects a path or executable name to look up.
+
+The response's `python.executable` is the first candidate found, or `null` when none is found. `python.candidates` contains the discovered paths, and `python.verification` is always `"not_run"`. Discovery reads filesystem metadata and `PATH`; it does not start Python, import project code, or verify a Python version. An explicit candidate that is missing does not fall back to another interpreter.
+
+Use `exec_command` to check the chosen interpreter or run a script, and inspect its output and exit code. A discovered file may fail to start or may be a different program. Environment discovery does not install or repair it.
 
 ## Run a project command
 
