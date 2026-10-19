@@ -9,6 +9,7 @@ const tools = new Set(["open_workspace", "attach_workspace", "read", "read_diagn
 const actions = new Set(["list","capture","search","status","recovery","start","observe","cancel"]);
 const errorCodes = new Set(["WORK_STATE", "INVALID_TASK", "AGENT_CONFLICT", "EXECUTION_CONFLICT", "STALE_CONTEXT", "ACCESS_DENIED", "WORKSPACE_NOT_FOUND", "WORKSPACE_MISMATCH", "AGENT_NOT_FOUND",
   "NODE_ADMISSION_PAUSED", "TASK_SESSION_MISMATCH", "TASK_NOT_FOUND", "INVALID_ARGUMENT", "OPERATION_KEY_INVALID", "REQUEST_ID_REUSED",
+  "OPERATION_RETRY_SCOPE_MISMATCH", "OPERATION_RETRY_NOT_ALLOWED", "OPERATION_RETRY_SUPERSEDED", "OPERATION_ID_MISMATCH",
   "REQUEST_TIMEOUT", "RPC_INTERRUPTED", "NODE_UNAVAILABLE", "PROCESS_RECONCILIATION_REQUIRED", "TOOL_EXECUTION_ERROR", "ZOD_ERROR",
   "ENOENT", "EACCES", "EPERM", "EINVAL", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ECONNABORTED", "EPIPE", "ENOTFOUND"]);
 const effects = new Set(["not_started", "started", "partial", "completed", "unknown"]);
@@ -109,8 +110,7 @@ export function traceMcpRequest(req: Request, res: Response, requestId: string, 
             structuredTextBytes:typeof structured.result==="string"?Buffer.byteLength(structured.result):0,
             duplicateBodyBytes:typeof structured.result==="string" && content.some((block:any)=>block.type==="text"&&block.text===structured.result)
               ? Buffer.byteLength(structured.result):0 };
-          // Canonical error results carry their code beside plain-text content.
-          // Keep the same metadata-only boundary for untrusted remote results.
+          // 结构化错误只提取允许的元数据，远端错误内容仍不进入日志。
           if (typeof structured.error_code === "string") result.toolErrorCode = known(structured.error_code, errorCodes);
           if (typeof structured.effect === "string") result.effect = known(structured.effect, effects);
           if (typeof structured.retry_hint === "string") result.retryHint = known(structured.retry_hint, retryHints);

@@ -77,6 +77,30 @@ function wireSchema(value: unknown): StandardSchemaWithJSON {
   }}};
 }
 
+const toolErrorOutput = z.strictObject({
+  error_code: z.string().min(1),
+  effect: z.enum(["not_started", "started", "partial", "completed", "unknown"]),
+  retry_hint: z.enum(["fix_input", "retry_same_key", "query_original", "do_not_retry", "retry_later"]),
+  operation_id: z.string().optional(),
+  owner_node_id: z.string().optional(),
+  details: z.unknown().optional(),
+});
+
+function wireToolOutputSchema(value: unknown): StandardSchemaWithJSON {
+  const success = value && typeof value === "object" && "~standard" in value
+    ? value as z.ZodType : z.object(value as z.ZodRawShape);
+  const standard = wireSchema(success)["~standard"];
+  // 由 Zod 生成联合类型的递归引用，成功类型的子节点仍只引用成功定义。
+  const advertised = wireSchema(z.union([success, toolErrorOutput]))["~standard"];
+  return {"~standard": {...standard,
+    // SDK 对 isError 结果跳过成功校验；这里只扩展公布的 schema。
+    jsonSchema: {
+      input: options => ({...advertised.jsonSchema.input(options), type: "object"}),
+      output: options => ({...advertised.jsonSchema.output(options), type: "object"}),
+    },
+  }};
+}
+
 function wireAnnotations(value: unknown): Record<string, unknown> {
   const annotations = value && typeof value === "object" ? value as Record<string,unknown> : {};
   // 宿主按实际 tools/list 读取能力声明，不能为了压缩报文删掉风险字段。
@@ -100,7 +124,7 @@ export function createModernMcpServerAdapter(
       name,
       {...definition,annotations:wireAnnotations(definition.annotations),
         ...(definition.inputSchema ? {inputSchema: wireSchema(definition.inputSchema)} : {}),
-        ...(definition.outputSchema ? {outputSchema: wireSchema(definition.outputSchema)} : {}),
+        ...(definition.outputSchema ? {outputSchema: wireToolOutputSchema(definition.outputSchema)} : {}),
       },
       async (input, context) => {
         const extra=legacyToolHandlerExtra(context);

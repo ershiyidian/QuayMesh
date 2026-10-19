@@ -66,6 +66,7 @@ function call(port: number, label: string) {
 async function fixture(t: TestContext, extraResponse?: (request: Request) => Response | undefined) {
   const blocked = new Map<string, ReturnType<typeof gate>>();
   const completed = new Set<string>();
+  const responsesCompleted = new Map<string, Promise<void>>();
   const errors: Error[] = [];
   const handler = createMcpHandler(() => {
     const adapter = createModernMcpServerAdapter({ name: "sse-fixture", version: "1" });
@@ -79,14 +80,17 @@ async function fixture(t: TestContext, extraResponse?: (request: Request) => Res
   const nodeHandler = toNodeHandler({
     fetch: async (request, options) => primeMcpSseResponse(extraResponse?.(request) ?? await handler.fetch(request, options)),
   }, { onerror: error => errors.push(error) });
-  const server = createServer((req, res) => { void nodeHandler(req, res); });
+  const server = createServer((req, res) => {
+    const done = nodeHandler(req, res).catch(error => { errors.push(error); });
+    responsesCompleted.set(req.url ?? "/", done);
+  });
   const port = await listen(server);
   t.after(async () => {
     for (const waiting of blocked.values()) waiting.resolve();
     await close(server);
     await handler.close();
   });
-  return { port, blocked, completed, errors };
+  return { port, blocked, completed, responsesCompleted, errors };
 }
 
 async function proxy(t: TestContext, upstreamPort: number) {
@@ -170,11 +174,11 @@ test("a paused real HTTP consumer preserves source backpressure and forwards can
   const server = await fixture(t, request => new URL(request.url).pathname === "/large"
     ? new Response(source, { headers: { "content-type": "text/event-stream" } }) : undefined);
   const req = request({ host: "127.0.0.1", port: server.port, path: "/large", agent: false });
-  req.on("error", () => { /* Closing the test observer may reset its socket. */ });
+  req.on("error", () => { /* 测试主动关闭观察者，允许连接重置。 */ });
   t.after(() => req.destroy());
   req.end();
   const [response] = await once(req, "response");
-  response.on("error", () => { /* The observer intentionally abandons this response. */ });
+  response.on("error", () => { /* 测试主动放弃该响应。 */ });
   response.pause();
   await delay(100);
   assert.ok(pulled > 0 && pulled < total, `paused reader eagerly consumed ${pulled}/${total} chunks`);
@@ -183,8 +187,13 @@ test("a paused real HTTP consumer preserves source backpressure and forwards can
   assert.ok(quick.every(row => row.status === 200 && row.durationMs < 1_000));
   response.destroy(); req.destroy();
   await Promise.race([cancelled.promise, delay(1_000).then(() => assert.fail("source cancellation was not forwarded"))]);
+  const finished = server.responsesCompleted.get("/large");
+  assert.ok(finished);
+  // source.cancel 入口早于 reader 的 finally；等待真实 HTTP 转发器完成清理。
+  await finished;
   assert.equal(cancellations, 1);
   assert.equal(source.locked, false);
+  assert.equal(server.errors.length, 0);
   t.diagnostic(JSON.stringify({ pausedAfterChunks: atPause, totalChunks: total, cancellations }));
 });
 

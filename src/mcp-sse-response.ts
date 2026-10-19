@@ -1,5 +1,4 @@
-/** Give an established SSE response its first wire bytes before the SDK's
- * periodic heartbeat. The Node adapter remains the only response writer. */
+/** SSE 响应建立后立即发送首块注释，响应仍由 Node 适配器统一写入。 */
 export function primeMcpSseResponse(response: Response): Response {
   const mediaType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
   if (!response.body || mediaType !== "text/event-stream") return response;
@@ -8,7 +7,7 @@ export function primeMcpSseResponse(response: Response): Response {
   let cancelled = false;
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
-      // A comment establishes transport liveness without claiming tool progress.
+      // 注释表示传输已建立，工具进度由真实事件报告。
       controller.enqueue(new TextEncoder().encode(": connected\n\n"));
     },
     async pull(controller) {

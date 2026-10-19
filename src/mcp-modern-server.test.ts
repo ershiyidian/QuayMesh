@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { registerAppResource, registerAppTool } from "@modelcontextprotocol/ext-apps/server";
-import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
+import { createMcpHandler, McpServer, type CallToolResult, type ListToolsResult } from "@modelcontextprotocol/server";
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/server/validators/ajv";
 import * as z from "zod/v4";
 import {
   compileMcpRegistrationSurface,
   createModernMcpServerAdapter,
   modernMcpAdapterErrorLogFields,
 } from "./mcp-modern-server.js";
+import { toolErrorResult } from "./session/outcome.js";
 
 test("strict modern handler answers the 2026-07-28 discovery probe", async (t) => {
   const handler = createMcpHandler(() => new McpServer(
@@ -67,6 +69,116 @@ test("modern registration adapter preserves tools and request metadata", async (
     result?: { content?: Array<{ text?: string }> };
   };
   assert.equal(callBody.result?.content?.[0]?.text, "ok:modern-chat");
+});
+
+test("输出 schema 兼容业务错误，同时保留成功结果的运行时校验", async (t) => {
+  const failure = toolErrorResult(new Error("REQUEST_TIMEOUT: operation receipt unavailable"), {
+    operationId: "op-output-schema-test",
+    ownerNodeId: "node-output-schema-test",
+  });
+  const success = { content: [], structuredContent: { value: "ok" } };
+  const cases = {
+    success,
+    proper_error: failure,
+    misflagged_error: { ...failure, isError: false },
+    unflagged_error: { content: failure.content, structuredContent: failure.structuredContent },
+    invalid_success: { content: [], structuredContent: { value: 42 } },
+  };
+  const handler = createMcpHandler(() => {
+    const adapter = createModernMcpServerAdapter({ name: "output-schema-test", version: "1.0.0" });
+    for (const [name, result] of Object.entries(cases)) {
+      registerRawTool(adapter.registrationTarget, name, {
+        inputSchema: {},
+        outputSchema: z.strictObject({ value: z.string() }),
+      }, async () => result);
+    }
+    registerRawTool(adapter.registrationTarget, "raw_shape", {
+      inputSchema: {},
+      outputSchema: { value: z.string() },
+    }, async () => success);
+    return adapter.server;
+  }, { legacy: "reject" });
+  t.after(async () => handler.close());
+
+  const listed = await handler.fetch(modernRequest("tools/list", {}));
+  assert.equal(listed.status, 200);
+  const listBody = await listed.json() as { result: ListToolsResult };
+  for (const name of ["success", "raw_shape"]) {
+    const output = listBody.result.tools.find((tool) => tool.name === name)?.outputSchema;
+    assert.ok(output);
+    assert.equal(output.type, "object");
+    const validate = new AjvJsonSchemaValidator().getValidator(output);
+    assert.equal(validate(success.structuredContent).valid, true);
+    assert.equal(validate(failure.structuredContent).valid, true);
+    assert.equal(validate({ value: 42 }).valid, false);
+    assert.equal(validate({ ...failure.structuredContent, retry_hint: "unknown" }).valid, false);
+  }
+
+  for (const name of ["proper_error", "success", "raw_shape"]) {
+    const response = await handler.fetch(modernRequest("tools/call", { name, arguments: {} }));
+    assert.equal(response.status, 200);
+    const body = await response.json() as { result: CallToolResult };
+    const expected = name === "proper_error" ? failure : success;
+    assert.deepEqual(body.result.content, expected.content);
+    assert.deepEqual(body.result.structuredContent, expected.structuredContent);
+    assert.equal(body.result.isError === true, name === "proper_error");
+  }
+  for (const name of ["misflagged_error", "unflagged_error", "invalid_success"]) {
+    const response = await handler.fetch(modernRequest("tools/call", { name, arguments: {} }));
+    assert.equal(response.status, 200);
+    const body = await response.json() as { result: CallToolResult };
+    assert.equal(body.result.isError, true, name);
+    assert.equal(body.result.structuredContent, undefined, name);
+    assert.match(JSON.stringify(body.result.content), /Output validation error/, name);
+  }
+});
+
+test("输出 schema 的递归成功类型不会接受嵌套错误回执", async (t) => {
+  interface TreeValue { value: string; child?: TreeValue }
+  const tree: z.ZodType<TreeValue> = z.strictObject({
+    value: z.string(),
+    child: z.lazy(() => tree).optional(),
+  });
+  const failure = toolErrorResult(new Error("REQUEST_TIMEOUT"));
+  const valid = { value: "root", child: { value: "leaf" } };
+  const nestedError = { value: "root", child: failure.structuredContent };
+  const handler = createMcpHandler(() => {
+    const adapter = createModernMcpServerAdapter({ name: "recursive-output-test", version: "1.0.0" });
+    registerRawTool(adapter.registrationTarget, "tree", {
+      inputSchema: { nested_error: z.boolean() },
+      outputSchema: tree,
+    }, async (input) => ({
+      content: [],
+      structuredContent: objectValue(input).nested_error ? nestedError : valid,
+    }));
+    return adapter.server;
+  }, { legacy: "reject" });
+  t.after(async () => handler.close());
+
+  const listed = await handler.fetch(modernRequest("tools/list", {}));
+  assert.equal(listed.status, 200);
+  const listBody = await listed.json() as { result: ListToolsResult };
+  const output = listBody.result.tools.find((tool) => tool.name === "tree")?.outputSchema;
+  assert.ok(output);
+  const validate = new AjvJsonSchemaValidator().getValidator(output);
+  assert.equal(validate(valid).valid, true);
+  assert.equal(validate(failure.structuredContent).valid, true);
+  assert.equal(validate(nestedError).valid, false);
+  assert.equal(validate({ value: "root", unexpected: true }).valid, false);
+
+  for (const nested_error of [false, true]) {
+    const response = await handler.fetch(modernRequest("tools/call", {
+      name: "tree", arguments: { nested_error },
+    }));
+    assert.equal(response.status, 200);
+    const body = await response.json() as { result: CallToolResult };
+    if (nested_error) {
+      assert.equal(body.result.isError, true);
+      assert.match(JSON.stringify(body.result.content), /Output validation error/);
+    } else {
+      assert.deepEqual(body.result.structuredContent, valid);
+    }
+  }
 });
 
 test("modern registration adapter preserves progress notifications", async (t) => {
