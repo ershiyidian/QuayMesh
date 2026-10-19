@@ -112,33 +112,37 @@ test("preparation refusal keeps its error and task, retries once, and fences a l
 
 test("agent tracking restores a new running attempt despite the previous refusal's finished event", async t => {
   const f = await fixture(); t.after(() => f.close());
-  const agents = new LocalAgentStore(f.stateDir); t.after(() => agents.close());
-  const input = {operation_key: "agent-retry"};
-  const options = {tool_name: "spawn_agent", kind: "agent_control" as const, label: "agent launch", input, affectsFiles: false,
-    operation: async () => {throw new ExecutionConflictError("held", undefined, "busy");}};
-  await f.recorder.recordWithContext(createInvocationContext(f.identity("first-agent")), options).catch(() => {});
-  const context = createInvocationContext(f.identity("next-agent"));
-  const agent = agents.create({workspaceId: f.member.workspace_id, workspaceRoot: f.root, profileName: "test", provider: "codex"});
-  agents.update(agent.id, {status: "running"});
-  await f.recorder.recordWithContext(context, {...options,
-    operation: async () => {
-      f.store.rememberAgentOperation({operationId: context.operation_id!, agentId: agent.id, sessionId: f.session.id, memberId: f.member.id});
-      return {running: true};
-    }, runningResult: result => result.running,
-  });
-  assert.equal(f.store.hasOperationFinished(context.operation_id!), false);
-  assert.equal(f.store.pendingAgentOperations()[0]?.operationId, context.operation_id);
-  const tracker = new AgentOperationTracker(agents, f.service, new SessionStore(f.ledger.db), {intervalMs: 5, ledger: f.ledger});
-  t.after(() => tracker.close());
-  agents.update(agent.id, {status: "idle", latestResponse: "Completed after restore"});
-  tracker.restore();
-  const deadline = Date.now() + 3000;
-  while (f.store.findInvocationByOperationId(context.operation_id!)?.state !== "succeeded" && Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, 10));
+  const agents = new LocalAgentStore(f.stateDir);
+  let tracker: AgentOperationTracker | undefined;
+  try {
+    const input = {operation_key: "agent-retry"};
+    const options = {tool_name: "spawn_agent", kind: "agent_control" as const, label: "agent launch", input, affectsFiles: false,
+      operation: async () => {throw new ExecutionConflictError("held", undefined, "busy");}};
+    await f.recorder.recordWithContext(createInvocationContext(f.identity("first-agent")), options).catch(() => {});
+    const context = createInvocationContext(f.identity("next-agent"));
+    const agent = agents.create({workspaceId: f.member.workspace_id, workspaceRoot: f.root, profileName: "test", provider: "codex"});
+    agents.update(agent.id, {status: "running"});
+    await f.recorder.recordWithContext(context, {...options,
+      operation: async () => {
+        f.store.rememberAgentOperation({operationId: context.operation_id!, agentId: agent.id, sessionId: f.session.id, memberId: f.member.id});
+        return {running: true};
+      }, runningResult: result => result.running,
+    });
+    assert.equal(f.store.hasOperationFinished(context.operation_id!), false);
+    assert.equal(f.store.pendingAgentOperations()[0]?.operationId, context.operation_id);
+    tracker = new AgentOperationTracker(agents, f.service, new SessionStore(f.ledger.db), {intervalMs: 5, ledger: f.ledger});
+    agents.update(agent.id, {status: "idle", latestResponse: "Completed after restore"});
+    tracker.restore();
+    const deadline = Date.now() + 3000;
+    while (f.store.findInvocationByOperationId(context.operation_id!)?.state !== "succeeded" && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(f.store.findInvocationByOperationId(context.operation_id!)?.state, "succeeded");
+    assert.equal(f.store.pendingAgentOperations().length, 0);
+  } finally {
+    // 先停止观察者，再关闭旁路数据库；fixture 的 after 随后才能删除 Windows 文件。
+    try { await tracker?.close(); } finally { agents.close(); }
   }
-  assert.equal(f.store.findInvocationByOperationId(context.operation_id!)?.state, "succeeded");
-  assert.equal(f.store.pendingAgentOperations().length, 0);
-  await tracker.close();
 });
 
 test("unknown, completed, cancelled, partial, and permanent failures never start another attempt", async t => {

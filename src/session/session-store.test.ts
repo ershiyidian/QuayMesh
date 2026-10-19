@@ -89,20 +89,24 @@ test("event append acquires the WAL writer before reading its revision snapshot"
       try { competingWrite.run(session.id); } catch (error) { competingError = error; }
     },
   });
-  t.after(() => connection.close());
-  connection.pragma("busy_timeout = 5000");
-  const store = new SessionStore(connection);
-  store.appendEvent({
-    session_id: session.id, member_id: member.id, type: "agent_changed",
-    source_id: "contended-observation", timestamp: new Date().toISOString(), payload: {},
-  });
-  assert.equal(armed, false, "the competing writer must actually attempt a write between our reads and write");
-  assert.equal((competingError as { code?: string } | undefined)?.code, "SQLITE_BUSY");
-  assert.equal(store.getSession(session.id).revision, 1);
-  // 事件提交后另一写入可重试成功，两个版本更新均不丢失。
-  competingWrite.run(session.id);
-  assert.equal(store.getSession(session.id).revision, 2);
-  assert.equal(store.eventsForSession(session.id).length, 1);
+  try {
+    connection.pragma("busy_timeout = 5000");
+    const store = new SessionStore(connection);
+    store.appendEvent({
+      session_id: session.id, member_id: member.id, type: "agent_changed",
+      source_id: "contended-observation", timestamp: new Date().toISOString(), payload: {},
+    });
+    assert.equal(armed, false, "the competing writer must actually attempt a write between our reads and write");
+    assert.equal((competingError as { code?: string } | undefined)?.code, "SQLITE_BUSY");
+    assert.equal(store.getSession(session.id).revision, 1);
+    // 事件提交后另一写入可重试成功，两个版本更新均不丢失。
+    competingWrite.run(session.id);
+    assert.equal(store.getSession(session.id).revision, 2);
+    assert.equal(store.eventsForSession(session.id).length, 1);
+  } finally {
+    // 测试的旁路连接须先于 fixture 的目录清理关闭，Windows 不允许删除仍打开的 SQLite。
+    connection.close();
+  }
 });
 
 test("long sessions keep later events and bounded reads return the newest window", async (t) => {
