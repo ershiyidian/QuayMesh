@@ -1065,7 +1065,10 @@ export function createServer(
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const workspaceStore = createWorkspaceStore(config.stateDir);
-  const workRunReconciler = new WorkRunReconciler(config.stateDir);
+  const workRunReconciler = new WorkRunReconciler(config.stateDir, 60_000, error => {
+    if (options.diagnostics) options.diagnostics.record("work_run_reconcile_failed", diagnosticError(error), "error");
+    else logEvent(config.logging, "error", "work_run_reconcile_failed", diagnosticError(error));
+  });
   workRunReconciler.start();
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
@@ -1084,6 +1087,8 @@ export function createServer(
     agents: localAgentStore,
     execution: processSessions.executionCoordinator,
     processSessions,
+    diagnostics: (event, fields, level) => options.diagnostics
+      ? options.diagnostics.record(event, fields, level) : logEvent(config.logging, level ?? "info", event, fields),
   });
   const toolActivities = new ToolActivityTracker();
   const localAgentProviders = buildLocalAgentProviderStatuses(

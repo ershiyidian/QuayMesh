@@ -1,21 +1,29 @@
 import { WorkLedger } from "./work-ledger.js";
 
-/**
- * Startup marks in-flight executions/operations reconciliation_required because this process
- * did not start them and must not replay them. The interval only releases dead claims and
- * expires leases. Repeating the startup sweep would interrupt a command that is still running.
- */
+// 启动时核对上个进程留下的执行；周期核对只回收已失效状态，避免中断当前工作。
 export class WorkRunReconciler {
   private timer?: NodeJS.Timeout;
   private ledger?: WorkLedger;
 
-  constructor(private readonly stateDir: string, private readonly intervalMs = 60_000) {}
+  constructor(
+    private readonly stateDir: string,
+    private readonly intervalMs = 60_000,
+    private readonly onError: (error: unknown) => void = error => {
+      console.error("QuayMesh 执行账本核对失败，将在下一周期重试", error);
+    },
+  ) {}
 
   start(): void {
     if (this.timer) return;
     this.ledger = new WorkLedger(this.stateDir);
     this.startup();
-    this.timer = setInterval(() => this.tick(), this.intervalMs);
+    this.timer = setInterval(() => {
+      try { this.tick(); }
+      catch (error) {
+        // 待核对状态保留在账本中，下一周期重试；后台写锁冲突不终止正在执行的 Core。
+        try { this.onError(error); } catch { /* 诊断失败也保留下一周期的重试。 */ }
+      }
+    }, this.intervalMs);
     this.timer.unref?.();
   }
 

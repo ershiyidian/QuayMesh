@@ -3,7 +3,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { migrateDatabase } from "../db/migrations.js";
 import { logEvent } from "../logger.js";
-import { diagnosticError } from "../server-diagnostics.js";
+import { diagnosticError, type ServerDiagnostics } from "../server-diagnostics.js";
 import type { ServerConfig } from "../config.js";
 import { ExecutionCoordinator } from "../execution-coordinator.js";
 import type { ProcessSessionManager } from "../process-sessions.js";
@@ -47,6 +47,7 @@ export interface SessionRuntimeOptions {
   execution?: ExecutionCoordinator;
   processSessions?: ProcessSessionManager;
   consoleUrl?: string | null;
+  diagnostics?: ServerDiagnostics["record"];
 }
 
 export interface SessionRuntime {
@@ -161,11 +162,15 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
   if (!agents) throw new Error("SESSION_LOCAL_AGENT_STORE_REQUIRED");
   const agentOperations = new AgentOperationTracker(agents, service, store, {
     ledger,
-    onError: (error, identity, retry) => logEvent(config.logging, "error", "agent_operation_poll_failed", {
-      operationId: identity.operationId, agentId: identity.agentId,
-      sessionId: identity.sessionId, memberId: identity.memberId,
-      retryAttempt: retry.attempt, retryDelayMs: retry.delayMs, ...diagnosticError(error),
-    }),
+    onError: (error, identity, retry) => {
+      const fields = {
+        operationId: identity.operationId, agentId: identity.agentId,
+        sessionId: identity.sessionId, memberId: identity.memberId,
+        retryAttempt: retry.attempt, retryDelayMs: retry.delayMs, ...diagnosticError(error),
+      };
+      if (options.diagnostics) options.diagnostics("agent_operation_poll_failed", fields, "error");
+      else logEvent(config.logging, "error", "agent_operation_poll_failed", fields);
+    },
   });
   agentOperations.restore();
   const pendingProcessOperations = new Set<Promise<void>>();

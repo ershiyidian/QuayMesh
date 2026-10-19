@@ -133,7 +133,7 @@ test("run with active child is NOT marked interrupted even when lease expires", 
 
   const stillRunning = ledger.run(run.id);
   assert.equal(stillRunning.status, "running");
-  assert.ok(Date.parse(stillRunning.lease_expires_at!) > Date.now());
+  assert.equal(stillRunning.lease_expires_at, pastTime, "核对状态不代替执行所有者续租");
 
   // 命令结束后，用户工作进入等待下一步；过期租约不能把它改写成中断。
   ledger.endOperation(opId, "completed");
