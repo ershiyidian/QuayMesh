@@ -8,7 +8,7 @@ See [Execution lifecycle](RELIABILITY.md) and [Architecture](ARCHITECTURE.md) fo
 
 ## Scope and evidence
 
-The source baseline was `d452b51`. The experiments used Node.js 24.21.0 and MCP server/Node adapter packages 2.0.0.
+The source baseline was `d452b51`. The experiments used Node.js 24.21.0, MCP server/Node adapter packages 2.0.0, and the official MCP client SDK 1.29.0.
 The repository's supported development setup also pins pnpm 11.25.0; see [Contributing](../CONTRIBUTING.md).
 Measurements below describe individual local experiments. They are not hosted-client latency targets.
 
@@ -32,6 +32,7 @@ Host messages such as “Thinking failed” or “message delivery time out” d
 | Periodic ledger reconciliation under a real lock | Passed, **1/1** | Real error code, same process, original operation converged after lock release |
 | Idle task liveness | Passed over real HTTP | Stalled presentation stops timing; the next call reuses the original task/run |
 | Output schema and handler contracts | Passed, **10/10** handler tests | Official JSON Schema validator; valid success, typed error, and recursive success cases |
+| Official SDK discovery and file-error recovery | Passed, **1/1** | Normal `Client.listTools()` and `Client.callTool()` through the transport's official fetch interface and actual handler; real ENOENT then a successful file read; no TCP listener |
 | Admission retry, local suite | Passed, **7/7** | Includes two real processes competing for one operation key |
 | Admission retry, two-node HTTP | Passed, **2/2**, about **941 ms** and **379 ms** | Admission worktree, raw SDK requests; final integrated standard `callTool` matrix pending |
 | Integrated local regression suite | Passed, **80/80**, **30.42 s** | Session, migration, execution coordinator, and real periodic-reconciler subprocess tests |
@@ -105,8 +106,10 @@ The SDK's `isError` branch handles genuine errors; an error-shaped object with m
 
 QuayMesh's typed envelope carries `error_code`, `effect`, `retry_hint`, and optional operation/owner identifiers and details.
 Readable `content` and `isError: true` remain present. SDK protocol or validation errors can have text without `structuredContent`.
-The file-error integration test checks that such an error stays an error after discovery and that a subsequent valid read succeeds.
-The final standard-client matrix also checks the structured business-error path after `listTools()`.
+The [official-client regression](../src/mcp-sdk-error-contract.test.ts) calls `listTools()` to cache the SDK's actual output validators, then uses normal `callTool()`.
+A real `readFile` ENOENT retains `isError: true` and its `ENOENT` / `not_started` / `fix_input` envelope; creating the file then produces a valid strict success result.
+The transport's documented fetch interface passes actual Request/Response objects through the real handler without a TCP listener.
+The separate TCP file-error test covers SDK text-only errors. Its corrected assertions and the integrated two-node standard-client admission matrix still require their final network rerun.
 
 [Ingress diagnostics](../src/mcp-request-diagnostics.ts) now inspect the canonical structured error fields before legacy text fallbacks.
 HTTP completion, JSON-RPC errors, tool errors, and uninspected responses retain separate outcomes.
@@ -159,7 +162,8 @@ Integrated local regression suite and handler contracts:
 pnpm exec node --import tsx --test --test-isolation=none --test-concurrency=1 \
   src/session/*.test.ts src/db/migrations.test.ts src/execution-coordinator.test.ts \
   test/reliability-background.test.ts
-pnpm exec node --import tsx --test --test-isolation=none src/mcp-modern-server.test.ts
+pnpm exec node --import tsx --test --test-isolation=none \
+  src/mcp-modern-server.test.ts src/mcp-sdk-error-contract.test.ts
 ```
 
 Real transport, task liveness, and two-node contracts:
@@ -169,6 +173,7 @@ pnpm exec node --import tsx --test --test-isolation=none --test-concurrency=1 \
   src/mcp-sse-response.test.ts src/mcp-request-diagnostics.test.ts \
   test/reliability-liveness.test.ts \
   test/tool-contract/error-receipt.test.ts test/tool-contract/admission-retry.test.ts
+pnpm test:node
 ```
 
 For a focused slow-consumer rerun, add `--test-name-pattern='^a paused real HTTP'` and select only `src/mcp-sse-response.test.ts`.

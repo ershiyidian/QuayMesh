@@ -8,7 +8,7 @@
 
 ## 范围与证据
 
-源码基线为 `d452b51`。实验使用 Node.js 24.21.0，以及 2.0.0 版本的 MCP server/Node adapter 包。
+源码基线为 `d452b51`。实验使用 Node.js 24.21.0、2.0.0 版本的 MCP server/Node adapter 包，以及官方 MCP client SDK 1.29.0。
 仓库开发环境同时固定 pnpm 11.25.0，见[参与开发](CONTRIBUTING.md)。
 下列耗时来自单次本地实验，不作为宿主客户端的延迟承诺。
 
@@ -31,6 +31,7 @@ QuayMesh 记录服务端传输是否结束；没有宿主回执时，`hostAcknow
 | 周期账本核对遇真实写锁 | **1/1 通过** | 实际错误码、同一进程、释放锁后原操作收敛 |
 | 空闲任务活性 | 真实 HTTP 通过 | 停滞展示停止计时，下一次调用复用原任务与 run |
 | 输出 schema 与 handler 契约 | **10/10 通过** | 官方 JSON Schema 校验器，覆盖成功、结构化错误与递归成功类型 |
+| 官方 SDK 发现工具与文件错误恢复 | **1/1 通过** | 正常 `Client.listTools()` 与 `Client.callTool()`，经 transport 正式 fetch 接口进入实际 handler；真实 ENOENT 后成功读取文件；未监听 TCP 端口 |
 | 本地准入重试 | **7/7 通过** | 包含两个真实进程争用同一操作 key |
 | 两节点 HTTP 准入重试 | **2/2 通过**，约 **941 ms**、**379 ms** | 准入改动 worktree 的原始 SDK 请求；整合后的最终标准 `callTool` 矩阵待验 |
 | 整合主线本地回归 | **80/80 通过**，**30.42 s** | Session、迁移、执行协调器，以及真实周期核对子进程测试 |
@@ -103,8 +104,10 @@ SDK Node 适配器仍是唯一的响应写入者；包装层只有一个 reader�
 
 QuayMesh 的结构化错误包含 `error_code`、`effect`、`retry_hint`，以及可选的操作标识、所属节点标识和 details。
 可读 `content` 与 `isError: true` 同时保留。SDK 协议错误或校验错误可以只有文本，没有 `structuredContent`。
-真实文件错误集成测试检查发现工具后错误仍保留错误身份，以及后续合法读取可以恢复。
-最终标准客户端矩阵还需要检查 `listTools()` 之后的结构化业务错误路径。
+[官方客户端回归](../../src/mcp-sdk-error-contract.test.ts) 先调用 `listTools()` 缓存 SDK 实际输出校验器，再使用正常 `callTool()`。
+真实 `readFile` ENOENT 保留 `isError: true` 和 `ENOENT` / `not_started` / `fix_input` 回执；创建文件后返回符合严格成功类型的读取结果。
+transport 的正式 fetch 接口将真实 Request/Response 传入实际 handler，全程未监听 TCP 端口。
+独立的 TCP 文件错误测试覆盖 SDK 纯文本错误；其修正后的断言，以及整合后的两节点标准客户端准入矩阵，仍待最终网络复跑。
 
 [入站诊断](../../src/mcp-request-diagnostics.ts) 现在先读取规范的结构化错误字段，再考虑旧文本格式。
 HTTP 完成、JSON-RPC 错误、工具错误，以及未检查的响应分别分类。
@@ -156,7 +159,8 @@ pnpm build
 pnpm exec node --import tsx --test --test-isolation=none --test-concurrency=1 \
   src/session/*.test.ts src/db/migrations.test.ts src/execution-coordinator.test.ts \
   test/reliability-background.test.ts
-pnpm exec node --import tsx --test --test-isolation=none src/mcp-modern-server.test.ts
+pnpm exec node --import tsx --test --test-isolation=none \
+  src/mcp-modern-server.test.ts src/mcp-sdk-error-contract.test.ts
 ```
 
 真实传输、任务活性与两节点契约：
@@ -166,6 +170,7 @@ pnpm exec node --import tsx --test --test-isolation=none --test-concurrency=1 \
   src/mcp-sse-response.test.ts src/mcp-request-diagnostics.test.ts \
   test/reliability-liveness.test.ts \
   test/tool-contract/error-receipt.test.ts test/tool-contract/admission-retry.test.ts
+pnpm test:node
 ```
 
 单独复验慢消费者时，添加 `--test-name-pattern='^a paused real HTTP'`，只选择 `src/mcp-sse-response.test.ts`。
