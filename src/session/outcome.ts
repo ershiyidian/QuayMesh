@@ -96,7 +96,7 @@ export function toolErrorResult(error: unknown, extras: { operationId?: string |
   const outcome=classifyError(error,{sideEffecting:extras.sideEffecting??false,forwarded:extras.forwarded,effectStarted:extras.sideEffecting??false});
   return {
     isError:true,
-    content:[{type:"text" as const,text:outcome.message}],
+    content:[{type:"text" as const,text:errorRecoveryText(outcome,extras.operationId)}],
     structuredContent:{
       error_code:outcome.code,effect:outcome.effect,retry_hint:outcome.retryHint,
       ...(extras.operationId?{operation_id:extras.operationId}:{}),
@@ -104,6 +104,20 @@ export function toolErrorResult(error: unknown, extras: { operationId?: string |
       ...(outcome.details!==undefined?{details:outcome.details}:{}),
     },
   };
+}
+
+const RECOVERY_SUFFIX=/\n\[QuayMesh recovery: (?:error_code=[A-Z][A-Z0-9_]{0,63}; )?effect=(?:not_started|started|partial|completed|unknown); retry_hint=(?:fix_input|retry_same_key|query_original|do_not_retry|retry_later)(?:; operation_id=[A-Za-z0-9][A-Za-z0-9_.:%~-]{0,255})?\]$/u;
+
+function errorRecoveryText(outcome:ErrorOutcome,operationId?:string|null):string {
+  let message=outcome.message;
+  // 只替换本模块生成的尾注，不复制 details，也不从错误文本推导操作身份。
+  while(RECOVERY_SUFFIX.test(message))message=message.replace(RECOVERY_SUFFIX,"");
+  const fields=[
+    ...(/^[A-Z][A-Z0-9_]{0,63}$/u.test(outcome.code)?[`error_code=${outcome.code}`]:[]),
+    `effect=${outcome.effect}`,`retry_hint=${outcome.retryHint}`,
+    ...(operationId&&/^[A-Za-z0-9][A-Za-z0-9_.:%~-]{0,255}$/u.test(operationId)?[`operation_id=${operationId}`]:[]),
+  ];
+  return `${message}\n[QuayMesh recovery: ${fields.join("; ")}]`;
 }
 
 export function classifyToolResultError(result: unknown, options:{sideEffecting:boolean;forwarded?:boolean}): ErrorOutcome {
