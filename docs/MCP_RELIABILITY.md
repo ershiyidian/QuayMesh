@@ -494,6 +494,18 @@ An active copy records its task/member participation before forwarding. This ens
 
 The old-peer test uses an old-style RPC dispatch branch against the real current transfer machinery. It is not a complete two-release binary compatibility matrix. Old ingress nodes retain their old behavior until upgraded.
 
+### HTTP request-body boundary
+
+Transferring this round's test bundle through the running MCP endpoint exposed a separate HTTP 413: the base64 field alone contained 108,476 characters, and the target file was absent after rejection. Five smaller, 24,000-character-or-less fragments were accepted and their assembled bundle passed its SHA-256 check.
+
+Source inspection found that the SDK 1.x Express helper installed `express.json()` before QuayMesh request diagnostics and authorization. The installed parser's default limit is 100 KiB, consistent with the observed rejection; [Express documents that default and the memory tradeoff of larger bodies](https://expressjs.com/en/resources/middleware/body-parser/). A specific production stack trace was not captured, so this observation does not attribute every upstream HTTP 413 to this parser.
+
+The MCP path now has an explicit **2 MiB UTF-8 request-body limit**, including the complete JSON envelope. This is a QuayMesh limit. Existing SDK Host-header validation and OAuth/resource checks remain in use. Every MCP body is bounded, including a request with a non-JSON content type that the downstream protocol handler will reject.
+
+Oversized input returns HTTP 413 with JSON-RPC error data `REQUEST_BODY_TOO_LARGE`, `effect: not_started`, `retry_hint: fix_input`, and `limit_bytes`. Malformed JSON returns HTTP 400 / `INVALID_JSON`. Both errors are produced before tool invocation. A separate `mcp_request_rejected` record contains a generated request ID, fixed classification, and byte counts. It contains no body, token, workspace, or claimed task identity; parsing rejection occurs before authentication and cannot be presented as an authenticated task request.
+
+[The real HTTP tests](../test/tool-contract/request-body.test.ts) cover a patch larger than 100 KiB, same-key replay after an independent file change, oversized JSON and non-JSON bodies, invalid JSON, absent bearer credentials, Host rejection, and subsequent ping. Large changes should still use bounded requests or artifact transfer; increasing this limit does not increase an upstream host's independent budget.
+
 ### Reproducible checks and remaining scope
 
 The regressions use real SQLite files, independent Worker-held writer locks, SQL triggers and deferred foreign keys, actual Node child processes, and the OAuth MCP SDK over TCP. They assert original IDs, exactly one file effect, event counts, responsive observation during the lock, and normal resource cleanup. Relevant sources include:

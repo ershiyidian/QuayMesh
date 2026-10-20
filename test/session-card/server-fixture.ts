@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig, type ServerConfig } from "../../src/config.js";
-import { createServer } from "../../src/server.js";
+import { createServer, type CreateServerOptions } from "../../src/server.js";
 import { defaultQuayMeshConfig } from "../../src/config-schema.js";
 import { writeQuayMeshConfig } from "../../src/user-config.js";
 
@@ -17,6 +17,7 @@ const execFileAsync = promisify(execFile);
 const ownerToken = "test-owner-token-that-is-long-enough";
 
 export interface RealTestServerOptions {
+  diagnostics?: CreateServerOptions["diagnostics"];
   prefix?: string;
   uiEnabled?: boolean;
   git?: boolean;
@@ -144,7 +145,7 @@ export async function createRealTestServer(options: RealTestServerOptions = {}):
   const loaded = loadConfig(env);
   const config = options.configure ? await options.configure(loaded) : loaded;
 
-  const running = createServer(config, { incomingArtifactAdapters: [] });
+  const running = createServer(config, { incomingArtifactAdapters: [], diagnostics: options.diagnostics });
   await running.ready;
   const httpServer = running.app.listen(httpPort, "127.0.0.1");
   const client = new Client({ name: "session-card-test-client", version: "1.0.0" });

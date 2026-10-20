@@ -74,7 +74,9 @@ const timer = setInterval(() => {
     await lock.done;
     await until(async () => {
       const page = await output();
-      return page.process_done === true && page.operation_state === "succeeded";
+      const status = await f.call("workspace_context", {...f.scope, action: "status", operation_id: operationId});
+      // 输出接口公开进程账本 completed；任务调用回执公开 succeeded。
+      return page.process_done === true && page.operation_state === "completed" && status.operation_state === "succeeded";
     });
     clearInterval(timer); timer = undefined;
     const finished = await output();

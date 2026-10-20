@@ -490,6 +490,18 @@ shutdown 等待所有所属 session 的 exit 和 close promise，包括已经设
 
 旧节点测试使用旧式 RPC 分发分支，配合真实的当前传输实现。它没有覆盖两套历史发行二进制的完整混版本矩阵。尚未升级的旧入口节点仍保留旧行为。
 
+### HTTP 请求体边界
+
+本轮通过正在运行的 MCP 传送测试 bundle 时，实际遇到另一项 HTTP 413：仅 base64 字段就有 108,476 个字符，拒绝后目标文件不存在。拆成五片、每片最多 24,000 个字符后成功接收，合并 bundle 的 SHA-256 校验通过。
+
+源码检查发现，SDK 1.x 的 Express helper 在 QuayMesh 请求诊断与鉴权之前安装 `express.json()`；已安装 parser 默认限制为 100 KiB，与本次拒绝相符。[Express 文档说明了这个默认值以及大请求的内存开销](https://expressjs.com/en/resources/middleware/body-parser/)。本次没有取得该生产请求的具体调用栈，因此不会把所有上游 HTTP 413 都归因于这一 parser。
+
+MCP 路径现在明确限制为 **2 MiB UTF-8 请求体**，包含完整 JSON envelope。这是 QuayMesh 自己的限额。SDK 原有 Host header 验证和 OAuth/resource 检查继续生效。所有 MCP 正文均受大小限制，包括随后会被协议处理器拒绝的非 JSON Content-Type 请求。
+
+超限输入返回 HTTP 413，JSON-RPC 错误数据包含 `REQUEST_BODY_TOO_LARGE`、`effect: not_started`、`retry_hint: fix_input` 和 `limit_bytes`；非法 JSON 返回 HTTP 400 / `INVALID_JSON`。这两种错误均发生在工具调用之前。独立的 `mcp_request_rejected` 记录只保存生成的请求 ID、固定分类和字节数，不保存正文、token、工作区或声称的任务身份。解析拒绝发生在鉴权之前，不能被当作某个任务已鉴权的入站证据。
+
+[真实 HTTP 回归](../../test/tool-contract/request-body.test.ts) 覆盖超过 100 KiB 的补丁、文件另有变化后的同 key 回放、超限 JSON 与非 JSON 正文、非法 JSON、缺少 bearer、Host 拒绝及后续 ping。大改动仍应使用有界请求或文件传输；提高本地限额不会扩大上游宿主独立的预算。
+
 ### 可复现实验与剩余范围
 
 回归使用真实 SQLite 文件、独立 Worker 写锁、SQL 触发器与延迟外键、真实 Node 子进程，以及经过 OAuth 的 MCP SDK/TCP。断言覆盖原身份、单次文件副作用、事件数、持锁期间可观察和资源正常清理。相关入口：

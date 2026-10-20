@@ -25,7 +25,7 @@ import { parsePatch as parseMutationPaths } from "./apply-patch.js";
 import type { WriteEvidence } from "./session/write-evidence.js";
 import { describeWorkspace } from "./session/workspace-metadata.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
+import { createMcpHttpApp } from "./mcp-http-app.js";
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
@@ -124,7 +124,7 @@ function mcpServerInfo() {
 }
 
 interface RunningServer {
-  app: ReturnType<typeof createMcpExpressApp>;
+  app: ReturnType<typeof createMcpHttpApp>;
   config: ServerConfig;
   workspaceStore: ReturnType<typeof createWorkspaceStore>;
   localAgentProviders: LocalAgentProviderStatus[];
@@ -1083,9 +1083,15 @@ export function createServer(
   const allowedHosts = config.allowedHosts.includes("*")
     ? undefined
     : Array.from(new Set([config.host, ...config.allowedHosts]));
-  const app = createMcpExpressApp({
+  const app = createMcpHttpApp({
     host: config.host,
     ...(allowedHosts ? { allowedHosts } : {}),
+    onRejected: (req, fields) => {
+      const requestId = (req as Request & { [httpDiagnosticRequestId]?: string })[httpDiagnosticRequestId] ?? randomUUID();
+      if (options.diagnostics) options.diagnostics.record("mcp_request_rejected", { requestId, ...fields }, "warn");
+      else logEvent(config.logging, "warn", "mcp_request_rejected", { requestId, ...fields });
+      return requestId;
+    },
   });
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);

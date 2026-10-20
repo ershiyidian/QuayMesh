@@ -39,6 +39,7 @@ async function main() {
       "src/mcp-request-diagnostics.test.ts", "src/mcp-sdk-error-contract.test.ts",
       "src/reliability-core.test.ts", "test/tool-contract/admission-retry.test.ts",
       "test/tool-contract/sqlite-contention.test.ts", "test/tool-contract/sqlite-process-exit.test.ts",
+      "test/tool-contract/request-body.test.ts",
       "test/tool-contract/error-receipt.test.ts", "test/reliability-liveness.test.ts",
       "test/receipt-wire-contract.test.ts",
     ],
