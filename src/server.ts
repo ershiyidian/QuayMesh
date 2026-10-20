@@ -1293,9 +1293,9 @@ export function createServer(
 
   app.all("/mcp", async (req, res) => {
     const requestId = res.locals.requestId as string | undefined;
-    if (config.logging.requests) traceMcpRequest(req, res, requestId ?? randomUUID(),
+    const requestTrace = config.logging.requests ? traceMcpRequest(req, res, requestId ?? randomUUID(),
       (event, fields, level = "info") => options.diagnostics
-        ? options.diagnostics.record(event, fields, level) : logEvent(config.logging, level, event, fields));
+        ? options.diagnostics.record(event, fields, level) : logEvent(config.logging, level, event, fields)) : undefined;
 
     await new Promise<void>((resolve, reject) => {
       bearerAuth(req, res, (error?: unknown) => {
@@ -1316,6 +1316,7 @@ export function createServer(
       sendJsonRpcError(res, 401, -32001, "Unauthorized");
       return;
     }
+    requestTrace?.authenticated();
 
     // 无状态 HTTP 请求每次使用独立的传输身份。客户端可以重复使用 JSON-RPC 序号，
     // 不能把同一对话里的不同调用当成同一次调用的重试。客户端提供 MCP 会话标识时，

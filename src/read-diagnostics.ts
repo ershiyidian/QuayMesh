@@ -29,8 +29,9 @@ type Entry = {key:string; time:string; source:'operation'|'card'|'transport'|'no
 const cursorSchema = z.object({scope:z.string(),until:timestamp,after:z.string().max(512)}).strict();
 const lifecycle = new Set(['server_starting','server_exit','server_shutdown_started','server_shutdown_completed','server_shutdown_failed','server_uncaught_exception']);
 const logFields = ['requestId','method','tool','resourceUri','taskId','operationId','sessionId','httpStatus','rpcErrorCode',
-  'toolError','toolErrorCode','resultInspection','transportStatus','aborted','durationMs','responseHeadersMs','firstResponseByteMs',
+  'toolError','toolErrorCode','effect','retryHint','resultInspection','transportStatus','aborted','durationMs','authenticationMs','responseHeadersMs','firstResponseByteMs',
   'responseBytes','pid','ppid','childPid','exitCode','signal','elapsedMs','errorCode','outcome'];
+const MAX_LOG_SCAN_BYTES = 32*1024*1024;
 const operationFields = ['operation_id','kind','status','state','effect','exit_code','signal','error_code','result_ref'];
 function select(row:Row, fields:string[]):Row {
   const result:Row = {};
@@ -104,35 +105,43 @@ export async function readDiagnostics(config:Pick<ServerConfig,'stateDir'|'feder
     }
     candidates.sort((a,b) => b.mtimeMs-a.mtimeMs);
     let scannedBytes=0, malformedLines=0, filesRead=0, logsTruncated=false;
-    scan: for (const file of candidates) {
+    let authenticatedIngressRecords=0, finishedExchangeRecords=0;
+    for (const file of candidates) {
       if (file.mtimeMs < Date.parse(since)) continue;
-      const stream = createReadStream(join(directory,file.name),{encoding:'utf8'});
+      const remainingBytes = MAX_LOG_SCAN_BYTES-scannedBytes;
+      if (remainingBytes <= 0) { logsTruncated=true; break; }
+      // 在流上限制实际读取字节，超长单行和文件轮转都不能突破扫描预算。
+      const stream = createReadStream(join(directory,file.name),{end:remainingBytes-1});
       const lines = createInterface({input:stream,crlfDelay:Infinity});
       filesRead++;
       try {
         for await (const line of lines) {
-          scannedBytes += Buffer.byteLength(line)+1;
-          if (scannedBytes > 32*1024*1024) { logsTruncated=true; break scan; }
           let row:Row;
           try { row = JSON.parse(line) as Row; } catch { malformedLines++; continue; }
           if (!row || typeof row !== 'object' || typeof row.ts !== 'string' || row.ts < since || row.ts > until) continue;
           if (row.tool === 'read_diagnostics') continue;
           const op = typeof row.operationId === 'string' ? row.operationId : row.sessionId;
-          const exact = (typeof row.ownerHash !== 'string' || row.ownerHash === ownerHash) &&
+          const authenticatedIngress = row.event === 'mcp_exchange_authenticated';
+          const finishedExchange = row.event === 'mcp_exchange_finished';
+          const exchange = authenticatedIngress || finishedExchange;
+          const exact = (exchange ? row.ownerHash === ownerHash : typeof row.ownerHash !== 'string' || row.ownerHash === ownerHash) &&
             (input.operation_id ? op === input.operation_id : row.taskId === input.task_id || typeof op === 'string' && operationIds.has(op));
-          const accountResource = row.method === 'resources/read' &&
+          const accountResource = !authenticatedIngress && row.method === 'resources/read' &&
             (row.ownerHash === ownerHash || row.ownerHash === undefined && conversationHash && row.conversationHash === conversationHash);
           const nodeEvent = lifecycle.has(String(row.event));
           if (input.resource_uri && row.resourceUri !== input.resource_uri || !exact && !accountResource && !nodeEvent) continue;
-          if (row.event !== 'mcp_exchange_finished' && !String(row.event).startsWith('process_') && !nodeEvent) continue;
+          if (!exchange && !String(row.event).startsWith('process_') && !nodeEvent) continue;
+          if (exact && authenticatedIngress) authenticatedIngressRecords++;
+          if (exact && finishedExchange) finishedExchangeRecords++;
           const data = {event:row.event,...select(row,logFields),correlation:exact ? 'task' : accountResource ? 'account_resource' : 'node',
-            ...(row.event === 'mcp_exchange_finished' ? {outcome:mcpExchangeOutcome(row)} : {})};
+            ...(finishedExchange ? {outcome:mcpExchangeOutcome(row)} : {})};
           offer(nodeEvent ? 'node' : 'transport',row.ts,`${row.event}|${row.requestId ?? op ?? row.pid ?? ''}`,data);
         }
       } catch(error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
         rotatedFiles++;
-      } finally { lines.close(); stream.destroy(); }
+      } finally { scannedBytes += stream.bytesRead; lines.close(); stream.destroy(); }
+      if (scannedBytes >= MAX_LOG_SCAN_BYTES) { logsTruncated=true; break; }
     }
     let hasMore = entries.length > input.limit;
     if (hasMore) entries.pop();
@@ -140,7 +149,10 @@ export async function readDiagnostics(config:Pick<ServerConfig,'stateDir'|'feder
       since,until,events:entries.map(({key,...entry}) => entry),
       next_cursor:hasMore ? JSON.stringify({scope,until,after:entries.at(-1)!.key}) : null,
       coverage:{files_read:filesRead,scanned_bytes:scannedBytes,malformed_lines:malformedLines,logs_truncated:logsTruncated,rotated_files:rotatedFiles,
-        transport_log:files.length ? 'available' : 'not_recorded',host_acknowledgment:'unknown'}});
+        transport_log:files.length ? 'available' : 'not_found',
+        task_transport:{authenticated_ingress_records:authenticatedIngressRecords,finished_exchange_records:finishedExchangeRecords,
+          evidence:authenticatedIngressRecords || finishedExchangeRecords ? 'observed' : 'not_observed_in_scan',
+          completion:'not_inferred'},history_completeness:'unknown',host_acknowledgment:'unknown'}});
     let reply=result();
     while (entries.length>1 && replyBytes(reply)>REPLY_BYTES) {
       entries.pop();hasMore=true;reply=result();
@@ -152,7 +164,7 @@ export async function readDiagnostics(config:Pick<ServerConfig,'stateDir'|'feder
 export function registerReadDiagnostics(server:McpRegistrationTarget, config:ServerConfig):void {
   server.registerTool('read_diagnostics',{
     title:'Read task diagnostics',
-    description:'Read an authorized task’s saved events and transport/card diagnostics within a time window of at most 24 hours. node_id selects a cluster node; omit it for this MCP entry. Fixed read-only queries, no shell, SQL input, workspace locks or task progress updates. Host safety decisions and browser acknowledgments may be unavailable.',
+    description:'Read an authorized task’s saved events and transport/card diagnostics within at most 24 hours. node_id selects a cluster node. Authenticated ingress only proves HTTP identity/resource validation. Missing finish records do not establish execution state or non-arrival; older pre-auth starts cannot be attributed. Fixed read-only queries, no shell, SQL input, workspace locks or task progress updates. Host safety decisions and browser acknowledgments may be unavailable.',
     inputSchema:diagnosticsInputSchema,
     annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
   }, async (input,extra) => {

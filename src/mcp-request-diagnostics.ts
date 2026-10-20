@@ -7,7 +7,7 @@ const tools = new Set(["open_workspace", "attach_workspace", "read", "read_diagn
   "start_session","finish_task","workspace_catalog","read_output","cancel_command","checkpoint_task","download_artifact","copy_artifact","qm_widget_stage",
   "qm_session","qm_file_diff","qm_command_output","qm_command_outputs","qm_instruction","qm_patch","qm_revert","qm_file_url","qm_session_continue"]);
 const actions = new Set(["list","capture","search","status","recovery","start","observe","cancel"]);
-const errorCodes = new Set(["WORK_STATE", "INVALID_TASK", "AGENT_CONFLICT", "EXECUTION_CONFLICT", "STALE_CONTEXT", "ACCESS_DENIED", "WORKSPACE_NOT_FOUND", "WORKSPACE_MISMATCH", "AGENT_NOT_FOUND",
+const errorCodes = new Set(["WORK_STATE", "INVALID_TASK", "AGENT_CONFLICT", "EXECUTION_CONFLICT", "STALE_CONTEXT", "ACCESS_DENIED", "WORKSPACE_NOT_FOUND", "WORKSPACE_RESTORE_REQUIRED", "WORKSPACE_MISMATCH", "WORKSPACE_SESSION_MISMATCH", "SESSION_SCOPE_MISMATCH", "TASK_NOT_ACTIVE", "AGENT_NOT_FOUND",
   "NODE_ADMISSION_PAUSED", "TASK_SESSION_MISMATCH", "TASK_NOT_FOUND", "INVALID_ARGUMENT", "OPERATION_KEY_INVALID", "REQUEST_ID_REUSED",
   "OPERATION_RETRY_SCOPE_MISMATCH", "OPERATION_RETRY_NOT_ALLOWED", "OPERATION_RETRY_SUPERSEDED", "OPERATION_ID_MISMATCH",
   "REQUEST_TIMEOUT", "RPC_INTERRUPTED", "NODE_UNAVAILABLE", "PROCESS_RECONCILIATION_REQUIRED", "TOOL_EXECUTION_ERROR", "ZOD_ERROR",
@@ -44,12 +44,13 @@ export function argumentFingerprint(args: Record<string, any>): string {
 
 /** Metadata only. Never log request arguments, result text, headers, or raw errors.
  * This boundary also sees schema/auth failures that never enter a tool handler. */
-export function traceMcpRequest(req: Request, res: Response, requestId: string, record: RecordEvent): void {
+export function traceMcpRequest(req: Request, res: Response, requestId: string, record: RecordEvent): { authenticated(): void } {
   const body = object(req.body), params = object(body.params), args = object(params.arguments);
   const session = object(params._meta)["openai/session"];
   const context = { requestId, method: known(body.method, methods),
     source:body.method!=="tools/call" ? "protocol" : String(params.name).startsWith("qm_") ? "card" : "model",
     sourceEvidence:"tool_surface",taskId:identity(args.task_id,"task"),
+    operationId:identity(args.operation_id ?? args.operationId,"op"),
     requestBytes:Number(req.headers["content-length"] ?? 0),
     ...(body.method === "resources/read" && typeof params.uri === "string" ? { resourceUri: params.uri.slice(0, 512) } : {}),
     ...(body.method === "tools/call" ? { tool: known(params.name, tools), action: known(args.action, actions),
@@ -58,7 +59,7 @@ export function traceMcpRequest(req: Request, res: Response, requestId: string, 
     conversationHash: typeof session === "string" && session.length <= 1024
       ? createHash("sha256").update(JSON.stringify(session)).digest("hex").slice(0, 24) : undefined };
   const started = performance.now(), limit = 64 * 1024;
-  let bytes = 0, capturedBytes = 0, done = false;
+  let bytes = 0, capturedBytes = 0, done = false, authenticated = false;
   let headersAt: number | undefined;
   let firstByteAt: number | undefined;
   const chunks: Buffer[] = [], hash = createHash("sha256");
@@ -103,7 +104,7 @@ export function traceMcpRequest(req: Request, res: Response, requestId: string, 
           const content = Array.isArray(payload.content) ? payload.content : [];
           result = { resultInspection: "inspected", rpcErrorCode: Number.isInteger(error.code) ? error.code : undefined,
             taskId: identity(structured.task_id, "task") ?? context.taskId,
-            operationId: identity(structured.operation_id ?? structured.operationId, "op"),
+            operationId: identity(structured.operation_id ?? structured.operationId, "op") ?? context.operationId,
             toolError: payload.isError === true, contentBlocks: content.length,
             textBytes: content.reduce((n: number, block: any) => n + (typeof block?.text === "string" ? Buffer.byteLength(block.text) : 0), 0),
             structuredContentPresent: payload.structuredContent !== undefined,
@@ -144,4 +145,13 @@ export function traceMcpRequest(req: Request, res: Response, requestId: string, 
     res.off("finish", finish); res.off("close", finish);
   };
   res.once("finish", finish); res.once("close", finish);
+  return { authenticated() {
+    if (done || authenticated) return;
+    const owner = object(req.auth?.extra).owner_id;
+    if (typeof owner !== "string" || !owner) return;
+    authenticated = true;
+    // 仅由 HTTP 身份和目标资源校验成功处调用，不表示工具已经授权或执行。
+    emit("mcp_exchange_authenticated", { ...context, ownerHash: diagnosticOwnerHash(owner),
+      authenticationMs: Math.round(performance.now() - started) });
+  } };
 }

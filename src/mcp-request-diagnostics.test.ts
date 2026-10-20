@@ -43,7 +43,7 @@ test("real modern HTTP MCP diagnostics separate schema/tool errors from successf
     const response = await fetch(`http://127.0.0.1:${(http.address() as AddressInfo).port}/mcp`, { method: "POST",
       headers: { "content-type": "application/json", "mcp-method": "tools/call", "mcp-name": "work_task", "mcp-protocol-version": "2026-07-28", authorization: "Bearer secret-header" },
       body: JSON.stringify({ jsonrpc: "2.0", id: "secret-id", method: "tools/call", params: { name: "work_task",
-        arguments: { action, workspaceId: "ws_abcdef", prompt: "secret-prompt" },
+        arguments: { action, workspaceId: "ws_abcdef", operation_id: action === "untrusted" ? "secret-operation" : "op_123abc", prompt: "secret-prompt" },
         _meta: { "openai/session": "secret-session", "io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {} } } }) });
     const text = await response.text();
     const row = rows.at(-1)!;
@@ -53,6 +53,8 @@ test("real modern HTTP MCP diagnostics separate schema/tool errors from successf
   };
   const success = await call("snapshot"); assert.equal(success.response.status, 200);
   assert.equal(success.row.outcome, 'success');
+  assert.equal(success.row.operationId, "op_123abc");
+  assert.equal(rows.find(row => row.event === "mcp_exchange_started")!.operationId, "op_123abc");
   assert.equal(success.row.receiptPresent, true); assert.equal(success.row.toolError, false);
   const failed = await call("finish"); assert.equal(failed.response.status, 200); assert.equal(failed.row.toolError, true);
   assert.equal(failed.row.outcome, 'tool_error');
@@ -71,6 +73,7 @@ test("real modern HTTP MCP diagnostics separate schema/tool errors from successf
   assert.equal(untrusted.row.toolErrorCode, "other");
   assert.equal(untrusted.row.effect, "other");
   assert.equal(untrusted.row.retryHint, "other");
+  assert.equal(untrusted.row.operationId, undefined);
   const rejected = await call("unknown-secret-action");
   assert(rejected.row.rpcErrorCode || rejected.row.toolError, "Schema rejection must be visible even if no handler ran");
   assert.equal(rejected.row.action, "other");

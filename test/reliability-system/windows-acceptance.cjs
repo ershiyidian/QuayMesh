@@ -54,6 +54,7 @@ async function main() {
       "test/reliability-system/task-lifecycle.test.ts", "test/reliability-system/process-output-lifecycle.test.ts",
     ],
     "environment-review": ["src/tool-surfaces/subagents.test.ts", "test/python-workflow.test.ts"],
+    diagnostics: ["src/read-diagnostics.test.ts", "test/read-diagnostics.test.ts"],
     "workspace-restore": ["src/workspaces.test.ts", "src/git-worktrees.test.ts", "test/tool-contract/workspace-restore.test.ts"],
     // helpers.mjs 和 worker-process.mjs 是辅助程序，后者会定时常驻，不能当测试入口。
     node: files("node/test", ".test.mjs"),
