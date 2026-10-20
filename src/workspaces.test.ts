@@ -161,7 +161,7 @@ test("persisted checkout and worktree sessions restore after recreating the regi
   }
 });
 
-test("using a pruned workspace id restores its tracked worktree state", async (t) => {
+test("reading a pruned workspace never runs Git; explicit restore retains its identity and tracked changes", async (t) => {
   const context = await fixture(t);
   const gitRoot = await createGitProject(context.root);
   const stateDir = await mkdtemp(join(tmpdir(), "quaymesh-pruned-restore-state-test-"));
@@ -171,7 +171,14 @@ test("using a pruned workspace id restores its tracked worktree state", async (t
     await rm(stateDir, { recursive: true, force: true });
   });
   const registry = new WorkspaceRegistry(context.config, store);
+  const hooks = join(context.outsideRoot, "hooks");
+  const hook = join(hooks, "post-checkout");
+  const marker = `${hook}.marker`;
+  await mkdir(hooks);
+  await writeFile(hook, '#!/bin/sh\nprintf "checkout\\n" >> "$0.marker"\n', { mode: 0o755 });
+  await git(gitRoot, ["config", "core.hooksPath", hooks]);
   const opened = await registry.openWorkspace({ path: gitRoot, mode: "worktree" });
+  assert.equal(await readFile(marker, "utf8"), "checkout\n", "显式 worktree add 确实会执行配置的 Git hook");
   const workspaceId = opened.workspace.id;
   const worktreePath = opened.workspace.root;
 
@@ -188,15 +195,31 @@ test("using a pruned workspace id restores its tracked worktree state", async (t
 
   assert.equal(store.getSession(workspaceId)?.status, "pruned");
   await assert.rejects(() => stat(worktreePath), /ENOENT/);
+  await rm(marker);
 
-  const restored = await registry.getWorkspace(workspaceId);
+  await assert.rejects(() => registry.getWorkspace(workspaceId), (error: unknown) => {
+    const failure = error as { code?: string; effect?: string; details?: unknown };
+    assert.equal(failure.code, "WORKSPACE_RESTORE_REQUIRED");
+    assert.equal(failure.effect, "not_started");
+    assert.deepEqual(failure.details, { workspace_id: workspaceId,
+      restore: { tool: "attach_workspace", arguments: { workspace_id: workspaceId } } });
+    return true;
+  });
+  assert.equal(store.getSession(workspaceId)?.status, "pruned");
+  await assert.rejects(() => stat(worktreePath), /ENOENT/);
+  await assert.rejects(() => stat(marker), /ENOENT/);
+
+  const { workspace: restored } = await registry.restoreWorkspace(workspaceId);
   assert.equal(restored.id, workspaceId);
   assert.equal(restored.root, worktreePath);
   assert.equal(store.getSession(workspaceId)?.status, "active");
   assert.equal(await git(worktreePath, ["status", "--short"]), "MM README.md");
+  assert.equal(await readFile(marker, "utf8"), "checkout\n");
+  await registry.restoreWorkspace(workspaceId);
+  assert.equal(await readFile(marker, "utf8"), "checkout\n", "已恢复工作区的重复请求不再次运行 Git");
 });
 
-test("concurrent lookups share one pruned workspace restoration", async (t) => {
+test("concurrent explicit restores share one pruned workspace restoration", async (t) => {
   const context = await fixture(t);
   const gitRoot = await createGitProject(context.root);
   const stateDir = await mkdtemp(join(tmpdir(), "quaymesh-pruned-concurrent-state-test-"));
@@ -217,13 +240,13 @@ test("concurrent lookups share one pruned workspace restoration", async (t) => {
   }));
 
   const [first, second] = await Promise.all([
-    registry.getWorkspace(workspaceId),
-    registry.getWorkspace(workspaceId),
+    registry.restoreWorkspace(workspaceId),
+    registry.restoreWorkspace(workspaceId),
   ]);
 
-  assert.equal(first.id, workspaceId);
-  assert.equal(second.id, workspaceId);
-  assert.equal(first.root, second.root);
+  assert.equal(first.workspace.id, workspaceId);
+  assert.equal(second.workspace.id, workspaceId);
+  assert.equal(first.workspace.root, second.workspace.root);
   assert.equal(store.getSession(workspaceId)?.status, "active");
 });
 
@@ -260,14 +283,14 @@ test("failed session reactivation does not strand a restored worktree", async (t
   }));
 
   await assert.rejects(
-    () => registry.getWorkspace(workspaceId),
+    () => registry.restoreWorkspace(workspaceId),
     /could not be reactivated/,
   );
   assert.equal(store.getSession(workspaceId)?.status, "pruned");
   await assert.rejects(() => stat(worktreePath), /ENOENT/);
 
-  const retried = await registry.getWorkspace(workspaceId);
-  assert.equal(retried.id, workspaceId);
+  const retried = await registry.restoreWorkspace(workspaceId);
+  assert.equal(retried.workspace.id, workspaceId);
   assert.equal(store.getSession(workspaceId)?.status, "active");
 });
 

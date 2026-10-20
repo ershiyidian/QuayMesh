@@ -19,7 +19,9 @@ export function federatedTools(target: McpRegistrationTarget, runtime: Federatio
         return handler(schema.parse(input) as JsonRecord, extra);
       });
       const wrapped = name === "open_workspace" || name === "attach_workspace" ? { ...definition,
-        description: "Open root_id/subdirectory or an absolute path. Reuse the returned workspace_id.",
+        description: name === "attach_workspace"
+          ? "Attach root_id/subdirectory or an absolute path to the same session, or restore its pruned workspace with workspace_id alone. Restore retains the original workspace and saved tracked changes."
+          : "Open root_id/subdirectory or an absolute path. Reuse the returned workspace_id; restore a pruned one with attach_workspace.",
         inputSchema: { ...originalShape, path: z.string().optional(), root_id: z.string().optional().describe("Exported root from workspace_catalog."),
           subdirectory: z.string().optional().describe("Path within root_id.") },
       } : definition;

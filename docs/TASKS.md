@@ -26,6 +26,25 @@ Use `workspace_catalog` to find available roots. Open the chosen project with `o
 
 `mode: "checkout"` operates in the existing project. `mode: "worktree"` creates a separate Git checkout.
 
+Use `attach_workspace` with `path` or `root_id` to add another project to the current session. Opening or restoring a Git worktree can run the repository's configured checkout hooks and filters; these tools therefore advertise write and open-world behavior.
+
+### Restore a cleaned-up worktree
+
+Read-only tools never recreate a managed worktree that retention cleanup has removed. File reads and environment queries return `WORKSPACE_RESTORE_REQUIRED`, with `effect: "not_started"`, `retry_hint: "fix_input"`, and the original workspace handle in `details.restore.arguments`.
+
+To continue work, call `attach_workspace` in the original session with that handle:
+
+```json
+{
+  "workspace_id": "<original_workspace_id>",
+  "session_id": "<original_session_id>"
+}
+```
+
+Keep the complete `qm:node:...` handle when a worker owns the workspace. Omit `path`, `root_id`, `subdirectory`, `mode`, `base_ref`, and `create_directory` for this form. The original session must have an active task; start the next task in that session first if its previous task is closed. A workspace belonging to another session cannot be restored through this call.
+
+Restoration retains the workspace ID, directory, session member, and saved staged and unstaged changes to tracked files. Concurrent restores share the same restoration, and an already active workspace is reused. `workspace_context` with `status` or `recovery`, and `read_output`, can read authorized retained history while the directory is absent, including after the task has closed.
+
 ## Read and modify files
 
 `read` retrieves text ranges or images. `workspace_context` can collect several file ranges, search the workspace, or recover saved task context.

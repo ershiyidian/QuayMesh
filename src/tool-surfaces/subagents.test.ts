@@ -286,7 +286,7 @@ async function fixture(t: TestContext): Promise<Fixture> {
     await runtime.close();
     await daemon.close();
     await manager.close();
-    processSessions.shutdown();
+    await processSessions.shutdown();
     workspaceStore.close();
     sessionLedger.close();
     agents.close();

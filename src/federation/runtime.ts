@@ -23,6 +23,8 @@ export { isTransientPeerFailure, isIdempotentPeerRequest, dispatchPeerRequest, R
 import { toolDeadline, remainingToolTime, TOOL_DEADLINE_META } from "../tool-request-budget.js";
 import { jsonReply } from "../bounded-reply.js";
 import { currentInvocation } from "../session/invocations.js";
+import { toolErrorResult } from "../session/outcome.js";
+import { WorkspaceAccessError } from "../workspaces.js";
 import { dispatchPeerRequest, isTransientPeerFailure } from "./read-retry.js";
 import { dispatchConsoleRequest } from "./console-request.js";
 
@@ -379,7 +381,14 @@ export class FederationRuntime extends EventEmitter {
     // 查询原工作区的历史记录无需重新打开已经删除的文件目录。
     const historical = name === "read_output" || name === "workspace_context" &&
       (args.action === "recovery" || args.action === "status" && args.environment !== true);
-    if (typeof args.workspace_id === "string" && !historical) await this.hooks.checkWorkspace(args.workspace_id);
+    if (typeof args.workspace_id === "string" && !historical && !opensWorkspace) {
+      try { await this.hooks.checkWorkspace(args.workspace_id); }
+      catch (error) {
+        // 恢复提示属于工具回执；先保留节点句柄和参数，再跨节点传输。
+        if (error instanceof WorkspaceAccessError) return routedResult(toolErrorResult(error), this.localId, { textReferences: true });
+        throw error;
+      }
+    }
     this.activeCalls++;
     try {
       remainingToolTime(deadlineAt);
@@ -433,7 +442,9 @@ export class FederationRuntime extends EventEmitter {
         owner_id: identity.owner_id, transport_instance_id: identity.transport_instance_id,
       } } } : {}) };
     const result = await this.request(node, "tool", { name, input: args, extra: context }, remainingToolTime(deadlineAt));
-    await this.sessionFeed?.afterRemoteResult(name, args, result, node, trustedInvocation);
+    if ((result as JsonRecord | null)?.isError !== true) {
+      await this.sessionFeed?.afterRemoteResult(name, args, result, node, trustedInvocation);
+    }
     return result;
   }
   private async openGatewayStream(service: "ingress" | "egress"): Promise<Duplex> {

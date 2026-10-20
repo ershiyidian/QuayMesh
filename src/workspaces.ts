@@ -94,6 +94,20 @@ export interface OpenWorkspaceOptions {
   conversationScopeId?: string;
 }
 
+export class WorkspaceAccessError extends Error {
+  readonly effect = "not_started";
+  readonly details: { workspace_id: string; restore?: { tool: string; arguments: { workspace_id: string } } };
+
+  constructor(readonly code: "WORKSPACE_NOT_FOUND" | "WORKSPACE_RESTORE_REQUIRED", workspaceId: string) {
+    const restore = { tool: "attach_workspace", arguments: { workspace_id: workspaceId } };
+    super(code === "WORKSPACE_RESTORE_REQUIRED"
+      ? `${code}: Workspace ${workspaceId} was pruned. Call attach_workspace(${JSON.stringify(restore.arguments)}) in its original session to restore it before accessing files.`
+      : `${code}: Unknown workspaceId: ${workspaceId}. Open the target project or worktree again and continue with the new workspaceId.`);
+    this.name = "WorkspaceAccessError";
+    this.details = { workspace_id: workspaceId, ...(code === "WORKSPACE_RESTORE_REQUIRED" ? { restore } : {}) };
+  }
+}
+
 type PathStats = Stats;
 type DirectoryOps = {
   stat: (path: string) => Promise<PathStats>;
@@ -322,13 +336,7 @@ export class WorkspaceRegistry {
       session = sessionLookup.value;
     }
     if (session?.status === "pruned") {
-      const restored = await this.ensurePrunedWorkspaceRestored(session);
-      if (restored.isErr()) throw restored.error;
-      if (this.store) {
-        const restoredLookup = this.store.getSessionResult(workspaceId);
-        if (restoredLookup.isErr()) throw restoredLookup.error;
-        session = restoredLookup.value;
-      }
+      throw new WorkspaceAccessError("WORKSPACE_RESTORE_REQUIRED", workspaceId);
     }
     if (!session || session.status !== "active") {
       throw unavailableWorkspaceError(workspaceId);
@@ -369,6 +377,19 @@ export class WorkspaceRegistry {
     this.rememberWorkspace(restoredWorkspace);
 
     return restoredWorkspace;
+  }
+
+  async restoreWorkspace(workspaceId: string): Promise<WorkspaceContext> {
+    if (this.store) {
+      const saved = this.store.getSessionResult(workspaceId);
+      if (saved.isErr()) throw saved.error;
+      if (saved.value?.status === "pruned") {
+        // 只有明确的恢复入口可以重建工作树；普通读取不运行 Git 或项目 hook。
+        const restored = await this.ensurePrunedWorkspaceRestored(saved.value);
+        if (restored.isErr()) throw restored.error;
+      }
+    }
+    return this.reusedWorkspaceContext(await this.getWorkspace(workspaceId));
   }
 
   private async ensurePrunedWorkspaceRestored(
@@ -624,9 +645,7 @@ export class WorkspaceRegistry {
 }
 
 function unavailableWorkspaceError(workspaceId: string): Error {
-  return new Error(
-    `Unknown workspaceId: ${workspaceId}. Open the target project or worktree again and continue with the new workspaceId.`,
-  );
+  return new WorkspaceAccessError("WORKSPACE_NOT_FOUND", workspaceId);
 }
 
 export async function ensureCheckoutWorkspaceRoot(

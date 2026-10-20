@@ -62,6 +62,14 @@ export function createFederation(config: ServerConfig, workspaces: WorkspaceRegi
     console: consoleOperation, settings,
     prepareOpen: async (input) => {
       const { root_id, subdirectory, ...rest } = input;
+      if (input.workspace_id !== undefined) {
+        if (typeof input.workspace_id !== "string" || !input.workspace_id ||
+            [root_id, subdirectory, input.path].some(value => value !== undefined)) {
+          throw Object.assign(new Error("INVALID_ARGUMENT: restore workspace_id without path, root_id, or subdirectory."),
+            { code: "INVALID_ARGUMENT", effect: "not_started" });
+        }
+        return rest;
+      }
       if (root_id !== undefined) {
         const root = federation.roots.find((entry) => entry.id === root_id && entry.enabled);
         if (!root) throw new Error(`根目录 ${root_id} 当前未启用`);

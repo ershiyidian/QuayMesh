@@ -91,6 +91,9 @@ export class SessionFeed {
     const current = typeof input.session_id === "string"
       ? this.store.requireSession(ownerId, input.session_id)
       : conversation ? this.store.findByConversation(ownerId, conversation) : null;
+    if (name === "attach_workspace" && current && conversation && current.conversation_id && current.conversation_id !== conversation) {
+      throw Object.assign(new Error(`SESSION_SCOPE_MISMATCH: ${current.id}`), { code: "SESSION_SCOPE_MISMATCH", effect: "not_started" });
+    }
     const handle = typeof input.workspace_id === "string" ? parseWorkspaceHandle(input.workspace_id) : undefined;
     const found = current?.members.find((candidate) => candidate.id === input.member_id
       || (candidate.workspace_id === (handle?.local ?? input.workspace_id) && (!handle || candidate.node_id === handle.node)));

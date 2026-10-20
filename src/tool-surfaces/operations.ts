@@ -5,10 +5,21 @@ import { OperationState } from "../session/types.js";
 import { mapConcurrent } from "../concurrency.js";
 import type { ToolRegistrationContext } from "./types.js";
 
+function outputWorkspace(context: ToolRegistrationContext, workspaceId: string) {
+  const runtime = context.sessionRuntime, invocation = currentInvocation();
+  if (!runtime || !invocation) throw new Error("SESSION_RUNTIME_REQUIRED");
+  // 输出属于已经授权的成员，读取历史结果不依赖工作目录仍然存在。
+  const member = runtime.store.getMember(invocation.session_id, invocation.member_id);
+  if (member.workspace_id !== workspaceId || member.node_id !== (context.config.federation?.nodeId ?? "local")) {
+    throw Object.assign(new Error("WORKSPACE_SESSION_MISMATCH"), { code: "WORKSPACE_SESSION_MISMATCH", effect: "not_started" });
+  }
+  return member;
+}
+
 export async function commandOutput(context:ToolRegistrationContext,workspaceId:string,operationId:string,cursor=0,limit=16384,preview=false) {
   const runtime=context.sessionRuntime,invocation=currentInvocation();
   if(!runtime||!invocation)throw new Error("SESSION_RUNTIME_REQUIRED");
-  const workspace=await context.workspaces.getWorkspace(workspaceId);
+  const workspace=outputWorkspace(context,workspaceId);
   const command=runtime.store.requireCommand(invocation.owner_id,context.config.federation?.nodeId??"local",workspace.root,operationId);
   const saved = runtime.store.findInvocationByOperation(invocation.owner_id, operationId)!;
   if (saved.effect === "not_started") {
@@ -59,7 +70,7 @@ export function registerOperationTools(context:ToolRegistrationContext):void {
     annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
   },async(input,extra)=>{
     const invocation=currentInvocation();if(!invocation)throw new Error("MISSING_OPERATION_CONTEXT");
-    const workspace=await context.workspaces.getWorkspace(input.workspace_id);
+    const workspace=outputWorkspace(context,input.workspace_id);
     const items=input.outputs??[{operation_id:input.operation_id!,cursor:input.cursor??0}];
     // 身份先验证；已授权结果的过期/范围错误按对应项返回。
     for(const item of items)runtime.store.requireCommand(invocation.owner_id,context.config.federation?.nodeId??"local",workspace.root,item.operation_id);

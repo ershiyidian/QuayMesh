@@ -71,7 +71,7 @@ import { LocalAgentStore } from "./local-agent-store.js";
 import { createSessionRuntime, type SessionRuntime } from "./session/runtime.js";
 import { buildHostPrompt } from "./session/prompts.js";
 import { OperationState, type Snapshot } from "./session/types.js";
-import { classifyToolResultError } from "./session/outcome.js";
+import { classifyToolResultError, errorCode, toolErrorResult } from "./session/outcome.js";
 import { registerWorkspaceContextTool } from "./tool-surfaces/workspace-context.js";
 import { createProjectConsoleRouter } from "./project-console-router.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
@@ -462,7 +462,7 @@ function registerMcpSurface(
           .describe("Worktree base; default HEAD."),
       },
       outputSchema: workspaceOutputSchema,
-      annotations: { readOnlyHint:false, destructiveHint:true, openWorldHint:false },
+      annotations: { readOnlyHint:false, destructiveHint:true, openWorldHint:true },
     },
     async ({ path, mode, base_ref, create_directory }, extra) => {
       const { _meta } = extra;
@@ -632,63 +632,85 @@ function registerMcpSurface(
     {
       title: "Attach another workspace",
       description:
-        "Open an additional project root in the same conversation without creating another card. Reuse this after open_workspace established the session.",
+        "Open an additional project in the same conversation with path, or restore a pruned workspace with its existing workspace_id. Restoring retains its session, directory, and saved tracked changes.",
       inputSchema: {
         create_directory: z.boolean().optional().describe("Create the directory when absent."),
-        path: z.string().describe("Relative file path; workspace open accepts an absolute path."),
+        path: z.string().min(1).optional().describe("Project path; omit when restoring workspace_id."),
+        workspace_id: z.string().min(1).optional().describe("Existing workspace in this session to restore; omit path, mode, base_ref, and create_directory."),
         mode: z.enum(["checkout", "worktree"]).optional().describe("checkout edits the source; worktree creates an isolated checkout."),
         base_ref: z.string().optional().describe("Worktree base; default HEAD."),
         session_id: z.string().optional().describe("Existing session."),
       },
       outputSchema: workspaceOutputSchema,
-      annotations: { readOnlyHint:false, destructiveHint:true, openWorldHint:false },
+      annotations: { readOnlyHint:false, destructiveHint:true, openWorldHint:true },
     },
-    async ({ path, mode, base_ref, create_directory, session_id }, extra) => {
-      if (!sessionRuntime) throw new Error("SESSION_RUNTIME_UNAVAILABLE");
-      const identity = sessionRequestIdentity(extra);
-      const opened = await workspaces.openWorkspace(
-        { path, mode, baseRef: base_ref, createDirectory: create_directory },
-        { conversationScopeId: identity.conversation_id ?? undefined },
-      );
-      const session = session_id
-        ? sessionRuntime.store.requireSession(identity.owner_id, session_id)
-        : identity.conversation_id
-          ? sessionRuntime.store.findByConversation(identity.owner_id, identity.conversation_id)
-          : null;
-      if (!session) throw new Error("SESSION_REQUIRED: call open_workspace first or pass session_id.");
-      const attached = await sessionRuntime.service.attach(
-        { owner_id: identity.owner_id, conversation_id: identity.conversation_id },
-        session.id,
-        {
-          id: opened.workspace.id,
-          node: config.federation?.nodeId ?? "local",
-          root: opened.workspace.root,
-          mode: opened.workspace.mode === "worktree" ? "worktree" : "checkout",
-          sourceRoot: opened.workspace.sourceRoot ?? null,
-          metadata: await describeWorkspace(opened.workspace),
-        },
-      );
-      sessionRuntime.context.registerDiscovered({
-        sessionId: session.id, memberId: attached.member.id, workspace: opened.workspace,
-        loadedAgentsFiles: opened.agentsFiles, availableAgentsFiles: opened.availableAgentsFiles,
-      });
-      const task = sessionRuntime.store.currentTask(session.id);
-      if (!task) throw new Error(`TASK_NOT_FOUND_FOR_SESSION: ${session.id}`);
-      const instruction = "Use this workspace_id for subsequent work in this root. It belongs to the same session card.";
-      const text = "Attached workspace " + opened.workspace.id + " to session " + session.id + ". Root: " + opened.workspace.root;
-      return {
-        content:[{type:"text",text:"Workspace attached."}],
-        _meta:{quaymesh:{session_id:session.id,task_id:task.id,member_id:attached.member.id,workspace_id:opened.workspace.id}},
-        structuredContent:{
-          workspace_id:opened.workspace.id,root:opened.workspace.root,node_id:config.federation?.nodeId??"local",
-          session_id:session.id,task_id:task.id,mode:opened.workspace.mode,
-          ...(opened.workspace.sourceRoot?{source_root:opened.workspace.sourceRoot}:{}),
-          ...(opened.includeBootstrapContext?{
-            execution:{platform:executionContract().platform,shell:executionContract().shell},
-            ...(opened.availableAgentsFiles.length?{available_agents_files:opened.availableAgentsFiles.map(file=>({path:formatAgentsPath(file.path,opened.workspace.root)}))}:{}),
-          }:{}),
-        },
-      };
+    async ({ path, workspace_id, mode, base_ref, create_directory, session_id }, extra) => {
+      let effectStarted = false;
+      try {
+        if (!sessionRuntime) throw new Error("SESSION_RUNTIME_UNAVAILABLE");
+        if ((path === undefined) === (workspace_id === undefined)) {
+          throw new Error("INVALID_ARGUMENT: provide exactly one of path or workspace_id.");
+        }
+        if (workspace_id !== undefined && [mode, base_ref, create_directory].some(value => value !== undefined)) {
+          throw new Error("INVALID_ARGUMENT: workspace_id restores the original workspace; omit mode, base_ref, and create_directory.");
+        }
+        const identity = sessionRequestIdentity(extra);
+        const session = session_id
+          ? sessionRuntime.store.requireSession(identity.owner_id, session_id)
+          : identity.conversation_id
+            ? sessionRuntime.store.findByConversation(identity.owner_id, identity.conversation_id)
+            : null;
+        if (!session) throw new Error("SESSION_REQUIRED: call open_workspace first or pass session_id.");
+        if (identity.conversation_id && session.conversation_id && session.conversation_id !== identity.conversation_id) {
+          throw new Error(`SESSION_SCOPE_MISMATCH: ${session.id}`);
+        }
+        const nodeId = config.federation?.nodeId ?? "local";
+        if (workspace_id !== undefined && !session.members.some(member => member.node_id === nodeId && member.workspace_id === workspace_id)) {
+          throw new Error(`WORKSPACE_SESSION_MISMATCH: ${workspace_id} is not a member of session ${session.id}.`);
+        }
+        const task = sessionRuntime.store.currentTask(session.id);
+        if (!task || task.state !== "active") throw new Error(`TASK_NOT_ACTIVE: start a task in session ${session.id} before attaching a workspace.`);
+
+        // 身份、原成员和任务先验证，再允许创建目录、运行 Git 或恢复修改。
+        effectStarted = true;
+        const opened = workspace_id !== undefined
+          ? await workspaces.restoreWorkspace(workspace_id)
+          : await workspaces.openWorkspace(
+            { path: path!, mode, baseRef: base_ref, createDirectory: create_directory },
+            { conversationScopeId: identity.conversation_id ?? undefined },
+          );
+        const attached = await sessionRuntime.service.attach(
+          { owner_id: identity.owner_id, conversation_id: identity.conversation_id },
+          session.id,
+          {
+            id: opened.workspace.id,
+            node: nodeId,
+            root: opened.workspace.root,
+            mode: opened.workspace.mode === "worktree" ? "worktree" : "checkout",
+            sourceRoot: opened.workspace.sourceRoot ?? null,
+            metadata: await describeWorkspace(opened.workspace),
+          },
+        );
+        sessionRuntime.context.registerDiscovered({
+          sessionId: session.id, memberId: attached.member.id, workspace: opened.workspace,
+          loadedAgentsFiles: opened.agentsFiles, availableAgentsFiles: opened.availableAgentsFiles,
+        });
+        return {
+          content:[{type:"text",text:"Workspace attached."}],
+          _meta:{quaymesh:{session_id:session.id,task_id:task.id,member_id:attached.member.id,workspace_id:opened.workspace.id}},
+          structuredContent:{
+            workspace_id:opened.workspace.id,root:opened.workspace.root,node_id:nodeId,
+            session_id:session.id,task_id:task.id,mode:opened.workspace.mode,
+            ...(opened.workspace.sourceRoot?{source_root:opened.workspace.sourceRoot}:{}),
+            ...(opened.includeBootstrapContext?{
+              execution:{platform:executionContract().platform,shell:executionContract().shell},
+              ...(opened.availableAgentsFiles.length?{available_agents_files:opened.availableAgentsFiles.map(file=>({path:formatAgentsPath(file.path,opened.workspace.root)}))}:{}),
+            }:{}),
+          },
+        };
+      } catch (error) {
+        return toolErrorResult(error, { sideEffecting: effectStarted });
+      }
     },
   );
 
@@ -1033,7 +1055,10 @@ function withSessionToolRecording(
           },
         }).then(compatibleToolReceipt);
       };
-      const recordedHandler = (input: any, extra: any) => recordOperation(input, extra, async () => handler(input, extra));
+      const recordedHandler = (input: any, extra: any) => recordOperation(input, extra, async () => handler(input, extra)).catch(error => {
+        if (["WORKSPACE_NOT_FOUND", "WORKSPACE_RESTORE_REQUIRED"].includes(errorCode(error))) return toolErrorResult(error);
+        throw error;
+      });
       return (server.registerTool as any)(name, definition, markSessionRecordedTool(
         recordedHandler,
         async (input, extra, operation, options) => recordOperation(input, extra, operation, options?.forwarded === true),

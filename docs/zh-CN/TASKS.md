@@ -28,6 +28,25 @@ QuayMesh 将一次用户请求涉及的工作区、命令、文件和编程代�
 
 `mode: "checkout"` 使用现有项目目录，`mode: "worktree"` 创建独立的 Git 检出目录。
 
+使用 `attach_workspace` 的 `path` 或 `root_id` 参数，将另一个项目加入当前会话。创建或恢复 Git 工作树可能运行仓库配置的检出 hook 和 filter，因此这两个工具如实声明具有写入及开放环境行为。
+
+### 恢复被清理的工作树
+
+只读工具不会重建已被保留策略清理的托管工作树。文件读取和环境查询会返回 `WORKSPACE_RESTORE_REQUIRED`，并包含 `effect: "not_started"`、`retry_hint: "fix_input"` 和 `details.restore.arguments` 中的原工作区句柄。
+
+需要继续工作时，在原会话中使用该句柄调用 `attach_workspace`：
+
+```json
+{
+  "workspace_id": "<original_workspace_id>",
+  "session_id": "<original_session_id>"
+}
+```
+
+工作区属于执行节点时，保留完整的 `qm:node:...` 句柄。此形式不传 `path`、`root_id`、`subdirectory`、`mode`、`base_ref` 或 `create_directory`。原会话必须有活跃任务；如果上一任务已结束，先在原会话中创建下一任务。此调用不能恢复属于其他会话的工作区。
+
+恢复保留原工作区 ID、目录、会话成员，以及已保存的受跟踪文件的暂存和未暂存修改。并发恢复共用同一次执行，已处于活跃状态的工作区直接复用。目录缺失时，`workspace_context` 的 `status`、`recovery` 以及 `read_output` 仍可读取经过授权且尚在保留期内的历史记录，包括已结束任务的记录。
+
 ## 阅读与修改文件
 
 `read` 读取指定文本范围或图片。`workspace_context` 可以批量收集文件片段、搜索工作区或恢复已保存的任务上下文。
