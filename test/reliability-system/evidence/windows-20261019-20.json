@@ -1,0 +1,645 @@
+{
+  "schema_version": 1,
+  "description": "Sanitized Windows acceptance receipts. Counts come from Node's root test:summary, not parsed TAP lines. These runs tested different commits; no combined final-head claim is made.",
+  "runs": [
+    {
+      "id": "run-01",
+      "commit": "5964a6a127b594e35cd5ac8f8b5d962bef05b5eb",
+      "dirty": false,
+      "runtime": {
+        "version": "v24.21.0",
+        "platform": "win32",
+        "arch": "x64"
+      },
+      "started_at": "2026-10-19T09:22:32.771Z",
+      "finished_at": "2026-10-19T09:29:38.996Z",
+      "status": "failed",
+      "group_timeout_ms": 240000,
+      "source_summary_sha256": "8538dab4d5cd7dcfb78671075be7c3b64a7092c27bd2511e695187f435b196c4",
+      "groups": [
+        {
+          "name": "mcp-http",
+          "status": "failed",
+          "files": [
+            "src/mcp-modern-server.test.ts",
+            "src/mcp-sse-response.test.ts",
+            "src/mcp-request-diagnostics.test.ts",
+            "src/mcp-sdk-error-contract.test.ts",
+            "src/reliability-core.test.ts",
+            "test/tool-contract/admission-retry.test.ts",
+            "test/tool-contract/error-receipt.test.ts",
+            "test/reliability-liveness.test.ts",
+            "test/receipt-wire-contract.test.ts"
+          ],
+          "duration_ms": 240408.291,
+          "exit_code": 1,
+          "signal": null,
+          "timed_out": true,
+          "cleanup_incomplete": false,
+          "counts": null,
+          "owned_process_tree_termination_exit_code": 0
+        },
+        {
+          "name": "session-sqlite",
+          "status": "failed",
+          "files": [
+            "src/session/admission-retry.test.ts",
+            "src/session/agent-operations-lock.test.ts",
+            "src/session/agent-operations.test.ts",
+            "src/session/agent-results.test.ts",
+            "src/session/binding.test.ts",
+            "src/session/changes.test.ts",
+            "src/session/context-reads.test.ts",
+            "src/session/invocations.test.ts",
+            "src/session/output.test.ts",
+            "src/session/prompts.test.ts",
+            "src/session/recovery.test.ts",
+            "src/session/revert.test.ts",
+            "src/session/session-store.test.ts",
+            "src/db/migrations.test.ts",
+            "src/execution-coordinator.test.ts",
+            "src/reliability-followup.test.ts",
+            "src/server-diagnostics.test.ts",
+            "test/reliability-background.test.ts"
+          ],
+          "duration_ms": 72586.05,
+          "exit_code": 1,
+          "signal": null,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 92,
+            "failed": 2,
+            "passed": 90,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 92,
+            "suites": 0
+          }
+        },
+        {
+          "name": "recovery-federation",
+          "status": "passed",
+          "files": [
+            "test/federation/core.test.ts",
+            "test/federation/runtime.test.ts",
+            "test/federation/transport-edge.test.ts",
+            "test/tool-contract/federation.test.ts",
+            "test/tool-contract/receipts.test.ts",
+            "test/tool-contract/output.test.ts",
+            "test/tool-contract/parallel.test.ts",
+            "test/reliability-system/invocation-outcome.test.ts",
+            "test/reliability-system/card-command-projection.test.ts",
+            "test/reliability-system/task-lifecycle.test.ts",
+            "test/reliability-system/process-output-lifecycle.test.ts"
+          ],
+          "duration_ms": 97982.874,
+          "exit_code": 0,
+          "signal": null,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 43,
+            "failed": 0,
+            "passed": 43,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 43,
+            "suites": 0
+          }
+        },
+        {
+          "name": "node",
+          "status": "passed",
+          "files": [
+            "node/test/config.test.mjs",
+            "node/test/core-runtime.test.mjs",
+            "node/test/cutover-preflight.test.mjs",
+            "node/test/discovery-readiness.test.mjs",
+            "node/test/easytier-health.test.mjs",
+            "node/test/install-payload.test.mjs",
+            "node/test/mcp-diagnostics-timing.test.mjs",
+            "node/test/registry.test.mjs",
+            "node/test/relay.test.mjs",
+            "node/test/reliability.test.mjs",
+            "node/test/roots-recovery-preview.test.mjs",
+            "node/test/settings-lifecycle.test.mjs",
+            "node/test/supervisor.test.mjs",
+            "node/test/windows-powershell-scripts.test.mjs"
+          ],
+          "duration_ms": 15205.458,
+          "exit_code": 0,
+          "signal": null,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 49,
+            "failed": 0,
+            "passed": 49,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 49,
+            "suites": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "run-02",
+      "commit": "52e85864221867f40de15d98217c702cddc10799",
+      "dirty": false,
+      "runtime": {
+        "version": "v24.21.0",
+        "platform": "win32",
+        "arch": "x64"
+      },
+      "started_at": "2026-10-19T09:38:32.880Z",
+      "finished_at": "2026-10-19T09:40:24.795Z",
+      "status": "passed",
+      "group_timeout_ms": 240000,
+      "source_summary_sha256": "0bbc9c3caa74be4a2e855645c0c63904e271e493ea44e20678331b47d91741c9",
+      "groups": [
+        {
+          "name": "mcp-http",
+          "status": "passed",
+          "files": [
+            "src/mcp-modern-server.test.ts",
+            "src/mcp-sse-response.test.ts",
+            "src/mcp-request-diagnostics.test.ts",
+            "src/mcp-sdk-error-contract.test.ts",
+            "src/reliability-core.test.ts",
+            "test/tool-contract/admission-retry.test.ts",
+            "test/tool-contract/error-receipt.test.ts",
+            "test/reliability-liveness.test.ts",
+            "test/receipt-wire-contract.test.ts"
+          ],
+          "duration_ms": 27836.209,
+          "exit_code": 0,
+          "signal": null,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 36,
+            "failed": 0,
+            "passed": 36,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 36,
+            "suites": 0
+          }
+        },
+        {
+          "name": "session-sqlite",
+          "status": "passed",
+          "files": [
+            "src/session/admission-retry.test.ts",
+            "src/session/agent-operations-lock.test.ts",
+            "src/session/agent-operations.test.ts",
+            "src/session/agent-results.test.ts",
+            "src/session/binding.test.ts",
+            "src/session/changes.test.ts",
+            "src/session/context-reads.test.ts",
+            "src/session/invocations.test.ts",
+            "src/session/output.test.ts",
+            "src/session/prompts.test.ts",
+            "src/session/recovery.test.ts",
+            "src/session/revert.test.ts",
+            "src/session/session-store.test.ts",
+            "src/db/migrations.test.ts",
+            "src/execution-coordinator.test.ts",
+            "src/reliability-followup.test.ts",
+            "src/server-diagnostics.test.ts",
+            "test/reliability-background.test.ts"
+          ],
+          "duration_ms": 72513.101,
+          "exit_code": 0,
+          "signal": null,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 92,
+            "failed": 0,
+            "passed": 92,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 92,
+            "suites": 0
+          }
+        },
+        {
+          "name": "environment-review",
+          "status": "passed",
+          "files": [
+            "src/tool-surfaces/subagents.test.ts",
+            "test/python-workflow.test.ts"
+          ],
+          "duration_ms": 11544.131,
+          "exit_code": 0,
+          "signal": null,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 6,
+            "failed": 0,
+            "passed": 6,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 6,
+            "suites": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "run-03",
+      "commit": "6df13487da8770c7878574a30df6a2d46da515b8",
+      "dirty": false,
+      "runtime": {
+        "version": "v24.21.0",
+        "platform": "win32",
+        "arch": "x64"
+      },
+      "started_at": "2026-10-20T06:14:40.885Z",
+      "finished_at": "2026-10-20T06:17:00.184Z",
+      "status": "failed",
+      "group_timeout_ms": 240000,
+      "source_summary_sha256": "55c0a5786fd1c91b0ac531bd7a97051461cda40521dbd6c9adec49868755e584",
+      "groups": [
+        {
+          "name": "recovery-federation",
+          "status": "passed",
+          "files": [
+            "test/federation/core.test.ts",
+            "test/federation/runtime.test.ts",
+            "test/federation/transport-edge.test.ts",
+            "test/tool-contract/federation.test.ts",
+            "test/tool-contract/receipts.test.ts",
+            "test/tool-contract/output.test.ts",
+            "test/tool-contract/parallel.test.ts",
+            "test/reliability-system/invocation-outcome.test.ts",
+            "test/reliability-system/card-command-projection.test.ts",
+            "test/reliability-system/task-lifecycle.test.ts",
+            "test/reliability-system/process-output-lifecycle.test.ts"
+          ],
+          "duration_ms": 98777.245,
+          "exit_code": 0,
+          "signal": null,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 43,
+            "failed": 0,
+            "passed": 43,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 43,
+            "suites": 0
+          }
+        },
+        {
+          "name": "environment-review",
+          "status": "passed",
+          "files": [
+            "src/tool-surfaces/subagents.test.ts",
+            "test/python-workflow.test.ts"
+          ],
+          "duration_ms": 12930.947,
+          "exit_code": 0,
+          "signal": null,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 6,
+            "failed": 0,
+            "passed": 6,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 6,
+            "suites": 0
+          }
+        },
+        {
+          "name": "workspace-restore",
+          "status": "failed",
+          "files": [
+            "src/workspaces.test.ts",
+            "src/git-worktrees.test.ts",
+            "test/tool-contract/workspace-restore.test.ts"
+          ],
+          "duration_ms": 27558.871,
+          "exit_code": 1,
+          "signal": null,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 27,
+            "failed": 1,
+            "passed": 21,
+            "cancelled": 0,
+            "skipped": 5,
+            "todo": 0,
+            "topLevel": 27,
+            "suites": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "run-04",
+      "commit": "e3d5b5ae26797a8a64c5aee3b9b686d613120008",
+      "dirty": false,
+      "runtime": {
+        "version": "v24.21.0",
+        "platform": "win32",
+        "arch": "x64"
+      },
+      "started_at": "2026-10-20T06:31:19.259Z",
+      "finished_at": "2026-10-20T06:35:24.157Z",
+      "status": "passed",
+      "group_timeout_ms": 240000,
+      "source_summary_sha256": "99d9ef2a7edf7cbb8979030e84e06fac66e3ffbca9d1b1b4475decdb3b87aea7",
+      "groups": [
+        {
+          "name": "mcp-http",
+          "status": "passed",
+          "files": [
+            "src/mcp-modern-server.test.ts",
+            "src/mcp-sse-response.test.ts",
+            "src/mcp-request-diagnostics.test.ts",
+            "src/mcp-sdk-error-contract.test.ts",
+            "src/reliability-core.test.ts",
+            "test/tool-contract/admission-retry.test.ts",
+            "test/tool-contract/error-receipt.test.ts",
+            "test/reliability-liveness.test.ts",
+            "test/receipt-wire-contract.test.ts"
+          ],
+          "duration_ms": 31244.939,
+          "exit_code": 0,
+          "signal": null,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 37,
+            "failed": 0,
+            "passed": 37,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 37,
+            "suites": 0
+          },
+          "source_tap_sha256": "88eccc7462f92b4dbfa2ea4dd667bd05a16020b3cedf00b6c93e2436d335165b"
+        },
+        {
+          "name": "session-sqlite",
+          "status": "passed",
+          "files": [
+            "src/session/admission-retry.test.ts",
+            "src/session/agent-operations-lock.test.ts",
+            "src/session/agent-operations.test.ts",
+            "src/session/agent-results.test.ts",
+            "src/session/binding.test.ts",
+            "src/session/changes.test.ts",
+            "src/session/command-history.test.ts",
+            "src/session/context-reads.test.ts",
+            "src/session/invocations.test.ts",
+            "src/session/output.test.ts",
+            "src/session/prompts.test.ts",
+            "src/session/recovery.test.ts",
+            "src/session/revert.test.ts",
+            "src/session/session-store.test.ts",
+            "src/db/migrations.test.ts",
+            "src/execution-coordinator.test.ts",
+            "src/reliability-followup.test.ts",
+            "src/server-diagnostics.test.ts",
+            "test/reliability-background.test.ts"
+          ],
+          "duration_ms": 76378.545,
+          "exit_code": 0,
+          "signal": null,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 94,
+            "failed": 0,
+            "passed": 94,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 94,
+            "suites": 0
+          }
+        },
+        {
+          "name": "recovery-federation",
+          "status": "passed",
+          "files": [
+            "test/federation/core.test.ts",
+            "test/federation/runtime.test.ts",
+            "test/federation/transport-edge.test.ts",
+            "test/tool-contract/federation.test.ts",
+            "test/tool-contract/receipts.test.ts",
+            "test/tool-contract/output.test.ts",
+            "test/tool-contract/parallel.test.ts",
+            "test/reliability-system/invocation-outcome.test.ts",
+            "test/reliability-system/card-command-projection.test.ts",
+            "test/reliability-system/task-lifecycle.test.ts",
+            "test/reliability-system/process-output-lifecycle.test.ts"
+          ],
+          "duration_ms": 98951.492,
+          "exit_code": 0,
+          "signal": null,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 43,
+            "failed": 0,
+            "passed": 43,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 43,
+            "suites": 0
+          }
+        },
+        {
+          "name": "diagnostics",
+          "status": "passed",
+          "files": [
+            "src/read-diagnostics.test.ts",
+            "test/read-diagnostics.test.ts"
+          ],
+          "duration_ms": 9853.727,
+          "exit_code": 0,
+          "signal": null,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 7,
+            "failed": 0,
+            "passed": 7,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 7,
+            "suites": 0
+          }
+        },
+        {
+          "name": "workspace-restore",
+          "status": "passed",
+          "files": [
+            "src/workspaces.test.ts",
+            "src/git-worktrees.test.ts",
+            "test/tool-contract/workspace-restore.test.ts"
+          ],
+          "duration_ms": 28425.106,
+          "exit_code": 0,
+          "signal": null,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 27,
+            "failed": 0,
+            "passed": 22,
+            "cancelled": 0,
+            "skipped": 5,
+            "todo": 0,
+            "topLevel": 27,
+            "suites": 0
+          },
+          "source_tap_sha256": "faf256dd14f6ceb5ae2d0de6c001d00932d807bdec02a4bccef696718f306bf7"
+        }
+      ]
+    }
+  ],
+  "observations": [
+    {
+      "run": "run-01",
+      "finding": "Five fixture cleanup failures across four files were caused by SQLite handles remaining open when Windows attempted directory removal. Fixed in e35fcfb and relevant groups passed in run-02."
+    },
+    {
+      "run": "run-03",
+      "finding": "Real two-node HTTP restoration test failed at historical read_output after worktree pruning: requireCommand still resolved the deleted directory. Fixed by 27f9a25; the same HTTP scenario passed in run-04. Recovery-federation and environment-review also passed in run-03."
+    },
+    {
+      "commit": "f0bfac9",
+      "finding": "Two real SQLite databases and production SessionService/SessionFeed methods reproduced a closed coordinator Task becoming active on first worker mirror during attach. The fixed coordinator rejected before mirroring and allowed forwarding of a later active Task. The network scenario is also part of workspace-restore."
+    },
+    {
+      "run": "run-04",
+      "finding": "All five affected groups exited normally at clean e3d5b5a: 203 passed, five existing Windows platform skips, zero failures, cancellations or timeouts. Original pruned-workspace HTTP history failure and the closed-task first-mirror boundary both passed. The five skipped symlink cases passed on Linux in the earlier focused workspace/git-worktree runs."
+    }
+  ],
+  "local_checks": [
+    {
+      "commit": "6df13487da8770c7878574a30df6a2d46da515b8",
+      "runtime": "v24.21.0",
+      "platform": "linux",
+      "test": "src/workspaces.test.ts",
+      "counts": {
+        "tests": 15,
+        "passed": 15,
+        "failed": 0,
+        "skipped": 0
+      }
+    },
+    {
+      "commit": "6df13487da8770c7878574a30df6a2d46da515b8",
+      "runtime": "v24.21.0",
+      "platform": "linux",
+      "test": "src/git-worktrees.test.ts",
+      "counts": {
+        "tests": 11,
+        "passed": 10,
+        "failed": 1,
+        "skipped": 0
+      },
+      "limitation": "Existing failure-injection test's synchronous git child was blocked with EPERM. The same case passed on Windows run-03."
+    },
+    {
+      "commit": "6df13487da8770c7878574a30df6a2d46da515b8",
+      "runtime": "v24.21.0",
+      "platform": "linux",
+      "test": "test/tool-contract/workspace-restore.test.ts",
+      "limitation": "Loopback TCP listen was blocked with EPERM; no local HTTP integration pass is claimed."
+    },
+    {
+      "commit": "1ee6931a280a2e50656413fcc4fed138a1cbd687",
+      "runtime": "v24.21.0",
+      "platform": "linux",
+      "test": "src/read-diagnostics.test.ts",
+      "counts": {
+        "tests": 2,
+        "passed": 2,
+        "failed": 0,
+        "skipped": 0
+      },
+      "scope": "Real SQLite and JSONL; actual 32 MiB stream cap including oversized lines; bounded replies and authenticated task/owner association."
+    },
+    {
+      "commit": "27f9a25",
+      "runtime": "v24.21.0",
+      "platform": "linux",
+      "test": "src/session/command-history.test.ts",
+      "duration_ms": 1897.443084,
+      "counts": {
+        "tests": 2,
+        "passed": 2,
+        "failed": 0,
+        "skipped": 0
+      },
+      "scope": "Real SQLite, files and SDK InMemoryTransport; deleted-root output retention, identity rejection and retargeted alias rejection."
+    },
+    {
+      "commit": "e3d5b5ae26797a8a64c5aee3b9b686d613120008",
+      "runtime": "v24.21.0",
+      "platform": "linux",
+      "test": "src/mcp-modern-server.test.ts + src/mcp-sdk-error-contract.test.ts",
+      "duration_ms": 816.15,
+      "counts": {
+        "tests": 12,
+        "passed": 12,
+        "failed": 0,
+        "skipped": 0
+      },
+      "scope": "Official SDK and real MCP handler through the SDK fetch interface; real ENOENT and successful file read; static fixture operation identity tests text/structured contract, not command execution."
+    }
+  ],
+  "checks": [
+    {
+      "commit": "6df13487da8770c7878574a30df6a2d46da515b8",
+      "platform": "windows",
+      "typecheck": "passed",
+      "build": "passed",
+      "evidence": "Both commands completed before run-03 was launched through an && command chain."
+    },
+    {
+      "commit": "e3d5b5ae26797a8a64c5aee3b9b686d613120008",
+      "platform": "windows",
+      "typecheck": "passed",
+      "build": "passed",
+      "evidence": "Both commands completed before run-04 was launched through an && command chain."
+    }
+  ],
+  "live_host_probe": {
+    "at": "2026-10-20T06:17:03.301Z",
+    "missing_call_wall_ms": 2013,
+    "missing_is_error": true,
+    "missing_structured": {
+      "error_code": "INVALID_ARGUMENT"
+    },
+    "existing_call_wall_ms": 1567,
+    "existing_is_error": false,
+    "existing_has_result": true,
+    "scope": "one live root MCP read of an absent file followed by an existing file; active deployed version, not branch code"
+  }
+}

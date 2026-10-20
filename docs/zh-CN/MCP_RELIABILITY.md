@@ -2,7 +2,7 @@
 
 [English](../MCP_RELIABILITY.md) · 简体中文 · [首页](../../README.zh-CN.md)
 
-本文记录 2026-10-19 调查的可靠性改动。
+本文记录 2026-10-19–20 调查的可靠性改动。
 证据来自源码审阅，以及临时 SQLite 数据库、真实子进程、MCP handler 和本地 HTTP 连接实验。
 系统整体模型可参阅[执行生命周期](../RELIABILITY.md)与[架构](ARCHITECTURE.md)。
 
@@ -12,11 +12,13 @@
 仓库开发环境同时固定 pnpm 11.25.0，见[参与开发](CONTRIBUTING.md)。
 下列耗时来自单次本地实验，不作为宿主客户端的延迟承诺。
 
-一次请求会经过多个可以分别观察的边界：MCP 入站、准入、操作持久化、执行节点运行、响应发送，以及宿主消费响应。
+一次请求会经过多个可以分别观察的边界：宿主授权审核与派发、MCP 入站、准入、操作持久化、执行节点运行、响应发送，以及宿主消费响应。
 QuayMesh 记录服务端传输是否结束；没有宿主回执时，`hostAcknowledgment` 保持为 `"unknown"`。
 宿主显示的 “Thinking failed” 或 “message delivery time out” 本身不能定位其中哪一步出了问题。
 
-### 验证状态
+### 初期验证状态
+
+此表保留早期实验；后面的 Windows 矩阵记录后续整合运行、清理失败与成功复跑。
 
 | 实验 | 已观察结果 | 范围与剩余验收 |
 | --- | --- | --- |
@@ -24,8 +26,8 @@ QuayMesh 记录服务端传输是否结束；没有宿主回执时，`hostAcknow
 | 加入首块注释后的直连 | 首字节 **10.862 ms** | 真实 Node HTTP，此时被门闩阻塞的工具尚未结束 |
 | 加入首块注释后的流式代理 | 首字节 **3.690 ms** | 真实 loopback 转发代理 |
 | 独立请求与观察者断开 | 通过 | 阻塞调用旁的 12 个快速调用，以及观察者断开后的另一次调用 |
-| 暂停消费的 8 MiB 响应 | 取消已到达且仅发生一次；首轮测试过早检查了 reader 解锁 | 已改为等待真实 Node handler 清理完成；**最终 TCP 复验待执行** |
-| 首轮合并 HTTP 矩阵 | **9/11 通过** | 已修正取消清理观测，以及 SDK 纯文本错误的断言；整合复验待执行 |
+| 暂停消费的 8 MiB 响应 | 取消已到达且仅发生一次；首轮测试过早检查了 reader 解锁 | 修正后的清理观测已在下方 Windows SSE 组通过 |
+| 首轮合并 HTTP 矩阵 | **9/11 通过** | 已修正取消清理观测，以及 SDK 纯文本错误的断言；后续 Windows 结果见下方 |
 | 代理轮询遇真实 SQLite 写锁 | 旧进程以状态码 1 退出；修后存活并完成原操作 | 同 PID、持久结果、重试与 tracker 恢复，并检查事件数量 |
 | 同步 SQLite 争锁 | 追加耗时 **5007.875 ms**；10 ms 定时器实际在 **5009.010 ms** 后触发 | 默认 `busy_timeout=5000`，额外定时器延迟 **4999.010 ms** |
 | 周期账本核对遇真实写锁 | **1/1 通过** | 实际错误码、同一进程、释放锁后原操作收敛 |
@@ -33,12 +35,168 @@ QuayMesh 记录服务端传输是否结束；没有宿主回执时，`hostAcknow
 | 输出 schema 与 handler 契约 | **10/10 通过** | 官方 JSON Schema 校验器，覆盖成功、结构化错误与递归成功类型 |
 | 官方 SDK 发现工具与文件错误恢复 | **1/1 通过** | 正常 `Client.listTools()` 与 `Client.callTool()`，经 transport 正式 fetch 接口进入实际 handler；真实 ENOENT 后成功读取文件；未监听 TCP 端口 |
 | 本地准入重试 | **7/7 通过** | 包含两个真实进程争用同一操作 key |
-| 两节点 HTTP 准入重试 | **2/2 通过**，约 **941 ms**、**379 ms** | 准入改动 worktree 的原始 SDK 请求；整合后的最终标准 `callTool` 矩阵待验 |
+| 两节点 HTTP 准入重试 | **2/2 通过**，约 **941 ms**、**379 ms** | 准入改动 worktree 的原始 SDK 请求；整合后的 Windows 清理与复跑见下方 |
 | 整合主线本地回归 | **80/80 通过**，**30.42 s** | Session、迁移、执行协调器，以及真实周期核对子进程测试 |
 | 旧 v5 数据库打开代码访问 v6 | 因数据库版本不受支持而拒绝 | 真实临时数据库；协调节点与执行节点混版本运行尚未实测 |
 
-整合主线的类型检查、完整构建与源码检查已通过；最终标准 SDK/TCP 与 Node 生命周期矩阵仍为独立待验项。
-执行环境的自动权限审核多次因容量不足或审核超时，在命令启动前中止。剩余验收需要完成权限审核；这些待验项目尚无测试通过或失败结果。
+早期整合主线的类型检查、完整构建与源码检查已通过。
+本地启动剩余 TCP 与 Node 矩阵的尝试，多次因自动权限审核容量不足或达到审核期限而结束；这些具体命令保持未执行状态。
+后续 Windows 运行补充了以下证据。
+
+### Windows `5964a6a` 验收
+
+Windows 运行使用固定的 Node.js 24.21.0 和真实 TCP 连接。以下计数与测量对应这次检出与运行。
+
+| 检查 | 已观察结果 | 范围与剩余验收 |
+| --- | --- | --- |
+| TypeScript 类型检查 | 通过 | Windows 上的 `tsc` 已完成 |
+| SSE 测试组 | **6/6 通过** | 直连首字节 **65.0885 ms**；流式代理首字节 **7.3658 ms**；暂停消费的 8 MiB 响应与取消检查通过 |
+| 合并 `mcp-http` 组 | 三个测试在数据库清理阶段失败；组进程到 **240 s** 运行器预算时仍未退出 | 删除目录时 SQLite 连接仍打开；修正清理后的 `run-02` 已通过，见下方 |
+| `session-sqlite` | **92 个测试：90 通过、2 失败** | 两个失败均为相同数据库清理顺序问题；修正用例已在 `run-02` 通过 |
+| `recovery-federation` | **43/43 通过** | 真实恢复与联邦 fixture |
+| Node 生命周期 | **49/49 通过** | 真实 Node 测试入口 |
+
+SSE 耗时来自单次观测；这些测量尚未建立宿主客户端的超时阈值。
+Windows 失败暴露了测试资源归属问题：fixture 先注册会删除目录的 `after`，测试随后才注册旁路 SQLite 连接或 WorkLedger 的关闭回调。
+实测 FIFO hook 顺序让目录删除先遇到仍打开的句柄；`EBUSY` 随后中断后续清理，留下未关闭的监听器。
+提交 `e35fcfb` 将测试自身持有的句柄放进测试体 `finally`，在 fixture dispose 前关闭，涉及五个测试、四个文件：
+[准入重试](../../src/session/admission-retry.test.ts)、[Session store](../../src/session/session-store.test.ts)、
+[任务活性](../../test/reliability-liveness.test.ts)和[两节点准入](../../test/tool-contract/admission-retry.test.ts)。
+已记录的清理失败继续保留在调查历史中；下方成功复跑验证了修后进程正常退出。
+
+### 清理修复后的 Windows 验收
+
+| 所需证据 | 当前记录 |
+| --- | --- |
+| 被测提交与工作树状态 | Windows `run-02` 于 **2026-10-19 09:38 UTC** 从 clean `52e8586` 开始，包含清理 `e35fcfb`、审核/环境修正 `a9ee137` 与 Windows 运行器 |
+| 运行时与完成状态 | Node.js **24.21.0**；三个所选测试组均成功结束 |
+| `mcp-http` | **36/36 通过**，**27.836 s**；正常退出 |
+| `session-sqlite` | **92/92 通过**，**72.513 s**；正常退出 |
+| `environment-review` | **6/6 通过**，**11.544 s**；两项检查/注解用例与四项 Python 工作流用例 |
+| 保留证据 | [脱敏验收摘要](../../test/reliability-system/evidence/windows-20261019-20.json)：保留各轮提交、官方计数、完成状态与原始 summary 的 SHA-256；原始 TAP、JSON 事件保留在测试环境 |
+
+`run-02` 选择了 `mcp-http`、`session-sqlite` 和 `environment-review`。
+此前恢复/联邦的 `43/43` 与 Node 的 `49/49` 继续对应 `5964a6a`。
+两轮合计覆盖 **226 个不同且通过的测试**，各组被测提交分别保留在上方。
+Windows 运行器与调用方式见[复跑检查](#复跑检查)。
+
+### 恢复回归与后续修复
+
+Windows `run-03` 于 2026-10-20 使用 clean `6df1348`，启动前类型检查和完整构建均通过。
+`recovery-federation` **43/43 通过**，耗时 **98.777 s**；`environment-review` **6/6 通过**，耗时 **12.931 s**。
+`workspace-restore` 正常结束，**21 项通过、一项失败、五项平台跳过**，耗时 **27.559 s**。
+真实双节点 HTTP 失败发生在工作树清理后的历史命令输出读取：`SessionStore.requireCommand` 仍对已删除目录执行路径解析。
+提交 `27f9a25` 改为验证持久化的规范根身份；历史读取保留 owner、节点、根目录和 operation 检查，活动输入/取消入口仍先验证当前工作区，再使用规范根。
+两个真实 SQLite/SDK 回归已在本地通过，包含合法别名与别名改指向后的拒绝；下方 Windows 后续验收原样复跑这条 HTTP 失败链。
+
+审阅还实际复现了协调节点的关闭任务在 worker 首次接触时被镜像为 active 的边界。
+提交 `f0bfac9` 在协调节点 `attach_workspace` 转发入口，完成 owner/session 检查后、创建 worker 镜像前拒绝关闭任务。
+双库生产方法探针先复现缺陷，再验证修复后拒绝以及下一轮合法活动任务仍可转发；双节点 HTTP 恢复回归也纳入同一场景。
+
+### 最终受影响组 Windows 验收
+
+`run-04` 使用 clean **`e3d5b5ae26797a8a64c5aee3b9b686d613120008`**，从 **2026-10-20 06:31:19 UTC** 运行至 **06:35:24 UTC**，Node.js 为 **24.21.0**。
+运行器启动前，类型检查和完整构建均成功完成。
+
+| 测试组 | 官方结果 | 耗时 |
+| --- | --- | --- |
+| `mcp-http` | **37/37 通过** | **31.245 s** |
+| `session-sqlite` | **94/94 通过** | **76.379 s** |
+| `recovery-federation` | **43/43 通过** | **98.951 s** |
+| `diagnostics` | **7/7 通过** | **9.854 s** |
+| `workspace-restore` | **22 项通过、五项平台跳过**，无失败 | **28.425 s** |
+
+五组均以 0 正常退出，无超时、取消或未完成清理：共 **203 项通过、五项跳过**。
+Windows 的五项既有跳过用例涉及符号链接，已在此前 Linux 工作区/git-worktree 回归通过。
+历史根目录修复后，真实双节点恢复用例通过，其中也包含关闭任务首次镜像前的拒绝。
+诊断 HTTP 用例在输出读取尚未完成时观察到已认证入口，随后观察到完成记录；身份无效、目标资源不符的请求均未产生 authenticated 事件。
+最终 SSE 单次首字节测得直连 **60.307 ms**、本地流式代理 **8.235 ms**；8 MiB 慢消费者案例在取消前读取 128 块中的 9 块，取消仅发生一次。
+这些数值保留为单次本地观测。[验收摘要](../../test/reliability-system/evidence/windows-20261019-20.json)包含全部四轮及原始 summary 哈希，同时保留失败轮次。
+此前 Node **49/49**、环境检查 **6/6** 结果继续对应上方各自提交，与这次最终受影响组矩阵分别记录。
+
+## 自动权限审核与尚未抵达 QuayMesh 的请求
+
+### 直接证据与授权
+
+本次调查的本地执行尝试在创建进程前返回以下审核错误：
+
+```text
+Automatic approval review failed: Selected model is at capacity. Please try a different model.
+The automatic permission approval review did not finish before its deadline.
+```
+
+工具错误同时报告动作尚未执行。用户的既有授权继续覆盖同一动作与范围。
+沙箱执行能力、审批决定和审核器可用性分别构成执行条件。
+[OpenAI 安全文档](https://learn.chatgpt.com/docs/agent-approvals-security)说明了额外模型调用与独立的超时结果；审核服务不可用时，可以在尚无完整风险决定的情况下阻止执行。
+2026-10-19 审阅的公开 [Guardian policy template](https://github.com/openai/codex/blob/main/codex-rs/prompts/templates/guardian/policy_template.md) 将用户明确要求的动作及落实请求所必需的实现动作视为高授权，并按实际语义判断。
+单纯重复用户同意，无法证明审核器容量已经恢复。
+
+### 公开机制与部署边界
+
+[OpenAI Auto-review](https://learn.chatgpt.com/docs/sandboxing/auto-review)描述了独立 reviewer：它接收具体待审批动作，以及由用户消息、可见助手更新和相关工具证据组成的精简上下文。
+这些输入不包含主模型的私有思考链。
+文档列出的入口包括 shell 升权、受阻网络访问、配置可写范围外的写入，以及因注解或审批模式而需要审核的 MCP/app 调用。
+因此，进程启动或 MCP 请求派发之前存在一个可能失败的审核边界。
+
+2026-10-19 审阅的公开 [`ReviewModel` 选择逻辑](https://github.com/openai/codex/blob/main/codex-rs/core/src/guardian/review.rs)和
+[`review_session.rs`](https://github.com/openai/codex/blob/main/codex-rs/core/src/guardian/review_session.rs)包含独立审核模型/会话，以及覆盖审核准备和等待的 deadline。
+主对话可以继续可用，同时这一依赖发生故障。本会话实际部署的 reviewer 模型、容量池与 deadline 尚未确认。
+固定公开版本 [`rust-v0.163.0-alpha.10.2`](https://github.com/openai/codex/blob/rust-v0.163.0-alpha.10.2/codex-rs/ext/guardian-reviewer/src/lib.rs)定义 90 秒审核预算、最多三次尝试；
+其 [`retry.rs`](https://github.com/openai/codex/blob/rust-v0.163.0-alpha.10.2/codex-rs/ext/guardian-reviewer/src/retry.rs)让符合条件的暂时性重试共享原 deadline。这些常量仅描述该版本，重试对象是执行前的审核计算。
+
+[openai/codex issue #45395](https://github.com/openai/codex/issues/45395)创建于 2026-09-14，包含相同的容量报错。
+其中 10 月 5 日的用户评论报告：已授权的 MCP 动作在送达前失败。它属于 OpenAI 公开仓库中的同类用户报告；当前个案根因与共享部署服务仍缺少确认。
+官方文档证明审核框架能够覆盖 shell 和 MCP/app 动作；当前本地 exec 与网页版 MCP 的实际部署关系仍未核实。
+
+另一段历史追踪 E13 观察到：三个子代理调用等待 **840–1417 秒**，所检查日志中没有对应 Cloud 入站；同期主会话一次读取在 **179 ms** 完成。
+这组证据将停滞定位到所观察入口之前的特定调用路径。审核器可用性属于这些早期调用的合理候选，其记录没有对应的明确 reviewer 错误。
+本轮容量/deadline 错误直接证明其各自本地执行尝试发生了审核失败。
+
+### 跨越未入站边界的可观测性
+
+现有[服务端诊断](../../src/server-diagnostics.ts)在启用请求日志时，于 HTTP 边界发出 `server_request_started`。
+[MCP 诊断](../../src/mcp-request-diagnostics.ts)在 MCP 诊断边界发出 `mcp_exchange_started`，并在完成时保留请求身份、参数指纹、HTTP/RPC/tool 分类、首包耗时、aborted 状态及 unknown 宿主确认。
+QuayMesh 只能直接测量抵达其可观察入口的请求。
+提交 `1ee6931` 在 Bearer 身份和目标资源校验后增加 `mcp_exchange_authenticated`，记录这两项 HTTP 检查；工具授权、准入与执行分别使用各自证据。
+按任务读取的 [`read_diagnostics` 投影](../../src/read-diagnostics.ts)纳入能够安全关联的 authenticated 和 finished 记录，按 owner、时间窗及任务/操作身份过滤；未经认证的 started 记录不进入该投影。
+`coverage.task_transport` 分别报告观察到的两类记录数，并返回 `completion: "not_inferred"`；两者差值不会被展示为运行中操作数量。
+`history_completeness` 与 `host_acknowledgment` 保持 `unknown`，缺少安全任务/操作关联的调用仍可能不在结果中。
+32 MiB 扫描预算落实到文件流实际读取范围，包括单行超长的情况；回复预算、分页和诊断字段白名单继续生效。
+解释空结果前检查 coverage 和相关入站记录。宿主审核、派发等上游阶段的关联仍需要宿主提供证据。
+
+| 证据 | 该证据支持的归因 | 还需观察什么 |
+| --- | --- | --- |
+| 审核错误明确报告未执行 | 本次尝试在执行前结束 | 宿主提交/审核时间与派发状态 |
+| 已有反向代理或 MCP 入站，尚无持久 invocation | 请求已抵达，故障可以发生在 invocation 记录之前 | 鉴权、路由、准入和数据库事件 |
+| 已有持久操作，转发报告 `REQUEST_TIMEOUT` | 请求已进入后端路径 | 各跳等待、准备、执行与响应时间 |
+| 已有后端完成与响应发送记录 | 服务端工作与发送状态已知 | 宿主收到或消费响应的证据 |
+| QuayMesh 无记录，宿主/边缘入口也无追踪 | 送达状态继续为 unknown | 上游证据，或相关日志确实覆盖该时段的确认 |
+
+关联 UTC 提交/审核事件、宿主和边缘请求 ID、有界参数指纹、进程启动证据，以及持久 operation ID。
+分别保留 `review_state`、`execution_started` 与 `hostAcknowledgment`；拟议的宿主侧字段需要真实宿主证据。
+仅凭 invocation 行缺失，无法证明请求从未到达。已经记录的后端超时仍需继续调查后端。
+“Thinking failed” 和 “message delivery time out” 继续作为可能跨越多个边界的症状处理。
+
+### 减轻方法与当前工作
+
+为工具公布符合实际执行、观察、网络与中断能力的注解，让环境检查保持只读。
+安装、修复或获取运行时通过修改入口执行，并遵守任务已有授权范围。
+**提交 `a9ee137` 已实现能力注解与 Python 发现检查修正；Windows `environment-review` 在 `52e8586` 上 6/6 通过。**
+[子代理工具](../../src/tool-surfaces/subagents.ts)声明了提供方执行的网络能力。
+[工作区环境](../../src/workspace-environment.ts)通过文件与 PATH 发现已有解释器候选，返回 `verification: "not_run"`；解释器及其启动代码通过显式执行入口运行。
+
+提交 `6df1348` 让 [`getWorkspace`](../../src/workspaces.ts)保持观察性：受管 worktree 已清理时，返回 `WORKSPACE_RESTORE_REQUIRED`、`effect: not_started` 和原工作区 handle。
+恢复通过已授权 session 和活动 task 中的 `attach_workspace({workspace_id: originalHandle})` 显式进行，保留工作区/member 身份及原有暂存、未暂存内容，并合并并发恢复。
+真实 Git checkout hook 回归检查了读取不重建目录、不触发 hook，显式恢复会触发，已活动目录的重复 attach 不再触发。
+恢复前仍可读取历史状态与输出；上面的后续验收记录了实际运行这条链路时发现的历史根目录校验和关闭任务问题。
+Python 测试覆盖解释器发现，工作区回归覆盖受管 worktree 恢复路径；其他观察入口继续遵守各自能力契约。
+
+通过既有授权执行路径使用有界诊断与明确文件范围。
+审核器明确报告未执行时，进行有次数上限的延后重试，并在接口支持时保留原意图/key。
+执行状态不确定时，先查询原操作，再决定另一次副作用；恢复过程中保留原审核错误和各次尝试时间。
+切换到已经授权的环境可以提供可用执行路径；目标环境仍受自己的审核和沙箱条件约束。
+准确注解让审核看到真实能力，包括需要增加审核的情况；有界只读检查与重试限制重复调用，同时保留适用的审批策略。
+服务容量仍属于宿主侧可用性依赖，这些方法尚不能保证其恢复时间。
 
 ## 原因链与修复契约
 
@@ -104,10 +262,14 @@ SDK Node 适配器仍是唯一的响应写入者；包装层只有一个 reader�
 
 QuayMesh 的结构化错误包含 `error_code`、`effect`、`retry_hint`，以及可选的操作标识、所属节点标识和 details。
 可读 `content` 与 `isError: true` 同时保留。SDK 协议错误或校验错误可以只有文本，没有 `structuredContent`。
+提交 `e3d5b5a` 为规范错误文本增加简短恢复尾注，供只展示 `content` 的消费者使用。
+尾注包含长度、格式受限的错误码、effect、retry hint 和明确传入的 operation ID；不复制原始 details，也不从消息猜测缺失身份。
+再次规范包装时替换旧尾注，避免文本持续增长；结构化错误与成功校验保持原语义。
+SDK 回归使用静态 fixture operation ID 验证这一契约；实际文件读取失败与随后成功读取均真实发生，该 ID 不表述为执行命令生成的回执。
 [官方客户端回归](../../src/mcp-sdk-error-contract.test.ts) 先调用 `listTools()` 缓存 SDK 实际输出校验器，再使用正常 `callTool()`。
 真实 `readFile` ENOENT 保留 `isError: true` 和 `ENOENT` / `not_started` / `fix_input` 回执；创建文件后返回符合严格成功类型的读取结果。
 transport 的正式 fetch 接口将真实 Request/Response 传入实际 handler，全程未监听 TCP 端口。
-独立的 TCP 文件错误测试覆盖 SDK 纯文本错误；其修正后的断言，以及整合后的两节点标准客户端准入矩阵，仍待最终网络复跑。
+独立的 TCP 文件错误测试覆盖 SDK 纯文本错误；上方 Windows 矩阵记录后续网络验证，包含 SQLite fixture 清理修复后整个 HTTP 组成功结束。
 
 [入站诊断](../../src/mcp-request-diagnostics.ts) 现在先读取规范的结构化错误字段，再考虑旧文本格式。
 HTTP 完成、JSON-RPC 错误、工具错误，以及未检查的响应分别分类。
@@ -177,6 +339,28 @@ pnpm test:node
 保存运行时版本、提交、命令、传输模式和实际通过/失败数量；保留对应原始测试输出。
 单次首字节观测与重复负载的分位数统计应分别报告。
 
+### Windows 验收运行器
+
+仓库中的 [Windows 运行器](../../test/reliability-system/windows-acceptance.cjs)校验 Node.js 24.21.0，并记录实际可执行文件、提交和工作树状态。
+它用独立进程、并发度一运行测试文件，文件预算为 120 秒，组预算默认为 240 秒。
+计数来自官方根 `test:summary` 事件；各组保留 TAP 和 JSON 事件，退出码、超时和清理状态写入 `summary.json`。
+正常结束等待子进程 `close`；超时或中断时仅处理本组创建的进程树，并记录终止结果。
+
+在已经安装固定依赖的检出中，使用 PowerShell、通用本地路径和全新输出目录：
+
+```powershell
+$qmNode = "C:\Tools\node-v24.21.0-win-x64\node.exe"
+$qmRepo = (Get-Location).Path
+$qmResults = Join-Path $env:TEMP ("quaymesh-acceptance-" + [guid]::NewGuid().ToString("N"))
+& $qmNode test/reliability-system/windows-acceptance.cjs $qmRepo $qmNode $qmResults --groups=mcp-http,session-sqlite,environment-review
+```
+
+最终恢复/诊断复验选择 `--groups=mcp-http,session-sqlite,recovery-federation,diagnostics,workspace-restore`，使用另一个全新输出目录。
+
+`environment-review` 选择 `src/tool-surfaces/subagents.test.ts` 和 `test/python-workflow.test.ts`，使用 `--test-name-pattern=只读环境查询|真实 MCP 注解|^PY`，覆盖两项检查/注解回归与全部四项 Python 工作流测试。
+省略 `--groups` 会运行全部七组，包含 `diagnostics`、`workspace-restore`、`recovery-federation` 和 `node`。
+保留生成的证据后再回填最终 Windows 表格。组进程正常退出、官方计数通过、未超时且清理完成，才满足该组验收。
+
 独立的 [SQLite 事件循环测量脚本](../../test/reliability-system/sqlite-event-loop.ts) 使用另一个连接持有真实写锁：
 
 ```sh
@@ -196,6 +380,7 @@ pnpm exec node --import tsx test/reliability-system/sqlite-event-loop.ts
 共享同一 state directory 的所有进程需要一致切换；新增列并不代表旧程序会接受新的 schema 版本。
 对于各自拥有数据库的协调节点和执行节点，源码契约支持先升级执行节点、再升级协调节点的发布顺序建议。
 混版本运行仍需独立矩阵；已通过的两节点测试使用相同实现版本。
+关闭任务恢复入口检查在协调节点运行新实现后生效。
 
 以下混版本行为属于**源码推断，尚未完成对应网络实验**：
 
@@ -213,12 +398,51 @@ pnpm exec node --import tsx test/reliability-system/sqlite-event-loop.ts
 已有新工作后，优先前滚修复以保留证据；任何数据库恢复都需要明确核对这些外部效果。
 Unknown 结果、缺失任务身份或不完整的旧错误回执，都不足以开放自动重试。
 
+## 同类 WebGPT MCP 项目对照
+
+以下一手来源于 2026-10-20 核对。项目文档、用户报告和待合并方案的证据强度各有范围；项目采用的等待预算仅代表其自身策略。
+
+| 项目与一手来源 | 已观察方案 | QuayMesh 的取舍 |
+| --- | --- | --- |
+| DevSpace [issue #334](https://github.com/Waishnav/devspace/issues/334)、[PR #335](https://github.com/Waishnav/devspace/pull/335) | 针对副作用已发生但响应丢失，设计 operation ID 回执、同请求重放与文件前置状态校验。PR 仍为 open，回执存在当前进程内。 | 保留 SQLite 持久回执与 attempt 防护，先恢复原命令或输入回执。 |
+| WebCodex [故障排查](https://github.com/yyjeqhc/webcodex/blob/main/docs/TROUBLESHOOTING.md) | 明确讨论 Thinking failed，要求宿主中断后观察原 job。 | 让 operation ID、输出游标和检查点独立于模型轮次保存。 |
+| WebCodex [MCP 契约](https://github.com/yyjeqhc/webcodex/blob/main/docs/MCP.md) | 分离观察窗口与执行期限，并记载针对 `openai-mcp` 的错误投影。 | 当前保留标准错误语义；兼容投影需要在受影响宿主路径上进行受控对照。 |
+| WebCodex [Runner 契约](https://github.com/yyjeqhc/webcodex/blob/main/docs/RUNNER.md) | 分别处理进程所有权、重连恢复与持久终态回执。 | 分别展示保存的证据和当前存活状态；替换进程需要有效的执行所有权才能接管。 |
+| Coding Tools MCP [运行契约](https://github.com/xyTom/coding-tools-mcp/blob/main/docs/runtime-contract-v0.3.md) | 分开前台等待、进程总寿命、输出偏移与显式取消；旧默认值曾在返回句柄后终止长命令。 | 每个 timeout 都标明它停止的是观察、准入、执行还是结果保留。 |
+| Coding Tools MCP [issue #48](https://github.com/xyTom/coding-tools-mcp/issues/48) | 披露取消响应限制，以及客户端自选 JSON-RPC ID 冲突。 | 执行控制使用已授权 operation 身份；观察流释放保持单独语义。 |
+
+本次一条真实主会话 MCP 调用收到 `isError: true / INVALID_ARGUMENT` 后，同轮下一次文件读取成功。原始错误正文未保留，因此不判断该次失败所在层。该结果记录了这一条调用链能够继续，其他 ChatGPT 客户端路径仍需单独验证。[证据摘要](../../test/reliability-system/evidence/windows-20261019-20.json)保留了这一范围。
+
+## 消费者恢复策略
+
+现有[命令入口](../../src/tool-surfaces/codex.ts)默认前台等待 2 秒，上限 12 秒。
+[`read_output`](../../src/tool-surfaces/operations.ts)默认不等待，单次观察上限 10 秒；一次最多合并八个命令，共享最大 32 KiB 字节预算。
+这些参数决定前台等待和观察窗口，调用者依据返回的 operation 及执行契约判断工作是否结束。
+现有[联邦预算](../../src/tool-request-budget.ts)传递剩余请求期限，各跳不能重新获得一整份等待预算。
+
+恢复动作根据持久证据和当前授权范围选择：
+
+| 当前证据 | 下一步 |
+| --- | --- |
+| 已知 `operation_id`，执行结果不确定 | 查询原状态，再按保存的 byte cursor 调用 `read_output`，保留原 ID。 |
+| 原操作仍拥有活动执行 | 处理独立工作，或进行一次有界观察，并遵守 `poll_after_ms`。 |
+| 已有完成结果 | 取回保留结果，从已发生的效果继续。 |
+| `effect=not_started`、`retry_hint=retry_later`，且属于支持的准入错误 | 在原 owner/session/member/active-task 范围内，以完全相同参数和 key 重试；已有准入契约为同一 operation 建立新 attempt。 |
+| `effect=unknown`、部分效果或传输中断 | 先核对原操作，再决定新的修改；自动写重放继续关闭。 |
+| `WORKSPACE_RESTORE_REQUIRED` | 在原 session 中以原 `workspace_id` 显式调用 `attach_workspace`；恢复前仍可读取历史输出。 |
+| 恢复时返回 `TASK_NOT_ACTIVE` | 在原 session 中开始下一项已授权任务，再显式恢复原工作区；已关闭任务保持关闭。 |
+| 缺少可安全关联的传输记录 | 查看 coverage 与已有任务恢复事实；有条件时取得上游证据，派发和审核状态保持 unknown。 |
+
+相关文件选区和命令输出在工具已有上限内合并读取。形成重要判断或完成一个阶段后，保存包含操作引用、必要游标及下一步的检查点。代码完成一个可审阅阶段就形成提交。后续模型轮次依靠这些记录恢复工作，无需保留原始思考过程。
+
+分别衡量四个目标：减少可避免的请求、观察者消失后保住已接受操作、防止重复副作用、降低每次中断损失的工作量。服务端错误数与宿主完成用户轮次的比例需要各自观测。
+
 ## 后续设计阶段
 
-### 第一阶段：完成整合验收
+### 第一阶段：保留验收证据，增加混版本发布检查
 
-完成发现工具后的标准 SDK 矩阵，覆盖结构化业务错误、正常读取与准入重试。
-复跑修正后的慢消费者测试，保留真实传输清理完成的观测。
+按提交保留 Windows summary，包含已通过的六项 SSE 测试与完整 HTTP 组正常退出的记录。
+把恢复失败、对应修复和受影响组复验共同保留，让这项回归始终可以复现。
 增加独立的混版本发布矩阵，覆盖所有共享状态的进程，以及协调节点/执行节点的两种升级方向。
 将现有故障 fixture 纳入发布检查，以原 operation ID 和单次外部效果为核心断言。
 
@@ -238,11 +462,19 @@ Unknown 结果、缺失任务身份或不完整的旧错误回执，都不足以
 
 宿主等待、HTTP 响应、操作执行与输出保留分别设置预算。
 尽早返回已持久化的操作引用，让观察调用有界，并按 cursor 接续输出。
-跨节点传递剩余期限，分别记录准入、准备、执行与响应耗时。
+在已有跨节点剩余期限契约上，补齐准入、准备、执行与响应的独立耗时测量。
 观察者消失时释放其流；取消执行仍是针对操作的明确动作。
 
 持久 checkpoint 保存当前操作引用、输出 cursor、已作决策和下一步安全动作。
 恢复时先查询原操作/key，再决定是否提交另一个副作用。
 保持错误 schema 可发现、响应大小受限；大段不可变输出保留在引用后，不在每次轮询中重复发送。
 只报告真实工具活动与已知执行状态，传输注释和卡片刷新不能制造工作进度或宿主确认。
+
+### 下一次架构改动的验收目标
+
+分别测量已接收操作的恢复成功率、重复外部效果、持久准入回执耗时和事件循环延迟。
+重复受控实验后再报告分位数，同时保留并发度、输出大小、运行时和传输模式。
+SQLite 写锁被持有时，独立观察仍应及时响应；释放后，原操作完成一次。
+写入之后丢失响应时，应恢复保存的回执且不重复写入；执行所有者重启后，要么恢复已证实的所有权，要么明确进入核对状态。
+宿主轮次完成率需要用户可见错误时间与宿主证据共同测量，当前服务端测试尚未建立该指标。
 

@@ -2,7 +2,7 @@
 
 [English](MCP_RELIABILITY.md) · [简体中文](zh-CN/MCP_RELIABILITY.md) · [Home](../README.md)
 
-This engineering record covers the reliability changes investigated on 2026-10-19.
+This engineering record covers the reliability changes investigated on 2026-10-19–20.
 It combines source review with disposable SQLite databases, child processes, MCP handlers, and local HTTP connections.
 See [Execution lifecycle](RELIABILITY.md) and [Architecture](ARCHITECTURE.md) for the wider system model.
 
@@ -12,12 +12,14 @@ The source baseline was `d452b51`. The experiments used Node.js 24.21.0, MCP ser
 The repository's supported development setup also pins pnpm 11.25.0; see [Contributing](../CONTRIBUTING.md).
 Measurements below describe individual local experiments. They are not hosted-client latency targets.
 
-A request crosses several independently observable boundaries: MCP ingress, admission, durable operation recording,
+A request crosses several independently observable boundaries: host authorization/review and dispatch, MCP ingress, admission, durable operation recording,
 worker execution, response transmission, and the host's consumption of that response.
 QuayMesh records server-side completion and keeps `hostAcknowledgment: "unknown"` when there is no host receipt.
 Host messages such as “Thinking failed” or “message delivery time out” do not identify which boundary failed.
 
-### Validation snapshot
+### Initial validation snapshot
+
+This table retains the earlier experiments. The Windows matrices below record the later integrated run, its cleanup failures, and the successful rerun.
 
 | Experiment | Observed result | Scope / remaining check |
 | --- | --- | --- |
@@ -25,8 +27,8 @@ Host messages such as “Thinking failed” or “message delivery time out” d
 | Primed SSE, direct connection | First byte at **10.862 ms** | Real Node HTTP; gated tool had not completed |
 | Primed SSE, streaming proxy | First byte at **3.690 ms** | Real forwarding proxy on loopback |
 | Independent calls and observer disconnect | Passed | Twelve fast calls alongside a gated call; another call after observer disconnect |
-| Paused 8 MiB response | Cancellation arrived once; the first test checked reader unlocking too early | Test now awaits actual Node handler cleanup; **final TCP rerun pending** |
-| First combined HTTP matrix | **9/11** passed | Cleanup observation and SDK text-only error assertions corrected; integrated rerun pending |
+| Paused 8 MiB response | Cancellation arrived once; the first test checked reader unlocking too early | Corrected cleanup observation passed in the Windows SSE suite below |
+| First combined HTTP matrix | **9/11** passed | Cleanup observation and SDK text-only error assertions corrected; later Windows results recorded below |
 | Agent polling under a real SQLite lock | Old process exited with code 1; fixed process survived and completed the original operation | Same PID, durable result, retry and tracker restoration; event counts checked |
 | Synchronous SQLite contention | Append took **5007.875 ms**; a 10 ms timer fired after **5009.010 ms** | Default `busy_timeout=5000`; extra timer delay **4999.010 ms** |
 | Periodic ledger reconciliation under a real lock | Passed, **1/1** | Real error code, same process, original operation converged after lock release |
@@ -34,12 +36,169 @@ Host messages such as “Thinking failed” or “message delivery time out” d
 | Output schema and handler contracts | Passed, **10/10** handler tests | Official JSON Schema validator; valid success, typed error, and recursive success cases |
 | Official SDK discovery and file-error recovery | Passed, **1/1** | Normal `Client.listTools()` and `Client.callTool()` through the transport's official fetch interface and actual handler; real ENOENT then a successful file read; no TCP listener |
 | Admission retry, local suite | Passed, **7/7** | Includes two real processes competing for one operation key |
-| Admission retry, two-node HTTP | Passed, **2/2**, about **941 ms** and **379 ms** | Admission worktree, raw SDK requests; final integrated standard `callTool` matrix pending |
+| Admission retry, two-node HTTP | Passed, **2/2**, about **941 ms** and **379 ms** | Admission worktree, raw SDK requests; integrated Windows cleanup and rerun recorded below |
 | Integrated local regression suite | Passed, **80/80**, **30.42 s** | Session, migration, execution coordinator, and real periodic-reconciler subprocess tests |
 | Old v5 database-opening code against v6 | Rejected as an unsupported database version | Real temporary database; mixed-version coordinator/worker operation remains untested |
 
-Integrated type checking, the full build, and source checks passed. The final standard SDK/TCP and Node lifecycle matrices remain separate pending gates.
-The execution environment's automatic permission review repeatedly reached capacity or its deadline before starting those commands. The pending gates require a completed permission review; their outcome is not recorded as a test failure or a pass.
+Earlier integrated type checking, the full build, and source checks passed.
+Attempts to launch the remaining local TCP and Node matrices repeatedly ended during automatic permission review because of capacity or a review deadline. Those particular commands remained unexecuted.
+The subsequent Windows run supplies the additional evidence below.
+
+### Windows validation at `5964a6a`
+
+The Windows run used the pinned Node.js 24.21.0 runtime and real TCP connections. Counts and measurements describe this checkout and run.
+
+| Check | Observed result | Scope / remaining check |
+| --- | --- | --- |
+| TypeScript type checking | Passed | `tsc` completed on Windows |
+| SSE suite | **6/6 passed** | Direct first byte **65.0885 ms**; streaming-proxy first byte **7.3658 ms**; paused 8 MiB consumer and cancellation checks passed |
+| Combined `mcp-http` group | Three tests failed during database cleanup; the group process remained alive at the **240 s** runner limit | SQLite handles were still open during directory removal; corrected cleanup passed in `run-02` below |
+| `session-sqlite` | **92 tests: 90 passed, 2 failed** | Both failures used the same database cleanup ordering; corrected cases passed in `run-02` |
+| `recovery-federation` | **43/43 passed** | Real recovery and federation fixtures |
+| Node lifecycle | **49/49 passed** | Real Node test entries |
+
+The SSE timings are individual observations. A hosted-client timeout threshold has not been established by these measurements.
+The Windows failures exposed test resource ownership: a fixture registered its directory-removing `after` hook before a test registered closure of an additional SQLite connection or WorkLedger.
+The observed FIFO hook order reached directory removal with that handle still open; `EBUSY` then interrupted later cleanup and left listeners alive.
+Commit `e35fcfb` moves the owned-handle cleanup into the test body's `finally`, before fixture disposal, across five tests in
+[admission retry](../src/session/admission-retry.test.ts), [session store](../src/session/session-store.test.ts),
+[task liveness](../test/reliability-liveness.test.ts), and [two-node admission](../test/tool-contract/admission-retry.test.ts).
+The recorded failures remain part of the investigation history. The successful rerun below verifies normal process exit after the fix.
+
+### Windows acceptance after cleanup
+
+| Required evidence | Current record |
+| --- | --- |
+| Tested commit and working-tree state | Windows `run-02` started at **2026-10-19 09:38 UTC** from clean `52e8586`, containing cleanup `e35fcfb`, review/environment changes `a9ee137`, and the Windows runner |
+| Runtime and completion | Node.js **24.21.0**; the three selected groups completed successfully |
+| `mcp-http` | **36/36 passed**, **27.836 s**; normal exit |
+| `session-sqlite` | **92/92 passed**, **72.513 s**; normal exit |
+| `environment-review` | **6/6 passed**, **11.544 s**; two inspection/annotation cases and four Python workflow cases |
+| Retained artifacts | [Sanitized acceptance receipt](../test/reliability-system/evidence/windows-20261019-20.json), with per-run commits, official counts, completion state, and SHA-256 of the original summaries; raw TAP and JSON events remain in the test environment |
+
+`run-02` selected `mcp-http`, `session-sqlite`, and `environment-review`.
+The earlier `43/43` recovery/federation and `49/49` Node results remain attached to `5964a6a`.
+Together the two runs cover **226 distinct passing tests**, with each group's tested commit retained above.
+The Windows runner and invocation are documented under [Reproduce the checks](#reproduce-the-checks).
+
+### Restoration regression and follow-up
+
+Windows `run-03` used clean `6df1348` on 2026-10-20 after successful type checking and a full build.
+`recovery-federation` passed **43/43** in **98.777 s**, and `environment-review` passed **6/6** in **12.931 s**.
+`workspace-restore` completed normally with **21 passed, one failed, and five platform skips** in **27.559 s**.
+The real two-node HTTP failure occurred while reading saved command output after pruning: `SessionStore.requireCommand` still resolved the deleted directory.
+Commit `27f9a25` validates the persisted canonical root identity instead. Historical reads retain owner, node, root, and operation checks; live input/cancellation still validate the current workspace before using its canonical root.
+Its two real SQLite/SDK regressions passed locally, including a valid alias and rejection after the alias is retargeted. The Windows follow-up below reruns the original HTTP failure.
+
+Review also reproduced a closed coordinator task being mirrored as active when the worker first saw it during restoration.
+Commit `f0bfac9` rejects a closed task at the coordinator's `attach_workspace` forwarding boundary, after owner/session checks and before creating the worker mirror.
+The two-database production-method probe first reproduced the defect and then verified refusal plus successful forwarding of a new active task.
+The same scenario is included in the two-node HTTP restoration regression.
+
+### Final affected-group Windows acceptance
+
+`run-04` tested clean **`e3d5b5ae26797a8a64c5aee3b9b686d613120008`**, from **2026-10-20 06:31:19 UTC** to **06:35:24 UTC**, with Node.js **24.21.0**.
+Type checking and the full build both completed successfully before the runner started.
+
+| Group | Official result | Duration |
+| --- | --- | --- |
+| `mcp-http` | **37/37 passed** | **31.245 s** |
+| `session-sqlite` | **94/94 passed** | **76.379 s** |
+| `recovery-federation` | **43/43 passed** | **98.951 s** |
+| `diagnostics` | **7/7 passed** | **9.854 s** |
+| `workspace-restore` | **22 passed, five platform skips**, no failures | **28.425 s** |
+
+All five groups exited normally with code 0, without timeout, cancellation, or incomplete cleanup: **203 passed and five skipped**.
+The five existing Windows skips concern symlinks and passed in the earlier Linux workspace/git-worktree runs.
+The real two-node restoration case passed after the historical-root fix, including the closed-task first-mirror refusal.
+The diagnostic HTTP case observed authenticated ingress during an unfinished output read, then its completion; invalid identity and target-resource requests had no authenticated event.
+The final SSE run measured **60.307 ms** directly and **8.235 ms** through the local streaming proxy; the paused 8 MiB case consumed 9 of 128 source chunks before cancellation and observed one cancellation.
+These remain individual local measurements. The [acceptance receipt](../test/reliability-system/evidence/windows-20261019-20.json) retains all four runs and original summary hashes, including the failed runs.
+The earlier Node **49/49** and environment **6/6** results retain their own commits above; they are separate evidence from this final affected-group matrix.
+
+## Automatic permission review and requests that never reach QuayMesh
+
+### Direct evidence and authorization
+
+The local execution attempts in this investigation returned these reviewer errors before process creation:
+
+```text
+Automatic approval review failed: Selected model is at capacity. Please try a different model.
+The automatic permission approval review did not finish before its deadline.
+```
+
+The tool error also reported that the action had not executed. Existing user authorization continued to cover the same action and scope.
+Sandbox capability, the approval decision, and reviewer availability remain separate execution conditions.
+[OpenAI's security documentation](https://learn.chatgpt.com/docs/agent-approvals-security) describes the extra model calls and the separate timeout outcome; an unavailable review can prevent execution without producing a completed risk decision.
+The public [Guardian policy template](https://github.com/openai/codex/blob/main/codex-rs/prompts/templates/guardian/policy_template.md), reviewed on 2026-10-19, treats an explicitly requested action or a necessary implementation of that request as high authorization and evaluates its material semantics.
+Repeating user consent alone supplies no evidence that reviewer capacity has recovered.
+
+### Public mechanism and deployment limits
+
+[OpenAI Auto-review](https://learn.chatgpt.com/docs/sandboxing/auto-review) describes a separate reviewer receiving the exact proposed action and a compact transcript of user messages, visible assistant updates, and relevant tool evidence.
+The inputs exclude the main model's private chain of thought.
+Documented entry points include escalated shell execution, blocked network access, writes outside configured roots, and MCP/app calls whose annotations or approval mode require review.
+This creates a possible failure boundary before a process starts or an MCP request is dispatched.
+
+The public [`ReviewModel` selection](https://github.com/openai/codex/blob/main/codex-rs/core/src/guardian/review.rs) and
+[`review_session.rs`](https://github.com/openai/codex/blob/main/codex-rs/core/src/guardian/review_session.rs), reviewed on 2026-10-19, show a separate reviewer model/session and deadlines covering review preparation and waiting.
+The main conversation can remain available while that dependency fails. The deployed reviewer model, capacity pool, and deadline for this session remain unconfirmed.
+The fixed public version [`rust-v0.163.0-alpha.10.2`](https://github.com/openai/codex/blob/rust-v0.163.0-alpha.10.2/codex-rs/ext/guardian-reviewer/src/lib.rs) defines a 90-second review budget and at most three attempts;
+its [`retry.rs`](https://github.com/openai/codex/blob/rust-v0.163.0-alpha.10.2/codex-rs/ext/guardian-reviewer/src/retry.rs) shares the original deadline across eligible transient retries. Those constants describe that version only. The retries concern review computation before execution.
+
+[openai/codex issue #45395](https://github.com/openai/codex/issues/45395), opened on 2026-09-14, contains the same capacity message.
+An October 5 user comment reports an authorized MCP action failing before delivery. This is a comparable user report in OpenAI's public repository; it supplies neither a confirmed root cause for this incident nor proof of a shared deployed service.
+Official documentation establishes that the review framework can cover shell and MCP/app actions. The current local exec and browser-hosted MCP deployment relationship remains unverified.
+
+A separate historical trace review, E13, observed three subagent calls waiting **840–1417 seconds** with no corresponding Cloud ingress in the inspected logs, while a contemporaneous main-session read completed in **179 ms**.
+That evidence localizes a path-specific stall before the observed ingress. Reviewer availability is a plausible candidate for those earlier calls; their records contain no matching explicit reviewer error.
+The current capacity/deadline errors establish review failure for their own local execution attempts.
+
+### Observability across the missing-ingress boundary
+
+Existing [server diagnostics](../src/server-diagnostics.ts) emit `server_request_started` at the HTTP boundary when request logging is enabled.
+[MCP diagnostics](../src/mcp-request-diagnostics.ts) emit `mcp_exchange_started` at the MCP diagnostic boundary and retain request identity, argument fingerprints, HTTP/RPC/tool outcomes, first-byte timing, aborted state, and an unknown host acknowledgment on completion.
+QuayMesh can directly measure only requests that reach one of its observable entry points.
+Commit `1ee6931` adds `mcp_exchange_authenticated` after the Bearer identity and target-resource checks. This event records those two HTTP checks; tool authorization, admission, and execution have their own evidence.
+The task-scoped [`read_diagnostics` projection](../src/read-diagnostics.ts) includes attributable authenticated and finished transport records, filtered by owner, time window, and task/operation identity. Unauthenticated start events stay outside this projection.
+`coverage.task_transport` reports the two observed record counts and `completion: "not_inferred"`; their difference is never presented as a count of running operations.
+`history_completeness` and `host_acknowledgment` remain `unknown`. Calls without safe task/operation association can be absent from the result.
+The 32 MiB scan budget applies to the actual file stream, including a single oversized line. Response budgets, pagination, and the diagnostic field allowlist remain in force.
+Inspect coverage and relevant ingress records before interpreting an empty result. Host-side review/dispatch correlation still requires evidence supplied by the host.
+
+| Evidence | Attribution supported by that evidence | Additional observation needed |
+| --- | --- | --- |
+| Reviewer error explicitly reports no execution | That attempt stopped before execution | Host submission/review timestamps and dispatch status |
+| Reverse-proxy or MCP ingress exists, with no durable invocation | Request arrived; failure can precede invocation recording | Authentication, routing, admission and database events |
+| Durable operation exists and forwarding reports `REQUEST_TIMEOUT` | The request entered the backend path | Per-hop waiting, preparation, execution and response timestamps |
+| Backend completion and response transmission exist | Server-side work and transmission are known | Host receipt or consumption evidence |
+| No QuayMesh record and no host/edge trace | Delivery remains unknown | Upstream evidence or confirmation that the relevant logs cover the interval |
+
+Correlate UTC submission/review events, host and edge request IDs, bounded parameter fingerprints, process-start evidence, and durable operation IDs.
+Keep `review_state`, `execution_started`, and `hostAcknowledgment` separate; proposed host-side fields require actual host evidence.
+Missing invocation rows alone cannot establish that a request never arrived. An already-recorded backend timeout continues to require backend investigation.
+“Thinking failed” and “message delivery time out” remain symptoms spanning several boundaries.
+
+### Mitigation and current work
+
+Publish tool annotations that describe actual execution, observation, network and interruption capabilities, and keep environment inspection observational.
+Installation, repair, or runtime acquisition uses an explicit mutating entry point covered by the task's authorization.
+**Commit `a9ee137` implements the capability-annotation and Python discovery corrections; Windows `environment-review` passed 6/6 at `52e8586`.**
+The [subagent surface](../src/tool-surfaces/subagents.ts) declares provider execution's network capability.
+The [workspace environment](../src/workspace-environment.ts) discovers existing interpreter candidates through files and PATH, returns `verification: "not_run"`, and leaves interpreter/startup-code execution to an explicit execution entry point.
+
+Commit `6df1348` makes [`getWorkspace`](../src/workspaces.ts) observational: a pruned managed worktree produces `WORKSPACE_RESTORE_REQUIRED`, with `effect: not_started` and the original workspace handle.
+Restoration is explicit through `attach_workspace({workspace_id: originalHandle})` in the authorized session and active task. It preserves workspace/member identity and the saved staged/unstaged changes, and coalesces concurrent restoration.
+The actual Git checkout-hook regression verifies that reads do not recreate the tree or run its hook; explicit restoration does, and repeated attachment of an active tree does not run it again.
+Historical status and output remain readable before restoration. The follow-up above records the additional historical-root and closed-task defects found by exercising this workflow.
+The Python tests cover interpreter discovery, while the workspace regressions cover this managed-worktree restoration path; other observational paths retain their existing capability contracts.
+
+Use bounded diagnostics and explicit file scope through an existing authorized execution path.
+When the reviewer explicitly reports no execution, use a bounded delayed retry and retain the original intent/key where supported.
+When execution is uncertain, query the original operation before another side effect. Preserve the original review error and attempt timestamps during recovery.
+Switching to an already authorized environment can supply a working execution path; the destination's own review and sandbox conditions still apply.
+Accurate annotations expose the real capabilities to review, including cases that warrant additional review. Bounded observational checks and retries limit redundant calls while retaining the applicable approval policy.
+Service capacity remains a host-side availability dependency, and these measures provide no guarantee about its recovery time.
 
 ## Failure chains and repair contracts
 
@@ -106,10 +265,14 @@ The SDK's `isError` branch handles genuine errors; an error-shaped object with m
 
 QuayMesh's typed envelope carries `error_code`, `effect`, `retry_hint`, and optional operation/owner identifiers and details.
 Readable `content` and `isError: true` remain present. SDK protocol or validation errors can have text without `structuredContent`.
+Commit `e3d5b5a` adds a compact recovery suffix to canonical error text for consumers that only expose `content`.
+It includes bounded safe-format code, effect, retry hint, and an explicitly supplied operation ID. It does not copy raw details or infer a missing ID from a message.
+Repeated canonical wrapping replaces the earlier suffix, keeping the text stable. Structured errors and success validation retain their original semantics.
+The SDK regression uses a static fixture operation ID to validate this contract; its actual file-read failure and subsequent successful read do not claim an executed command receipt.
 The [official-client regression](../src/mcp-sdk-error-contract.test.ts) calls `listTools()` to cache the SDK's actual output validators, then uses normal `callTool()`.
 A real `readFile` ENOENT retains `isError: true` and its `ENOENT` / `not_started` / `fix_input` envelope; creating the file then produces a valid strict success result.
 The transport's documented fetch interface passes actual Request/Response objects through the real handler without a TCP listener.
-The separate TCP file-error test covers SDK text-only errors. Its corrected assertions and the integrated two-node standard-client admission matrix still require their final network rerun.
+The separate TCP file-error test covers SDK text-only errors. The Windows matrix above records subsequent network validation, including successful completion of the whole HTTP group after the SQLite fixture cleanup fix.
 
 [Ingress diagnostics](../src/mcp-request-diagnostics.ts) now inspect the canonical structured error fields before legacy text fallbacks.
 HTTP completion, JSON-RPC errors, tool errors, and uninspected responses retain separate outcomes.
@@ -180,6 +343,28 @@ For a focused slow-consumer rerun, add `--test-name-pattern='^a paused real HTTP
 Record runtime version, commit, command, transport mode, and actual pass/fail counts with the retained test output.
 Keep individual first-byte measurements separate from percentile measurements over repeated workloads.
 
+### Windows acceptance runner
+
+The repository's [Windows runner](../test/reliability-system/windows-acceptance.cjs) verifies Node.js 24.21.0 and records the actual executable, commit, and working-tree state.
+It runs test files in separate processes with concurrency one, a 120-second test-file budget, and a default 240-second group budget.
+Counts come from the official root `test:summary` event. Each group retains TAP and JSON events, with its exit code, timeout and cleanup state in `summary.json`.
+Normal completion follows the child's `close` event. Timeout/interruption handling targets the process tree created for that group and records the termination result.
+
+From a checkout with the pinned dependencies installed, use PowerShell with generic local paths and a fresh output directory:
+
+```powershell
+$qmNode = "C:\Tools\node-v24.21.0-win-x64\node.exe"
+$qmRepo = (Get-Location).Path
+$qmResults = Join-Path $env:TEMP ("quaymesh-acceptance-" + [guid]::NewGuid().ToString("N"))
+& $qmNode test/reliability-system/windows-acceptance.cjs $qmRepo $qmNode $qmResults --groups=mcp-http,session-sqlite,environment-review
+```
+
+For the final restoration/diagnostics follow-up, select `--groups=mcp-http,session-sqlite,recovery-federation,diagnostics,workspace-restore` and use a new output directory.
+
+`environment-review` selects `src/tool-surfaces/subagents.test.ts` and `test/python-workflow.test.ts` with `--test-name-pattern=只读环境查询|真实 MCP 注解|^PY`: two inspection/annotation regressions and all four Python workflow cases.
+Omit `--groups` to run all seven groups, including `diagnostics`, `workspace-restore`, `recovery-federation`, and `node`.
+Archive the generated evidence before filling the final Windows table. A summary is accepted only when the group exits successfully, reports successful test counts, and has no timeout or incomplete cleanup.
+
 The standalone [SQLite event-loop measurement](../test/reliability-system/sqlite-event-loop.ts) uses a separate connection holding a real writer lock:
 
 ```sh
@@ -199,6 +384,7 @@ The actual old v5 migration-code probe rejected a v6 database with “不支持�
 All processes sharing one state directory must switch coherently; additive columns do not make an older binary accept a newer schema version.
 For separate coordinator and worker databases, upgrading workers before the coordinator is the rollout order suggested by the source contracts.
 Mixed-version coordinator/worker behavior still requires its own matrix; the passing two-node tests used matching implementations.
+The closed-task restoration guard becomes effective when the coordinator runs the updated implementation.
 
 The following mixed-version outcomes are **source-based expectations, not completed network experiments**:
 
@@ -216,12 +402,51 @@ Restoring an earlier ledger does not undo file changes or external effects produ
 Once new work has run, prefer a forward fix that preserves its evidence; any database restore needs explicit reconciliation of those effects.
 An unknown outcome, missing task identity, or incomplete legacy error receipt is not sufficient evidence to unlock automatic retry.
 
+## Comparable WebGPT MCP projects
+
+Sources below were checked on 2026-10-20. Project documentation, issue reports, and proposed changes have different evidence strength; their timing policies are not measured OpenAI limits.
+
+| Project and primary source | Observed approach | QuayMesh decision |
+| --- | --- | --- |
+| DevSpace [issue #334](https://github.com/Waishnav/devspace/issues/334) and [PR #335](https://github.com/Waishnav/devspace/pull/335) | Lost responses after effects prompted operation-ID receipts, identical-request replay, and stale-file preconditions. The PR remained open; its receipts are process-local. | Preserve durable SQLite receipts and attempt fences. Recover the original command/input receipt before repeating effects. |
+| WebCodex [troubleshooting](https://github.com/yyjeqhc/webcodex/blob/main/docs/TROUBLESHOOTING.md) | Explicitly addresses Thinking failed: observe the existing job after a host interruption. | Keep operation IDs, byte cursors, and saved checkpoints available independently of the current model turn. |
+| WebCodex [MCP contract](https://github.com/yyjeqhc/webcodex/blob/main/docs/MCP.md) | Separates observation windows from execution; documents a client-specific error projection for `openai-mcp`. | Keep standard errors for now. A host compatibility change requires a controlled comparison on the affected host path. |
+| WebCodex [Runner contract](https://github.com/yyjeqhc/webcodex/blob/main/docs/RUNNER.md) | Separates live process ownership, reconnect recovery, and persistent terminal receipts. | Report saved evidence and current process liveness separately; a replacement process cannot claim an old operation merely from its receipt. |
+| Coding Tools MCP [runtime contract](https://github.com/xyTom/coding-tools-mcp/blob/main/docs/runtime-contract-v0.3.md) | Separates foreground yield from process lifetime, bounded output offsets, and explicit command cancellation. Older defaults could kill a command after its handle had been returned. | Audit each timeout by what it stops: observation, admission, execution, or retention. |
+| Coding Tools MCP [issue #48](https://github.com/xyTom/coding-tools-mcp/issues/48) | Documents cancellation limitations and collisions in client-chosen JSON-RPC request IDs. | Use authorized operation identity for execution control; releasing an observation stream has its own semantics. |
+
+A single live root MCP probe in this investigation received `isError: true` with `INVALID_ARGUMENT`, then successfully read an existing file in the same turn. Its original error text was not retained, so the failed layer is unspecified. This observation supports continuing that one call chain, with no general conclusion about every ChatGPT client path. The [evidence receipt](../test/reliability-system/evidence/windows-20261019-20.json) records that limited scope.
+
+## Consumer recovery policy
+
+The existing [command surface](../src/tool-surfaces/codex.ts) defaults to a 2-second initial wait, capped at 12 seconds.
+[`read_output`](../src/tool-surfaces/operations.ts) defaults to no wait and caps an observation at 10 seconds; one call can read up to eight commands within a shared byte budget of at most 32 KiB.
+These are foreground/observation settings. A caller should inspect the returned operation and its execution contract when deciding whether work has ended.
+The existing [federation budget](../src/tool-request-budget.ts) propagates the remaining request deadline; each new hop cannot silently reset that budget.
+
+Recovery should select an action from persisted evidence and the current authorization scope:
+
+| Available evidence | Next action |
+| --- | --- |
+| Known `operation_id`, execution state uncertain | Read its saved status, then `read_output` from the saved byte cursor. Keep the original ID. |
+| Original operation still owns active work | Perform independent work or one bounded observation; respect `poll_after_ms`. |
+| Completed result exists | Retrieve the retained result and continue from its effects. |
+| `effect=not_started`, `retry_hint=retry_later`, supported admission error | Retry the identical request/key within the original owner/session/member/active-task scope. The existing admission contract creates a new attempt for the same operation. |
+| `effect=unknown`, partial effect, or interrupted transport | Reconcile the original operation before another mutation. Automatic write replay remains closed. |
+| `WORKSPACE_RESTORE_REQUIRED` | Explicitly call `attach_workspace` with the original `workspace_id` in its session. Historical output can be read before restoration. |
+| `TASK_NOT_ACTIVE` when restoring | Start the next authorized task in the existing session, then explicitly restore the original workspace. A closed task stays closed. |
+| No safely attributable transport evidence | Inspect coverage and existing task recovery facts. Obtain upstream evidence when available; keep dispatch/review status unknown. |
+
+Batch related file selections and output reads within the tools' existing bounds. Save a checkpoint after a meaningful decision or completed stage, including operation references, cursor positions when useful, and the next action. Commit completed code changes at reviewable boundaries. A later model turn can reconstruct the work from these records without retaining the original reasoning transcript.
+
+The reliability goals are separate: reduce avoidable requests, preserve an accepted operation across observer loss, prevent repeated effects, and reduce the amount of work lost per interruption. Measure these goals separately. A lower server error count alone does not measure how often the host completed a user turn.
+
 ## Next design stages
 
-### Stage 1: finish integrated acceptance
+### Stage 1: preserve acceptance and add mixed-version release gates
 
-Run the final standard SDK matrix after discovery, including typed business errors, normal reads, and admission retries.
-Repeat the corrected paused-consumer test and retain the real transport-cleanup observation.
+Retain the commit-specific Windows summaries, including the passing six-test SSE suite and clean exit for the complete HTTP group.
+Retain the restoration failure, its repair, and the corresponding affected-group rerun together so the regression remains reproducible.
 Add a separate mixed-version release matrix covering every process that opens shared state and both coordinator/worker directions.
 Use the existing fault fixtures as release gates, with the original operation ID and single external effect as core assertions.
 
@@ -241,11 +466,19 @@ Use bounded diagnostic APIs and explicit file scopes for investigation; generic 
 
 Treat the host wait, HTTP response, operation execution, and output retention as separate budgets.
 Return a durable operation reference promptly, keep observation calls bounded, and resume output by cursor.
-Propagate the remaining deadline across hops; record admission, preparation, execution, and response timing separately.
+Extend the existing cross-hop deadline contract with separate admission, preparation, execution, and response measurements.
 Losing an observer should release its stream; cancelling execution remains an explicit operation-level action.
 
 Persist checkpoints containing current operation references, output cursors, decisions, and the next safe action.
 Recovery should query the original operation/key before proposing another side effect.
 Keep error schemas discoverable and responses bounded; retain large immutable output behind references instead of repeating it in every poll.
 Report real tool activity and known execution state. Transport comments and card refreshes must not manufacture work progress or host acknowledgment.
+
+### Acceptance targets for the next architecture change
+
+Measure retained-operation recovery success, duplicate external effects, acknowledged-admission latency, and event-loop delay independently.
+Use percentiles only after repeated controlled runs, preserving concurrency, payload sizes, runtime, and transport mode with the results.
+A held SQLite writer should leave an independent observation responsive; release should complete the original operation once.
+A dropped response after a write should recover the saved receipt without repeating the write, and a restarted owner should either restore proven ownership or expose reconciliation explicitly.
+Host completion rates need user-visible failure timestamps and host evidence in addition to QuayMesh logs. The current server tests do not establish that rate.
 
