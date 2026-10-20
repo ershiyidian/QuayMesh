@@ -50,6 +50,8 @@ async function main() {
       "test/reliability-background.test.ts"],
     "recovery-federation": [
       "test/federation/core.test.ts", "test/federation/runtime.test.ts", "test/federation/transport-edge.test.ts",
+      "test/federation/observation-budget.test.ts", "test/tool-contract/federation-observation-contention.test.ts",
+      "test/console-v5/relay.test.ts", "test/console-v5/relay-contention.test.ts",
       "src/federation/copy-task-state.test.ts",
       "test/tool-contract/federation.test.ts", "test/tool-contract/receipts.test.ts",
       "test/tool-contract/output.test.ts", "test/tool-contract/parallel.test.ts",

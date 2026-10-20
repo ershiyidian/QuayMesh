@@ -68,9 +68,10 @@ async function fixture(t: TestContext) {
         const envelope = { ...trusted, invocation_id: context.invocation_id, operation_id: context.operation_id };
         const localInput = { ...input, workspace_id: workspace.id };
         // 复用生产信封生成、worker 镜像和两端 recorder，只有网络传输由同进程直连代替。
-        await SessionFeed.prototype.prepareLocalTool.call({ store: worker.store, service: worker.service } as unknown as SessionFeed,
+        const prepared = await SessionFeed.prototype.prepareLocalTool.call({ store: worker.store, service: worker.service,
+          runtime: { localId: "worker" } } as unknown as SessionFeed,
           name, localInput, envelope);
-        return worker.recorder.record({ ...options, input: localInput, identity: envelope, workspace_id: workspace.id,
+        return worker.recorder.record({ ...options, input: localInput, identity: prepared ?? envelope, workspace_id: workspace.id,
           operation: async () => {
             if (!observe) await appendFile(marker, "once\n");
             return { result: observe ? await readFile(marker, "utf8") : "written", operation_id: context.operation_id };

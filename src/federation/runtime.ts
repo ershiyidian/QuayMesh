@@ -14,7 +14,7 @@ import type { SessionFeed } from "./session-feed.js";
 import { safeForwardedContext } from "../request-meta.js";
 import type { TrustedInvocationEnvelope } from "./session-types.js";
 import { ExecutionCoordinator, type RuntimeWorkLease } from "../execution-coordinator.js";
-import { observesAcceptedWork } from "../tool-admission.js";
+import { isReadOnlyObservation, observesAcceptedWork } from "../tool-admission.js";
 import { TransferStore, type TransferRequest, type TransferView } from "./transfer-store.js";
 export type { TransferView } from "./transfer-store.js";
 
@@ -302,13 +302,17 @@ export class FederationRuntime extends EventEmitter {
         if (!this.sessionFeed) throw new Error("SESSION_FEED_UNAVAILABLE");
         return this.sessionFeed.receiveUpdate(params, peer);
       }
-      case "console": return this.execution.withWork({kind:"console",allowWhilePaused:["GET","HEAD"].includes(String(params.method??"GET").toUpperCase())},
-        () => this.hooks.console(params.method, params.path, params.body));
+      case "console": {
+        const request = () => this.hooks.console(params.method, params.path, params.body);
+        return ["GET", "HEAD"].includes(String(params.method ?? "GET").toUpperCase())
+          ? request() : this.execution.withWork({kind: "console"}, request);
+      }
       case "console.request": {
         const manifest = this.known.get(peer);
         if (!manifest?.capabilities?.consoleRelay) throw new Error("CONSOLE_RELAY_CAPABILITY_REQUIRED");
-        return this.execution.withWork({kind:"console",allowWhilePaused:["GET","HEAD"].includes(String(params.method??"GET").toUpperCase())},
-          () => dispatchConsoleRequest(this.hooks.httpPort, peer, params ?? {}));
+        const request = () => dispatchConsoleRequest(this.hooks.httpPort, peer, params ?? {});
+        return ["GET", "HEAD"].includes(String(params.method ?? "GET").toUpperCase())
+          ? request() : this.execution.withWork({kind: "console"}, request);
       }
       case "settings.get": return this.hooks.settings();
       case "settings.update": await this.hooks.updateSettings(params); return this.hooks.settings();
@@ -364,6 +368,8 @@ export class FederationRuntime extends EventEmitter {
     }
   }
   async invokeLocal(name: string, input: JsonRecord, extra: JsonRecord = {}): Promise<unknown> {
+    // 历史观察仍经过身份准备与原 handler，不为读取另建持久执行租约。
+    if (isReadOnlyObservation(name, input)) return this.invokeAcceptedTool(name, input, extra);
     return this.execution.withWork({kind:"tool",allowWhilePaused:observesAcceptedWork(name,input),
       taskId:(extra.trustedInvocation as TrustedInvocationEnvelope | undefined)?.task_id},
       () => this.invokeAcceptedTool(name,input,extra));
@@ -376,7 +382,8 @@ export class FederationRuntime extends EventEmitter {
       throw new Error(`节点 ${this.localId} 未启用执行能力`);
     }
     const handler = this.handlers.get(name); if (!handler) throw new Error(`节点 ${this.config.nickname} 没有启用 ${name}`);
-    await this.sessionFeed?.prepareLocalTool(name, input, extra.trustedInvocation as TrustedInvocationEnvelope | undefined);
+    const prepared = await this.sessionFeed?.prepareLocalTool(name, input, extra.trustedInvocation as TrustedInvocationEnvelope | undefined);
+    if (prepared) extra = {...extra, trustedInvocation: prepared};
     const opensWorkspace = name === "open_workspace" || name === "attach_workspace";
     const args = opensWorkspace ? await this.hooks.prepareOpen(input) : input;
     // 查询原工作区的历史记录无需重新打开已经删除的文件目录。

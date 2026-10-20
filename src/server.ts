@@ -1256,8 +1256,9 @@ export function createServer(
     const nodeId = typeof body?.nodeId === "string" ? body.nodeId : federation.localId;
     try {
       const method = String(body.request?.method ?? "GET").toUpperCase();
-      const reply = await processSessions.executionCoordinator!.withWork({kind:"console",allowWhilePaused:["GET","HEAD"].includes(method)},
-        () => federation.request(nodeId, "console.request", body?.request ?? {}));
+      const request = () => federation.request(nodeId, "console.request", body?.request ?? {});
+      const reply = await (["GET", "HEAD"].includes(method) ? request()
+        : processSessions.executionCoordinator!.withWork({kind: "console"}, request));
       res.status(200).json(reply);
     } catch (error) {
       res.status(502).json({ code: "CONSOLE_REQUEST_FAILED", message: error instanceof Error ? error.message : String(error) });

@@ -11,6 +11,7 @@ import type { PeerLink } from "./transport.js";
 import type { JsonRecord } from "./types.js";
 import { parseWorkspaceHandle } from "./routing.js";
 import type { SessionFeedRequest, SessionFeedUpdate, TrustedInvocationEnvelope } from "./session-types.js";
+import { isReadOnlyObservation } from "../tool-admission.js";
 
 interface RemoteSubscription {
   nodeId: string;
@@ -129,10 +130,34 @@ export class SessionFeed {
     };
   }
 
-  async prepareLocalTool(name: string, input: JsonRecord, envelope: TrustedInvocationEnvelope | undefined): Promise<void> {
+  async prepareLocalTool(name: string, input: JsonRecord, envelope: TrustedInvocationEnvelope | undefined): Promise<TrustedInvocationEnvelope | undefined> {
     if (!envelope) return;
     const sessionId = typeof input.session_id === "string" ? input.session_id : envelope.session_id;
-    if (!sessionId) return;
+    if (!sessionId) return envelope;
+    if (isReadOnlyObservation(name, input)) {
+      // 观察只使用已有归属，不能同步标题、补建远端会话或推进当前 Task。
+      if (envelope.session_id && envelope.session_id !== sessionId) throw new Error("SESSION_SCOPE_MISMATCH");
+      const session = this.store.requireSession(envelope.owner_id, sessionId);
+      if (envelope.conversation_id && session.conversation_id && envelope.conversation_id !== session.conversation_id)
+        throw new Error("SESSION_SCOPE_MISMATCH");
+      const workspaceId = typeof input.workspace_id === "string" ? input.workspace_id : envelope.workspace_id;
+      if (workspaceId) {
+        if (!envelope.member_id) throw new Error("REMOTE_SESSION_MEMBER_REQUIRED");
+        const member = this.store.getMember(sessionId, envelope.member_id);
+        const handle = parseWorkspaceHandle(workspaceId);
+        if (member.node_id !== this.runtime.localId || handle && handle.node !== this.runtime.localId
+          || member.workspace_id !== (handle?.local ?? workspaceId)) throw new Error("WORKSPACE_SESSION_MISMATCH");
+      }
+      const claimedTask = envelope.task_id ? this.store.findTask(envelope.task_id) : null;
+      if (claimedTask && claimedTask.session_id !== sessionId) throw new Error("TASK_SESSION_MISMATCH");
+      // 新入口 Task 可能尚未镜像；旧操作由 handler 按持久身份核对，不为观察创建新 Task。
+      const task = typeof input.task_id === "string" ? this.store.getTask(input.task_id)
+        : claimedTask ?? this.store.currentTask(sessionId);
+      if (!task) throw new Error("TASK_NOT_FOUND");
+      if (task.session_id !== sessionId) throw new Error("TASK_SESSION_MISMATCH");
+      return {...envelope, task_id: task.id, task_title: task.title, task_created_at: task.created_at,
+        task_source_id: task.source_task_id ?? undefined};
+    }
     this.store.adoptRemoteSession({
       id: sessionId,
       ownerId: envelope.owner_id,
@@ -142,7 +167,7 @@ export class SessionFeed {
     if (envelope.task_id) {
       await this.service.adoptTask(sessionId, envelope.task_id, envelope.task_title ?? envelope.session_title ?? "QuayMesh task", envelope.task_created_at, envelope.task_source_id);
     }
-    void name;
+    return envelope;
   }
 
   assertTaskAcceptsWork(envelope: TrustedInvocationEnvelope): void {

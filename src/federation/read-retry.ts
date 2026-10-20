@@ -148,13 +148,13 @@ function readAttemptTimeout(method: string, params: unknown): number {
     // for the client-owned project mapping before returning a verified/partial receipt.
     return 20_000;
   }
-  if (request.name !== "write_stdin") return READ_ATTEMPT_TIMEOUT_MS;
-  const yieldMs = Number(request.input?.yield_time_ms ?? 5_000);
-  if (!Number.isFinite(yieldMs) || yieldMs < 0) return READ_ATTEMPT_TIMEOUT_MS;
-  // A write_stdin poll can intentionally wait for up to 12 seconds. The
-  // transport attempt has to outlive that wait or a healthy request is retried
-  // while the first invocation is still executing on the remote node.
-  return Math.max(READ_ATTEMPT_TIMEOUT_MS, Math.min(12_000, yieldMs) + 3_000);
+  const waitMs = request.name === "read_output" ? Number(request.input?.wait_ms ?? 0)
+    : request.name === "wait_agent" ? Number(request.input?.result_cursor ? 0 : request.input?.timeout_ms ?? 5_000)
+      : request.name === "write_stdin" ? Number(request.input?.yield_time_ms ?? 5_000) : 0;
+  if (!Number.isFinite(waitMs) || waitMs < 0) return READ_ATTEMPT_TIMEOUT_MS;
+  const maxWaitMs = request.name === "write_stdin" ? 12_000 : 10_000;
+  // 观察可以等满窗口；单次 RPC 还要留出传输和回传时间，总期限仍由调用方限制。
+  return Math.max(READ_ATTEMPT_TIMEOUT_MS, Math.min(maxWaitMs, waitMs) + 3_000);
 }
 
 /** Idempotent reads retry inside a 30s budget. Mutations are attempted exactly once. */
