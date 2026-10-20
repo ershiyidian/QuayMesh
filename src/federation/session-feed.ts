@@ -107,6 +107,11 @@ export class SessionFeed {
     if (!memberId && name !== "open_workspace" && name !== "attach_workspace") return undefined;
     const requestedTaskId=typeof input.task_id==="string"?input.task_id:identity.task_id;
     const task = sessionId ? requestedTaskId ? this.store.getTask(requestedTaskId) : this.store.currentTask(sessionId) : null;
+    // 首次镜像会创建 active 任务，入口须先拒绝已经结束的任务，避免恢复时重新激活。
+    if (name === "attach_workspace" && (!task || task.state !== "active")) {
+      throw Object.assign(new Error(`TASK_NOT_ACTIVE: start a task in session ${sessionId} before attaching a workspace.`),
+        { code: "TASK_NOT_ACTIVE", effect: "not_started" });
+    }
     return {
       invocation_id: invocationId(ownerId, identity.transport_instance_id, String(identity.request_id), name),
       owner_id: ownerId,

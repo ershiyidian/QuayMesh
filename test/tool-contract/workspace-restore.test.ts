@@ -3,6 +3,7 @@ import test from "node:test";
 import { randomUUID } from "node:crypto";
 import { access, chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { git } from "../../src/git.js";
 import { cleanupManagedWorktrees } from "../../src/git-worktrees.js";
 import { parseWorkspaceHandle } from "../../src/federation/routing.js";
@@ -181,4 +182,32 @@ test("真实双节点 HTTP：查询不恢复已清理工作树，授权的显式
   const read = await call("read", { workspace_id, path: "README.md" });
   assert.match(read.result, /staged worktree content/);
   assert.match(read.result, /unstaged worktree content/);
+
+  // 新任务只在入口创建并完成，worker 没见过它；恢复前不能把它首次镜像为 active。
+  await call("finish_task", { task_id: task.task_id, status: "completed", summary: "原工作树任务已完成" });
+  const closedTask = await call("start_session", { title: "未访问 worker 的任务", request_key: randomUUID() });
+  const finished = await call("finish_task", { task_id: closedTask.task_id, status: "completed", summary: "入口任务完成" });
+  assert.equal(finished.state, "closed");
+  const prunedAgain = await cleanupManagedWorktrees({ store,
+    worktreeRoot: worker.config.worktreeRoot, allowedRoots: worker.config.allowedRoots,
+    staleBefore: new Date(Date.now() + 60_000) });
+  assert.ok(prunedAgain.isOk(), prunedAgain.isErr() ? prunedAgain.error.message : "");
+  assert.deepEqual(prunedAgain.value.failed, []);
+  assert.deepEqual(prunedAgain.value.removed.map(entry => entry.workspaceId), [handle.local]);
+  await rm(marker);
+  const workerDb = new Database(join(worker.config.stateDir, "quaymesh.sqlite"), { readonly: true });
+  try {
+    const workerTask = workerDb.prepare("SELECT state FROM qm_tasks WHERE id=?");
+    assert.equal(workerTask.get(closedTask.task_id), undefined);
+    const refused = await raw("attach_workspace", { workspace_id, session_id: task.session_id });
+    assert.equal(refused.isError, true, JSON.stringify(refused));
+    const error = refused.structuredContent as Record<string, unknown>;
+    assert.equal(error.error_code, "TASK_NOT_ACTIVE");
+    assert.equal(error.effect, "not_started");
+    assert.equal(error.retry_hint, "fix_input");
+    assert.equal(workerTask.get(closedTask.task_id), undefined, "入口拒绝不得在 worker 上创建 active 镜像");
+    await assertStillPruned();
+  } finally {
+    workerDb.close();
+  }
 });
