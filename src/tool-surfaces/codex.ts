@@ -273,7 +273,7 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
         const saved = await commandOutput(context,workspaceId,sessionId,cursor,Math.max(4,Math.min(16384,(max_output_tokens??10000)*4)));
         const invocation = currentInvocation()!;
         const workspace = await workspaces.getWorkspace(workspaceId);
-        const recorded = context.sessionRuntime!.store.requireCommand(invocation.owner_id,config.federation?.nodeId ?? "local",workspace.root,sessionId);
+        const recorded = context.sessionRuntime!.store.requireCommand(invocation.owner_id,config.federation?.nodeId ?? "local",workspace.canonicalRoot,sessionId);
         if (!recorded.execution || !saved.process_done) throw new Error("COMMAND_NOT_ATTACHED: use read_output to inspect saved evidence");
         return {...jsonReply({result:saved.result,operation_id:sessionId,
           ...(typeof session_id==="number"?{session_id}:{}),running:false,exit_code:saved.exit_code??undefined,

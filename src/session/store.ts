@@ -1404,7 +1404,8 @@ export class SessionStore {
     const invocation = this.findInvocationByOperation(ownerId, operationId);
     if (!invocation || !["exec_command", "bash"].includes(invocation.tool_name)) throw new Error("COMMAND_NOT_FOUND");
     const member = this.getMember(invocation.session_id, invocation.member_id);
-    if (member.node_id !== nodeId || canonicalWorkspaceRoot(member.root) !== canonicalWorkspaceRoot(root)) {
+    // 历史命令校验已保存的根身份，目录清理后也无需再次访问文件系统。
+    if (member.node_id !== nodeId || canonicalPathIdentity(resolve(member.root)) !== canonicalPathIdentity(resolve(root))) {
       throw new Error("COMMAND_WORKSPACE_MISMATCH");
     }
     const row = this.db.prepare(`SELECT o.status,o.finished_at,o.created_at,l.task_id,t.finished_at AS task_finished_at

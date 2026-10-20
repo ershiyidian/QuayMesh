@@ -105,7 +105,7 @@ export function registerOperationTools(context:ToolRegistrationContext):void {
   },async({workspace_id,operation_id})=>{
     const invocation=currentInvocation();if(!invocation)throw new Error("MISSING_OPERATION_CONTEXT");
     const workspace=await context.workspaces.getWorkspace(workspace_id);
-    const recorded=runtime.store.requireCommand(invocation.owner_id,context.config.federation?.nodeId??"local",workspace.root,operation_id);
+    const recorded=runtime.store.requireCommand(invocation.owner_id,context.config.federation?.nodeId??"local",workspace.canonicalRoot,operation_id);
     const active=processSessions.findOperation(operation_id);
     if(["completed","failed","cancelled"].includes(recorded.status))return jsonReply({operation_id,state:recorded.status,cancel_requested:false});
     const saved = runtime.store.findInvocationByOperation(invocation.owner_id, operation_id)!;
