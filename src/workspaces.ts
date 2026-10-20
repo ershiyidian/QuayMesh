@@ -305,7 +305,20 @@ export class WorkspaceRegistry {
     };
   }
 
-  async getWorkspace(workspaceId: string): Promise<Workspace> {
+  async getWorkspace(workspaceId: string, options: { touch?: boolean } = {}): Promise<Workspace> {
+    const confirmActive = () => {
+      if (!this.store) return;
+      if (options.touch !== false) {
+        const touched = this.store.touchSession(workspaceId);
+        if (touched.isErr()) throw touched.error;
+        if (!touched.value) throw unavailableWorkspaceError(workspaceId);
+        return;
+      }
+      // 观察不更新时间戳；异步路径检查后仍须确认工作区尚未被清理或停用。
+      const current = this.store.getSessionResult(workspaceId);
+      if (current.isErr()) throw current.error;
+      if (current.value?.status !== "active") throw unavailableWorkspaceError(workspaceId);
+    };
     const workspace = this.workspaces.get(workspaceId);
     if (workspace) {
       if (!this.store) {
@@ -319,9 +332,7 @@ export class WorkspaceRegistry {
       if (cachedSession.isErr()) throw cachedSession.error;
       if (cachedSession.value?.status === "active") {
         await this.assertWorkspaceRootUnchanged(workspace);
-        const touched = this.store.touchSession(workspaceId);
-        if (touched.isErr()) throw touched.error;
-        if (!touched.value) throw unavailableWorkspaceError(workspaceId);
+        confirmActive();
         this.workspaces.delete(workspaceId);
         this.workspaces.set(workspaceId, workspace);
         return workspace;
@@ -348,11 +359,7 @@ export class WorkspaceRegistry {
       session.mode,
       session.sourceRoot,
     );
-    if (this.store) {
-      const touched = this.store.touchSession(workspaceId);
-      if (touched.isErr()) throw touched.error;
-      if (!touched.value) throw unavailableWorkspaceError(workspaceId);
-    }
+    confirmActive();
 
     const restoredWorkspace: Workspace = {
       id: session.id,

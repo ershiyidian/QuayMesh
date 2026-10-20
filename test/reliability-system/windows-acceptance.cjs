@@ -46,6 +46,7 @@ async function main() {
     "session-sqlite": [...files("src/session", ".test.ts"),
       "src/db/migrations.test.ts", "src/db/async-write.test.ts", "src/execution-coordinator.test.ts", "src/execution-coordinator.async.test.ts",
       "src/execution-admission.test.ts", "src/execution-resources.test.ts", "src/process-sessions-contention.test.ts",
+      "src/tool-surfaces/subagents.test.ts",
       "src/reliability-followup.test.ts", "src/server-diagnostics.test.ts",
       "test/reliability-background.test.ts"],
     "recovery-federation": [

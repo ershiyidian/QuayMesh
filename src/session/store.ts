@@ -949,6 +949,10 @@ export class SessionStore {
     providerTurnId: string | null,
     controlRevision: number,
   ): void {
+    const previous = this.lastAgentObservation(sessionId, agentId);
+    // 同版本不刷新时间；仅真实终态允许修复旧 interrupt 留下的目标 turn。
+    if (previous && (previous.controlRevision > controlRevision || previous.controlRevision === controlRevision
+      && (previous.providerTurnId === providerTurnId || providerTurnId !== null || previous.providerTurnId === null))) return;
     const now = new Date().toISOString();
     this.db
       .prepare(
@@ -957,9 +961,32 @@ export class SessionStore {
          ON CONFLICT(session_id, agent_id) DO UPDATE SET
            provider_turn_id = excluded.provider_turn_id,
            control_revision = excluded.control_revision,
-           observed_at = excluded.observed_at`,
+           observed_at = excluded.observed_at
+         WHERE qm_agent_observations.control_revision < excluded.control_revision
+            OR (qm_agent_observations.control_revision = excluded.control_revision
+              AND qm_agent_observations.provider_turn_id IS NOT NULL AND excluded.provider_turn_id IS NULL
+              AND EXISTS (SELECT 1 FROM local_agent_sessions a WHERE a.id = excluded.agent_id
+                AND a.control_revision = excluded.control_revision AND a.control_state = 'terminal'
+                AND a.status IN ('idle', 'error', 'stopped') AND a.provider_turn_id IS NULL))`,
       )
       .run(sessionId, agentId, providerTurnId, controlRevision, now);
+  }
+
+  async rememberAgentObservationsAsync(
+    sessionId: SessionId,
+    observations: ReadonlyArray<{agentId: string; providerTurnId: string | null; controlRevision: number}>,
+  ): Promise<boolean[]> {
+    const matches = (observation: typeof observations[number]) => {
+      const saved = this.lastAgentObservation(sessionId, observation.agentId);
+      return saved?.providerTurnId === observation.providerTurnId && saved.controlRevision === observation.controlRevision;
+    };
+    const unchanged = observations.map(matches);
+    if (unchanged.every(Boolean)) return unchanged;
+    // 整批共享短预算；等待结束前不返回，也不安排后台授权刷新。
+    return this.writeAsync(() => {
+      for (const item of observations) this.rememberAgentObservation(sessionId, item.agentId, item.providerTurnId, item.controlRevision);
+      return observations.map(matches);
+    }, {timeoutMs: 150});
   }
 
   rememberAgentOperation(input: {

@@ -83,7 +83,7 @@ export function createFederation(config: ServerConfig, workspaces: WorkspaceRegi
       if (typeof input.path !== "string" || !input.path) throw new Error("请选择 workspace_catalog 中的 root_id");
       return rest;
     },
-    checkWorkspace: async (id) => { const workspace = await workspaces.getWorkspace(id); assertAllowedPath(workspace.sourceRoot ?? workspace.root, config.allowedRoots); },
+    checkWorkspace: async (id, options) => { const workspace = await workspaces.getWorkspace(id, options); assertAllowedPath(workspace.sourceRoot ?? workspace.root, config.allowedRoots); },
     updateSettings: async (input) => {
       const editable = ["nickname", "priority", "roots", "egress"] as const;
       const settings = Object.fromEntries(editable.filter((key) => key in input).map((key) => [key, input[key]]));

@@ -36,9 +36,9 @@ export function registerSubagentTools(
     return agentClient ??= createLocalAgentClient(config);
   };
 
-  const scopeFor = async (workspaceId: string) => {
+  const scopeFor = async (workspaceId: string, observation = false) => {
     if (!config.subagents.enabled) throw new Error("SUBAGENTS_DISABLED_ON_NODE: select a worker with an enabled provider");
-    const workspace = await workspaces.getWorkspace(workspaceId);
+    const workspace = await workspaces.getWorkspace(workspaceId, {touch: !observation});
     return {
       workspace,
       scope: { workspaceId: workspace.id, workspaceRoot: workspace.root },
@@ -144,14 +144,38 @@ export function registerSubagentTools(
     scope: { workspaceId: string; workspaceRoot: string },
   ): Promise<LocalAgentRecord> => (await authorizeAgentRecord(agentId, scope)).record;
 
-  const rememberControl = (sessionId: string, record: LocalAgentRecord): void => {
-    requireSessionRuntime().store.rememberAgentObservation(
-      sessionId,
-      record.id,
-      record.providerTurnId ?? null,
-      record.controlRevision,
-    );
+  interface ControlObservation {
+    status: "saved" | "observe_again";
+    provider_turn_id: string | null;
+    control_revision: number;
+    error_code?: "CONTROL_OBSERVATION_BUSY" | "CONTROL_OBSERVATION_PERSISTENCE_FAILED" | "CONTROL_OBSERVATION_SUPERSEDED";
+  }
+
+  const rememberControls = async (sessionId: string, records: LocalAgentRecord[]): Promise<ControlObservation[]> => {
+    const store = requireSessionRuntime().store;
+    const observations = records.map(record => ({agentId: record.id,
+      providerTurnId: record.providerTurnId ?? null, controlRevision: record.controlRevision}));
+    let saved: boolean[], failure: ControlObservation["error_code"] = "CONTROL_OBSERVATION_SUPERSEDED";
+    try { saved = await store.rememberAgentObservationsAsync(sessionId, observations); }
+    catch (error) {
+      const code = error && typeof error === "object" ? (error as {code?: unknown}).code : undefined;
+      failure = typeof code === "string" && /^SQLITE_BUSY(?:_|$)/u.test(code)
+        ? "CONTROL_OBSERVATION_BUSY" : "CONTROL_OBSERVATION_PERSISTENCE_FAILED";
+      // 保存失败不覆盖已完成的动作；只读核对已保存的项，不能偷偷补写。
+      saved = observations.map(item => {
+        try {
+          const previous = store.lastAgentObservation(sessionId, item.agentId);
+          return previous?.providerTurnId === item.providerTurnId && previous.controlRevision === item.controlRevision;
+        } catch { return false; }
+      });
+    }
+    return observations.map((item, index) => ({status: saved[index] ? "saved" : "observe_again",
+      provider_turn_id: item.providerTurnId, control_revision: item.controlRevision,
+      ...(saved[index] ? {} : {error_code: failure})}));
   };
+
+  const rememberControl = async (sessionId: string, record: LocalAgentRecord): Promise<ControlObservation> =>
+    (await rememberControls(sessionId, [record]))[0]!;
 
   const controlChanged = (sessionId: string, record: LocalAgentRecord): boolean => {
     const observed = requireSessionRuntime().store.lastAgentObservation(sessionId, record.id);
@@ -202,8 +226,8 @@ export function registerSubagentTools(
         return reply({ code: result.error.code, message: result.error.message, requestAccepted: false, providerInvoked: false }, true);
       }
       trackAgentOperation(invocation, result.value.id);
-      rememberControl(invocation.session_id, result.value);
-      return reply(presentSubagentRecord(result.value, workspace.id));
+      const controlObservation = await rememberControl(invocation.session_id, result.value);
+      return reply({...presentSubagentRecord(result.value, workspace.id), control_observation: controlObservation});
     },
   );
 
@@ -244,8 +268,8 @@ export function registerSubagentTools(
       );
       if (result.isErr()) return reply({ code: result.error.code, message: result.error.message, requestAccepted: false, providerInvoked: false }, true);
       trackAgentOperation(invocation, result.value.id);
-      rememberControl(invocation.session_id, result.value);
-      return reply(presentSubagentRecord(result.value, workspace.id));
+      const controlObservation = await rememberControl(invocation.session_id, result.value);
+      return reply({...presentSubagentRecord(result.value, workspace.id), control_observation: controlObservation});
     },
   );
 
@@ -289,9 +313,10 @@ export function registerSubagentTools(
         scope,
       });
       if (result.isErr()) return reply({ code: result.error.code, message: result.error.message, requestAccepted: false, providerInvoked: false }, true);
-      rememberControl(invocation.session_id, { ...record, controlRevision: result.value.controlRevision,
+      const controlObservation = await rememberControl(invocation.session_id, { ...record, controlRevision: result.value.controlRevision,
         controlState: result.value.controlState, providerTurnId: result.value.providerTurnId });
-      return reply({ ...result.value, result_ref: recordRef(record), next_action: { tool: "wait_agent", arguments: { workspace_id: workspace.id, agent_ids: [record.id] } } });
+      return reply({ ...result.value, control_observation: controlObservation, result_ref: recordRef(record),
+        next_action: { tool: "wait_agent", arguments: { workspace_id: workspace.id, agent_ids: [record.id] } } });
     },
   );
 
@@ -305,7 +330,7 @@ export function registerSubagentTools(
     },
     async (input, extra) => {
       void extra;
-      const { workspace, scope } = await scopeFor(input.workspace_id);
+      const { workspace, scope } = await scopeFor(input.workspace_id, true);
       const invocation = currentInvocation();
       if (!invocation) throw new Error("MISSING_OPERATION_CONTEXT");
       const records = new Map<string, LocalAgentRecord>();
@@ -330,16 +355,13 @@ export function registerSubagentTools(
           new Set(requireSessionRuntime().store.runIdsForMember(invocation.session_id, invocation.member_id)),
           input.agent_ids, ordered.filter((item) => item.status === "completed").map((item) => item.id), input.result_cursor);
       } finally { ledger.close(); }
-      for (const item of ordered) {
-        const record = records.get(item.id)!;
-        rememberControl(invocation.session_id, record);
-      }
+      const controlObservations = await rememberControls(invocation.session_id, ordered.map(item => records.get(item.id)!));
       return reply({
         workspace_id: workspace.id,
-        results: ordered.map((item) => {
+        results: ordered.map((item, index) => {
           const record = records.get(item.id)!;
           return { agent_id: item.id, state: item.status, result_ref: page.references[item.id] ?? null,
-            result_available: Boolean(page.references[item.id]),
+            result_available: Boolean(page.references[item.id]), control_observation: controlObservations[index],
             ...(record.error ? { error: record.error, code: record.errorCode } : {}) };
         }),
         response_text: page.text,
@@ -374,8 +396,8 @@ export function registerSubagentTools(
       if (record.status === "queued" || record.status === "starting") {
         const cancelled = await getAgents().cancelQueued(record.id, scope);
         if (cancelled.isErr()) return reply({ code: cancelled.error.code, message: cancelled.error.message }, true);
-        rememberControl(invocation.session_id, cancelled.value);
-        return reply({ ...presentSubagentRecord(cancelled.value, workspace.id), action: "cancel_queued" });
+        const controlObservation = await rememberControl(invocation.session_id, cancelled.value);
+        return reply({ ...presentSubagentRecord(cancelled.value, workspace.id), control_observation: controlObservation, action: "cancel_queued" });
       }
       if (record.status !== "running") {
         return reply({ ...presentSubagentRecord(record, workspace.id), action: "none", terminal: true });
@@ -398,9 +420,10 @@ export function registerSubagentTools(
         scope,
       });
       if (result.isErr()) return reply({ code: result.error.code, message: result.error.message, requestAccepted: false, providerInvoked: false }, true);
-      rememberControl(invocation.session_id, { ...record, controlRevision: result.value.controlRevision,
-        controlState: result.value.controlState, providerTurnId: result.value.providerTurnId });
-      return reply({ ...result.value, result_ref: recordRef(record), action: "interrupt" });
+      // manager 的 terminal 回执在当前 turn 清空后生成；回执里的 turn 仍是被中断的目标。
+      const controlObservation = await rememberControl(invocation.session_id, { ...record, controlRevision: result.value.controlRevision,
+        controlState: result.value.controlState, providerTurnId: result.value.controlState === "terminal" ? undefined : result.value.providerTurnId });
+      return reply({ ...result.value, control_observation: controlObservation, result_ref: recordRef(record), action: "interrupt" });
     },
   );
 
@@ -413,7 +436,7 @@ export function registerSubagentTools(
       annotations: READ_ONLY,
     },
     async (input) => {
-      const { workspace, scope } = await scopeFor(input.workspace_id);
+      const { workspace, scope } = await scopeFor(input.workspace_id, true);
       const invocation = currentInvocation();
       if (!invocation) throw new Error("MISSING_OPERATION_CONTEXT");
       const result = await getAgents().list(scope);
@@ -428,10 +451,10 @@ export function registerSubagentTools(
       }
       const start = input.cursor ? sessionAgents.findIndex((agent) => agent.record.id === input.cursor) + 1 : 0;
       const rows = sessionAgents.slice(start, start + input.limit);
-      for (const agent of rows) rememberControl(invocation.session_id, agent.record);
+      const controlObservations = await rememberControls(invocation.session_id, rows.map(agent => agent.record));
       return reply({
         workspace_id: workspace.id,
-        agents: rows.map(({ record, task }) => ({
+        agents: rows.map(({ record, task }, index) => ({
           agent_id: record.id,
           name: record.taskName ?? record.profileName,
           task,
@@ -441,6 +464,7 @@ export function registerSubagentTools(
           effort: record.effort ?? null,
           result_ref: record.status === "idle" ? recordRef(record) : null,
           result_available: record.status === "idle" && record.latestResponse !== undefined,
+          control_observation: controlObservations[index],
         })),
         cursor: start + rows.length < sessionAgents.length ? rows.at(-1)?.record.id ?? null : null,
       });

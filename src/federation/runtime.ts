@@ -42,7 +42,7 @@ export interface FederationHooks {
   execution?: ExecutionCoordinator;
   providers(): unknown[];
   prepareOpen(input: JsonRecord): Promise<JsonRecord>;
-  checkWorkspace(id: string): Promise<void>;
+  checkWorkspace(id: string, options?: { touch?: boolean }): Promise<void>;
   console(method: string, path: string, body?: unknown): Promise<ConsoleReply>;
   settings(): unknown;
   updateSettings(input: JsonRecord): Promise<void>;
@@ -390,7 +390,8 @@ export class FederationRuntime extends EventEmitter {
     const historical = name === "read_output" || name === "workspace_context" &&
       (args.action === "recovery" || args.action === "status" && args.environment !== true);
     if (typeof args.workspace_id === "string" && !historical && !opensWorkspace) {
-      try { await this.hooks.checkWorkspace(args.workspace_id); }
+      try { await this.hooks.checkWorkspace(args.workspace_id,
+        name === "wait_agent" || name === "list_agents" ? {touch: false} : undefined); }
       catch (error) {
         // 恢复提示属于工具回执；先保留节点句柄和参数，再跨节点传输。
         if (error instanceof WorkspaceAccessError) return routedResult(toolErrorResult(error), this.localId, { textReferences: true });
