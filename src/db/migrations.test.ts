@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import Database from "better-sqlite3";
+import { databasePath, openDatabase, type DatabaseHandle } from "./client.js";
 import { migrateDatabase, LATEST_DATABASE_VERSION } from "./migrations.js";
 import { initialSchema } from "./initial-schema.js";
 import { runtimeSchema } from "./runtime-schema.js";
@@ -111,4 +115,91 @@ test("版本三数据库区分明确交付与历史归档",()=>{
     ]);
     assert.equal(db.pragma("integrity_check",{simple:true}),"ok");
   } finally {db.close();}
+});
+
+test("已最新数据库在真实写锁下仍可通过正式连接工厂读取，未知新版仍立即拒绝",t=>{
+  const directory=mkdtempSync(join(tmpdir(),"qm-migration-read-lock-"));
+  const initial=openDatabase(directory);
+  let blocker:Database.Database|undefined, opened:DatabaseHandle|undefined;
+  try {
+    initial.sqlite.prepare("INSERT INTO qm_sessions(id,owner_id,title,created_at,last_activity_at) VALUES(?,?,?,?,?)")
+      .run("session","owner","committed","2026-10-20","2026-10-20");
+    blocker=new Database(databasePath(directory));
+    blocker.exec("BEGIN IMMEDIATE");
+    blocker.prepare("UPDATE qm_sessions SET title='uncommitted' WHERE id='session'").run();
+    const started=performance.now();
+    opened=openDatabase(directory);
+    assert.equal(blocker.inTransaction,true);
+    assert.equal(opened.sqlite.prepare("SELECT title FROM qm_sessions WHERE id='session'").pluck().get(),"committed");
+    assert.equal(opened.sqlite.prepare("SELECT total_changes()").pluck().get(),0);
+    t.diagnostic(`已最新数据库持锁打开并读取耗时 ${performance.now()-started} ms`);
+    opened.close();opened=undefined;
+    blocker.exec("ROLLBACK");
+    initial.sqlite.prepare("UPDATE qm_schema_migrations SET version=999 WHERE version=?").run(LATEST_DATABASE_VERSION);
+    blocker.exec("BEGIN IMMEDIATE");
+    assert.throws(()=>openDatabase(directory),/不支持的 QuayMesh 数据库版本：999/);
+    assert.equal(blocker.inTransaction,true);
+  } finally {
+    opened?.close();
+    if(blocker?.inTransaction)blocker.exec("ROLLBACK");
+    blocker?.close();initial.close();rmSync(directory,{recursive:true,force:true});
+  }
+});
+
+test("最新版本的 legacy thinking 修复保留值，修复后打开不再抢写锁",()=>{
+  const directory=mkdtempSync(join(tmpdir(),"qm-migration-legacy-lock-"));
+  const legacy=new Database(databasePath(directory));
+  let opened:DatabaseHandle|undefined;
+  try {
+    legacy.pragma("journal_mode = WAL");
+    legacy.exec(`CREATE TABLE qm_schema_migrations(version INTEGER PRIMARY KEY,name TEXT,applied_at TEXT);
+      CREATE TABLE local_agent_sessions(id TEXT PRIMARY KEY,thinking TEXT,effort TEXT);
+      INSERT INTO local_agent_sessions VALUES('copy','high',NULL),('keep','high','medium'),('empty',NULL,NULL);`);
+    legacy.prepare("INSERT INTO qm_schema_migrations VALUES(?,'legacy','2026-10-20')").run(LATEST_DATABASE_VERSION);
+    migrateDatabase(legacy);
+    assert.deepEqual(legacy.prepare("SELECT id,effort FROM local_agent_sessions ORDER BY id").all(),[
+      {id:"copy",effort:"high"},{id:"empty",effort:null},{id:"keep",effort:"medium"},
+    ]);
+    const columns=new Set((legacy.pragma("table_info(local_agent_sessions)") as Array<{name:string}>).map(row=>row.name));
+    assert.ok(columns.has("control_revision"));assert.ok(columns.has("task_name"));
+    assert.ok(legacy.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='local_agent_turns'").get());
+    legacy.exec("BEGIN IMMEDIATE");
+    opened=openDatabase(directory);
+    assert.equal(legacy.inTransaction,true);
+    assert.equal(opened.sqlite.prepare("SELECT total_changes()").pluck().get(),0);
+    opened.close();opened=undefined;legacy.exec("ROLLBACK");
+    // 仍检查后来出现的旧格式数据，不以进程内缓存跳过需要修复的行。
+    legacy.prepare("INSERT INTO local_agent_sessions(id,thinking) VALUES('later','low')").run();
+    migrateDatabase(legacy);
+    assert.equal(legacy.prepare("SELECT effort FROM local_agent_sessions WHERE id='later'").pluck().get(),"low");
+  } finally {
+    opened?.close();if(legacy.inTransaction)legacy.exec("ROLLBACK");legacy.close();
+    rmSync(directory,{recursive:true,force:true});
+  }
+});
+
+test("首次建表和旧版本升级失败均回滚全部迁移，再次升级可成功",()=>{
+  const fresh=new Database(":memory:"), old=new Database(":memory:");
+  try {
+    fresh.exec("CREATE TABLE oauth_clients(preserved TEXT)");
+    assert.throws(()=>migrateDatabase(fresh),/already exists/);
+    assert.deepEqual(fresh.prepare("SELECT name FROM sqlite_master WHERE type='table'").all(),[{name:"oauth_clients"}]);
+    assert.equal(fresh.inTransaction,false);
+
+    migrateDatabase(old);
+    old.exec(`DROP INDEX qm_invocations_retry_of;
+      ALTER TABLE qm_invocations DROP COLUMN retry_of_invocation_id;
+      ALTER TABLE qm_invocations DROP COLUMN task_id;
+      DELETE FROM qm_schema_migrations WHERE version=6;
+      CREATE TRIGGER reject_upgrade BEFORE INSERT ON qm_schema_migrations WHEN NEW.version=6
+        BEGIN SELECT RAISE(ABORT,'migration stopped'); END;`);
+    assert.throws(()=>migrateDatabase(old),/migration stopped/);
+    assert.equal(old.inTransaction,false);
+    assert.equal(old.prepare("SELECT max(version) FROM qm_schema_migrations").pluck().get(),5);
+    const columns=(old.pragma("table_info(qm_invocations)") as Array<{name:string}>).map(row=>row.name);
+    assert.ok(!columns.includes("task_id"));assert.ok(!columns.includes("retry_of_invocation_id"));
+    old.exec("DROP TRIGGER reject_upgrade");migrateDatabase(old);
+    assert.equal(old.prepare("SELECT max(version) FROM qm_schema_migrations").pluck().get(),LATEST_DATABASE_VERSION);
+    assert.equal(old.pragma("integrity_check",{simple:true}),"ok");
+  } finally {fresh.close();old.close();}
 });
