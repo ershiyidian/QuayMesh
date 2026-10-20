@@ -16,8 +16,9 @@ import type { SessionRuntime } from "../session/runtime.js";
 import { resolveMihomoProxy, importMihomoConfig } from "./mihomo.js";
 import type { ConsoleReply, JsonRecord } from "./types.js";
 import type { ExecutionCoordinator } from "../execution-coordinator.js";
-import { OperationState } from "../session/types.js";
+import { OperationState, type InvocationContext } from "../session/types.js";
 import { stableJson } from "../session/invocations.js";
+import { errorEnvelope } from "../session/outcome.js";
 
 export function createFederation(config: ServerConfig, workspaces: WorkspaceRegistry, providers: () => unknown[],
   consoleOperation: (method: string, path: string, body?: unknown) => Promise<ConsoleReply>,
@@ -121,9 +122,10 @@ export function createFederation(config: ServerConfig, workspaces: WorkspaceRegi
       const workspace = await workspaces.getWorkspace(String(input.workspace_id));
       const operationId = String(input.operation_id);
       if (!/^op_copy_[0-9a-f-]+$/.test(operationId)) throw new Error("COPY_OPERATION_ID_INVALID");
-      const claim = runtime.execution.acquire({ workspaceRoot: workspace.root,kind:"mutation",operationId,
+      const claim = await runtime.execution.acquireAsync({ workspaceRoot: workspace.root,kind:"mutation",operationId,
         taskId:envelope?.task_id,scopes:[{kind:"file",path:destination,access:"write"}],title:"文件复制" });
       let ticket: Awaited<ReturnType<SessionRuntime["service"]["beforeOperation"]>> | undefined;
+      let reservedContext: InvocationContext | undefined;
       let evidence: Awaited<ReturnType<SessionRuntime["changes"]["prepareWrite"]>> = [];
       let finished = false;
       try {
@@ -131,24 +133,45 @@ export function createFederation(config: ServerConfig, workspaces: WorkspaceRegi
           const identity = { owner_id: envelope.owner_id, conversation_id: envelope.conversation_id,
             transport_instance_id: `copy:${federation.nodeId}`, request_id: String(input.request_key),
             invocation_id: operationId, task_id: envelope.task_id };
-          const context = sessionRuntime.recorder.contextForSession(identity, envelope.session_id, envelope.member_id, workspace.id, "copy_artifact");
+          const context = sessionRuntime.recorder.contextForSession(identity, envelope.session_id, envelope.member_id, workspace.id, "copy_artifact", false);
           context.operation_id = operationId;
-          sessionRuntime.store.reserveInvocation({ id: context.invocation_id, ownerId: context.owner_id,
-            transportInstanceId: context.transport_instance_id, requestId: String(context.request_id),
-            sessionId: context.session_id, memberId: context.member_id, toolName: "copy_artifact",
-            argumentsJson: stableJson({ source_node: input.source_node, source_workspace: input.source_workspace,
-              source_path: input.source_path, destination_workspace: workspace.id, destination_path: input.path, overwrite: input.overwrite }) });
+          const reservation = await sessionRuntime.store.writeAsync(() => {
+            sessionRuntime.store.touchTaskMember(context.task_id!, context.member_id);
+            return sessionRuntime.store.reserveInvocation({ id: context.invocation_id, ownerId: context.owner_id,
+              transportInstanceId: context.transport_instance_id, requestId: String(context.request_id),
+              sessionId: context.session_id, memberId: context.member_id, taskId: context.task_id, operationId, toolName: "copy_artifact",
+              argumentsJson: stableJson({ source_node: input.source_node, source_workspace: input.source_workspace,
+                source_path: input.source_path, destination_workspace: workspace.id, destination_path: input.path, overwrite: input.overwrite }) });
+          });
+          if (reservation.id === context.invocation_id) reservedContext = context;
           ticket = await sessionRuntime.service.beforeOperation(context, "copy", `复制文件到 ${String(input.path)}`);
-          sessionRuntime.store.updateInvocation({ ownerId: context.owner_id, transportInstanceId: context.transport_instance_id,
-            requestId: String(context.request_id), operationId, state: OperationState.running, effect: "started" });
+          await sessionRuntime.store.writeAsync(() => sessionRuntime.store.updateInvocation({
+            ownerId: context.owner_id, transportInstanceId: context.transport_instance_id,
+            requestId: String(context.request_id), operationId, state: OperationState.running, effect: "started" }));
           const member = sessionRuntime.store.getMember(context.session_id, context.member_id);
           evidence = await sessionRuntime.changes.prepareWrite(member, [String(input.path)], member.root, context.task_id);
         }
       } catch (error) {
-        if (ticket && sessionRuntime) await sessionRuntime.service.finishOperationById(operationId, {
-          status: OperationState.failed, effect: "not_started", error_message: error instanceof Error ? error.message : String(error),
-        });
-        claim.release(); throw error;
+        try {
+          if (ticket && sessionRuntime) await sessionRuntime.service.finishOperationById(operationId, {
+            status: OperationState.failed, effect: "not_started", error_message: error instanceof Error ? error.message : String(error),
+          }, ticket.invocation_id);
+          else if (reservedContext && sessionRuntime) {
+            const context = reservedContext;
+            // 准入未建立操作时，复制尚未开始；终结原预留，避免遗留 accepted。
+            await sessionRuntime.store.writeAsync(() => {
+              if (context.run_id || sessionRuntime.store.findOperationEvent(operationId)) return;
+              sessionRuntime.store.updateInvocation({ ownerId: context.owner_id, transportInstanceId: context.transport_instance_id,
+                requestId: String(context.request_id), operationId, state: OperationState.failed, effect: "not_started",
+                result: errorEnvelope(error, { sideEffecting: true, effectStarted: false }), finished: true });
+            });
+          }
+        } catch (receiptError) { console.error("QuayMesh transfer preparation receipt:", receiptError); }
+        finally {
+          try { await claim.releaseAsync(); }
+          catch (releaseError) { console.error("QuayMesh transfer preparation cleanup:", releaseError); }
+        }
+        throw error;
       }
       return {
         temporaryPath: `${destination}.quaymesh-${operationId}.part`, claimId: claim.id,

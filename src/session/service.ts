@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
+import { runSqliteWrite } from "../db/async-write.js";
 import {
   ExecutionState,
   HostState,
@@ -16,7 +17,7 @@ import {
   type FileSummary,
   type WorkspaceId,
 } from "./types.js";
-import type { SessionStore } from "./store.js";
+import { SessionStore } from "./store.js";
 import type { WorkspaceRegistry, Workspace } from "../workspaces.js";
 import type { WorkLedger } from "../work-ledger.js";
 import type { LocalAgentStore } from "../local-agent-store.js";
@@ -98,6 +99,7 @@ export class SessionService {
   private readonly pendingRecovery = new Set<Promise<void>>();
   private readonly finalizing = new Map<string, Promise<TaskRecord>>();
   private readonly finalizingLocal = new Map<string, Promise<TaskOwnerReceipt>>();
+  private readonly pendingRuns = new Map<string, Promise<string>>();
   private remoteFinalizer?: (task: TaskRecord, status: TaskFinalStatus, summary: string) => Promise<TaskOwnerReceipt[]>;
   private remoteArchiver?: (task:TaskRecord)=>Promise<TaskOwnerReceipt[]>;
 
@@ -443,35 +445,59 @@ export class SessionService {
   async ensureRun(
     session: SessionRecord,
     member: SessionMember,
-    operation: { kind: string; label: string },
+    operation: { kind: string; label: string; invocationId?: string; operationId?: string },
     taskId?: string,
   ): Promise<string> {
-    if (this.ledger) {
-      const ledger = this.ledger;
-      const task = taskId ? this.store.getTask(taskId) : this.ensureCurrentTask(session);
-      if (task.session_id !== session.id || task.state !== "active") throw new Error(`TASK_NOT_ACTIVE: ${task.id}`);
-      for (const runId of this.store.runIdsForMember(session.id, member.id, task.id)) {
-        const current = ledger.run(runId);
-        if (current.status === "running") {
-          ledger.setRunTitle(current.id, task.title);
-          return current.id;
-        }
-      }
+    const ledger = this.requireLedger();
+    const task = taskId ? this.store.getTask(taskId) : this.ensureCurrentTask(session);
+    if (task.session_id !== session.id || task.state !== "active") throw new Error(`TASK_NOT_ACTIVE: ${task.id}`);
+    const key = `${task.id}:${member.id}`;
+    const pending = this.pendingRuns.get(key);
+    if (pending) return pending;
+    const create = async () => {
       const previousRun = this.store.runIdsForMember(session.id, member.id, task.id)[0];
-      if (previousRun) await this.checkpointRun(previousRun, session.id, member.id, task.id);
-      const run = this.ledger.begin({
-        root: member.root,
-        workspaceId: member.workspace_id,
-        workItemId: `task-${task.id}`,
-        runKey: `task-${task.id}-${member.id}-${randomUUID()}`,
-        title: task.title,
-        origin: { entryPoint: "chatgpt_mcp", evidence: "server_entry" },
+      if (previousRun && ledger.run(previousRun).status !== "running") {
+        await this.checkpointRun(previousRun, session.id, member.id, task.id);
+      }
+      const runKey = `task-${task.id}-${member.id}-${randomUUID()}`;
+      // 同一连接验证身份并提交 run 与关联，不能在两个连接间分段提交。
+      const linkedStore = new SessionStore(ledger.db);
+      const run = await runSqliteWrite(ledger.db, () => {
+        linkedStore.requireSession(session.owner_id, session.id);
+        const currentMember = linkedStore.getMember(session.id, member.id);
+        const currentTask = linkedStore.getTask(task.id);
+        if (currentTask.session_id !== session.id || currentTask.state !== "active") throw new Error(`TASK_NOT_ACTIVE: ${task.id}`);
+        const finishing = linkedStore.taskData.finalization(task.id);
+        if (finishing && !finishing.error) throw new Error(`TASK_FINISHING: ${task.id}`);
+        if (operation.invocationId !== undefined || operation.operationId !== undefined) {
+          const attempt = operation.operationId ? linkedStore.findInvocationByOperation(session.owner_id, operation.operationId) : null;
+          if (!attempt || attempt.id !== operation.invocationId || attempt.task_id !== task.id
+            || attempt.session_id !== session.id || attempt.member_id !== member.id) throw new Error("OPERATION_RETRY_SUPERSEDED");
+        }
+        for (const runId of linkedStore.runIdsForMember(session.id, member.id, task.id)) {
+          const current = ledger.run(runId);
+          if (current.status === "running") {
+            if (current.title !== currentTask.title) ledger.setRunTitle(current.id, currentTask.title);
+            return current;
+          }
+        }
+        const created = ledger.begin({
+          root: currentMember.root,
+          workspaceId: currentMember.workspace_id,
+          workItemId: `task-${task.id}`,
+          runKey,
+          title: currentTask.title,
+          origin: { entryPoint: "chatgpt_mcp", evidence: "server_entry" },
+        });
+        linkedStore.linkRun(session.id, member.id, created.id, task.id);
+        return created;
       });
-      this.store.linkRun(session.id, member.id, run.id, task.id);
-      this.store.setReviewState(session.id, ReviewState.unknown);
+      await this.store.setReviewStateAsync(session.id, ReviewState.unknown, task.id);
       return run.id;
-    }
-    throw new Error("SESSION_WORK_LEDGER_REQUIRED");
+    };
+    const work = create().finally(() => { this.pendingRuns.delete(key); });
+    this.pendingRuns.set(key, work);
+    return work;
   }
 
   async beforeOperation(
@@ -486,18 +512,27 @@ export class SessionService {
     if (task.session_id !== session.id || task.state !== "active") throw new Error(`TASK_NOT_ACTIVE: ${task.id}`);
     const finalization=this.store.taskData.finalization(task.id);
     if(finalization && !finalization.error)throw new Error(`TASK_FINISHING: ${task.id}`);
-    const runId = await this.ensureRun(session, member, { kind, label }, task.id);
+    const runId = await this.ensureRun(session, member, {
+      kind, label, invocationId: context.invocation_id, operationId: context.operation_id,
+    }, task.id);
     const ledger = this.requireLedger();
     const attempt = context.operation_id ? this.store.findInvocationByOperation(context.owner_id, context.operation_id) : null;
     if (attempt && attempt.id !== context.invocation_id) throw new Error("OPERATION_RETRY_SUPERSEDED");
-    const operationId = ledger.operation({
-      id: context.operation_id,
-      runId,
-      requestKey: context.invocation_id,
-      kind,
-      label,
-      status: "running",
-      retryOfInvocationId: attempt?.retry_of_invocation_id ?? undefined,
+    const operationId = await runSqliteWrite(ledger.db, () => {
+      if (this.store.getTask(task.id).state !== "active") throw new Error(`TASK_NOT_ACTIVE: ${task.id}`);
+      const finishing = this.store.taskData.finalization(task.id);
+      if (finishing && !finishing.error) throw new Error(`TASK_FINISHING: ${task.id}`);
+      const currentAttempt = context.operation_id ? this.store.findInvocationByOperation(context.owner_id, context.operation_id) : null;
+      if (currentAttempt && currentAttempt.id !== context.invocation_id) throw new Error("OPERATION_RETRY_SUPERSEDED");
+      return ledger.operation({
+        id: context.operation_id,
+        runId,
+        requestKey: context.invocation_id,
+        kind,
+        label,
+        status: "running",
+        retryOfInvocationId: attempt?.retry_of_invocation_id ?? undefined,
+      });
     });
     const ticket: OperationTicket = {
       ticket_id: randomUUID(),
@@ -514,7 +549,7 @@ export class SessionService {
     };
     context.run_id = runId;
 
-    this.store.appendEvent({
+    await this.store.appendEventAsync({
       session_id: session.id,
       task_id: task.id,
       member_id: member.id,
@@ -531,7 +566,8 @@ export class SessionService {
   async checkpointRun(runId: string, sessionId: string, memberId: string, taskId?: string): Promise<void> {
     const db = this.requireLedger().db;
     if (!this.projections || readRunCheckpoint(db, runId)) return;
-    saveRunCheckpoint(db, runId, await this.prepareRunCheckpoint(sessionId, memberId, taskId));
+    const checkpoint = await this.prepareRunCheckpoint(sessionId, memberId, taskId);
+    await runSqliteWrite(db, () => saveRunCheckpoint(db, runId, checkpoint));
   }
 
   async prepareRunCheckpoint(sessionId: string, memberId: string, taskId?: string): Promise<RunCheckpoint> {
@@ -547,7 +583,7 @@ export class SessionService {
     const invocation = this.store.findInvocationByOperationId(operationId);
     if (invocationId && invocation?.id !== invocationId) return;
     if (invocation) {
-      this.store.updateInvocation({
+      await this.store.writeAsync(() => this.store.updateInvocation({
         ownerId: invocation.owner_id,
         transportInstanceId: invocation.transport_instance_id,
         requestId: invocation.request_id,
@@ -555,7 +591,7 @@ export class SessionService {
         effect: result.effect,
         resultRef: result.result_ref ?? invocation.result_ref,
         finished: true,
-      });
+      }));
     }
     await this.operationFinished({
       ticket_id: operationId,
@@ -577,7 +613,7 @@ export class SessionService {
   async operationFinished(ticket: OperationTicket, result: OperationFinishResult): Promise<void> {
     if (this.supersededAttempt(ticket) || this.store.hasOperationFinished(ticket.operation_id, ticket.invocation_id)) return;
     if (result.status === OperationState.accepted || result.status === OperationState.queued || result.status === OperationState.running) {
-      this.operationProgress(ticket, { effect: result.effect, result_ref: result.result_ref });
+      await this.operationProgress(ticket, { effect: result.effect, result_ref: result.result_ref });
       return;
     }
     const ledger = this.requireLedger();
@@ -588,14 +624,15 @@ export class SessionService {
       : result.status === OperationState.unknown
         ? "reconciliation_required"
         : "failed";
-    ledger.endOperation(ticket.operation_id, ledgerStatus, result.error_message || result.error_code
+    await runSqliteWrite(ledger.db, () => ledger.endOperation(ticket.operation_id, ledgerStatus, result.error_message || result.error_code
       ? [{
           label: result.error_code ?? "operation_failed",
           reference: JSON.stringify({ error: result.error_message ?? null, effect: result.effect, result_ref: result.result_ref ?? null }),
           outcome: "failed",
         }]
-      : [{ label: "operation_completed", reference: JSON.stringify({ effect: result.effect, result_ref: result.result_ref ?? null }), outcome: "passed" }], ticket.invocation_id);
-    this.store.appendEvent({
+      : [{ label: "operation_completed", reference: JSON.stringify({ effect: result.effect, result_ref: result.result_ref ?? null }), outcome: "passed" }], ticket.invocation_id));
+    if (this.supersededAttempt(ticket)) return;
+    const appended = await this.store.appendOperationEventAsync({
       session_id: ticket.session_id,
       task_id: ticket.task_id,
       member_id: ticket.member_id,
@@ -614,6 +651,7 @@ export class SessionService {
         result_ref: result.result_ref,
       },
     });
+    if (!appended) return;
 
     if (result.effect !== "not_started" && (["patch", "command", "copy", "agent_control"].includes(ticket.kind) || result.known_paths?.length)) {
       this.changes?.markDirty(ticket.member_id, result.known_paths ?? [], ticket.task_id);
@@ -629,10 +667,15 @@ export class SessionService {
     this.scheduleRecovery(member.root);
   }
 
-  operationProgress(ticket: OperationTicket, result: OperationProgressResult): void {
+  async operationProgress(ticket: OperationTicket, result: OperationProgressResult): Promise<void> {
     if (this.supersededAttempt(ticket) || this.store.hasOperationFinished(ticket.operation_id, ticket.invocation_id)) return;
-    this.store.setExecutionState(ticket.session_id, ExecutionState.active);
-    this.store.appendEvent({
+    await this.store.writeAsync(() => {
+      if (!this.supersededAttempt(ticket) && !this.store.hasOperationFinished(ticket.operation_id, ticket.invocation_id)) {
+        this.store.setExecutionState(ticket.session_id, ExecutionState.active);
+      }
+    });
+    if (this.supersededAttempt(ticket) || this.store.hasOperationFinished(ticket.operation_id, ticket.invocation_id)) return;
+    const appended = await this.store.appendOperationEventAsync({
       session_id: ticket.session_id,
       task_id: ticket.task_id,
       member_id: ticket.member_id,
@@ -650,6 +693,7 @@ export class SessionService {
         result_ref: result.result_ref ?? null,
       },
     });
+    if (!appended) return;
     if (this.projections?.schedule) {
       this.projections.schedule(ticket.session_id, ticket.member_id);
     }
@@ -666,7 +710,7 @@ export class SessionService {
 
   async agentEvent(sessionId: SessionId, memberId: string, event: Record<string, unknown>, taskId?: string): Promise<void> {
     const sourceId = (event.source_id as string) || `agent-${Date.now()}-${randomUUID().slice(0, 6)}`;
-    this.store.appendEvent({
+    await this.store.appendEventAsync({
       session_id: sessionId,
       task_id: taskId ?? this.store.currentTask(sessionId)?.id ?? null,
       member_id: memberId,
@@ -699,6 +743,11 @@ export class SessionService {
   }
 
   async reconcile(sessionId: SessionId): Promise<ExecutionState> {
+    // 获取写锁后再计算状态，等待期间新开始的工作不会被旧快照覆盖。
+    return this.store.writeAsync(() => this.reconcileState(sessionId));
+  }
+
+  private reconcileState(sessionId: SessionId): ExecutionState {
     const ledger = this.requireLedger();
     const session = this.store.getSession(sessionId);
     let state = ExecutionState.idle;

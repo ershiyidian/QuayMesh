@@ -32,8 +32,8 @@ for (const mode of ["locked", "post-commit"] as const) {
       }
       await rm(root, { recursive: true, force: true });
     });
-    const receive = async (type: string): Promise<Record<string, any>> => {
-      const deadline = Date.now() + 5_000;
+    const receive = async (type: string, timeoutMs = 5_000): Promise<Record<string, any>> => {
+      const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
         const index = messages.findIndex(message => message.type === type);
         if (index >= 0) return messages.splice(index, 1)[0]!;
@@ -44,7 +44,8 @@ for (const mode of ["locked", "post-commit"] as const) {
       assert.fail(`Timed out waiting for ${type}: ${stderr}`);
     };
     const ready = await receive("ready");
-    assert.match((await receive("poll-error")).code, /^SQLITE_BUSY/);
+    // 正式异步取锁预算为五秒，另留首轮定时器与 IPC 调度余量。
+    assert.match((await receive("poll-error", 8_000)).code, /^SQLITE_BUSY/);
     child.send({ type: "ping" });
     assert.equal((await receive("pong")).pid, ready.pid, "the same process must survive the failed timer callback");
 

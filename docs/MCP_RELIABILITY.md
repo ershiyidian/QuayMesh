@@ -441,6 +441,71 @@ Batch related file selections and output reads within the tools' existing bounds
 
 The reliability goals are separate: reduce avoidable requests, preserve an accepted operation across observer loss, prevent repeated effects, and reduce the amount of work lost per interruption. Measure these goals separately. A lower server error count alone does not measure how often the host completed a user turn.
 
+## 2026-10-20: SQLite contention and execution cleanup
+
+This follow-up addresses a measured source of local stalls and the recovery boundaries exposed while removing it.
+The database schema remains version 6. No production node was deployed by this acceptance work.
+
+### Why a database lock affected unrelated observations
+
+The existing synchronous SQLite connection used `busy_timeout=5000`. SQLite's [busy handler](https://www.sqlite.org/c3ref/busy_timeout.html) sleeps inside the database call until its waiting budget is exhausted. On the Node request thread, that wait also prevents timers, HTTP handling, and transport activity from progressing. [WAL permits readers alongside a writer](https://www.sqlite.org/isolation.html), but our observation paths were also acquiring persistent write leases, and opening an already-current database still entered a migration write transaction.
+
+The new real HTTP regression was first run against `eb0adca`, with only the test and its independent lock-worker helper overlaid. A Worker held the actual database writer lock for three seconds. Historical output, diagnostics, and Console observations failed to complete while the lock was held. The failure is a baseline observation, not an estimate of ChatGPT's timeout threshold. The test's total duration includes fixture setup and cleanup and must not be reported as query latency.
+
+The repair has three layers:
+
+1. Opening an up-to-date database checks the schema and legacy repair requirements without taking the writer lock. Actual migrations and required repairs still acquire the lock, re-read the version, and commit atomically. Initialization failures close their connection.
+2. `runSqliteWrite` attempts `BEGIN IMMEDIATE` with the connection's busy handler temporarily disabled. If admission encounters `SQLITE_BUSY`, it restores the setting and yields to a timer before another attempt. The default admission budget is five seconds; delays grow from 10 ms to at most 100 ms. The callback begins only after writer admission succeeds.
+3. Historical `read_output`, `read_diagnostics`, agent list/wait, workspace status/recovery, empty stdin polls, and Console GET/HEAD no longer acquire a persistent execution lease merely to observe. Their existing handlers still enforce identity and scope. Write actions retain their execution claims.
+
+This is cooperative lock waiting. The SQL body still runs synchronously. Large SQL scans, serialization, filesystem work, and checkpoint work need their own measurements and may still block the request thread.
+
+### Transaction and effect boundaries
+
+`runSqliteWrite` accepts a synchronous SQL-only callback. It rejects an existing outer transaction and async callbacks, observes an accidentally returned Promise's rejection, and restores `busy_timeout` after each synchronous attempt. Cancellation interrupts waiting; a callback that has begun runs to its synchronous conclusion.
+
+Only a busy error from **writer admission before the callback starts** is retried. A callback error, COMMIT error, rollback error, or connection-cleanup error never causes the transaction body to run again. This matters even when an application listener throws an error with a SQLite-looking code. External commands, file writes, network requests, and post-commit listeners stay outside that retry boundary.
+
+The invocation layer now separates invoking an operation from saving its result. A failed result save reports `INVOCATION_PERSISTENCE_FAILED`, retains the original operation ID, and marks the reported effect as unknown. It does not reinterpret a completed file modification as a fresh `not_started` execution failure or rerun the command. The durable accepted/running record remains available for reconciliation. Arbitrary results lost to a permanent storage failure are not reconstructed by an in-memory retry queue.
+
+Review state and review events commit together before change listeners run. Creating a work run and linking it to its task/member now uses one connection and one transaction. The transaction rechecks the owner, member, active task, finalization state, and invocation attempt after any lock wait. A changed current task prevents a waiting review update from affecting the new task. Concurrent requests share a pending run creation and recheck existing linked runs under the writer lock.
+
+Late operation events also validate their invocation attempt inside the event's write transaction. The regression keeps the newer attempt running while an old finish waits for a lock; the old finish must not append after the newer start or move task/session activity timestamps backwards.
+
+### Process and background lifecycle
+
+Runtime leases and command/mutation claims now have async acquisition and release paths. An action is executed once, outside the lock-admission retry. If release fails after the action ends, `releaseAsync()` reports `EXECUTION_RELEASE_PENDING` and directs recovery to the original operation. Release errors do not replace an action's original exception. Process finalization records pending cleanup and continues delivering its confirmed terminal result. A bounded, single-flight cleanup loop retries deletion of explicitly ended leases owned by that coordinator. It never steals a live claim. A claim pending release still blocks conflicting work but cannot authorize new nested writes.
+
+The pending-release set is process-local; durable occupancy rows remain until deletion commits. Recovery after a process restart still follows the existing owner/operation reconciliation rules.
+
+Session observation, retention, and work-run reconciliation have one maintenance job in flight per loop. Errors are observed and reported, and subsequent cycles can recover. Closing the runtime cancels maintenance lock waits and waits for their settlement before closing the connection.
+
+The async conversion exposed a command-start race: two simultaneous calls with one operation ID could both pass the initial session check and inherit the same claim. A real process probe launched twice and appended twice. `ProcessSessionManager` now reserves the ID before its first await, removes the reservation on preparation failure, and retains the completed session's duplicate-start guard.
+
+Shutdown waits for all owned sessions' exit and close promises, including sessions that have set `running=false` but are still releasing a claim or executing finish callbacks. Ended claims leave the manager's active set; the coordinator retains pending cleanup in memory while the occupancy row remains in SQLite. A real deferred foreign key exercises DELETE success followed by COMMIT failure, then confirms cleanup after the constraint is removed.
+
+### Cross-node task boundaries
+
+New forwarded work is checked before forwarding or creating its first remote task mirror. Existing accepted-work observations and saved receipt replay remain available after task closure.
+
+Artifact copying needs a separate check because its transfer protocol can start work without the ordinary tool recorder. On a closed or finalizing task, an ingress may only perform a read-only lookup of an existing copy receipt. Owner, request key, session, task, member, and original copy parameters must match. Missing receipts reject new copies. An unavailable lookup or an older peer without this method produces an explicit lookup error; it never falls back to starting a copy.
+
+An active copy records its task/member participation before forwarding. This ensures that a task containing only a copy still finalizes the destination's task. Destination invocation reservation carries the original task and operation IDs before `beforeOperation`. A destination that has already closed its task can reject the copy before effects; that rejected invocation must also become terminal instead of remaining `accepted` indefinitely.
+
+The old-peer test uses an old-style RPC dispatch branch against the real current transfer machinery. It is not a complete two-release binary compatibility matrix. Old ingress nodes retain their old behavior until upgraded.
+
+### Reproducible checks and remaining scope
+
+The regressions use real SQLite files, independent Worker-held writer locks, SQL triggers and deferred foreign keys, actual Node child processes, and the OAuth MCP SDK over TCP. They assert original IDs, exactly one file effect, event counts, responsive observation during the lock, and normal resource cleanup. Relevant sources include:
+
+- [Lock-admission tests](../src/db/async-write.test.ts), [coordinator tests](../src/execution-coordinator.async.test.ts), and [process lifecycle tests](../src/process-sessions-contention.test.ts).
+- [Receipt contention](../src/session/receipt-contention.test.ts), [run/review atomicity](../src/session/run-review-atomicity.test.ts), and [runtime maintenance](../src/session/runtime-contention.test.ts).
+- [Cross-node copy state](../src/federation/copy-task-state.test.ts), [HTTP writer contention](../test/tool-contract/sqlite-contention.test.ts), and [HTTP observation during process exit](../test/tool-contract/sqlite-process-exit.test.ts).
+
+The HTTP fixtures check output, diagnostics, Console, and MCP ping while the writer is held, then verify that the original command converges and the original key does not repeat its effect. Timing measurements are individual controlled runs, not production percentiles or a measured ChatGPT failure-rate reduction.
+
+Legacy synchronous APIs remain for other callers, including queued-agent claim transitions and thread binding. This round does not move all database work into a dedicated worker, change upstream approval/dispatch behavior, or establish the cause of every host-side `thinking failed` message. The committed evidence identifies which local paths were exercised.
+
 ## Next design stages
 
 ### Stage 1: preserve acceptance and add mixed-version release gates
@@ -450,10 +515,11 @@ Retain the restoration failure, its repair, and the corresponding affected-group
 Add a separate mixed-version release matrix covering every process that opens shared state and both coordinator/worker directions.
 Use the existing fault fixtures as release gates, with the original operation ID and single external effect as core assertions.
 
-### Stage 2: remove synchronous SQLite stalls from request handling
+### Stage 2: finish isolating synchronous database work
 
-Move contended database work behind a bounded worker-thread or process interface with connections owned by that execution context.
-Coordinate all writers, including background agent bookkeeping; moving only one caller leaves other blocking paths intact.
+The follow-up above removes synchronous busy waiting from the covered request, receipt, claim, and maintenance paths.
+Measure the remaining synchronous callers, large queries, checkpoint work, and serialization before moving them behind a bounded worker-thread or process interface with connections owned by that execution context.
+Coordinate all writers, including queued-agent transitions and remaining background bookkeeping; moving only one caller leaves other blocking paths intact.
 Keep transactions short, make queue saturation observable, and include admission waiting in the request's deadline budget.
 An in-memory queue entry must not be reported as durable acceptance before its operation identity is committed.
 

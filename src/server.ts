@@ -1281,12 +1281,19 @@ export function createServer(
   projectConsole = createProjectConsoleRouter(config, { assetDirectory: uiBuildDirectory(), federation, sessionRuntime, relayConsoleEnabled: true,
     fleetDirectory: fileURLToPath(new URL("./ui/fleet/", import.meta.url)) });
   app.get(/^\/console$/, (req, res) => res.redirect(303, `/console/${req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : ""}`));
-  app.use("/console", (req, res, next) => {
-    const observation = ["GET", "HEAD"].includes(req.method) || ["/api/login", "/api/logout", "/api/fleet/transfers/cancel"].includes(req.path);
+  app.use("/console", async (req, res, next) => {
+    // 浏览和刷新不需要执行占用，锁竞争期间仍能查看已有状态。
+    if (["GET", "HEAD"].includes(req.method)) { next(); return; }
+    const observation = ["/api/login", "/api/logout", "/api/fleet/transfers/cancel"].includes(req.path);
     let lease: RuntimeWorkLease;
-    try { lease = processSessions.executionCoordinator!.beginWork({kind:"console",allowWhilePaused:observation}); }
-    catch (error) { res.status(503).json({error:"NODE_ADMISSION_PAUSED",message:error instanceof Error?error.message:String(error)}); return; }
-    res.once("finish",()=>lease.release());res.once("close",()=>lease.release());
+    try { lease = await processSessions.executionCoordinator!.beginWorkAsync({kind:"console",allowWhilePaused:observation}); }
+    catch (error) { res.status(503).json({error:diagnosticError(error).errorCode ?? "CONSOLE_ADMISSION_FAILED",message:error instanceof Error?error.message:String(error)}); return; }
+    let released: Promise<void> | undefined;
+    const release = () => { released ??= lease.releaseAsync().catch(error => {
+      logEvent(config.logging, "warn", "console_work_release_pending", diagnosticError(error));
+    }); };
+    res.once("finish",release);res.once("close",release);
+    if (res.destroyed || res.writableFinished) { release(); return; }
     lease.run(next);
   });
   app.use("/console", projectConsole.router);
@@ -1360,7 +1367,7 @@ export function createServer(
     execution: processSessions.executionCoordinator!,
     close: () => {
       closePromise ??= (async () => {
-        processSessions.executionCoordinator!.pause("服务正在退出");
+        await processSessions.executionCoordinator!.pauseAsync("服务正在退出");
         try {
           await mcpHandler.close();
         } catch (error) {
@@ -1368,7 +1375,7 @@ export function createServer(
             error: error instanceof Error ? error.message : String(error),
           });
         }
-        workRunReconciler.close();
+        await workRunReconciler.close();
         await federation?.close();
         await toolActivities.waitForIdle();
         await processSessions.shutdown();

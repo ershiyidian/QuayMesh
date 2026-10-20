@@ -22,7 +22,7 @@ export function isTransientPeerFailure(error: unknown): boolean {
 export function isIdempotentPeerRequest(method: string, params: unknown): boolean {
   if (method === "hello") return true;
   if (method === "settings.get" || method === "mihomo.read") return true;
-  if (method === "transfers.list" || method === "artifact.stat" || method === "artifact.observe") return true;
+  if (method === "transfers.list" || method === "artifact.stat" || method === "artifact.observe" || method === "artifact.lookup") return true;
   if (method === "console") {
     const p = params as { method?: string } | undefined;
     const httpMethod = p?.method?.toUpperCase() ?? "GET";

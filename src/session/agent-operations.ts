@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { runSqliteWrite } from "../db/async-write.js";
 import type { LocalAgentStore } from "../local-agent-store.js";
 import { OperationState, type AgentId, type SessionId } from "./types.js";
 import type { SessionService } from "./service.js";
@@ -95,7 +96,7 @@ export class AgentOperationTracker {
         error_message: `Subagent record ${identity.agentId} is no longer available.`,
         result_ref: `agent:${identity.agentId}:missing`,
       });
-      this.store.completeAgentOperation(identity.operationId);
+      await this.store.writeAsync(() => this.store.completeAgentOperation(identity.operationId));
       return;
     }
 
@@ -126,7 +127,10 @@ export class AgentOperationTracker {
     }
 
     if (record.status === "starting" || record.status === "queued" || record.status === "running") {
-      if(this.options.ledger?.hasConfirmedAgent(identity.agentId))this.options.ledger.observeOperations([identity.operationId]);
+      const ledger = this.options.ledger;
+      if (ledger?.hasConfirmedAgent(identity.agentId)) await runSqliteWrite(ledger.db, () => {
+        if (ledger.hasConfirmedAgent(identity.agentId)) ledger.observeOperations([identity.operationId]);
+      });
       this.schedule(identity);
       return;
     }
@@ -138,7 +142,7 @@ export class AgentOperationTracker {
         effect: "completed",
         result_ref: resultRef,
       });
-      this.store.completeAgentOperation(identity.operationId);
+      await this.store.writeAsync(() => this.store.completeAgentOperation(identity.operationId));
       this.observations.delete(identity.operationId);
       return;
     }
@@ -150,7 +154,7 @@ export class AgentOperationTracker {
         error_message: record.error ?? "The subagent stopped.",
         result_ref: resultRef,
       });
-      this.store.completeAgentOperation(identity.operationId);
+      await this.store.writeAsync(() => this.store.completeAgentOperation(identity.operationId));
       this.observations.delete(identity.operationId);
       return;
     }
@@ -161,7 +165,7 @@ export class AgentOperationTracker {
       error_message: record.error ?? "The subagent failed.",
       result_ref: resultRef,
     });
-    this.store.completeAgentOperation(identity.operationId);
+    await this.store.writeAsync(() => this.store.completeAgentOperation(identity.operationId));
     this.observations.delete(identity.operationId);
   }
 }

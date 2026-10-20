@@ -1,7 +1,7 @@
-import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import Database from "better-sqlite3";
-import { migrateDatabase } from "../db/migrations.js";
+import type Database from "better-sqlite3";
+import { openDatabase } from "../db/client.js";
+import { runSqliteWrite } from "../db/async-write.js";
 import { logEvent } from "../logger.js";
 import { diagnosticError, type ServerDiagnostics } from "../server-diagnostics.js";
 import type { ServerConfig } from "../config.js";
@@ -72,23 +72,11 @@ export function sessionDatabasePath(stateDir: string): string {
 }
 
 export function openSessionDatabase(stateDir: string): SessionStore {
-  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  const database = new Database(sessionDatabasePath(stateDir));
-  database.pragma("journal_mode = WAL");
-  database.pragma("synchronous = NORMAL");
-  database.pragma("busy_timeout = 5000");
-  database.pragma("foreign_keys = ON");
-  migrateDatabase(database);
-  return new SessionStore(database, true);
+  return new SessionStore(openDatabase(stateDir).sqlite, true);
 }
 
 export function openSessionStore(stateDir: string): { store: SessionStore; database: SessionDatabase } {
-  const database = new Database(sessionDatabasePath(stateDir));
-  database.pragma("journal_mode = WAL");
-  database.pragma("synchronous = NORMAL");
-  database.pragma("busy_timeout = 5000");
-  database.pragma("foreign_keys = ON");
-  migrateDatabase(database);
+  const database = openDatabase(stateDir).sqlite;
   return { store: new SessionStore(database, false), database };
 }
 
@@ -98,7 +86,7 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
   store.reconcileFinishedInvocations();
   const output = new SessionOutputStore(config.stateDir);
   options.processSessions?.setHandleStore({
-    allocate: id => store.allocateProcessHandle(id), resolve: handle => store.operationForHandle(handle),
+    allocate: id => store.writeAsync(() => store.allocateProcessHandle(id)), resolve: handle => store.operationForHandle(handle),
   });
   const changes = new SessionChangeCollector(store, config.stateDir);
   const context = new ContextReadRecorder(store);
@@ -138,7 +126,7 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
       const event = store.findOperationEvent(operationId);
       if (!event) throw new Error(`OPERATION_NOT_FOUND: ${operationId}`);
       await output.open(event.session_id, operationId, operationId);
-      store.appendEvent({
+      await store.appendEventAsync({
         session_id: event.session_id, task_id: event.task_id ?? null, member_id: event.member_id,
         type: "operation_started", source_id: `${operationId}-output`, timestamp: new Date().toISOString(),
         payload: { ...event.payload, operation_id: operationId, command_id: operationId, kind: "command", label: command,
@@ -149,12 +137,12 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
       await output.append(operationId,chunk);
       const now=Date.now(),previous=lastOutputActivity.get(operationId)??0;
       if(now-previous<1000)return;
-      lastOutputActivity.set(operationId,now);
       const event=store.findOperationEvent(operationId);
       if(!event)return;
-      store.appendEvent({session_id:event.session_id,task_id:event.task_id??null,member_id:event.member_id,
+      await store.appendEventAsync({session_id:event.session_id,task_id:event.task_id??null,member_id:event.member_id,
         type:"operation_output",source_id:`${operationId}-output-${now}`,timestamp:new Date(now).toISOString(),
         payload:{operation_id:operationId,bytes:Buffer.byteLength(chunk),actor:"execution"}});
+      lastOutputActivity.set(operationId,now);
     },
     finish: (operationId, exitCode, signal) => output.finish(operationId, exitCode, signal),
     fail: (operationId, errorCode, exitCode, signal) => output.fail(operationId, errorCode, exitCode, signal),
@@ -204,29 +192,40 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
   };
   options.processSessions?.addFinishListener(closeProcessOperation);
   let closed = false;
+  const maintenance = new AbortController();
+  const reportMaintenance = (message: string, error: unknown) => {
+    if (closed) return;
+    try { console.error(message, error); } catch { /* 下一周期继续恢复。 */ }
+  };
   let retentionWork: Promise<void> | undefined;
   const expireResults = () => {
     if (closed || retentionWork) return;
     retentionWork = (async () => {
-      store.pruneContextResults();
+      await store.writeAsync(() => store.pruneContextResults(), { signal: maintenance.signal });
       for (const row of store.expiredCommandOutputs()) await output.expire(row.operation_id,row.retained_until);
-    })().finally(() => { retentionWork = undefined; });
-    void retentionWork.catch(error => console.error("QuayMesh 输出清理失败", error));
+    })().catch(error => reportMaintenance("QuayMesh 输出清理失败", error))
+      .finally(() => { retentionWork = undefined; });
   };
+  let observationWork: Promise<void> | undefined;
   const observationTimer=setInterval(()=>{
-    if(closed)return;
-    ledger.observeOperations([...recorder.activeOperationIds(),...options.processSessions?.activeOperationIds()??[]]);
-    store.reconcileFinishedInvocations();
-    ledger.reconcileTerminalOperations();
-    ledger.reconcileArchivedTaskRuns();
-    for(const finish of unfinishedProcesses.values()){
-      const pending=closeProcessOperation(finish);
-      if(pending)void pending.catch(error=>console.error("QuayMesh 进程收尾重试失败",error));
-    }
+    if(closed || observationWork)return;
+    observationWork = (async () => {
+      await store.writeAsync(() => store.reconcileFinishedInvocations(), { signal: maintenance.signal });
+      await runSqliteWrite(ledger.db, () => {
+        ledger.observeOperations([...recorder.activeOperationIds(),...options.processSessions?.activeOperationIds()??[]]);
+        ledger.reconcileTerminalOperations();
+        ledger.reconcileArchivedTaskRuns();
+      }, { signal: maintenance.signal });
+      for(const finish of unfinishedProcesses.values()){
+        const pending=closeProcessOperation(finish);
+        if(pending)void pending.catch(error=>reportMaintenance("QuayMesh 进程收尾重试失败",error));
+      }
+    })().catch(error => reportMaintenance("QuayMesh 会话状态核对失败，将在下一周期重试", error))
+      .finally(() => { observationWork = undefined; });
   },5000);
   observationTimer.unref();
   const finalizationTimer=setInterval(()=>{
-    if(!closed)void service.retryFinalizations().catch(error=>console.error("QuayMesh 收尾协调失败",error));
+    if(!closed)void service.retryFinalizations().catch(error=>reportMaintenance("QuayMesh 收尾协调失败",error));
   },30_000);
   finalizationTimer.unref();
   const retentionTimer = setInterval(expireResults, 3600_000);
@@ -270,7 +269,8 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
       clearInterval(observationTimer);
       clearInterval(finalizationTimer);
       clearInterval(retentionTimer);
-      await retentionWork;
+      maintenance.abort();
+      await Promise.allSettled([retentionWork, observationWork]);
       await recorder.close();
       options.processSessions?.setHandleStore(undefined);
       options.processSessions?.removeFinishListener(closeProcessOperation);
@@ -285,8 +285,8 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
       await projector.close();
       await recovery.close();
       await output.close();
-      if (ownsExecution) execution.close();
-      store.close();
+      try { if (ownsExecution) await execution.closeAsync(); }
+      finally { store.close(); }
     },
   };
 }

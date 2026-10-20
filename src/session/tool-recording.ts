@@ -1,6 +1,6 @@
 import { requestContextStorage as observationContext } from "./invocations.js";
 import { isReadOnlyObservation } from "../tool-admission.js";
-import { createInvocationContext, executeRecorded, type InvocationOperation } from "./invocations.js";
+import { createInvocationContext, executeRecorded, InvocationPersistenceError, type InvocationOperation } from "./invocations.js";
 import type { InvocationContext, OperationRecord, SessionId } from "./types.js";
 import type { SessionStore } from "./store.js";
 import type { SessionService } from "./service.js";
@@ -162,12 +162,13 @@ export class SessionToolRecorder {
 
   async record<T>(input: RecordModelToolInput<T>): Promise<T> {
     const observation = isReadOnlyObservation(input.tool_name,input.input as Record<string,unknown>);
-    const context = this.contextForKnownWorkspace(input.identity, input.workspace_id, !observation)
+    const context = this.contextForKnownWorkspace(input.identity, input.workspace_id, false)
       ?? await this.contextForWorkspace(input.identity, input.workspace_id);
     if (observation) {
       context.tool_name=input.tool_name;
       return observationContext.run(context, () => input.operation(context));
     }
+    await this.store.writeAsync(() => this.store.touchTaskMember(context.task_id!, context.member_id));
     const run = () => this.recordWithContext(context, input);
     // 提前返回受理回执时，实际工作继续保留执行占用与原操作身份。
     const execution = input.pendingResult && this.execution
@@ -182,9 +183,10 @@ export class SessionToolRecorder {
 
   async recordForwarded<T>(input: RecordModelToolInput<T>): Promise<T> {
     const observation=isReadOnlyObservation(input.tool_name,input.input as Record<string,unknown>);
-    const context = this.contextForKnownWorkspace(input.identity, input.workspace_id,!observation);
+    const context = this.contextForKnownWorkspace(input.identity, input.workspace_id,false);
     if (!context) throw new Error(`REMOTE_SESSION_MEMBER_REQUIRED: ${input.workspace_id}`);
     if(observation){context.tool_name=input.tool_name;return observationContext.run(context,()=>input.operation(context));}
+    await this.store.writeAsync(() => this.store.touchTaskMember(context.task_id!, context.member_id));
     // 入口回执由协调端持久保存，远程操作仍使用相同的确定性 operation_id。
     // 等待时间达到上限即返回可查询的受理回执，后台 RPC 继续执行并归档结果。
     return this.returnOrAccept(context, input, this.recordReceipt(context, input));
@@ -194,6 +196,16 @@ export class SessionToolRecorder {
     context.tool_name = input.tool_name;
     // 入口保存同一次请求的回执，文件、进程和工作记录由所属节点维护。
     const recorded = await executeRecorded<InvocationEnvelope<T>>(this.store, context, input.input, {
+      beforeEffect: () => {
+        // 已有回执先由 executeRecorded 重放；只有新工作必须在转发和首次镜像前验证任务。
+        if (observesAcceptedWork(input.tool_name, input.input as Record<string, unknown>)) return;
+        const task = context.task_id ? this.store.getTask(context.task_id) : null;
+        if (!task || task.state !== "active") throw Object.assign(new Error(`TASK_NOT_ACTIVE: ${context.task_id ?? "missing"}`),
+          { code: "TASK_NOT_ACTIVE", effect: "not_started" });
+        const finalization = this.store.taskData.finalization(task.id);
+        if (finalization && !finalization.error) throw Object.assign(new Error(`TASK_FINISHING: ${task.id}`),
+          { code: "TASK_FINISHING", effect: "not_started" });
+      },
       invoke: async () => {
         try { return { kind: "result", value: await input.operation(context) }; }
         catch (error) {
@@ -286,6 +298,7 @@ export class SessionToolRecorder {
         : null,
     };
     const recorded = await executeRecorded(this.store, context, input.input, operation).catch(async error => {
+      if (error instanceof InvocationPersistenceError) throw error;
       if (ticket) {
         const outcome = classifyError(error, { sideEffecting: isWrite, effectStarted: false });
         await this.service.operationFinished(ticket, {

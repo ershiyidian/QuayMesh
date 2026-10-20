@@ -8,6 +8,7 @@ import { WindowsCommandJob, processGroupAlive, watchOwnedProcesses } from "./pro
 import { mergeEnvironment } from "./local-agent-command.js";
 import { ExecutionCoordinator, type ExecutionClaim } from "./execution-coordinator.js";
 import { WorkLedger } from "./work-ledger.js";
+import { runSqliteWrite } from "./db/async-write.js";
 import { randomUUID, randomInt, createHash, type Hash } from "node:crypto";
 import { pidAlive } from "./process-liveness.js";
 import { diagnosticError } from "./server-diagnostics.js";
@@ -320,10 +321,11 @@ function truncateOutput(output: string, maxCharacters: number): { output: string
 export class ProcessSessionManager {
   private readonly workStateDir?: string;
   private readonly sessions = new Map<string, ProcessSession>();
+  private readonly startingSessionIds = new Set<string>();
   private readonly legacySessions = new Map<number, string>();
-  private handleStore?: { allocate(operationId:string):number; resolve(handle:number):string|null };
+  private handleStore?: { allocate(operationId:string):number | Promise<number>; resolve(handle:number):string|null };
 
-  setHandleStore(store: { allocate(operationId:string):number; resolve(handle:number):string|null } | undefined): void {
+  setHandleStore(store: { allocate(operationId:string):number | Promise<number>; resolve(handle:number):string|null } | undefined): void {
     this.handleStore = store;
   }
 
@@ -356,10 +358,16 @@ export class ProcessSessionManager {
   async mutate<T>(workspaceRoot: string, operation: () => Promise<T>, scopes?:readonly ExecutionResource[]): Promise<T> {
     if (this.shuttingDown) throw new Error("Execution manager is shutting down.");
     const context=currentInvocation();
-    const claim = this.executionCoordinator?.acquire({ workspaceRoot, kind: "mutation",scopes,
+    const claim = await this.executionCoordinator?.acquireAsync({ workspaceRoot, kind: "mutation",scopes,
       operationId:context?.operation_id,taskId:context?.task_id });
     if (claim) this.claims.add(claim);
-    try { return await operation(); } finally { this.releaseClaim(claim); }
+    let completed = false;
+    try {
+      if (this.shuttingDown) throw new Error("Execution manager is shutting down.");
+      const result = await operation(); completed = true; return result;
+    } finally {
+      try { await this.releaseClaim(claim); } catch (error) { if (completed) throw error; }
+    }
   }
 
   addFinishListener(listener: ProcessFinishListener): void {
@@ -408,8 +416,11 @@ export class ProcessSessionManager {
       : operation();
   }
 
-  private releaseClaim(claim?: ExecutionClaim): void {
-    if (claim) { claim.release(); this.claims.delete(claim); }
+  private async releaseClaim(claim?: ExecutionClaim): Promise<void> {
+    if (!claim) return;
+    // 动作已经结束；持久占用删除失败由 coordinator 的待释放队列继续处理。
+    try { await claim.releaseAsync(); }
+    finally { this.claims.delete(claim); }
   }
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
@@ -426,52 +437,69 @@ export class ProcessSessionManager {
     const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, MAX_PROCESS_YIELD_MS);
     boundedInteger(input.maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 100_000);
     const session = this.createSession(input);
-    if (this.sessions.has(session.id)) throw new Error(`RECORDED_OPERATION: ${session.id}`);
-    if (!session.sessionOperationId) session.sessionOperationId = currentInvocation()?.operation_id;
-    const scopes=input.scopes ?? [{kind:"tree" as const,path:await requireCommandScope(input.cwd,input.scopeRoot),access:"write" as const}];
-    session.executionClaim = this.executionCoordinator?.acquire({ workspaceRoot: input.workspaceRoot ?? input.cwd,
-      kind: "command", resources: input.resources,scopes,operationId:session.sessionOperationId ?? session.id,
-      taskId:currentInvocation()?.task_id,title:currentInvocation()?.tool_name ?? "命令" });
-    if (session.executionClaim) this.claims.add(session.executionClaim);
-    this.sessions.set(session.id, session);
-
+    if (this.sessions.has(session.id) || this.startingSessionIds.has(session.id)) throw new Error(`RECORDED_OPERATION: ${session.id}`);
+    // 首次异步等待前占位，资源继承不能成为重复启动同一进程的入口。
+    this.startingSessionIds.add(session.id);
     try {
-      if (session.sessionOperationId && this.outputSink) {
-        await this.outputSink.open(session.sessionOperationId, input.command);
-        session.outputPending = Promise.resolve();
+      if (!session.sessionOperationId) session.sessionOperationId = currentInvocation()?.operation_id;
+      const scopes=input.scopes ?? [{kind:"tree" as const,path:await requireCommandScope(input.cwd,input.scopeRoot),access:"write" as const}];
+      session.executionClaim = await this.executionCoordinator?.acquireAsync({ workspaceRoot: input.workspaceRoot ?? input.cwd,
+        kind: "command", resources: input.resources,scopes,operationId:session.sessionOperationId ?? session.id,
+        taskId:currentInvocation()?.task_id,title:currentInvocation()?.tool_name ?? "命令" });
+      if (session.executionClaim) this.claims.add(session.executionClaim);
+      this.sessions.set(session.id, session);
+
+      try {
+        if (this.shuttingDown) throw new Error("Execution manager is shutting down.");
+        if (session.sessionOperationId && this.outputSink) {
+          await this.outputSink.open(session.sessionOperationId, input.command);
+          session.outputPending = Promise.resolve();
+        }
+        if (input.workRunId && this.workStateDir) {
+          const ledger = new WorkLedger(this.workStateDir);
+          try {
+            ledger.requireScope(input.workRunId, input.workspaceRoot ?? input.cwd, input.workspaceId);
+            if (input.requestKey) {
+              const prior = ledger.db.prepare("select id from console_operations where run_id=? and request_key=?").get(input.workRunId, `command:${input.requestKey}`) as { id: string } | undefined;
+              if (prior) throw new Error(`RECORDED_OPERATION: ${prior.id}; inspect the existing operation with workspace_context status or Console. Command was not replayed.`);
+            }
+            const requestKey = `command:${input.requestKey ?? randomUUID()}`;
+            session.workOperationId = await runSqliteWrite(ledger.db, () => {
+              ledger.requireScope(input.workRunId!, input.workspaceRoot ?? input.cwd, input.workspaceId);
+              const prior = ledger.db.prepare("SELECT id FROM console_operations WHERE run_id=? AND request_key=?")
+                .get(input.workRunId!, requestKey) as { id: string } | undefined;
+              if (prior) throw new Error(`RECORDED_OPERATION: ${prior.id}; command was not replayed.`);
+              return ledger.operation({runId: input.workRunId!, requestKey,
+                kind: "command", label: "受管命令（不记录原始命令或凭据）", status: "running" });
+            });
+          } finally { ledger.close(); }
+        } else if (input.workRunId) throw new Error("Work accounting is unavailable; command was not started.");
+        if (this.handleStore && session.sessionOperationId) session.legacyId = await this.handleStore.allocate(session.sessionOperationId);
+        this.legacySessions.set(session.legacyId,session.id);
+        if (this.shuttingDown) throw new Error("Execution manager is shutting down.");
+        if (input.tty && process.platform !== "win32") await this.startPty(session, input);
+        else await this.startPipe(session, input);
+      } catch (error) {
+        session.failure = diagnosticError(error);
+        this.record(session, "process_start_failed", session.failure, "error");
+        this.stopDescendantPoll(session);
+        if (session.stdioDrainTimer) clearTimeout(session.stdioDrainTimer);
+        await this.endWorkOperation(session, false);
+        this.sessions.delete(session.id);
+        this.legacySessions.delete(session.legacyId);
+        try { await this.releaseClaim(session.executionClaim); }
+        catch (releaseError) { this.record(session, "process_claim_release_pending", diagnosticError(releaseError), "error"); }
+        if (!session.process) {
+          session.running = false;
+          session.resolveRootExit();
+          session.resolveExit();
+        }
+        throw error;
       }
-      if (input.workRunId && this.workStateDir) {
-        const ledger = new WorkLedger(this.workStateDir);
-        try {
-          ledger.requireScope(input.workRunId, input.workspaceRoot ?? input.cwd, input.workspaceId);
-          if (input.requestKey) {
-            const prior = ledger.db.prepare("select id from console_operations where run_id=? and request_key=?").get(input.workRunId, `command:${input.requestKey}`) as { id: string } | undefined;
-            if (prior) throw new Error(`RECORDED_OPERATION: ${prior.id}; inspect the existing operation with workspace_context status or Console. Command was not replayed.`);
-          }
-          session.workOperationId = ledger.operation({ runId: input.workRunId, requestKey: `command:${input.requestKey ?? randomUUID()}`,
-            kind: "command", label: "受管命令（不记录原始命令或凭据）", status: "running" });
-        } finally { ledger.close(); }
-      } else if (input.workRunId) throw new Error("Work accounting is unavailable; command was not started.");
-      if (this.handleStore && session.sessionOperationId) session.legacyId = this.handleStore.allocate(session.sessionOperationId);
-      this.legacySessions.set(session.legacyId,session.id);
-      if (input.tty && process.platform !== "win32") await this.startPty(session, input);
-      else await this.startPipe(session, input);
-    } catch (error) {
-      session.failure = diagnosticError(error);
-      this.record(session, "process_start_failed", session.failure, "error");
-      this.stopDescendantPoll(session);
-      if (session.stdioDrainTimer) clearTimeout(session.stdioDrainTimer);
-      this.endWorkOperation(session, false);
-      this.sessions.delete(session.id);
-      this.legacySessions.delete(session.legacyId);
-      this.releaseClaim(session.executionClaim);
-      throw error;
-    }
 
-    await this.waitForExit(session, yieldTimeMs);
-
-    const snapshot = this.consume(session, input.maxOutputTokens);
-    return snapshot;
+      await this.waitForExit(session, yieldTimeMs);
+      return this.consume(session, input.maxOutputTokens);
+    } finally { this.startingSessionIds.delete(session.id); }
   }
 
   async write(input: WriteStdinInput): Promise<ProcessSnapshot> {
@@ -546,7 +574,8 @@ export class ProcessSessionManager {
 
   private async closeOwnedProcesses(): Promise<void> {
     this.shuttingDown = true;
-    const active = [...this.sessions.values()].filter(session => session.running);
+    const owned = [...this.sessions.values()];
+    const active = owned.filter(session => session.running);
     const failures: unknown[] = [];
     await Promise.all(active.map(async session => {
       try { await session.process?.kill("SIGTERM"); } catch(error) { failures.push(error); }
@@ -556,8 +585,9 @@ export class ProcessSessionManager {
         .catch(error => { failures.push(error); });
     }, 5000);
     force.unref();
-    await Promise.all(active.map(session => session.exitPromise));
-    await Promise.all(active.map(session => session.closePromise));
+    // running=false 之后仍可能在保存结果、释放占用或执行收尾回调。
+    await Promise.all(owned.map(session => session.exitPromise));
+    await Promise.all(owned.map(session => session.closePromise));
     clearTimeout(force);
     for (const session of this.sessions.values()) {
       if (session.stdioDrainTimer) clearTimeout(session.stdioDrainTimer);
@@ -566,7 +596,9 @@ export class ProcessSessionManager {
     }
     this.sessions.clear();
     this.legacySessions.clear();
-    if (this.claims.size === 0) this.executionCoordinator?.close();
+    if (this.claims.size === 0) {
+      try { await this.executionCoordinator?.closeAsync(); } catch (error) { failures.push(error); }
+    }
     if (failures.length) throw new AggregateError(failures, "停止受管命令时发生错误");
   }
 
@@ -860,9 +892,10 @@ export class ProcessSessionManager {
       }
       await this.finishAfterOutput(session, exitCode, signal);
     })();
-    void session.finalizing.catch(error => {
+    void session.finalizing.catch(async error => {
       this.record(session,"process_finalization_failed",diagnosticError(error),"error");
-      this.releaseClaim(session.executionClaim);
+      try { await this.releaseClaim(session.executionClaim); }
+      catch (releaseError) { this.record(session, "process_claim_release_pending", diagnosticError(releaseError), "error"); }
       session.running=false;session.failure=diagnosticError(error);session.disposition="reconciliation_required";
       session.resolveExit();
     });
@@ -886,10 +919,11 @@ export class ProcessSessionManager {
     const cancelled = session.cancelRequestedAt !== undefined;
     const success = !cancelled && exitCode === 0 && !signal && !session.failure && session.disposition === "completed" && session.outputComplete === true;
     this.record(session, "process_finished", { exitCode, signal, outputBytes: session.outputBytes, ...session.failure }, success ? "info" : "warn");
-    this.endWorkOperation(session, success);
+    await this.endWorkOperation(session, success);
     // 进程与输出已经结束，立即释放执行范围；界面回调不占用命令资源。
     session.running = false;
-    this.releaseClaim(session.executionClaim);
+    try { await this.releaseClaim(session.executionClaim); }
+    catch (error) { this.record(session, "process_claim_release_pending", diagnosticError(error), "error"); }
     const finish: ProcessFinish = {
         workspaceId: session.workspaceId,
         sessionId: session.id,
@@ -923,7 +957,7 @@ export class ProcessSessionManager {
     while (completed.length > (this.options.maxCompletedSessions ?? 64)) this.removeSession(completed.shift()!.id);
   }
 
-  private endWorkOperation(session: ProcessSession, success: boolean): void {
+  private async endWorkOperation(session: ProcessSession, success: boolean): Promise<void> {
     if (!session.workOperationId || !this.workStateDir) return;
     let ledger: WorkLedger | undefined;
     try {
@@ -931,7 +965,9 @@ export class ProcessSessionManager {
       ledger = new WorkLedger(this.workStateDir);
       const operationStatus = session.disposition === "reconciliation_required" ? "reconciliation_required"
         : session.cancelRequestedAt !== undefined ? "cancelled" : success ? "completed" : "failed";
-      ledger.endOperation(session.workOperationId, operationStatus, [{
+      const activeLedger = ledger;
+      await runSqliteWrite(activeLedger.db, () => {
+        activeLedger.endOperation(session.workOperationId!, operationStatus, [{
         label: success ? "Managed process exited successfully (not deployment acceptance)" : session.disposition === "reconciliation_required" ? "Descendant state is unknown; reconcile before treating the command as finished" : session.disposition === "incomplete_output" ? "Root exited and no descendant remained, but the output pipe did not close" : "Managed process failed; inspect state before retrying",
         reference: JSON.stringify({ version: 1, boundary: "process", sessionId: session.id, pid: process.pid,
           exitCode: session.exitCode ?? null, signal: session.signal ?? null, elapsedMs: Date.now() - session.startedAt,
@@ -940,10 +976,11 @@ export class ProcessSessionManager {
           logReference: { event: "process_finished", operationId: session.workOperationId, sessionId: session.id, pid: process.pid },
           outputRecovery: outputPersisted ? "bounded_log_tail" : "metadata_only", hostAcknowledgment: "unknown", ...session.failure, retry: "reconcile_before_replay" }),
         outcome: success ? "passed" : session.disposition === "reconciliation_required" ? "not_run" : "failed",
-      }]);
-      if (operationStatus === "reconciliation_required" && session.workRunId) {
-        ledger.markRunReconciliationRequired(session.workRunId);
-      }
+        }]);
+        if (operationStatus === "reconciliation_required" && session.workRunId) {
+          activeLedger.markRunReconciliationRequired(session.workRunId);
+        }
+      });
     } catch (error) {
       this.record(session, "process_accounting_failed", diagnosticError(error), "error");
       this.append(session, "Work accounting could not be finalized; reconcile the work run before marking it complete.\n");

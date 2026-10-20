@@ -60,6 +60,18 @@ export interface RecordedInvocation<T> {
   result_ref: string | null;
 }
 
+// 原操作已返回，保存回执失败时保留原身份，禁止把数据库错误当成新的执行失败。
+export class InvocationPersistenceError extends Error {
+  readonly code = "INVOCATION_PERSISTENCE_FAILED";
+  readonly effect = "unknown";
+  readonly details: { operation_id: string; stage: "result" };
+
+  constructor(operationId: string, cause: unknown) {
+    super("INVOCATION_PERSISTENCE_FAILED: The operation returned, but its receipt could not be saved. Query the original operation before taking further action.", { cause });
+    this.details = { operation_id: operationId, stage: "result" };
+  }
+}
+
 export function stableJson(value: unknown): string {
   return JSON.stringify(normalizeJson(value));
 }
@@ -135,29 +147,34 @@ export async function executeRecorded<T>(
     } else return replayInvocation<T>(store, existing);
   }
 
-  const reserved = store.reserveInvocation({
-    id: context.invocation_id,
-    ownerId: context.owner_id,
-    transportInstanceId: context.transport_instance_id,
-    requestId,
-    sessionId: context.session_id,
-    memberId: context.member_id,
-    toolName: context.tool_name,
-    argumentsJson,
-    taskId: context.task_id,
-    operationId: context.operation_id ?? operationIdFrom(context, requestId),
-    retryOfInvocationId: retryOf,
-    operationKey,
+  const reservation = await store.writeAsync(() => {
+    const prior = store.findInvocation(context.owner_id, context.transport_instance_id, requestId);
+    const row = store.reserveInvocation({
+      id: context.invocation_id,
+      ownerId: context.owner_id,
+      transportInstanceId: context.transport_instance_id,
+      requestId,
+      sessionId: context.session_id,
+      memberId: context.member_id,
+      toolName: context.tool_name,
+      argumentsJson,
+      taskId: context.task_id,
+      operationId: context.operation_id ?? operationIdFrom(context, requestId),
+      retryOfInvocationId: retryOf,
+      operationKey,
+    });
+    return { row, alreadyReserved: prior !== null };
   });
-  if (reserved.id !== context.invocation_id) return executeRecorded(store, context, input, operation);
+  const reserved = reservation.row;
+  if (reservation.alreadyReserved || reserved.id !== context.invocation_id) return executeRecorded(store, context, input, operation);
   const operationId = reserved.operation_id ?? operationIdFrom(context, requestId);
   context.operation_id = operationId;
-  store.updateInvocation({
+  await store.writeAsync(() => store.updateInvocation({
     ownerId: context.owner_id,
     transportInstanceId: context.transport_instance_id,
     requestId,
     operationId,
-  });
+  }));
 
   try {
     await operation.beforeEffect?.();
@@ -170,7 +187,7 @@ export async function executeRecorded<T>(
     }
     const outcome = classifyError(error, {sideEffecting: operation.sideEffecting ?? false, effectStarted: false});
     const envelope = errorEnvelope(error, {sideEffecting: operation.sideEffecting ?? false, effectStarted: false});
-    store.updateInvocation({
+    await store.writeAsync(() => store.updateInvocation({
       ownerId: context.owner_id,
       transportInstanceId: context.transport_instance_id,
       requestId,
@@ -179,7 +196,7 @@ export async function executeRecorded<T>(
       result: envelope,
       finished: true,
       responded: true,
-    });
+    }));
     throw errorFromEnvelope(envelope, error);
   }
   const cancelled = store.findInvocation(context.owner_id, context.transport_instance_id, requestId);
@@ -188,17 +205,43 @@ export async function executeRecorded<T>(
       invocation_id: cancelled.id, operation_id: cancelled.operation_id,
       state: cancelled.state, effect: cancelled.effect, result_ref: cancelled.result_ref };
   }
-  store.updateInvocation({
+  const started = await store.writeAsync(() => store.updateInvocation({
     ownerId: context.owner_id,
     transportInstanceId: context.transport_instance_id,
     requestId,
     state: OperationState.running,
     effect: "started",
-  });
+  }));
+  if (started.state === OperationState.cancelled) return replayInvocation<T>(store, started);
 
   return requestContextStorage.run(context, async () => {
+    const latest = store.findInvocation(context.owner_id, context.transport_instance_id, requestId);
+    if (latest?.state === OperationState.cancelled) return replayInvocation<T>(store, latest);
+    let result: T;
     try {
-      const result = await operation.invoke();
+      result = await operation.invoke();
+    } catch (error) {
+      const outcome = classifyError(error, {sideEffecting: operation.sideEffecting ?? false, forwarded: operation.forwarded, effectStarted: true});
+      const envelope = errorEnvelope(error, {sideEffecting: operation.sideEffecting ?? false, forwarded: operation.forwarded, effectStarted: true});
+      try {
+        await store.writeAsync(() => store.updateInvocation({
+          ownerId: context.owner_id,
+          transportInstanceId: context.transport_instance_id,
+          requestId,
+          state: outcome.state,
+          effect: outcome.effect,
+          result: envelope,
+          finished: true,
+          responded: true,
+        }));
+      } catch (persistenceError) {
+        throw new InvocationPersistenceError(operationId, persistenceError);
+      }
+      throw errorFromEnvelope(envelope, error);
+    }
+
+    // 只保存已经算出的结果；锁等待和保存失败都不会再次调用 invoke。
+    try {
       const resultRef = operation.resultRef?.(result) ?? null;
       const isError = operation.isError?.(result) ?? false;
       const running = operation.runningResult?.(result) ?? false;
@@ -212,27 +255,29 @@ export async function executeRecorded<T>(
             ? OperationState.failed
             : OperationState.succeeded);
       const effect = explicit?.effect ?? (running ? "started" : unknown ? "unknown" : isError ? "completed" : "completed");
-      const current = store.findInvocation(context.owner_id, context.transport_instance_id, requestId);
-      if (running && current?.finished_at) {
-        store.updateInvocation({
+      const saved = await store.writeAsync(() => {
+        const current = store.findInvocation(context.owner_id, context.transport_instance_id, requestId);
+        if (running && current?.finished_at) {
+          return store.updateInvocation({
+            ownerId: context.owner_id,
+            transportInstanceId: context.transport_instance_id,
+            requestId,
+            resultRef: resultRef ?? current.result_ref,
+            result,
+          });
+        }
+        return store.updateInvocation({
           ownerId: context.owner_id,
           transportInstanceId: context.transport_instance_id,
           requestId,
-          resultRef: resultRef ?? current.result_ref,
+          state,
+          effect,
+          resultRef,
           result,
+          finished: !running,
+          responded: true,
         });
-      } else store.updateInvocation({
-        ownerId: context.owner_id,
-        transportInstanceId: context.transport_instance_id,
-        requestId,
-        state,
-        effect,
-        resultRef,
-        result,
-        finished: !running,
-        responded: true,
       });
-      const saved = store.findInvocation(context.owner_id, context.transport_instance_id, requestId)!;
       return {
         replay: false,
         result,
@@ -243,19 +288,7 @@ export async function executeRecorded<T>(
         result_ref: saved.result_ref,
       };
     } catch (error) {
-      const outcome=classifyError(error,{sideEffecting:operation.sideEffecting??false,forwarded:operation.forwarded,effectStarted:true});
-      const envelope = errorEnvelope(error, {sideEffecting: operation.sideEffecting ?? false, forwarded: operation.forwarded, effectStarted: true});
-      store.updateInvocation({
-        ownerId: context.owner_id,
-        transportInstanceId: context.transport_instance_id,
-        requestId,
-        state: outcome.state,
-        effect: outcome.effect,
-        result: envelope,
-        finished: true,
-        responded: true,
-      });
-      throw errorFromEnvelope(envelope, error);
+      throw new InvocationPersistenceError(operationId, error);
     }
   });
 }

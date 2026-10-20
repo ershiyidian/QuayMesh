@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
+import { runSqliteWrite, type SqliteWriteOptions } from "../db/async-write.js";
 import { canonicalWorkspaceRoot, canonicalPathIdentity } from "../roots.js";
 import { resolve } from "node:path";
 import { TaskDataStore, type ContextReadInput } from "./task-data.js";
@@ -42,6 +43,14 @@ interface InvocationRow {
   response_at: string | null;
 }
 
+interface EventAppendResult {
+  sequence: number;
+  sessionRevision: number;
+  memberRevision: number;
+  changed: boolean;
+  ownerId: string;
+}
+
 interface ContextReadRow {
   session_id: string;
   member_id: string;
@@ -78,6 +87,11 @@ export class SessionStore {
   constructor(private readonly db: Database.Database, owned = false) {
     this.ownedDatabase = owned;
     this.taskData = new TaskDataStore(db);
+  }
+
+  // 回调只允许同步 SQL；通知、文件和进程操作放在 await 之后。
+  writeAsync<T>(write: () => T, options?: SqliteWriteOptions): Promise<T> {
+    return runSqliteWrite(this.db, write, options);
   }
 
   findSession(sessionId: SessionId): SessionRecord | null {
@@ -587,7 +601,36 @@ export class SessionStore {
       .run(sessionId, memberId, runId, taskId);
   }
 
-  appendEvent(event: Omit<SessionEvent, "sequence">): { sequence: number; sessionRevision: number; memberRevision: number; changed: boolean; ownerId: string } {
+  appendEvent(event: Omit<SessionEvent, "sequence">): EventAppendResult {
+    const saved = this.persistEvent(event);
+    this.notifyEvent(event, saved.result, saved.taskId);
+    return saved.result;
+  }
+
+  async appendEventAsync(event: Omit<SessionEvent, "sequence">): Promise<EventAppendResult> {
+    const saved = await this.writeAsync(() => this.persistEvent(event));
+    // 提交后的监听器失败不能重放事务，持久事件仍可按 source_id 找回。
+    this.notifyEvent(event, saved.result, saved.taskId);
+    return saved.result;
+  }
+
+  async appendOperationEventAsync(event: Omit<SessionEvent, "sequence">): Promise<boolean> {
+    const operationId = event.payload.operation_id, invocationId = event.payload.invocation_id;
+    if ((event.type !== "operation_started" && event.type !== "operation_finished") || typeof operationId !== "string"
+      || (invocationId !== undefined && typeof invocationId !== "string")) throw new Error("INVALID_OPERATION_EVENT");
+    const saved = await this.writeAsync(() => {
+      // 等锁期间尝试可能已切换；身份检查与事件及活动时间更新必须共用事务。
+      const current = this.findInvocationByOperationId(operationId);
+      if ((invocationId && current && current.id !== invocationId)
+        || this.hasOperationFinished(operationId, invocationId)) return null;
+      return this.persistEvent(event);
+    });
+    if (!saved) return false;
+    this.notifyEvent(event, saved.result, saved.taskId);
+    return saved.result.changed;
+  }
+
+  private persistEvent(event: Omit<SessionEvent, "sequence">): { result: EventAppendResult; taskId?: string } {
     const appendTx = this.db.transaction(() => {
       const currentTask = event.task_id ?? this.currentTask(event.session_id)?.id ?? null;
       const existing = this.db
@@ -611,11 +654,14 @@ export class SessionStore {
 
       if (existing) {
         return {
-          sequence: existing.sequence,
-          sessionRevision: currentSessionRev,
-          memberRevision: currentMemberRev,
-          changed: false,
-          ownerId: currentRevs?.owner_id ?? "",
+          taskId: currentTask ?? undefined,
+          result: {
+            sequence: existing.sequence,
+            sessionRevision: currentSessionRev,
+            memberRevision: currentMemberRev,
+            changed: false,
+            ownerId: currentRevs?.owner_id ?? "",
+          },
         };
       }
 
@@ -672,16 +718,22 @@ export class SessionStore {
         .run(newMemberRev, newMemberRev, event.member_id);
 
       return {
-        sequence: assignedSequence,
-        sessionRevision: newSessionRev,
-        memberRevision: newMemberRev,
-        changed: true,
-        ownerId: currentRevs?.owner_id ?? "",
+        taskId: currentTask ?? undefined,
+        result: {
+          sequence: assignedSequence,
+          sessionRevision: newSessionRev,
+          memberRevision: newMemberRev,
+          changed: true,
+          ownerId: currentRevs?.owner_id ?? "",
+        },
       };
     });
 
     // 先取得写锁再读取版本和去重键，避免其他写入提交后无法升级旧 WAL 快照。
-    const result = appendTx.immediate();
+    return appendTx.immediate();
+  }
+
+  private notifyEvent(event: Omit<SessionEvent, "sequence">, result: EventAppendResult, taskId?: string): void {
     if (result.changed) {
       for (const listener of this.changeListeners) listener({
         sessionId: event.session_id,
@@ -689,10 +741,9 @@ export class SessionStore {
         ownerId: result.ownerId,
         revision: result.memberRevision,
         sequence: result.sequence,
-        taskId: event.task_id ?? this.currentTask(event.session_id)?.id,
+        taskId,
       });
     }
-    return result;
   }
 
   onChange(listener: (change: { sessionId: SessionId; memberId: string; ownerId: string; revision: number; sequence: number; taskId?: string }) => void): () => void {
@@ -1174,16 +1225,35 @@ export class SessionStore {
   }
 
   setReviewState(sessionId: SessionId, state: ReviewState): void {
+    if (this.db.inTransaction) throw Object.assign(new Error("SQLITE_WRITE_OUTER_TRANSACTION: Review notifications require a committed transaction."),
+      { code: "SQLITE_WRITE_OUTER_TRANSACTION" });
+    const saved = this.db.transaction(() => this.persistReviewState(sessionId, state)).immediate();
+    for (const { event, result, taskId } of saved) this.notifyEvent(event, result, taskId);
+  }
+
+  async setReviewStateAsync(sessionId: SessionId, state: ReviewState, taskId?: string): Promise<void> {
+    const expectedTaskId = taskId ?? this.getSession(sessionId).current_task_id;
+    const saved = await this.writeAsync(() => this.persistReviewState(sessionId, state, expectedTaskId));
+    // 状态与事件一起提交；监听器失败不能撤销提交或触发 SQL 重放。
+    for (const { event, result, taskId } of saved) this.notifyEvent(event, result, taskId);
+  }
+
+  private persistReviewState(sessionId: SessionId, state: ReviewState, expectedTaskId?: string | null): Array<{
+    event: Omit<SessionEvent, "sequence">; result: EventAppendResult; taskId?: string;
+  }> {
     const session = this.getSession(sessionId);
-    if (session.review_state === state) return;
-    this.db.transaction(() => {
-      this.db.prepare(`UPDATE qm_sessions SET review_state = ? WHERE id = ?`).run(state, sessionId);
-      for (const member of session.members) this.appendEvent({
-        session_id: sessionId, member_id: member.id, type: "verification_recorded",
+    if (expectedTaskId !== undefined && session.current_task_id !== expectedTaskId)
+      throw new Error("STALE_CONTEXT: The session task changed while the review update waited for its write lock.");
+    if (session.review_state === state) return [];
+    this.db.prepare(`UPDATE qm_sessions SET review_state = ? WHERE id = ?`).run(state, sessionId);
+    return session.members.map(member => {
+      const event: Omit<SessionEvent, "sequence"> = {
+        session_id: sessionId, task_id: expectedTaskId ?? session.current_task_id, member_id: member.id, type: "verification_recorded",
         source_id: `review-${randomUUID()}`, timestamp: new Date().toISOString(),
         payload: { decision: state },
-      });
-    }).immediate();
+      };
+      return { event, ...this.persistEvent(event) };
+    });
   }
 
   setHostState(sessionId: SessionId, state: HostState): void {

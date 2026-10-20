@@ -27,7 +27,7 @@ const workspaceStore = new SqliteWorkspaceStore(stateDir);
 const workspaces = new WorkspaceRegistry(config, workspaceStore);
 const ledger = new WorkLedger(stateDir), agents = new LocalAgentStore(stateDir);
 const { store, database } = openSessionStore(stateDir);
-// 仅隔离测试缩短等锁时间，生产默认值保持不变。
+// 只缩短监听器中的同步写入等待；异步事务仍使用正式五秒取锁预算。
 database.pragma("busy_timeout = 25");
 const service = new SessionService(store, workspaces, ledger, agents);
 const opened = await workspaces.openWorkspace({ path: project }, { conversationScopeId: "lock-conversation" });
@@ -37,7 +37,8 @@ const { session, member } = await service.open({ owner_id: "lock-owner", convers
 const context = createInvocationContext({
   auth: { owner_id: "lock-owner" }, transport: { instance_id: "lock-transport" },
   request: { id: "lock-request", tool_name: "spawn_agent" },
-  session: { session_id: session.id, member_id: member.id, workspace_id: opened.workspace.id },
+  session: { session_id: session.id, task_id: service.ensureCurrentTask(session).id,
+    member_id: member.id, workspace_id: opened.workspace.id },
 });
 await executeRecorded(store, context, {}, {
   beforeEffect: async () => { await service.beforeOperation(context, "agent_control", "spawn_agent"); },

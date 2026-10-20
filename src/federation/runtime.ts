@@ -23,7 +23,7 @@ export { isTransientPeerFailure, isIdempotentPeerRequest, dispatchPeerRequest, R
 import { toolDeadline, remainingToolTime, TOOL_DEADLINE_META } from "../tool-request-budget.js";
 import { jsonReply } from "../bounded-reply.js";
 import { currentInvocation } from "../session/invocations.js";
-import { toolErrorResult } from "../session/outcome.js";
+import { errorCode, toolErrorResult } from "../session/outcome.js";
 import { WorkspaceAccessError } from "../workspaces.js";
 import { dispatchPeerRequest, isTransientPeerFailure } from "./read-retry.js";
 import { dispatchConsoleRequest } from "./console-request.js";
@@ -318,6 +318,7 @@ export class FederationRuntime extends EventEmitter {
         if (!this.config.capabilities.egress) throw new Error("EGRESS_CAPABILITY_REQUIRED"); return this.hooks.mihomoRead();
       case "transfers.list": return this.transferStore.list();
       case "artifact.stat": return this.hooks.artifactStat(params);
+      case "artifact.lookup": return this.transferStore.lookup(params);
       case "artifact.copy": return this.startCopy(params);
       // SQLite is the source of truth; transient progress must not mask completion.
       case "artifact.observe": return this.transferStore.get(params.id);
@@ -515,9 +516,28 @@ export class FederationRuntime extends EventEmitter {
     if(!requestKey || requestKey.length>128)throw new Error("COPY_REQUEST_KEY_REQUIRED");
     const context=extra ? this.trustedInvocation("copy_artifact",{workspace_id:input.destination_workspace_id},extra) : undefined;
     if(extra && !context)throw new Error("COPY_TASK_CONTEXT_REQUIRED");
-    return this.request(destination.node, "artifact.copy", { sourceNode: source.node, sourceWorkspace: source.local,
+    const request = { sourceNode: source.node, sourceWorkspace: source.local,
       sourcePath: input.source_path, destinationWorkspace: destination.local, destinationPath: input.destination_path,
-      overwrite: input.overwrite === true, requestKey, context });
+      overwrite: input.overwrite === true, requestKey, context };
+    if (context) {
+      try { await this.sessionFeed?.recordTaskWork(context); }
+      catch (admissionError) {
+        const code = errorCode(admissionError);
+        if (code !== "TASK_NOT_ACTIVE" && code !== "TASK_FINISHING") throw admissionError;
+        // 结束任务只查询原回执；旧节点不支持查询时也绝不回退为启动复制。
+        let saved: TransferView | null;
+        try { saved = await this.request<TransferView | null>(destination.node, "artifact.lookup", request); }
+        catch (lookupError) {
+          if (errorCode(lookupError) === "COPY_REQUEST_KEY_REUSED") throw Object.assign(lookupError as Error, { effect: "not_started" });
+          throw Object.assign(new Error("COPY_RECEIPT_LOOKUP_FAILED: 未发送新的复制请求；原回执暂时无法查询，请检查目标节点连接和版本。", { cause: lookupError }),
+            { code: "COPY_RECEIPT_LOOKUP_FAILED", effect: "not_started", details: { task_id: context.task_id, owner_node_id: destination.node,
+              admission_error: code, lookup_error: errorCode(lookupError) } });
+        }
+        if (saved) return saved;
+        throw admissionError;
+      }
+    }
+    return this.request(destination.node, "artifact.copy", request);
   }
   private async startCopy(input: JsonRecord): Promise<TransferView> {
     if(this.stopped || !this.config.capabilities.worker)throw new Error("WORKER_CAPABILITY_UNAVAILABLE");

@@ -41,18 +41,25 @@ export class TransferStore {
   private readonly database: DatabaseHandle;
   constructor(stateDir: string, private readonly nodeId: string) { this.database = openDatabase(stateDir); }
 
+  lookup(request: TransferRequest): TransferView | null {
+    const owner = request.context?.owner_id ?? `node:${this.nodeId}`;
+    const existing = this.database.sqlite.prepare("SELECT * FROM qm_transfers WHERE owner_id=? AND request_key=?")
+      .get(owner, request.requestKey) as TransferRow | undefined;
+    if (!existing) return null;
+    if (existing.source_node !== request.sourceNode || existing.source_workspace !== request.sourceWorkspace ||
+        existing.source_path !== request.sourcePath || existing.destination_workspace !== request.destinationWorkspace ||
+        existing.destination_path !== request.destinationPath || Boolean(existing.overwrite) !== request.overwrite ||
+        existing.task_id !== (request.context?.task_id ?? null) || existing.session_id !== (request.context?.session_id ?? null) ||
+        existing.member_id !== (request.context?.member_id ?? null)) throw Object.assign(new Error("COPY_REQUEST_KEY_REUSED"),
+          { code: "COPY_REQUEST_KEY_REUSED", effect: "not_started" });
+    return this.view(existing);
+  }
+
   reserve(request: TransferRequest): { view: TransferView; created: boolean } {
     return this.database.sqlite.transaction(() => {
       const owner = request.context?.owner_id ?? `node:${this.nodeId}`;
-      const existing = this.database.sqlite.prepare("SELECT * FROM qm_transfers WHERE owner_id=? AND request_key=?")
-        .get(owner, request.requestKey) as TransferRow | undefined;
-      if (existing) {
-        if (existing.source_node !== request.sourceNode || existing.source_workspace !== request.sourceWorkspace ||
-          existing.source_path !== request.sourcePath || existing.destination_workspace !== request.destinationWorkspace ||
-          existing.destination_path !== request.destinationPath || Boolean(existing.overwrite) !== request.overwrite ||
-          existing.task_id !== (request.context?.task_id ?? null)) throw new Error("COPY_REQUEST_KEY_REUSED");
-        return { view: this.view(existing), created: false };
-      }
+      const existing = this.lookup(request);
+      if (existing) return { view: existing, created: false };
       const uuid = randomUUID();
       const id = `qm:${encodeURIComponent(this.nodeId)}:copy_${uuid}`;
       this.database.sqlite.prepare(`INSERT INTO qm_transfers

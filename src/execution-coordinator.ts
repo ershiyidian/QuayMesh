@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { realpathSync, existsSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
+import { runSqliteWrite, type SqliteWriteOptions } from "./db/async-write.js";
 import { canonicalPathIdentity } from "./roots.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { pidAlive } from "./process-liveness.js";
@@ -18,15 +19,30 @@ export interface RuntimeWorkInput {
 export interface RuntimeWorkLease {
   readonly id: string;
   release(): void;
+  releaseAsync(options?: SqliteWriteOptions): Promise<void>;
   run<T>(action: () => T): T;
 }
 const acceptedWork = new AsyncLocalStorage<{ stateDir: string; id: string }>();
+type ReleaseTable = "qm_runtime_work" | "execution_claims";
+interface PendingRelease { id: string; table: ReleaseTable; finish: () => void }
 
 export class AdmissionPausedError extends Error {
   readonly code = "NODE_ADMISSION_PAUSED";
   constructor(reason?: string | null) {
     super(reason ? `节点暂不接受新操作：${reason}` : "节点暂不接受新操作，已有操作继续执行。");
     this.name = "AdmissionPausedError";
+  }
+}
+
+export class ExecutionReleasePendingError extends Error {
+  readonly code = "EXECUTION_RELEASE_PENDING";
+  readonly effect = "unknown";
+  readonly retryHint = "query_original";
+  readonly details: { leaseId: string };
+  constructor(leaseId: string, cause: unknown) {
+    super("动作已结束，执行占用尚待释放；请查询原操作，勿重新执行动作。", { cause });
+    this.name = "ExecutionReleasePendingError";
+    this.details = { leaseId };
   }
 }
 
@@ -61,6 +77,7 @@ export interface ExecutionClaim {
   readonly id: string;
   bindThread(threadKey: string): void;
   release(): void;
+  releaseAsync(options?: SqliteWriteOptions): Promise<void>;
 }
 export interface ExecutionTicket {
   readonly id: string;
@@ -111,7 +128,12 @@ export class ExecutionCoordinator {
   private readonly database: DatabaseHandle;
   private readonly ownerId = randomUUID();
   private closed = false;
+  private closePromise?: Promise<void>;
   private readonly stateDir: string;
+  private readonly pendingReleases = new Map<string, PendingRelease>();
+  private releaseTimer?: ReturnType<typeof setTimeout>;
+  private flushingReleases = false;
+  private releaseDelayMs = 100;
 
   constructor(stateDir: string) { this.stateDir = resolve(stateDir); this.database = openDatabase(stateDir); }
 
@@ -129,6 +151,10 @@ export class ExecutionCoordinator {
     }).immediate();
   }
 
+  async pauseAsync(reason = "维护操作", options?: SqliteWriteOptions): Promise<void> {
+    await runSqliteWrite(this.database.sqlite, () => this.pause(reason), options);
+  }
+
   resume(): void {
     this.database.sqlite.prepare("UPDATE qm_runtime_admission SET accepting=1,reason=NULL,changed_at=? WHERE id=1")
       .run(new Date().toISOString());
@@ -143,35 +169,130 @@ export class ExecutionCoordinator {
     return true;
   }
   beginWork(input: RuntimeWorkInput): RuntimeWorkLease {
-    if (this.closed) throw new Error("Execution coordinator is closed.");
+    if (this.closed || this.closePromise) throw new Error("Execution coordinator is closed or closing.");
     const id = `work_${randomUUID()}`;
     this.database.sqlite.transaction(() => {
       if (!input.allowWhilePaused) this.assertAccepting();
+      const owners = this.database.sqlite.prepare("SELECT DISTINCT owner_pid FROM qm_runtime_work").all() as { owner_pid: number }[];
+      for (const owner of owners) if (!pidAlive(owner.owner_pid))
+        this.database.sqlite.prepare("DELETE FROM qm_runtime_work WHERE owner_pid=?").run(owner.owner_pid);
       this.database.sqlite.prepare(`INSERT INTO qm_runtime_work(id,owner_id,owner_pid,kind,operation_id,task_id,blocking,started_at)
         VALUES(?,?,?,?,?,?,?,?)`).run(id, this.ownerId, process.pid, input.kind, input.operationId ?? null,
           input.taskId ?? null, input.allowWhilePaused || input.blocking === false ? 0 : 1, new Date().toISOString());
     }).immediate();
-    let released = false;
+    const release = this.createReleaseHandle(id, "qm_runtime_work");
     return {
       id,
-      release: () => {
-        if (released || this.closed) return;
-        this.database.sqlite.prepare("DELETE FROM qm_runtime_work WHERE id=? AND owner_id=?").run(id, this.ownerId);
-        released = true;
-      },
+      release: release.release,
+      releaseAsync: release.releaseAsync,
       run: action => {
-        if (released || this.closed) throw new Error("执行占用已经释放");
+        release.assertActive();
         return acceptedWork.run({ stateDir: this.stateDir, id }, action);
       },
     };
   }
 
-  async withWork<T>(input: RuntimeWorkInput, action: () => Promise<T>): Promise<T> {
-    const lease = this.beginWork(input);
-    try { return await lease.run(action); } finally { lease.release(); }
+  private createReleaseHandle(id: string, table: ReleaseTable) {
+    let released = false;
+    let releaseRequested = false;
+    let releasePromise: Promise<void> | undefined;
+    const requestRelease = () => {
+      releaseRequested = true;
+      this.pendingReleases.set(id, { id, table, finish: () => { released = true; } });
+    };
+    return {
+      release: () => {
+        if (released || this.closed) return;
+        requestRelease();
+        try {
+          this.removeReleases([{ id, table }]);
+          this.finishRelease(id);
+        } catch (error) { this.scheduleReleases(); throw error; }
+      },
+      releaseAsync: (options?: SqliteWriteOptions): Promise<void> => {
+        if (released) return Promise.resolve();
+        if (releasePromise) return releasePromise;
+        if (this.closed) return Promise.reject(new ExecutionReleasePendingError(id, new Error("Execution coordinator is closed.")));
+        requestRelease();
+        releasePromise = runSqliteWrite(this.database.sqlite, () => {
+          this.removeReleases([{ id, table }]);
+        }, options).then(() => { this.finishRelease(id); }).catch(error => {
+          if (released) return;
+          this.scheduleReleases();
+          throw new ExecutionReleasePendingError(id, error);
+        }).finally(() => { releasePromise = undefined; });
+        return releasePromise;
+      },
+      assertActive: () => {
+        if (releaseRequested || released || this.closed) throw new Error("执行占用已经释放或正在释放");
+      },
+    };
+  }
+
+  async beginWorkAsync(input: RuntimeWorkInput, options?: SqliteWriteOptions): Promise<RuntimeWorkLease> {
+    return runSqliteWrite(this.database.sqlite, () => this.beginWork(input), options);
+  }
+
+  async withWork<T>(input: RuntimeWorkInput, action: () => Promise<T>, options?: SqliteWriteOptions): Promise<T> {
+    const lease = await this.beginWorkAsync(input, options);
+    let completed = false;
+    try {
+      const result = await lease.run(action);
+      completed = true;
+      return result;
+    } finally {
+      // 请求取消后仍须收尾；清理失败不能覆盖动作原异常。
+      try { await lease.releaseAsync({ timeoutMs: options?.timeoutMs }); }
+      catch (error) { if (completed) throw error; }
+    }
+  }
+
+  private removeReleases(releases: readonly Pick<PendingRelease, "id" | "table">[]): void {
+    const removeWork = this.database.sqlite.prepare("DELETE FROM qm_runtime_work WHERE id=? AND owner_id=?");
+    const removeClaim = this.database.sqlite.prepare("DELETE FROM execution_claims WHERE id=? AND owner_id=?");
+    for (const release of releases)
+      (release.table === "qm_runtime_work" ? removeWork : removeClaim).run(release.id, this.ownerId);
+  }
+
+  private finishRelease(id: string): void {
+    const release = this.pendingReleases.get(id);
+    this.pendingReleases.delete(id);
+    release?.finish();
+    if (!this.pendingReleases.size && this.releaseTimer) {
+      clearTimeout(this.releaseTimer);
+      this.releaseTimer = undefined;
+    }
+  }
+
+  private scheduleReleases(): void {
+    if (this.closed || this.releaseTimer || this.flushingReleases || !this.pendingReleases.size) return;
+    this.releaseTimer = setTimeout(() => {
+      this.releaseTimer = undefined;
+      void this.flushReleases();
+    }, this.releaseDelayMs);
+    this.releaseTimer.unref();
+  }
+
+  private async flushReleases(): Promise<void> {
+    if (this.closed || this.flushingReleases || !this.pendingReleases.size) return;
+    this.flushingReleases = true;
+    const releases: PendingRelease[] = [];
+    for (const release of this.pendingReleases.values()) { releases.push(release); if (releases.length === 64) break; }
+    try {
+      // 只补删本 owner 已结束的占用；不触碰活动租约或执行动作。
+      await runSqliteWrite(this.database.sqlite, () => this.removeReleases(releases), { timeoutMs: 250 });
+      for (const release of releases) this.finishRelease(release.id);
+      this.releaseDelayMs = 100;
+    } catch {
+      this.releaseDelayMs = Math.min(this.releaseDelayMs * 2, 5_000);
+    } finally {
+      this.flushingReleases = false;
+      this.scheduleReleases();
+    }
   }
 
   ownsWriteClaim(id: string, path: string, operationId?: string): boolean {
+    if (this.pendingReleases.has(id)) return false;
     const row = this.database.sqlite.prepare("SELECT * FROM execution_claims WHERE id=? AND owner_id=?")
       .get(id, this.ownerId) as ClaimRow | undefined;
     if (!row || !operationId || row.operation_id !== operationId) return false;
@@ -181,8 +302,6 @@ export class ExecutionCoordinator {
 
   admissionStatus() {
     return this.database.sqlite.transaction(() => {
-      const owners = this.database.sqlite.prepare("SELECT DISTINCT owner_pid FROM qm_runtime_work").all() as { owner_pid: number }[];
-      for (const owner of owners) if (!pidAlive(owner.owner_pid)) this.database.sqlite.prepare("DELETE FROM qm_runtime_work WHERE owner_pid=?").run(owner.owner_pid);
       const state = this.database.sqlite.prepare("SELECT accepting,reason,changed_at FROM qm_runtime_admission WHERE id=1").get() as { accepting: number; reason: string | null; changed_at: string };
       const count = (sql: string) => Number((this.database.sqlite.prepare(sql).get() as { n: number }).n);
       const claims = count("SELECT COUNT(*) AS n FROM execution_claims");
@@ -191,16 +310,24 @@ export class ExecutionCoordinator {
       const executions = count("SELECT COUNT(*) AS n FROM console_executions WHERE status IN ('running','starting')");
       const queuedOperations = count("SELECT COUNT(*) AS n FROM console_operations WHERE status='queued'");
       const queuedExecutions = count("SELECT COUNT(*) AS n FROM console_executions WHERE status='queued'");
-      const work = this.database.sqlite.prepare("SELECT kind,COUNT(*) AS count FROM qm_runtime_work WHERE blocking=1 GROUP BY kind").all() as { kind: string; count: number }[];
+      const rows = this.database.sqlite.prepare(`SELECT kind,owner_pid,COUNT(*) AS count FROM qm_runtime_work
+        WHERE blocking=1 GROUP BY kind,owner_pid ORDER BY kind,owner_pid`).all() as { kind: string; owner_pid: number; count: number }[];
+      const owners = new Map<number, boolean>();
+      const counts = new Map<string, number>();
+      for (const row of rows) {
+        if (!owners.has(row.owner_pid)) owners.set(row.owner_pid, pidAlive(row.owner_pid));
+        if (owners.get(row.owner_pid)) counts.set(row.kind, (counts.get(row.kind) ?? 0) + row.count);
+      }
+      const work = [...counts].map(([kind, count]) => ({ kind, count }));
       const activeWork = work.reduce((n, item) => n + item.count, 0);
       return { accepting: state.accepting === 1, reason: state.reason, changedAt: state.changed_at,
         idle: claims + operations + executions + activeWork === 0,
         claims, waiting, operations, executions, queuedOperations, queuedExecutions, activeWork, work };
-    }).immediate();
+    }).deferred();
   }
 
   private row(input: ExecutionClaimInput): ClaimRow {
-    if (this.closed) throw new Error("Execution coordinator is closed.");
+    if (this.closed || this.closePromise) throw new Error("Execution coordinator is closed or closing.");
     const resources = [...new Set(input.resources ?? [])].sort();
     if (resources.length > 16 || resources.some((key) => !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(key))) {
       throw new Error("Use at most 16 explicit, bounded resource keys.");
@@ -253,11 +380,13 @@ export class ExecutionCoordinator {
       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(row.id, row.owner_id, row.owner_pid, row.kind, row.checkout_root, row.agent_id, row.resources,
         new Date().toISOString(), row.access_mode, row.thread_key,row.scopes_json,row.operation_id,row.task_id,row.title);
-    let released = false;
+    const release = this.createReleaseHandle(row.id, "execution_claims");
     return {
       id: row.id,
+      release: release.release,
+      releaseAsync: release.releaseAsync,
       bindThread: (threadKey) => {
-        if (released || this.closed) throw new Error("Execution claim is no longer active.");
+        release.assertActive();
         this.database.sqlite.transaction(() => {
           const other = this.database.sqlite.prepare("select * from execution_claims where thread_key = ? and id != ?")
             .get(threadKey, row.id) as ClaimRow | undefined;
@@ -266,23 +395,28 @@ export class ExecutionCoordinator {
             .run(threadKey, row.id, this.ownerId);
         }).immediate();
       },
-      release: () => {
-        if (released || this.closed) return;
-        this.database.sqlite.prepare("delete from execution_claims where id = ? and owner_id = ?").run(row.id, this.ownerId);
-        released = true;
-      },
     };
   }
 
   acquire(input: ExecutionClaimInput): ExecutionClaim {
+    return this.acquireRow(this.row(input), input);
+  }
+
+  async acquireAsync(input: ExecutionClaimInput, options?: SqliteWriteOptions): Promise<ExecutionClaim> {
     const candidate = this.row(input);
+    return runSqliteWrite(this.database.sqlite, () => this.acquireRow(candidate, input), options);
+  }
+
+  private acquireRow(candidate: ClaimRow, input: ExecutionClaimInput): ExecutionClaim {
+    if (this.closed || this.closePromise) throw new Error("Execution coordinator is closed or closing.");
     return this.database.sqlite.transaction(() => {
       this.assertAccepting();
       if (candidate.operation_id) {
         const owned = this.database.sqlite.prepare("SELECT * FROM execution_claims WHERE owner_id=? AND operation_id=?")
           .all(this.ownerId,candidate.operation_id) as ClaimRow[];
-        const parent = owned.find(row => claimResources(candidate).every(requested => claimResources(row).some(scope => resourceContains(scope,requested))));
-        if (parent) return { id:parent.id,release:()=>{},bindThread:()=>{throw new Error("内部调用不能改变所属代理线程");} };
+        const parent = owned.find(row => !this.pendingReleases.has(row.id) &&
+          claimResources(candidate).every(requested => claimResources(row).some(scope => resourceContains(scope,requested))));
+        if (parent) return { id:parent.id,release:()=>{},releaseAsync:async()=>{},bindThread:()=>{throw new Error("内部调用不能改变所属代理线程");} };
       }
       const blocker = this.blocker(candidate, input);
       if (blocker) {
@@ -329,9 +463,17 @@ export class ExecutionCoordinator {
     };
   }
 
-  async run<T>(input: ExecutionClaimInput, action: () => Promise<T>): Promise<T> {
-    const claim = this.acquire(input);
-    try { return await action(); } finally { claim.release(); }
+  async run<T>(input: ExecutionClaimInput, action: () => Promise<T>, options?: SqliteWriteOptions): Promise<T> {
+    const claim = await this.acquireAsync(input, options);
+    let completed = false;
+    try {
+      const result = await action();
+      completed = true;
+      return result;
+    } finally {
+      try { await claim.releaseAsync({ timeoutMs: options?.timeoutMs }); }
+      catch (error) { if (completed) throw error; }
+    }
   }
 
   inspect(workspaceRoot: string) {
@@ -366,11 +508,35 @@ export class ExecutionCoordinator {
       guidance: "Wait for admission or cancel this owned queued task. Active claims are never stolen; writes are never replayed automatically." };
   }
 
+  private cleanupForClose(): PendingRelease[] {
+    const releases = [...this.pendingReleases.values()];
+    this.database.sqlite.prepare("DELETE FROM execution_waiters WHERE owner_id=?").run(this.ownerId);
+    this.removeReleases(releases);
+    return releases;
+  }
+
+  private finishClose(releases: PendingRelease[]): void {
+    for (const release of releases) this.finishRelease(release.id);
+    this.database.close();
+    this.closed = true;
+    if (this.releaseTimer) clearTimeout(this.releaseTimer);
+    this.releaseTimer = undefined;
+  }
+
   close(): void {
     if (this.closed) return;
-    // A waiting intent can safely disappear; an active child may still be running.
-    this.database.sqlite.prepare("delete from execution_waiters where owner_id = ?").run(this.ownerId);
-    this.closed = true;
-    this.database.close();
+    // 同步关闭失败时保留连接与后台清理；活动子进程的占用不能推断为结束。
+    const releases = this.database.sqlite.transaction(() => this.cleanupForClose()).immediate();
+    this.finishClose(releases);
+  }
+
+  closeAsync(options?: SqliteWriteOptions): Promise<void> {
+    if (this.closed) return Promise.resolve();
+    if (this.closePromise) return this.closePromise;
+    this.closePromise = runSqliteWrite(this.database.sqlite, () => this.cleanupForClose(), options)
+      .then(releases => { if (!this.closed) this.finishClose(releases); })
+      .catch(error => { if (!this.closed) throw error; })
+      .finally(() => { this.closePromise = undefined; });
+    return this.closePromise;
   }
 }

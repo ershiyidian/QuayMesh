@@ -437,6 +437,71 @@ Unknown 结果、缺失任务身份或不完整的旧错误回执，都不足以
 
 分别衡量四个目标：减少可避免的请求、观察者消失后保住已接受操作、防止重复副作用、降低每次中断损失的工作量。服务端错误数与宿主完成用户轮次的比例需要各自观测。
 
+## 2026-10-20：SQLite 争用与执行收尾
+
+本轮针对已测量的本地停顿，以及消除停顿时暴露出的恢复边界继续修复。
+数据库 schema 保持第 6 版，本次验收没有部署生产节点。
+
+### 为什么一个数据库锁会影响其它观察请求
+
+原同步 SQLite 连接使用 `busy_timeout=5000`。SQLite 的 [busy handler](https://www.sqlite.org/c3ref/busy_timeout.html) 在数据库调用内部反复等待，直到预算耗尽。它在 Node 请求线程上等待时，定时器、HTTP 处理和传输活动也无法继续。[WAL 支持读者与写者并行](https://www.sqlite.org/isolation.html)，但我们的观察路径也会申请持久写租约，打开已是最新版本的数据库仍会进入迁移写事务。
+
+新增真实 HTTP 回归先在 `eb0adca` 上运行，只叠加测试和独立持锁 Worker。Worker 对实际数据库持写锁三秒，历史输出、诊断和 Console 观察未能在持锁期间完成。这是基线故障证据；它没有测量 ChatGPT 的超时阈值。整条测试耗时包含 fixture 创建与清理，不能当作查询耗时。
+
+修复分三层：
+
+1. 打开最新数据库时，只读检查 schema 和旧结构修复需求。真正迁移或修复仍取得写锁、重读版本并原子提交。初始化失败会关闭连接。
+2. `runSqliteWrite` 临时关闭该连接的 busy handler，再尝试 `BEGIN IMMEDIATE`。准入遇到 `SQLITE_BUSY` 时先恢复设置，再通过定时器让出执行。默认准入预算五秒，退避从 10 ms 增至最多 100 ms；取得写锁后才进入事务体。
+3. 历史 `read_output`、`read_diagnostics`、代理 list/wait、工作区 status/recovery、空 stdin 轮询和 Console GET/HEAD，不再仅为查看状态申请持久执行租约。原处理函数继续检查身份和范围，写操作继续保留执行 claim。
+
+这套方案让争锁等待让出事件循环，SQL 事务体仍同步执行。大查询、序列化、文件系统操作和 checkpoint 需要分别测量，仍可能阻塞请求线程。
+
+### 事务与副作用的边界
+
+`runSqliteWrite` 只接受同步、纯 SQL 回调。它拒绝已有外层事务和 async 回调，观察误返回 Promise 的拒绝，并在每次同步尝试结束后恢复 `busy_timeout`。取消信号可以中断等待；已经开始的同步事务体会执行到自身结束。
+
+只有**尚未进入事务体时的写锁准入 BUSY**会重试。事务体、COMMIT、ROLLBACK 或连接清理失败，均不能导致事务体重放。应用监听器即使抛出形似 SQLite 的错误码，也遵循这个边界。命令、文件写入、网络请求和提交后通知都放在重试边界之外。
+
+invocation 层现在分开执行操作和保存回执。保存失败返回 `INVOCATION_PERSISTENCE_FAILED`，携带原 operation ID，并把报告的 effect 标为 unknown。已经完成的文件修改不会被改记为新的 `not_started` 执行失败，也不会重跑命令。持久的 accepted/running 记录继续保留供核对。永久存储故障下丢失的任意结果，目前不会由内存重试队列自动重建。
+
+review 状态和 review 事件一起提交，之后才触发变更监听器。创建 work run 与建立 task/member 关联，现在使用同一连接、同一事务。等待锁之后，事务内重新检查 owner、member、任务是否 active、收尾状态和 invocation attempt。review 等锁期间切换当前任务会拒绝旧更新，避免改动新任务。并发请求共享正在创建的 run，并在写锁内重查已有关联。
+
+迟到的操作事件也在事件写事务内检查 attempt。回归实验让旧 finish 等锁，同时创建新 attempt；旧 finish 不能晚于新 start 追加，也不能让 task/session 的活动时间倒退。
+
+### 进程与后台任务生命周期
+
+运行时租约、命令和修改 claim 增加异步申请与释放入口。动作只执行一次，放在取锁重试之外。动作结束后若释放失败，`releaseAsync()` 返回 `EXECUTION_RELEASE_PENDING`，指向原操作供查询。释放错误不会覆盖动作原异常；进程收尾记录待清理状态后，继续交付已确认的终态结果。有界、单飞的清理循环只重试删除本 coordinator 明确已经结束的占用，活动 claim 不会被抢走。待释放 claim 在数据库删除提交前继续挡住冲突，但不能授权新的嵌套写入。
+
+待释放集合仅存在于当前进程；占用行直到 DELETE 提交才消失。进程重启后的遗留占用仍按现有 owner/operation 核对规则恢复。
+
+会话观察、保留期清理和 work-run 核对，每个循环最多一个维护任务在途。异常被观察并报告，后续周期可以恢复。关闭运行时时取消正在等锁的维护工作，等待其结束后关闭连接。
+
+异步改造暴露了命令启动竞争：同 operation ID 的两个并发调用都可能通过最初的 session 检查，并继承同一 claim。真实探针启动了两个进程、追加了两次文件。现在 `ProcessSessionManager` 在第一次 await 前占住 ID，准备失败时释放占位；已经完成的 session 继续拒绝重复启动。
+
+shutdown 等待所有所属 session 的 exit 和 close promise，包括已经设置 `running=false`、仍在释放 claim 或执行 finish 回调的 session。已结束 claim 离开 manager 的活动集合；coordinator 在内存保留待清理项，SQLite 中的占用行继续保留。真实延迟外键覆盖了 DELETE 成功、COMMIT 失败，然后移除约束再完成清理的路径。
+
+### 跨节点任务边界
+
+新转发工作在发送 RPC 和首次创建远端任务镜像前检查 Task 状态。任务关闭后，既有工作的观察和已保存回执重放仍可使用。
+
+文件复制另有 transfer 协议入口，需要独立检查。任务已关闭或正在收尾时，入口只允许只读查找原复制回执；owner、请求 key、session、task、member 和原复制参数都必须相符。没有旧回执就拒绝新复制。查询失败或旧节点不支持查询方法时，返回明确错误，不会退回启动复制。
+
+活动任务的复制在转发前记录参与的 task/member，因此仅执行复制的任务也能将目标节点纳入收尾。目标端在 `beforeOperation` 前预留 invocation 时，保留原 task 和 operation ID。目标任务已经关闭时可以在副作用前拒绝复制；这条被拒绝的 invocation 也必须成为终态，避免永久停在 accepted。
+
+旧节点测试使用旧式 RPC 分发分支，配合真实的当前传输实现。它没有覆盖两套历史发行二进制的完整混版本矩阵。尚未升级的旧入口节点仍保留旧行为。
+
+### 可复现实验与剩余范围
+
+回归使用真实 SQLite 文件、独立 Worker 写锁、SQL 触发器与延迟外键、真实 Node 子进程，以及经过 OAuth 的 MCP SDK/TCP。断言覆盖原身份、单次文件副作用、事件数、持锁期间可观察和资源正常清理。相关入口：
+
+- [写锁准入](../../src/db/async-write.test.ts)、[执行协调器](../../src/execution-coordinator.async.test.ts)、[进程生命周期](../../src/process-sessions-contention.test.ts)。
+- [回执争锁](../../src/session/receipt-contention.test.ts)、[run/review 原子性](../../src/session/run-review-atomicity.test.ts)、[运行时维护](../../src/session/runtime-contention.test.ts)。
+- [跨节点复制状态](../../src/federation/copy-task-state.test.ts)、[HTTP 写锁争用](../../test/tool-contract/sqlite-contention.test.ts)、[进程退出时的 HTTP 观察](../../test/tool-contract/sqlite-process-exit.test.ts)。
+
+HTTP fixture 在持写锁期间检查输出、诊断、Console 和 MCP ping，再检查原命令收敛、相同 key 不重复副作用。耗时均为单次受控实验，没有据此报告生产分位数或 ChatGPT 故障率下降比例。
+
+其它调用者仍保留同步 API，包括代理排队的 claim 转换和线程绑定。本轮没有将所有数据库工作搬入专用 worker，也没有改变上游审核、派发行为；每条宿主 `thinking failed` 的原因仍需对应证据。提交中的验收记录列明本轮实际覆盖的本地路径。
+
 ## 后续设计阶段
 
 ### 第一阶段：保留验收证据，增加混版本发布检查
@@ -446,10 +511,11 @@ Unknown 结果、缺失任务身份或不完整的旧错误回执，都不足以
 增加独立的混版本发布矩阵，覆盖所有共享状态的进程，以及协调节点/执行节点的两种升级方向。
 将现有故障 fixture 纳入发布检查，以原 operation ID 和单次外部效果为核心断言。
 
-### 第二阶段：把同步 SQLite 停顿移出请求处理
+### 第二阶段：继续隔离剩余同步数据库工作
 
-将易争锁的数据库工作放到有界的 worker thread 或独立进程接口之后，由该执行上下文拥有数据库连接。
-同时协调后台代理记账等所有写入者；只搬走一个调用点仍会留下其它同步阻塞路径。
+上面的后续修复已让覆盖到的请求、回执、claim 和维护路径在争锁时让出事件循环。
+继续测量剩余同步调用者、大查询、checkpoint 和序列化，再将其放到有界 worker thread 或独立进程接口之后，由该执行上下文拥有数据库连接。
+同时协调代理排队转换和剩余后台记账等写入者；只搬走一个调用点仍会留下其它同步阻塞路径。
 缩短事务，记录队列饱和，把准入等待计入请求期限。
 在操作身份提交前，内存队列接收不能被报告成持久接收。
 

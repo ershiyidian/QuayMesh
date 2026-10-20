@@ -20,8 +20,10 @@ export function admittedTools(target: McpRegistrationTarget, execution: Executio
     registerResource: target.registerResource.bind(target),
     registerTool: ((name: string, definition: Record<string, unknown>, handler: (...args: any[]) => unknown) => {
       return (target.registerTool as (...args: any[]) => unknown)(name, definition,
-        (input: Record<string, unknown>, extra: Record<string, unknown>) =>
-          execution.withWork({ kind: "tool", allowWhilePaused: observesAcceptedWork(name, input) },
+        (input: Record<string, unknown>, extra: Record<string, unknown>) => {
+          // 历史状态与输出仍由 handler 授权；观察不争抢持久执行占用的写锁。
+          if (isReadOnlyObservation(name, input)) return handler(input, extra);
+          return execution.withWork({ kind: "tool", allowWhilePaused: observesAcceptedWork(name, input) },
             () => Promise.resolve(handler(input, extra))).catch((error:unknown)=>{
               const conflict=error as {code?:unknown;details?:unknown};
               if(conflict?.code!=="EXECUTION_CONFLICT")throw error;
@@ -29,7 +31,8 @@ export function admittedTools(target: McpRegistrationTarget, execution: Executio
               // 拒绝执行使用标准工具错误，不能套入各工具互不相同的成功输出 schema。
               return {isError:true,content:[{type:"text",text:result}],
                 _meta:{quaymesh:{error:{code:conflict.code,details:conflict.details,started:false}}}};
-            }));
+            });
+        });
     }) as McpRegistrationTarget["registerTool"],
   };
 }

@@ -145,6 +145,30 @@ export class SessionFeed {
     void name;
   }
 
+  assertTaskAcceptsWork(envelope: TrustedInvocationEnvelope): void {
+    const task = envelope.task_id ? this.store.getTask(envelope.task_id) : null;
+    if (task && task.session_id !== envelope.session_id) throw Object.assign(new Error(`TASK_SESSION_MISMATCH: ${task.id}`),
+      { code: "TASK_SESSION_MISMATCH", effect: "not_started" });
+    if (envelope.session_id) this.store.requireSession(envelope.owner_id, envelope.session_id);
+    if (!task || task.state !== "active") throw Object.assign(new Error(`TASK_NOT_ACTIVE: ${envelope.task_id ?? "missing"}`),
+      { code: "TASK_NOT_ACTIVE", effect: "not_started" });
+    const finalization = this.store.taskData.finalization(task.id);
+    if (finalization && !finalization.error) throw Object.assign(new Error(`TASK_FINISHING: ${task.id}`),
+      { code: "TASK_FINISHING", effect: "not_started" });
+  }
+
+  async recordTaskWork(envelope: TrustedInvocationEnvelope): Promise<void> {
+    this.assertTaskAcceptsWork(envelope);
+    if (!envelope.task_id || !envelope.member_id) throw Object.assign(new Error("TASK_MEMBER_REQUIRED"),
+      { code: "TASK_MEMBER_REQUIRED", effect: "not_started" });
+    const taskId = envelope.task_id, memberId = envelope.member_id;
+    await this.store.writeAsync(() => {
+      // 等待写锁时任务可能已结束；先复核，再登记目标节点以参与任务收尾。
+      this.assertTaskAcceptsWork(envelope);
+      this.store.touchTaskMember(taskId, memberId);
+    });
+  }
+
   async afterRemoteResult(
     name: string,
     input: JsonRecord,
