@@ -518,6 +518,51 @@ The HTTP fixtures check output, diagnostics, Console, and MCP ping while the wri
 
 Legacy synchronous APIs remain for other callers, including queued-agent claim transitions and thread binding. This round does not move all database work into a dedicated worker, change upstream approval/dispatch behavior, or establish the cause of every host-side `thinking failed` message. The committed evidence identifies which local paths were exercised.
 
+## 2026-10-21: federated observations and final acceptance
+
+This section covers the three runs in `reliability-acceptance-20261020`. The earlier `run-01` through `run-04` belong to a separate acceptance batch and retain their own dates and commits.
+
+### Three remaining call paths repaired
+
+**Federated long polls.** The peer RPC's ten-second attempt limit collided with a normal `read_output(wait_ms=10000)` or `wait_agent(timeout_ms=10000)` wait. Both real TCP baseline tests failed on `7725782`. Commit `82a1d02` includes a three-second reply margin around the observation window while preserving the original total request deadline. Short deadlines still expire on time, and timed-out write requests are not replayed. See the [observation-budget regression](../test/federation/observation-budget.test.ts).
+
+**Federated read preparation.** Historical observations still acquired a write lease, synchronized titles, or created a new Task mirror at the forwarding boundary. Commit `82a1d02` separates observations from that mutation preparation. A new Cloud Task can inspect an old operation in the same Session without creating its own worker mirror; the response retains the original task and operation. Owner, Session, and Task checks remain active. Console relay, internal forwarding, and legacy entrypoints now use the same read-only admission. The [two-node writer-lock test](../test/tool-contract/federation-observation-contention.test.ts) and [Console regression](../test/console-v5/relay-contention.test.ts) also verify rejected unauthorized reads and paused mutations.
+
+**Agent observation bookkeeping.** Agent list/wait records the provider turn and revision needed by a subsequent control action. Commit `9eb4dcf` gives the whole batch a shared 150 ms async writer-admission budget and skips writes for unchanged observations. A failed save preserves the actual agent state and returns `control_observation.status=observe_again`; no background job silently refreshes control authority. A late revision cannot overwrite a newer one. Repairing a historical interrupt observation requires an authoritative terminal agent record. The [contention regression](../src/session/agent-observation-contention.test.ts) uses real SQLite, batches of 50 agents, and control-refusal assertions with a controlled provider fixture.
+
+### Retained failures and resolutions
+
+On clean `7725782`, `run-01` recorded **277 passed and five skipped**. Subsequently added long-poll and federated-lock baselines failed **2/2** and **1/1**, respectively, and led to the repairs above.
+
+On clean `ada366e`, `run-02` recorded **291 passed, one failed, and five skipped**. The sole failure was an exact agent-response assertion whose expected object omitted the added `control_observation` field. Commit `42cb9d7` adds that field and verifies the persisted provider turn and revision. It retains exact response matching. All seven tests in that file then passed.
+
+The early `4e07cd3` probe's process-terminal-state assertion failure is also retained. The [acceptance evidence](../test/reliability-system/evidence/windows-20261020-db-contention.json) includes failed runs, baseline results, official counts, and source-log digests.
+
+### Final Windows results on a clean commit
+
+The final `run-03` used clean **`42cb9d78870707f0ae6d22eb2703aab68a08484d`** with Node.js **24.21.0**, running from **2026-10-21 07:08:31 to 07:13:01 UTC**. Type checking and the full build both exited with code 0 before acceptance.
+
+| Group | Passed | Failed | Skipped | Duration |
+| --- | ---: | ---: | ---: | ---: |
+| `mcp-http` | 43 | 0 | 0 | 33.525 s |
+| `session-sqlite` | 166 | 0 | 0 | 116.125 s |
+| `recovery-federation` | 54 | 0 | 0 | 98.332 s |
+| `diagnostics` | 7 | 0 | 0 | 6.029 s |
+| `workspace-restore` | 22 | 0 | 5 | 15.888 s |
+
+The total is **292 passed, zero failed, and five Windows symlink tests skipped**. Every group exited normally, with no timeout, cancellation, or incomplete cleanup. The evidence file lists every skipped test.
+
+| Controlled scenario | Measurement from this run |
+| --- | --- |
+| Three-second independent writer; historical output, diagnostics, and Console | Three authenticated observations took **18.043–20.999 ms**; one command effect |
+| Child exits while the writer holds its lock | Observations took **21.791–30.144 ms**; one finish event and one command effect |
+| Federated historical observation during the worker's writer lock | **58.905 ms**; no observation invocation, worker commit, or new Task mirror |
+| Three Console entrypoints during the writer lock | **10.136 ms**; zero commits and all three paused mutations rejected |
+| Ten-second quiet output wait / agent-wait RPC | **10029.028 / 10006.525 ms**; one remote request each |
+| Bookkeeping for 50 observed agents during a writer lock | List / wait took **220.034 / 279.653 ms**; zero saves while locked and explicit re-observation status; an unchanged batch performed zero writes |
+
+These are measurements from the controlled run. Evidence records the tested commit, platform, group inputs, official counts, and source-log digests. This delivery contains source changes, regressions, and reports; it did not upgrade or restart production nodes. Production rollout and post-rollout node acceptance remain separate work.
+
 ## Next design stages
 
 ### Stage 1: preserve acceptance and add mixed-version release gates

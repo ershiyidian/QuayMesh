@@ -1,0 +1,1390 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-10-21T07:13:11.976Z",
+  "source_baseline": "eb0adca0047f1c6ec31de79379fd0683d4c9cac9",
+  "accepted_code_commit": "42cb9d78870707f0ae6d22eb2703aab68a08484d",
+  "production_deployment_performed": false,
+  "scope": "Five affected Windows groups using Node.js 24.21.0, real SQLite contention, child processes and OAuth MCP/TCP fixtures. Provider lifecycle tests use a controlled provider fixture.",
+  "runs": [
+    {
+      "id": "run-01",
+      "commit": "77257827893fff498c6d55f1fea6bee605a8f722",
+      "dirty": false,
+      "runtime": {
+        "version": "v24.21.0",
+        "platform": "win32",
+        "arch": "x64"
+      },
+      "started_at": "2026-10-20T07:49:06.940Z",
+      "finished_at": "2026-10-20T07:54:33.076Z",
+      "status": "passed",
+      "group_timeout_ms": 300000,
+      "source_summary_sha256": "9a944ca04486a4c5835633b69ae093f02a4f52902bf958b376208a7f77aa74b2",
+      "validation_summary_sha256": "d39cef86dc5665adea3c34090001759f4e2146c5ba1afb00c89e9833faf74fcf",
+      "validation": [
+        {
+          "name": "typecheck",
+          "exit_code": 0,
+          "duration_ms": 19367.0694,
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "name": "build",
+          "exit_code": 0,
+          "duration_ms": 14401.4856,
+          "log_sha256": "587947be31a69ea0dbe64bab77d8b336f956583a8aa83f7a08f329eb6aa2adf7"
+        },
+        {
+          "name": "acceptance",
+          "exit_code": 0,
+          "duration_ms": 326418.3733,
+          "log_sha256": "8677632eb02800909684c51828ab7738bfe66b2b220e7488d896595d7cf87a96"
+        }
+      ],
+      "counts": {
+        "tests": 282,
+        "passed": 277,
+        "failed": 0,
+        "cancelled": 0,
+        "skipped": 5,
+        "todo": 0
+      },
+      "groups": [
+        {
+          "name": "mcp-http",
+          "status": "passed",
+          "files": [
+            "src/mcp-modern-server.test.ts",
+            "src/mcp-sse-response.test.ts",
+            "src/mcp-request-diagnostics.test.ts",
+            "src/mcp-sdk-error-contract.test.ts",
+            "src/reliability-core.test.ts",
+            "test/tool-contract/admission-retry.test.ts",
+            "test/tool-contract/sqlite-contention.test.ts",
+            "test/tool-contract/sqlite-process-exit.test.ts",
+            "test/tool-contract/request-body.test.ts",
+            "test/tool-contract/error-receipt.test.ts",
+            "test/reliability-liveness.test.ts",
+            "test/receipt-wire-contract.test.ts"
+          ],
+          "duration_ms": 53082.546,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 43,
+            "failed": 0,
+            "passed": 43,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 43,
+            "suites": 0
+          },
+          "log_sha256": "da08d2890aa9f3c636cc80239abc628eda1788afb532f78796cbbf2af7afe235",
+          "events_sha256": "e51161358b5d93189b94b0e39628f964bd55341e0d9690a139abc75f459118d2",
+          "failures": [],
+          "skipped": [],
+          "measurements": [
+            {
+              "viaProxy": false,
+              "firstByteMs": 70.24670000000003,
+              "fastestCallMs": 57.263000000000034,
+              "slowestCallMs": 62.381500000000074
+            },
+            {
+              "viaProxy": true,
+              "firstByteMs": 7.003500000000031,
+              "fastestCallMs": 37.95069999999998,
+              "slowestCallMs": 38.33069999999998
+            },
+            {
+              "pausedAfterChunks": 9,
+              "totalChunks": 128,
+              "cancellations": 1
+            },
+            {
+              "writer_lock_ms": 3000,
+              "authenticated_observation_ms": [
+                57.60660000000007,
+                52.04690000000028,
+                43.544700000000375
+              ],
+              "ticks": 122,
+              "max_gap_ms": 55.63459999999941,
+              "command_effects": 1,
+              "original_operation_id": "op_439e82c84df89093e73e9759021ad530"
+            },
+            {
+              "writer_lock_ms": 3000,
+              "child_exited_while_locked": true,
+              "observation_ms": [
+                73.96129999999994,
+                63.24510000000009,
+                101.22779999999966
+              ],
+              "ticks": 99,
+              "max_gap_ms": 70.10359999999946,
+              "finish_events": 1,
+              "command_effects": 1,
+              "original_operation_id": "op_e028f235f7bc7840970fd92a93f5e7f4"
+            }
+          ]
+        },
+        {
+          "name": "session-sqlite",
+          "status": "passed",
+          "files": [
+            "src/session/admission-retry.test.ts",
+            "src/session/agent-operations-lock.test.ts",
+            "src/session/agent-operations.test.ts",
+            "src/session/agent-results.test.ts",
+            "src/session/binding.test.ts",
+            "src/session/changes.test.ts",
+            "src/session/command-history.test.ts",
+            "src/session/context-reads.test.ts",
+            "src/session/federated-task-state.test.ts",
+            "src/session/invocations.test.ts",
+            "src/session/output.test.ts",
+            "src/session/prompts.test.ts",
+            "src/session/receipt-contention.test.ts",
+            "src/session/recovery.test.ts",
+            "src/session/revert.test.ts",
+            "src/session/run-review-atomicity.test.ts",
+            "src/session/runtime-contention.test.ts",
+            "src/session/session-store.test.ts",
+            "src/db/migrations.test.ts",
+            "src/db/async-write.test.ts",
+            "src/execution-coordinator.test.ts",
+            "src/execution-coordinator.async.test.ts",
+            "src/execution-admission.test.ts",
+            "src/execution-resources.test.ts",
+            "src/process-sessions-contention.test.ts",
+            "src/reliability-followup.test.ts",
+            "src/server-diagnostics.test.ts",
+            "test/reliability-background.test.ts"
+          ],
+          "duration_ms": 131520.596,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 156,
+            "failed": 0,
+            "passed": 156,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 156,
+            "suites": 0
+          },
+          "log_sha256": "7f7fa6fcaf681624502e1dc6a65f40828bca87ad34bcba0bd8c321a800a8ed32",
+          "events_sha256": "1c0c187d9b67727e255376ad8a0fa5e4fae888b9427193fba6ac131d051ef3b2",
+          "failures": [],
+          "skipped": [],
+          "measurements": [
+            {
+              "heldMs": 5000,
+              "elapsedMs": 5040.0669,
+              "ticks": 164,
+              "maxGapMs": 32.93119999999999,
+              "calls": 1
+            },
+            {
+              "operation_id": "op_491f025086a535da933e047efea39a5e",
+              "results": [
+                {
+                  "replay": false,
+                  "result": {
+                    "operation_id": "op_491f025086a535da933e047efea39a5e",
+                    "pid": 36680
+                  },
+                  "invocation_id": "bdc86f90-90db-44dc-b50b-529f38da0f35",
+                  "operation_id": "op_491f025086a535da933e047efea39a5e",
+                  "state": "succeeded",
+                  "effect": "completed",
+                  "result_ref": null
+                },
+                {
+                  "replay": true,
+                  "result": {
+                    "operation_id": "op_491f025086a535da933e047efea39a5e",
+                    "pid": 36680
+                  },
+                  "invocation_id": "bdc86f90-90db-44dc-b50b-529f38da0f35",
+                  "operation_id": "op_491f025086a535da933e047efea39a5e",
+                  "state": "succeeded",
+                  "effect": "completed",
+                  "result_ref": null
+                }
+              ]
+            },
+            {
+              "ticks": 44,
+              "max_gap_ms": 18.807399999999916,
+              "external_writes": 1
+            },
+            {
+              "held_ms": 5000,
+              "ticks": 162,
+              "max_gap_ms": 49.58729999999923,
+              "receipt_transitions": 1
+            },
+            {
+              "close_ms": 1.3163999999997031,
+              "cancelled_maintenance_commits": 0
+            },
+            {
+              "observed_sql_errors": 1,
+              "unhandled_rejections": 0,
+              "recovered": true
+            }
+          ]
+        },
+        {
+          "name": "recovery-federation",
+          "status": "passed",
+          "files": [
+            "test/federation/core.test.ts",
+            "test/federation/runtime.test.ts",
+            "test/federation/transport-edge.test.ts",
+            "src/federation/copy-task-state.test.ts",
+            "test/tool-contract/federation.test.ts",
+            "test/tool-contract/receipts.test.ts",
+            "test/tool-contract/output.test.ts",
+            "test/tool-contract/parallel.test.ts",
+            "test/reliability-system/invocation-outcome.test.ts",
+            "test/reliability-system/card-command-projection.test.ts",
+            "test/reliability-system/task-lifecycle.test.ts",
+            "test/reliability-system/process-output-lifecycle.test.ts"
+          ],
+          "duration_ms": 102754.294,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 49,
+            "failed": 0,
+            "passed": 49,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 49,
+            "suites": 0
+          },
+          "log_sha256": "031da82c7aa8cd1e253649a548ebe68a25419d0db91ace313f00dc84e92fe4dd",
+          "events_sha256": "d5e5b731fb8e326cb018b9ac63ed9244513667264776f19d7c8037ecb3fc15a7",
+          "failures": [],
+          "skipped": [],
+          "measurements": []
+        },
+        {
+          "name": "diagnostics",
+          "status": "passed",
+          "files": [
+            "src/read-diagnostics.test.ts",
+            "test/read-diagnostics.test.ts"
+          ],
+          "duration_ms": 10941.807,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 7,
+            "failed": 0,
+            "passed": 7,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 7,
+            "suites": 0
+          },
+          "log_sha256": "600e893d65b695145f674fbd9e597ee5b3f96f2dfe1c6b5cf833953392f91fee",
+          "events_sha256": "f934fdb0de752f6bf6a7bb70604e077e99ed5c9a72730f6bc08a778c4e109e76",
+          "failures": [],
+          "skipped": [],
+          "measurements": []
+        },
+        {
+          "name": "workspace-restore",
+          "status": "passed",
+          "files": [
+            "src/workspaces.test.ts",
+            "src/git-worktrees.test.ts",
+            "test/tool-contract/workspace-restore.test.ts"
+          ],
+          "duration_ms": 27798.768,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 27,
+            "failed": 0,
+            "passed": 22,
+            "cancelled": 0,
+            "skipped": 5,
+            "todo": 0,
+            "topLevel": 27,
+            "suites": 0
+          },
+          "log_sha256": "e818fc25304b06426e460085aea065d11b0151f3d525b83d1e57a3923200d28b",
+          "events_sha256": "43821713b9ea5872d086aa5a3545d7e4c865734208a45b81107309f4c65a81f9",
+          "failures": [],
+          "skipped": [
+            {
+              "name": "cleanup rejects a managed worktree path replaced by a symlink",
+              "file": "src/git-worktrees.test.ts"
+            },
+            {
+              "name": "global instruction symlinks may target user-managed files outside agentDir",
+              "file": "src/workspaces.test.ts"
+            },
+            {
+              "name": "workspace instruction symlinks cannot escape the workspace",
+              "file": "src/workspaces.test.ts"
+            },
+            {
+              "name": "an opened workspace does not follow a retargeted root symlink",
+              "file": "src/workspaces.test.ts"
+            },
+            {
+              "name": "a symlinked allowed root preserves checkout and worktree path behavior",
+              "file": "src/workspaces.test.ts"
+            }
+          ],
+          "measurements": []
+        }
+      ]
+    },
+    {
+      "id": "run-02",
+      "commit": "ada366e44998f5380082556475185e9f2921f6a9",
+      "dirty": false,
+      "runtime": {
+        "version": "v24.21.0",
+        "platform": "win32",
+        "arch": "x64"
+      },
+      "started_at": "2026-10-20T08:48:11.697Z",
+      "finished_at": "2026-10-20T08:55:03.246Z",
+      "status": "failed",
+      "group_timeout_ms": 300000,
+      "source_summary_sha256": "aeb45a6352d5f4af4ce45efebc3f84144b2ce6103c0130228652a87795be0846",
+      "validation_summary_sha256": "230b127852d266d1eda479e3c18a4ae028fab14beacb2816fc64e87dae74c76c",
+      "validation": [
+        {
+          "name": "typecheck",
+          "exit_code": 0,
+          "duration_ms": 16259.9898,
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "name": "build",
+          "exit_code": 0,
+          "duration_ms": 13159.6466,
+          "log_sha256": "6aea1d7fed199260bb2cb824a9744cfaef5001eca73cbf63cc85cc3bca573e19"
+        },
+        {
+          "name": "acceptance",
+          "exit_code": 1,
+          "duration_ms": 411890.4511,
+          "log_sha256": "ca6845be72c26f1efc8c82b19f7c9260140af16abc8bd0eccef83af470b96b10"
+        }
+      ],
+      "counts": {
+        "tests": 297,
+        "passed": 291,
+        "failed": 1,
+        "cancelled": 0,
+        "skipped": 5,
+        "todo": 0
+      },
+      "groups": [
+        {
+          "name": "mcp-http",
+          "status": "passed",
+          "files": [
+            "src/mcp-modern-server.test.ts",
+            "src/mcp-sse-response.test.ts",
+            "src/mcp-request-diagnostics.test.ts",
+            "src/mcp-sdk-error-contract.test.ts",
+            "src/reliability-core.test.ts",
+            "test/tool-contract/admission-retry.test.ts",
+            "test/tool-contract/sqlite-contention.test.ts",
+            "test/tool-contract/sqlite-process-exit.test.ts",
+            "test/tool-contract/request-body.test.ts",
+            "test/tool-contract/error-receipt.test.ts",
+            "test/reliability-liveness.test.ts",
+            "test/receipt-wire-contract.test.ts"
+          ],
+          "duration_ms": 55852.421,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 43,
+            "failed": 0,
+            "passed": 43,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 43,
+            "suites": 0
+          },
+          "log_sha256": "e8d9d03cf09b5aa7ab69e44590a06679c51880c9e3f658f65aecf824e52f15c4",
+          "events_sha256": "241d6e6c361af6eaceb66788c80ecd33a1bbd47ce65803f753ae6a2da7319e84",
+          "failures": [],
+          "skipped": [],
+          "measurements": [
+            {
+              "viaProxy": false,
+              "firstByteMs": 65.74800000000005,
+              "fastestCallMs": 57.89760000000001,
+              "slowestCallMs": 59.18910000000005
+            },
+            {
+              "viaProxy": true,
+              "firstByteMs": 6.4144000000000005,
+              "fastestCallMs": 49.3128999999999,
+              "slowestCallMs": 49.5227000000001
+            },
+            {
+              "pausedAfterChunks": 9,
+              "totalChunks": 128,
+              "cancellations": 1
+            },
+            {
+              "writer_lock_ms": 3000,
+              "authenticated_observation_ms": [
+                44.862599999999475,
+                40.72949999999946,
+                54.64890000000014
+              ],
+              "ticks": 123,
+              "max_gap_ms": 48.345900000000256,
+              "command_effects": 1,
+              "original_operation_id": "op_6179a6fbe6da16583e26b62b6fb47d03"
+            },
+            {
+              "writer_lock_ms": 3000,
+              "child_exited_while_locked": true,
+              "observation_ms": [
+                61.42150000000038,
+                63.63040000000001,
+                80.60019999999986
+              ],
+              "ticks": 103,
+              "max_gap_ms": 52.245200000000295,
+              "finish_events": 1,
+              "command_effects": 1,
+              "original_operation_id": "op_0d3a55dd654e98c490c115d91b93b8f2"
+            }
+          ]
+        },
+        {
+          "name": "session-sqlite",
+          "status": "failed",
+          "files": [
+            "src/session/admission-retry.test.ts",
+            "src/session/agent-observation-contention.test.ts",
+            "src/session/agent-operations-lock.test.ts",
+            "src/session/agent-operations.test.ts",
+            "src/session/agent-results.test.ts",
+            "src/session/binding.test.ts",
+            "src/session/changes.test.ts",
+            "src/session/command-history.test.ts",
+            "src/session/context-reads.test.ts",
+            "src/session/federated-task-state.test.ts",
+            "src/session/invocations.test.ts",
+            "src/session/output.test.ts",
+            "src/session/prompts.test.ts",
+            "src/session/receipt-contention.test.ts",
+            "src/session/recovery.test.ts",
+            "src/session/revert.test.ts",
+            "src/session/run-review-atomicity.test.ts",
+            "src/session/runtime-contention.test.ts",
+            "src/session/session-store.test.ts",
+            "src/db/migrations.test.ts",
+            "src/db/async-write.test.ts",
+            "src/execution-coordinator.test.ts",
+            "src/execution-coordinator.async.test.ts",
+            "src/execution-admission.test.ts",
+            "src/execution-resources.test.ts",
+            "src/process-sessions-contention.test.ts",
+            "src/tool-surfaces/subagents.test.ts",
+            "src/reliability-followup.test.ts",
+            "src/server-diagnostics.test.ts",
+            "test/reliability-background.test.ts"
+          ],
+          "duration_ms": 161647.779,
+          "exit_code": 1,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 166,
+            "failed": 1,
+            "passed": 165,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 166,
+            "suites": 0
+          },
+          "log_sha256": "3acc976cd206d57889aff08396025941615bcd3f106653e0c5aad86748058fb3",
+          "events_sha256": "3ba58abe65f3356d6b6f69b41747cd28bc909b69caf2102736ea4ca377d14afe",
+          "failures": [
+            {
+              "name": "spawn and followup persist per-agent task names, return wait guidance, and close operations",
+              "file": "src/tool-surfaces/subagents.test.ts",
+              "message": "Expected values to be strictly deep-equal:\n+ actual - expected\n\n  [\n    {\n      agent_id: 'agt_cfaddf6d',\n+     control_observation: {\n+       control_revision: 1,\n+       provider_turn_id: 'turn-agt_cfaddf6d-1',\n+       status: 'saved'\n+     },\n      effort: 'medium',\n      model: 'gpt-test',\n      name: '审查登录流程',\n      provider: 'codex',\n      result_available: false,\n",
+              "code": "ERR_TEST_FAILURE"
+            }
+          ],
+          "skipped": [],
+          "measurements": [
+            {
+              "heldMs": 5000,
+              "elapsedMs": 5098.480500000001,
+              "ticks": 164,
+              "maxGapMs": 34.08879999999999,
+              "calls": 1
+            },
+            {
+              "operation_id": "op_491f025086a535da933e047efea39a5e",
+              "results": [
+                {
+                  "replay": false,
+                  "result": {
+                    "operation_id": "op_491f025086a535da933e047efea39a5e",
+                    "pid": 33668
+                  },
+                  "invocation_id": "940a1f72-b3ac-49e7-9714-fe654656d5bc",
+                  "operation_id": "op_491f025086a535da933e047efea39a5e",
+                  "state": "succeeded",
+                  "effect": "completed",
+                  "result_ref": null
+                },
+                {
+                  "replay": true,
+                  "result": {
+                    "operation_id": "op_491f025086a535da933e047efea39a5e",
+                    "pid": 33668
+                  },
+                  "invocation_id": "940a1f72-b3ac-49e7-9714-fe654656d5bc",
+                  "operation_id": "op_491f025086a535da933e047efea39a5e",
+                  "state": "succeeded",
+                  "effect": "completed",
+                  "result_ref": null
+                }
+              ]
+            },
+            {
+              "tool": "list_agents",
+              "observation_elapsed_ms": 307.8471000000004,
+              "writer_released_at_return": false,
+              "saved_observations": 0,
+              "observe_again": 50
+            },
+            {
+              "tool": "wait_agent",
+              "observation_elapsed_ms": 452.19979999999987,
+              "writer_released_at_return": false,
+              "saved_observations": 0,
+              "observe_again": 50
+            },
+            {
+              "scope": "SDK in-memory transport + real SQLite Worker",
+              "batch_size": 50,
+              "shared_write_budget_ms": 150,
+              "default_busy_timeout_ms": 5000,
+              "elapsed_ms": {
+                "list_agents": 307.8471000000004,
+                "wait_agent": 452.19979999999987
+              },
+              "eventloop_max_gap_ms": 293.90899999999965,
+              "timer_reads": 22,
+              "saved_while_locked": 0,
+              "workspace_cached_and_cold_unchanged": true,
+              "unchanged_elapsed_ms": 1.1180999999996857,
+              "unchanged_connection_writes": 0,
+              "control_refusals": 2,
+              "external_actions": 0
+            },
+            {
+              "late_revision_rejected": true,
+              "revision_after_race": 10,
+              "legacy_terminal_statuses_repaired": [
+                "idle",
+                "error",
+                "stopped"
+              ],
+              "active_statuses_refused": [
+                "starting",
+                "queued",
+                "running"
+              ],
+              "newer_authority_refused": true,
+              "missing_authority_refused": true,
+              "old_turn_restored": false
+            },
+            {
+              "auxiliary_sql_failure": "SQLITE_CONSTRAINT_TRIGGER",
+              "successful_action_preserved": true,
+              "control_refusals": 2,
+              "external_actions": 2,
+              "automatic_replays": 0,
+              "interrupt_target_turn": "turn-0",
+              "current_turn": null,
+              "refreshed_observation": "saved"
+            },
+            {
+              "ticks": 43,
+              "max_gap_ms": 22.990999999999985,
+              "external_writes": 1
+            },
+            {
+              "held_ms": 5000,
+              "ticks": 163,
+              "max_gap_ms": 36.2476000000006,
+              "receipt_transitions": 1
+            },
+            {
+              "close_ms": 1.4431000000004133,
+              "cancelled_maintenance_commits": 0
+            },
+            {
+              "observed_sql_errors": 1,
+              "unhandled_rejections": 0,
+              "recovered": true
+            }
+          ]
+        },
+        {
+          "name": "recovery-federation",
+          "status": "passed",
+          "files": [
+            "test/federation/core.test.ts",
+            "test/federation/runtime.test.ts",
+            "test/federation/transport-edge.test.ts",
+            "test/federation/observation-budget.test.ts",
+            "test/tool-contract/federation-observation-contention.test.ts",
+            "test/console-v5/relay.test.ts",
+            "test/console-v5/relay-contention.test.ts",
+            "src/federation/copy-task-state.test.ts",
+            "test/tool-contract/federation.test.ts",
+            "test/tool-contract/receipts.test.ts",
+            "test/tool-contract/output.test.ts",
+            "test/tool-contract/parallel.test.ts",
+            "test/reliability-system/invocation-outcome.test.ts",
+            "test/reliability-system/card-command-projection.test.ts",
+            "test/reliability-system/task-lifecycle.test.ts",
+            "test/reliability-system/process-output-lifecycle.test.ts"
+          ],
+          "duration_ms": 154732.594,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 54,
+            "failed": 0,
+            "passed": 54,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 54,
+            "suites": 0
+          },
+          "log_sha256": "227d39b447b16a9bf0e81ad5e088ae5ef8b44fb183297fef647f85339d9e84a7",
+          "events_sha256": "df2d2f6b38f23e2d1a6b9fd77499b5c7c60db5ef6e099ef1a545a8943ab70c75",
+          "failures": [],
+          "skipped": [],
+          "measurements": [
+            {
+              "writer_lock_ms": 3000,
+              "console_observation_ms": 24.754799999999705,
+              "entrypoints": [
+                "relay",
+                "internal_forward",
+                "legacy_console"
+              ],
+              "authenticated_sessions": 1,
+              "commits_while_locked": 0,
+              "paused_mutations_rejected": 3
+            },
+            {
+              "observationMs": 10030.116399999999,
+              "remoteAttempts": 1
+            },
+            {
+              "agentWaitRpcMs": 10009.0978,
+              "remoteAttempts": 1
+            },
+            {
+              "writer_lock_ms": 3000,
+              "observation_ms": 110.10099999999875,
+              "original_operation_id": "op_24a314cbad7d150523b80288e8026759",
+              "original_task_id": "task_7af3c379a1d84ca3ba9a8a1d662baca5",
+              "unmirrored_task_id": "task_68e59e62f46145a6a84e9ecaed4ef3bf",
+              "observation_invocations": 0,
+              "worker_commits_while_locked": 0,
+              "command_effects": 1
+            }
+          ]
+        },
+        {
+          "name": "diagnostics",
+          "status": "passed",
+          "files": [
+            "src/read-diagnostics.test.ts",
+            "test/read-diagnostics.test.ts"
+          ],
+          "duration_ms": 10346.276,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 7,
+            "failed": 0,
+            "passed": 7,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 7,
+            "suites": 0
+          },
+          "log_sha256": "fb1abadcfa419ade896dff781214e2684473fe5dba2a82035cac0454bab29002",
+          "events_sha256": "3ff963c15df8f9a55fa2feb8250afd9efacbf38689cb059761586f8db9e9f493",
+          "failures": [],
+          "skipped": [],
+          "measurements": []
+        },
+        {
+          "name": "workspace-restore",
+          "status": "passed",
+          "files": [
+            "src/workspaces.test.ts",
+            "src/git-worktrees.test.ts",
+            "test/tool-contract/workspace-restore.test.ts"
+          ],
+          "duration_ms": 28920.327,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 27,
+            "failed": 0,
+            "passed": 22,
+            "cancelled": 0,
+            "skipped": 5,
+            "todo": 0,
+            "topLevel": 27,
+            "suites": 0
+          },
+          "log_sha256": "0e52a1679561c722efe48ad062af599655254b90a9a828551adb918fe99dd6b2",
+          "events_sha256": "de9be76008902c93fafcbe3aa865c12a11ddb15a3d9038f243c8408738403198",
+          "failures": [],
+          "skipped": [
+            {
+              "name": "cleanup rejects a managed worktree path replaced by a symlink",
+              "file": "src/git-worktrees.test.ts"
+            },
+            {
+              "name": "global instruction symlinks may target user-managed files outside agentDir",
+              "file": "src/workspaces.test.ts"
+            },
+            {
+              "name": "workspace instruction symlinks cannot escape the workspace",
+              "file": "src/workspaces.test.ts"
+            },
+            {
+              "name": "an opened workspace does not follow a retargeted root symlink",
+              "file": "src/workspaces.test.ts"
+            },
+            {
+              "name": "a symlinked allowed root preserves checkout and worktree path behavior",
+              "file": "src/workspaces.test.ts"
+            }
+          ],
+          "measurements": []
+        }
+      ]
+    },
+    {
+      "id": "run-03",
+      "commit": "42cb9d78870707f0ae6d22eb2703aab68a08484d",
+      "dirty": false,
+      "runtime": {
+        "version": "v24.21.0",
+        "platform": "win32",
+        "arch": "x64"
+      },
+      "started_at": "2026-10-21T07:08:31.793Z",
+      "finished_at": "2026-10-21T07:13:01.716Z",
+      "status": "passed",
+      "group_timeout_ms": 300000,
+      "source_summary_sha256": "085020616a4b654553afcea223543aef552c9b312d717c5bf9ec78bfba5b46e8",
+      "validation_summary_sha256": "73f3593a4634623e96d2db748d6fa59014a922fd7d9d13a173e1f44617994d7b",
+      "validation": [
+        {
+          "name": "typecheck",
+          "exit_code": 0,
+          "duration_ms": 13131.133600000001,
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "name": "build",
+          "exit_code": 0,
+          "duration_ms": 8147.3899,
+          "log_sha256": "73d9509b677085dddb6e54eb9115135bc01acd1c8a4e5c28be7955f7a7a81f86"
+        },
+        {
+          "name": "acceptance",
+          "exit_code": 0,
+          "duration_ms": 270114.9438,
+          "log_sha256": "b11d17f0ba65658f1a4a353552b66eb49c870f67826810c142931c28b22b982d"
+        }
+      ],
+      "counts": {
+        "tests": 297,
+        "passed": 292,
+        "failed": 0,
+        "cancelled": 0,
+        "skipped": 5,
+        "todo": 0
+      },
+      "groups": [
+        {
+          "name": "mcp-http",
+          "status": "passed",
+          "files": [
+            "src/mcp-modern-server.test.ts",
+            "src/mcp-sse-response.test.ts",
+            "src/mcp-request-diagnostics.test.ts",
+            "src/mcp-sdk-error-contract.test.ts",
+            "src/reliability-core.test.ts",
+            "test/tool-contract/admission-retry.test.ts",
+            "test/tool-contract/sqlite-contention.test.ts",
+            "test/tool-contract/sqlite-process-exit.test.ts",
+            "test/tool-contract/request-body.test.ts",
+            "test/tool-contract/error-receipt.test.ts",
+            "test/reliability-liveness.test.ts",
+            "test/receipt-wire-contract.test.ts"
+          ],
+          "duration_ms": 33524.742,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 43,
+            "failed": 0,
+            "passed": 43,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 43,
+            "suites": 0
+          },
+          "log_sha256": "afbb0ad2ed2170ad5815a5a938d61b75e4e3ab8db180613fa3f0dcd88d5e4d99",
+          "events_sha256": "ce995bec08b1a2836ad7d2ec86d86e652890f4cd9745bff54daefb94aecd5eb5",
+          "failures": [],
+          "skipped": [],
+          "measurements": [
+            {
+              "viaProxy": false,
+              "firstByteMs": 43.82310000000001,
+              "fastestCallMs": 30.455100000000016,
+              "slowestCallMs": 32.50510000000003
+            },
+            {
+              "viaProxy": true,
+              "firstByteMs": 4.179500000000019,
+              "fastestCallMs": 23.896599999999978,
+              "slowestCallMs": 24.0788
+            },
+            {
+              "pausedAfterChunks": 8,
+              "totalChunks": 128,
+              "cancellations": 1
+            },
+            {
+              "writer_lock_ms": 3000,
+              "authenticated_observation_ms": [
+                20.99929999999995,
+                18.043300000000272,
+                20.14930000000004
+              ],
+              "ticks": 120,
+              "max_gap_ms": 34.0565000000006,
+              "command_effects": 1,
+              "original_operation_id": "op_d37d68e91d5a46c4c5646dcf4c98f097"
+            },
+            {
+              "writer_lock_ms": 3000,
+              "child_exited_while_locked": true,
+              "observation_ms": [
+                29.014500000000226,
+                21.790800000000218,
+                30.14359999999988
+              ],
+              "ticks": 102,
+              "max_gap_ms": 33.02459999999974,
+              "finish_events": 1,
+              "command_effects": 1,
+              "original_operation_id": "op_b552cd54c227665491d2a9f22b5e6013"
+            }
+          ]
+        },
+        {
+          "name": "session-sqlite",
+          "status": "passed",
+          "files": [
+            "src/session/admission-retry.test.ts",
+            "src/session/agent-observation-contention.test.ts",
+            "src/session/agent-operations-lock.test.ts",
+            "src/session/agent-operations.test.ts",
+            "src/session/agent-results.test.ts",
+            "src/session/binding.test.ts",
+            "src/session/changes.test.ts",
+            "src/session/command-history.test.ts",
+            "src/session/context-reads.test.ts",
+            "src/session/federated-task-state.test.ts",
+            "src/session/invocations.test.ts",
+            "src/session/output.test.ts",
+            "src/session/prompts.test.ts",
+            "src/session/receipt-contention.test.ts",
+            "src/session/recovery.test.ts",
+            "src/session/revert.test.ts",
+            "src/session/run-review-atomicity.test.ts",
+            "src/session/runtime-contention.test.ts",
+            "src/session/session-store.test.ts",
+            "src/db/migrations.test.ts",
+            "src/db/async-write.test.ts",
+            "src/execution-coordinator.test.ts",
+            "src/execution-coordinator.async.test.ts",
+            "src/execution-admission.test.ts",
+            "src/execution-resources.test.ts",
+            "src/process-sessions-contention.test.ts",
+            "src/tool-surfaces/subagents.test.ts",
+            "src/reliability-followup.test.ts",
+            "src/server-diagnostics.test.ts",
+            "test/reliability-background.test.ts"
+          ],
+          "duration_ms": 116125.336,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 166,
+            "failed": 0,
+            "passed": 166,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 166,
+            "suites": 0
+          },
+          "log_sha256": "b96e1c6f00014ae8a314fb2ed89fc6c1928eec7e0400cd923969b0feb62fd184",
+          "events_sha256": "8f57f00f8eba337d29e490c2f863a7141de384025c1ba1f9f28e588ab5b41d3e",
+          "failures": [],
+          "skipped": [],
+          "measurements": [
+            {
+              "heldMs": 5000,
+              "elapsedMs": 5065.5824999999995,
+              "ticks": 164,
+              "maxGapMs": 32.06490000000008,
+              "calls": 1
+            },
+            {
+              "operation_id": "op_491f025086a535da933e047efea39a5e",
+              "results": [
+                {
+                  "replay": true,
+                  "result": {
+                    "operation_id": "op_491f025086a535da933e047efea39a5e",
+                    "pid": 45800
+                  },
+                  "invocation_id": "16db97fb-0294-4f9a-b061-8a0b682e3d85",
+                  "operation_id": "op_491f025086a535da933e047efea39a5e",
+                  "state": "succeeded",
+                  "effect": "completed",
+                  "result_ref": null
+                },
+                {
+                  "replay": false,
+                  "result": {
+                    "operation_id": "op_491f025086a535da933e047efea39a5e",
+                    "pid": 45800
+                  },
+                  "invocation_id": "16db97fb-0294-4f9a-b061-8a0b682e3d85",
+                  "operation_id": "op_491f025086a535da933e047efea39a5e",
+                  "state": "succeeded",
+                  "effect": "completed",
+                  "result_ref": null
+                }
+              ]
+            },
+            {
+              "tool": "list_agents",
+              "observation_elapsed_ms": 220.03430000000003,
+              "writer_released_at_return": false,
+              "saved_observations": 0,
+              "observe_again": 50
+            },
+            {
+              "tool": "wait_agent",
+              "observation_elapsed_ms": 279.6526000000001,
+              "writer_released_at_return": false,
+              "saved_observations": 0,
+              "observe_again": 50
+            },
+            {
+              "scope": "SDK in-memory transport + real SQLite Worker",
+              "batch_size": 50,
+              "shared_write_budget_ms": 150,
+              "default_busy_timeout_ms": 5000,
+              "elapsed_ms": {
+                "list_agents": 220.03430000000003,
+                "wait_agent": 279.6526000000001
+              },
+              "eventloop_max_gap_ms": 130.74730000000022,
+              "timer_reads": 21,
+              "saved_while_locked": 0,
+              "workspace_cached_and_cold_unchanged": true,
+              "unchanged_elapsed_ms": 0.7042000000001281,
+              "unchanged_connection_writes": 0,
+              "control_refusals": 2,
+              "external_actions": 0
+            },
+            {
+              "late_revision_rejected": true,
+              "revision_after_race": 10,
+              "legacy_terminal_statuses_repaired": [
+                "idle",
+                "error",
+                "stopped"
+              ],
+              "active_statuses_refused": [
+                "starting",
+                "queued",
+                "running"
+              ],
+              "newer_authority_refused": true,
+              "missing_authority_refused": true,
+              "old_turn_restored": false
+            },
+            {
+              "auxiliary_sql_failure": "SQLITE_CONSTRAINT_TRIGGER",
+              "successful_action_preserved": true,
+              "control_refusals": 2,
+              "external_actions": 2,
+              "automatic_replays": 0,
+              "interrupt_target_turn": "turn-0",
+              "current_turn": null,
+              "refreshed_observation": "saved"
+            },
+            {
+              "ticks": 44,
+              "max_gap_ms": 18.710400000000163,
+              "external_writes": 1
+            },
+            {
+              "held_ms": 5000,
+              "ticks": 162,
+              "max_gap_ms": 32.17760000000089,
+              "receipt_transitions": 1
+            },
+            {
+              "close_ms": 0.8387999999995372,
+              "cancelled_maintenance_commits": 0
+            },
+            {
+              "observed_sql_errors": 1,
+              "unhandled_rejections": 0,
+              "recovered": true
+            }
+          ]
+        },
+        {
+          "name": "recovery-federation",
+          "status": "passed",
+          "files": [
+            "test/federation/core.test.ts",
+            "test/federation/runtime.test.ts",
+            "test/federation/transport-edge.test.ts",
+            "test/federation/observation-budget.test.ts",
+            "test/tool-contract/federation-observation-contention.test.ts",
+            "test/console-v5/relay.test.ts",
+            "test/console-v5/relay-contention.test.ts",
+            "src/federation/copy-task-state.test.ts",
+            "test/tool-contract/federation.test.ts",
+            "test/tool-contract/receipts.test.ts",
+            "test/tool-contract/output.test.ts",
+            "test/tool-contract/parallel.test.ts",
+            "test/reliability-system/invocation-outcome.test.ts",
+            "test/reliability-system/card-command-projection.test.ts",
+            "test/reliability-system/task-lifecycle.test.ts",
+            "test/reliability-system/process-output-lifecycle.test.ts"
+          ],
+          "duration_ms": 98331.571,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 54,
+            "failed": 0,
+            "passed": 54,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 54,
+            "suites": 0
+          },
+          "log_sha256": "f77183f8cae17c3936ba6f7f773f32131f6701cb35b8af132b21545d34763b91",
+          "events_sha256": "989686927a6ca125195a73290b5d930544f37cc4c1359ff0cbff4934ef5ac595",
+          "failures": [],
+          "skipped": [],
+          "measurements": [
+            {
+              "writer_lock_ms": 3000,
+              "console_observation_ms": 10.136399999999867,
+              "entrypoints": [
+                "relay",
+                "internal_forward",
+                "legacy_console"
+              ],
+              "authenticated_sessions": 1,
+              "commits_while_locked": 0,
+              "paused_mutations_rejected": 3
+            },
+            {
+              "observationMs": 10029.0276,
+              "remoteAttempts": 1
+            },
+            {
+              "agentWaitRpcMs": 10006.525000000001,
+              "remoteAttempts": 1
+            },
+            {
+              "writer_lock_ms": 3000,
+              "observation_ms": 58.90490000000045,
+              "original_operation_id": "op_a1a1db2683824d5aa472635ed351b937",
+              "original_task_id": "task_2799805a4df94618b681bcee155df212",
+              "unmirrored_task_id": "task_a817daf531784d8896132d25ac48dfdd",
+              "observation_invocations": 0,
+              "worker_commits_while_locked": 0,
+              "command_effects": 1
+            }
+          ]
+        },
+        {
+          "name": "diagnostics",
+          "status": "passed",
+          "files": [
+            "src/read-diagnostics.test.ts",
+            "test/read-diagnostics.test.ts"
+          ],
+          "duration_ms": 6029.194,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 7,
+            "failed": 0,
+            "passed": 7,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0,
+            "topLevel": 7,
+            "suites": 0
+          },
+          "log_sha256": "f67663e77efdd658baa4612e4a489a3672f61b94dc8d24dba2a9bd32ebefd940",
+          "events_sha256": "61a94b705cb4f8d0bb60fa0f89cc852cfcc699889d12b66107c4b58a6c117f6b",
+          "failures": [],
+          "skipped": [],
+          "measurements": []
+        },
+        {
+          "name": "workspace-restore",
+          "status": "passed",
+          "files": [
+            "src/workspaces.test.ts",
+            "src/git-worktrees.test.ts",
+            "test/tool-contract/workspace-restore.test.ts"
+          ],
+          "duration_ms": 15887.986,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_incomplete": false,
+          "counts": {
+            "tests": 27,
+            "failed": 0,
+            "passed": 22,
+            "cancelled": 0,
+            "skipped": 5,
+            "todo": 0,
+            "topLevel": 27,
+            "suites": 0
+          },
+          "log_sha256": "2b1cbeb5e93b1e280f5dc03fb7f128e97e3683c1e1f0f465149bc90ef4451528",
+          "events_sha256": "f8cab44dfe1c31d3db7c82095d9299bde7a0390f9e1597627104f92cf62d1fdd",
+          "failures": [],
+          "skipped": [
+            {
+              "name": "cleanup rejects a managed worktree path replaced by a symlink",
+              "file": "src/git-worktrees.test.ts"
+            },
+            {
+              "name": "global instruction symlinks may target user-managed files outside agentDir",
+              "file": "src/workspaces.test.ts"
+            },
+            {
+              "name": "workspace instruction symlinks cannot escape the workspace",
+              "file": "src/workspaces.test.ts"
+            },
+            {
+              "name": "an opened workspace does not follow a retargeted root symlink",
+              "file": "src/workspaces.test.ts"
+            },
+            {
+              "name": "a symlinked allowed root preserves checkout and worktree path behavior",
+              "file": "src/workspaces.test.ts"
+            }
+          ],
+          "measurements": []
+        }
+      ]
+    }
+  ],
+  "baselines": [
+    {
+      "id": "baseline-budget",
+      "commit": "77257827893fff498c6d55f1fea6bee605a8f722",
+      "production_source_unchanged": true,
+      "runtime": {
+        "version": "v24.21.0",
+        "platform": "win32",
+        "arch": "x64"
+      },
+      "test": {
+        "file": "test/federation/observation-budget.test.ts",
+        "sha256": "4ccb155ea81fd5efb5679d7a4508cb72508a3913db8cb96fb131943a2235c464"
+      },
+      "started_at": "2026-10-20T08:00:33.709Z",
+      "finished_at": "2026-10-20T08:01:16.007Z",
+      "duration_ms": 42298.462999999996,
+      "exit_code": 1,
+      "signal": null,
+      "counts": {
+        "tests": 2,
+        "failed": 2,
+        "passed": 0,
+        "cancelled": 0,
+        "skipped": 0,
+        "todo": 0,
+        "topLevel": 2,
+        "suites": 0
+      },
+      "failures": [
+        {
+          "name": "真实双节点 MCP 的安静输出等待满 10 秒后只返回一次且不改变原操作",
+          "message": "{\"content\":[{\"type\":\"text\",\"text\":\"REQUEST_TIMEOUT: worker: 读取预算已耗尽。调用可能已在目标节点执行；使用原工作区查询进程或任务状态。\\n[QuayMesh recovery: error_code=REQUEST_TIMEOUT; effect=unknown; retry_hint=query_original]\"}],\"structuredContent\":{\"error_code\":\"REQUEST_TIMEOUT\",\"effect\":\"unknown\",\"retry_hint\":\"query_original\"},\"isError\":true}",
+          "code": "ERR_TEST_FAILURE"
+        },
+        {
+          "name": "真实 peer RPC 给 wait_agent 留回传时间且不延长总期限或重放写入",
+          "message": "REQUEST_TIMEOUT: target: 读取预算已耗尽。调用可能已在目标节点执行；使用原工作区查询进程或任务状态。",
+          "code": "ERR_TEST_FAILURE"
+        }
+      ],
+      "log_sha256": "ec3e855214d0106c50bef256cb91f1bf596f10020efbe1b339b78e2e6d83c0e1",
+      "events_sha256": "e4fc2f43d2fe60a1fa08d58220a65f6e7f7a0c282f44a39c7198896f7f9540a5",
+      "source_summary_sha256": "549917712a2f86e79d84d6665a1d392537125fb8eae62bf7a407fa3398c87005"
+    },
+    {
+      "id": "baseline-federated-lock",
+      "commit": "77257827893fff498c6d55f1fea6bee605a8f722",
+      "production_source_unchanged": true,
+      "runtime": {
+        "version": "v24.21.0",
+        "platform": "win32",
+        "arch": "x64"
+      },
+      "test": {
+        "file": "test/tool-contract/federation-observation-contention.test.ts",
+        "sha256": "d954c8f6f75caa8d9fdeab09f2cf2f57da881ba5ee5831edc3fd3a959afba87a"
+      },
+      "started_at": "2026-10-20T08:03:41.125Z",
+      "finished_at": "2026-10-20T08:03:52.943Z",
+      "duration_ms": 11818.126199999999,
+      "exit_code": 1,
+      "signal": null,
+      "counts": {
+        "tests": 1,
+        "failed": 1,
+        "passed": 0,
+        "cancelled": 0,
+        "skipped": 0,
+        "todo": 0,
+        "topLevel": 1,
+        "suites": 0
+      },
+      "failures": [
+        {
+          "name": "双节点历史观察在 worker 持写锁时保持只读，新 Cloud Task 不补建历史镜像且修改仍受准入限制",
+          "message": "跨节点观察必须在独立 writer 仍持锁时完成\n\ntrue !== false\n",
+          "code": "ERR_TEST_FAILURE"
+        }
+      ],
+      "log_sha256": "ba22bd7192500e7d9aa95335242ee82101ae26850a5c3f763a39a0c11d43f018",
+      "events_sha256": "a399734b118b7f32d710875366de3c85bc93be265696fbf9f030ecb5bf44be73",
+      "source_summary_sha256": "c44a90492b76f26c9bb807817e3fec8e573a91d80fcacdba1685593b360ccaf1"
+    }
+  ],
+  "initial_probe": {
+    "commit": "4e07cd3da857de02adc094625180ba9f1925e9e8",
+    "runtime": "v24.21.0",
+    "status": "failed",
+    "started_at": "2026-10-20T07:39:20.500Z",
+    "finished_at": "2026-10-20T07:40:20.064Z",
+    "source_summary_sha256": "5b3aced92b865f9cfbba65477cf0b7a93c7954110699e8bae59b95de01ac7a04",
+    "steps": [
+      {
+        "name": "typecheck",
+        "exit_code": 0,
+        "duration_ms": 19029.397800000002,
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "name": "build",
+        "exit_code": 0,
+        "duration_ms": 14300.300500000001,
+        "log_sha256": "be8f97047e9d18e16edbd8e187fa3ac40c39452bceb29ba5f500be53db64e3bd"
+      },
+      {
+        "name": "sqlite-http",
+        "exit_code": 1,
+        "duration_ms": 26181.1429,
+        "log_sha256": "7452a435dc4d56300ed9ceb3e983939e939af1fdf5dd0c917a3d984b42c9f29f"
+      }
+    ],
+    "result": "✔ 真实OAuth MCP在SQLite写锁和排队命令期间仍可读取历史输出、诊断与Console (5309.0503ms)\nℹ {\"writer_lock_ms\":3000,\"authenticated_observation_ms\":[64.24110000000019,37.56840000000011,55.121399999999994],\"ticks\":118,\"max_gap_ms\":58.78819999999996,\"command_effects\":1,\"original_operation_id\":\"op_7c99c10e6efb34e976a503b5215e2940\"}\n✖ 真实子进程在SQLite持写锁时退出，MCP观察与心跳继续响应，解锁后原操作只收尾一次 (14504.4163ms)\nℹ tests 2\nℹ suites 0\nℹ pass 1\nℹ fail 1\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 26093.9509\n\n✖ failing tests:\n\ntest at test/tool-contract/sqlite-process-exit.test.ts:1:562\n✖ 真实子进程在SQLite持写锁时退出，MCP观察与心跳继续响应，解锁后原操作只收尾一次 (14504.4163ms)\n  Error: 实际状态未按时到达\n      at until (test/tool-contract/fixture.ts:35:9)\n      at async TestContext.<anonymous> (test/tool-contract/sqlite-process-exit.test.ts:75:5)\n      at async Test.run (node:internal/test_runner/test:1409:7)\n      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:387:3)\n"
+  },
+  "resolutions": [
+    {
+      "baseline": "baseline-budget",
+      "commit": "82a1d0294de75a0643075c3ec3af2e23fdb0b252",
+      "result": "Observation wait plus reply margin fits the existing total deadline; write requests are not replayed."
+    },
+    {
+      "baseline": "baseline-federated-lock",
+      "commit": "82a1d0294de75a0643075c3ec3af2e23fdb0b252",
+      "result": "Historical federated observations avoid write admission and mirror creation while retaining owner/session checks."
+    },
+    {
+      "baseline": "run-02",
+      "commit": "42cb9d78870707f0ae6d22eb2703aab68a08484d",
+      "result": "Update the exact list_agents response assertion for control_observation and verify the persisted provider turn and revision. Production behavior unchanged from ada366e."
+    }
+  ]
+}
