@@ -471,7 +471,15 @@ test("spawn and followup persist per-agent task names, return wait guidance, and
     effort: "medium",
     result_ref: null,
     result_available: false,
+    control_observation: {
+      status: "saved",
+      provider_turn_id: `turn-${agentId}-1`,
+      control_revision: 1,
+    },
   }]);
+  const observation = f.runtime.store.lastAgentObservation(session.sessionId, agentId);
+  assert.equal(observation?.providerTurnId, `turn-${agentId}-1`);
+  assert.equal(observation?.controlRevision, 1);
   assert.doesNotMatch(JSON.stringify(listed), /usage|claim/i);
 
   f.controlled.get(agentId).release();
