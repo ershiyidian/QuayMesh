@@ -20,6 +20,19 @@ import { LocalActions } from "./actions.js";
 import { WriteReceipts } from "./receipts.js";
 import { WorkbenchError } from "./types.js";
 
+async function waitForPublication(entered: Promise<void>, capture: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      entered,
+      capture.then(() => { throw new Error("Capture completed without reaching its publication callback"); }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Capture did not reach its publication callback within 15 seconds")), 15_000);
+      }),
+    ]);
+  } finally { if (timer) clearTimeout(timer); }
+}
+
 function fixture(t: TestContext) {
   const directory = mkdtempSync(join(tmpdir(), "qm-console-review-")), root = join(directory, "project"), stateDir = join(directory, "state");
   mkdirSync(root);
@@ -41,7 +54,7 @@ function fixture(t: TestContext) {
   t.after(async () => {
     await service.close(); await projector.close(); await changes.close(); execution.close();
     ledger.close(); rmSync(directory, { recursive: true, force: true });
-  });
+  }, { timeout: 20_000 });
   return { directory, root, stateDir, ledger, store, session, member, task, changes, execution, reverter, service, run: ledger.run(run.id), actions };
 }
 
@@ -100,17 +113,18 @@ test("console review notifies after the atomic commit and reconciles a lost ackn
   assert.equal(f.ledger.run(f.run.id).revision, f.run.revision + 1);
 });
 
-test("live pending or failed capture blocks review, revert preview and commit without changing files or acceptance", async t => {
+test("live pending or failed capture blocks review, revert preview and commit without changing files or acceptance", { timeout: 60_000 }, async t => {
   const f = fixture(t), path = await changedFile(f), ref = { id: f.run.id, expectedRevision: f.run.revision };
   let entered!: () => void, release!: () => void;
   const reached = new Promise<void>(resolve => { entered = resolve; });
   const gate = new Promise<void>(resolve => { release = resolve; });
   f.changes.setCaptureListener(async () => { entered(); await gate; });
   const pending = f.changes.capture(f.member.id, f.task.id);
+  void pending.catch(() => undefined);
   const baseline = join(f.stateDir, "session-file-baselines", f.session.id, f.member.id, f.task.id, "baseline.json");
   let originalBaseline: string | undefined;
   try {
-    await reached;
+    await waitForPublication(reached, pending);
     assert.equal(f.changes.captureObservation(f.member.id, f.task.id).state, "pending");
     const files = f.changes.readSummaries(f.session.id, f.member.id, f.task.id).map(file => file.id);
     const blocked = (code: string) => (error: unknown) => error instanceof WorkbenchError && error.status === 409 && error.code === code && error.effect === "none";
@@ -134,7 +148,7 @@ test("live pending or failed capture blocks review, revert preview and commit wi
     assert.equal(f.store.eventsForTask(f.task.id).filter(event => event.type === "verification_recorded" || event.type === "operation_started").length, 0);
     assert.equal(f.execution.inspect(f.root).length, 0);
   } finally {
-    release(); await pending.catch(() => undefined); f.changes.setCaptureListener(() => undefined);
+    release(); f.changes.setCaptureListener(() => undefined);
     if (originalBaseline !== undefined) { await writeFile(baseline, originalBaseline); await f.changes.capture(f.member.id, f.task.id); }
   }
 });
@@ -184,7 +198,7 @@ test("a frozen historical review and old revert preview keep Task A scope while 
   } finally { await writeFile(baseline, original); await f.changes.capture(f.member.id, current.id); }
 });
 
-test("a frozen phase can be reviewed while the next phase of the same Task is still collecting files", async t => {
+test("a frozen phase can be reviewed while the next phase of the same Task is still collecting files", { timeout: 60_000 }, async t => {
   const f = fixture(t);
   await changedFile(f); await f.changes.capture(f.member.id, f.task.id);
   saveRunCheckpoint(f.ledger.db, f.run.id, await f.service.prepareRunCheckpoint(f.session.id, f.member.id, f.task.id));
@@ -197,8 +211,9 @@ test("a frozen phase can be reviewed while the next phase of the same Task is st
   const gate = new Promise<void>(resolve => { release = resolve; });
   f.changes.setCaptureListener(async () => { entered(); await gate; });
   const pending = f.changes.capture(f.member.id, f.task.id);
+  void pending.catch(() => undefined);
   try {
-    await reached;
+    await waitForPublication(reached, pending);
     await f.actions.review({ id: f.run.id, expectedRevision: f.run.revision }, "accept", "frozen phase only", "historical-phase");
     assert.equal(f.ledger.run(f.run.id).acceptance, "passed");
     assert.equal(f.ledger.run(next.id).status, "running");
@@ -206,7 +221,8 @@ test("a frozen phase can be reviewed while the next phase of the same Task is st
     const reviewed = f.store.eventsForTask(f.task.id).filter(event => event.type === "verification_recorded");
     assert.equal(reviewed.length, 1); assert.equal(reviewed[0]?.payload.run_id, f.run.id);
     assert.equal(f.changes.captureObservation(f.member.id, f.task.id).state, "pending");
-  } finally { release(); await pending; }
+    release(); await pending;
+  } finally { release(); }
 });
 
 test("revert preview refuses a newer phase captured during eligibility even after capture returns idle", async t => {

@@ -17,6 +17,19 @@ import { SessionStore } from "./store.js";
 
 const execFileAsync = promisify(execFile);
 
+async function waitForPublication(entered: Promise<void>, capture: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      entered,
+      capture.then(() => { throw new Error("Capture completed without reaching its publication callback"); }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Capture did not reach its publication callback within 15 seconds")), 15_000);
+      }),
+    ]);
+  } finally { if (timer) clearTimeout(timer); }
+}
+
 async function fixture() {
   const directory = await mkdtemp(join(tmpdir(), "quaymesh-revert-"));
   const root = join(directory, "repo");
@@ -155,9 +168,9 @@ test("a recorded rename restores both paths", async (t) => {
   await assert.rejects(readFile(join(f.root, "renamed.txt")), { code: "ENOENT" });
 });
 
-test("direct revert rejects pending and failed capture before selecting files or acquiring mutation scopes", async t => {
+test("direct revert rejects pending and failed capture before selecting files or acquiring mutation scopes", { timeout: 60_000 }, async t => {
   const f = await fixture();
-  t.after(async () => { await f.collector.close(); f.execution.close(); f.database.close(); await rm(f.directory, { recursive: true, force: true }); });
+  t.after(async () => { await f.collector.close(); f.execution.close(); f.database.close(); await rm(f.directory, { recursive: true, force: true }); }, { timeout: 20_000 });
   const { session, member } = await sessionFixture(f);
   const writeOwned = async (text: string) => {
     const evidence = await f.collector.prepareWrite(member, ["tracked.txt"]);
@@ -171,8 +184,9 @@ test("direct revert rejects pending and failed capture before selecting files or
   const gate = new Promise<void>(resolve => { release = resolve; });
   f.collector.setCaptureListener(async () => { entered(); await gate; });
   const pending = f.collector.capture(member.id);
+  void pending.catch(() => undefined);
   try {
-    await reached;
+    await waitForPublication(reached, pending);
     let selections = 0, claims = 0;
     const files = f.store.fileSummaries.bind(f.store), acquire = f.execution.acquire.bind(f.execution);
     t.mock.method(f.store, "fileSummaries", (...args: Parameters<typeof files>) => { selections++; return files(...args); });
@@ -195,8 +209,8 @@ test("direct revert rejects pending and failed capture before selecting files or
       assert.equal(f.store.eventsForSession(session.id).filter(event => event.type === "operation_started").length, 0);
     }
   } finally {
-    release(); await pending.catch(() => undefined); f.collector.setCaptureListener(() => undefined);
-    await f.collector.capture(member.id);
+    release(); f.collector.setCaptureListener(() => undefined);
+    if (f.collector.captureObservation(member.id).state === "failed") await f.collector.capture(member.id);
   }
 });
 

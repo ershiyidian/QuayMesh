@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { runSqliteWrite, type SqliteWriteOptions } from "../db/async-write.js";
 import { canonicalWorkspaceRoot, canonicalPathIdentity } from "../roots.js";
+import { samePhysicalPath } from "../physical-paths.js";
 import { resolve } from "node:path";
 import { TaskDataStore, type ContextReadInput } from "./task-data.js";
 import { retryableAdmission } from "./outcome.js";
@@ -1705,13 +1706,16 @@ export class SessionStore {
   getChangeBaseline(sessionId: SessionId, memberId: string, repoRoot: string, taskId?: string): ChangeBaselineRow | null {
     if (taskId) return this.taskData.baseline(taskId, sessionId, memberId, repoRoot);
     const canonicalRoot = canonicalWorkspaceRoot(repoRoot);
-    const row = this.db
-      .prepare(
+    const query = this.db.prepare(
         `SELECT session_id, member_id, repo_root, baseline_ref, latest_ref, coverage
          FROM qm_change_baselines WHERE session_id = ? AND member_id = ? AND repo_root = ?`,
-      )
-      .get(sessionId, memberId, canonicalRoot) as ChangeBaselineRow | undefined;
-    return row ?? null;
+      );
+    const row = (query.get(sessionId, memberId, repoRoot)
+      ?? query.get(sessionId, memberId, canonicalRoot)) as ChangeBaselineRow | undefined;
+    if (row) return row;
+    const aliases = this.changeBaselines(sessionId, memberId).filter(value => samePhysicalPath(value.repo_root, repoRoot));
+    if (aliases.length > 1) throw new Error("CHANGE_BASELINE_ALIAS_AMBIGUOUS");
+    return aliases[0] ?? null;
   }
 
   changeBaselines(sessionId: SessionId, memberId: string, taskId?: string): ChangeBaselineRow[] {
@@ -1728,8 +1732,12 @@ export class SessionStore {
 
   putChangeBaseline(input: ChangeBaselineRow, taskId?: string): void {
     if (taskId) { this.taskData.putBaseline(taskId, input); return; }
-    const canonicalRoot = canonicalWorkspaceRoot(input.repo_root);
-    this.db
+    this.db.transaction(() => {
+      // Reuse an existing physical alias without moving its primary key or
+      // rebasing the captured history. Scope remains this session and member.
+      const canonicalRoot = this.getChangeBaseline(input.session_id, input.member_id, input.repo_root)?.repo_root
+        ?? canonicalWorkspaceRoot(input.repo_root);
+      this.db
       .prepare(
         `INSERT INTO qm_change_baselines (
            session_id, member_id, repo_root, baseline_ref, latest_ref, coverage
@@ -1747,6 +1755,7 @@ export class SessionStore {
         input.latest_ref,
         input.coverage,
       );
+    }).immediate();
   }
 
   sessionStartedAt(sessionId: SessionId): number {

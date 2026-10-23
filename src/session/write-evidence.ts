@@ -2,6 +2,7 @@ import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/pro
 import { dirname, join, relative, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { isPathInsideRoot } from "../roots.js";
+import { resolvePhysicalPath } from "../physical-paths.js";
 
 export interface FileState {
   exists: boolean;
@@ -37,9 +38,10 @@ export function sameFileState(a: FileState, b: FileState): boolean {
 }
 
 export function memberFile(root: string, path: string, cwd = root): { absolute: string; path: string } {
-  const absolute = resolve(cwd, path);
-  if (!isPathInsideRoot(absolute, root)) throw new Error(`WRITE_OUTSIDE_WORKSPACE: ${path}`);
-  return { absolute, path: relative(root, absolute).replaceAll("\\", "/") };
+  const absolute = resolve(cwd, path), physicalRoot = resolvePhysicalPath(root);
+  const physical = resolvePhysicalPath(absolute);
+  if (!isPathInsideRoot(physical, physicalRoot)) throw new Error(`WRITE_OUTSIDE_WORKSPACE: ${path}`);
+  return { absolute, path: relative(physicalRoot, physical).replaceAll("\\", "/") };
 }
 
 export async function beginWrite(root: string, paths: string[], cwd = root): Promise<WriteEvidence[]> {

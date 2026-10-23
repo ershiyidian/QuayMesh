@@ -5,6 +5,7 @@ import { createPatch } from "diff";
 import { git, getGitEligibility } from "../git.js";
 import { createWorkingTreeSnapshot } from "../review-checkpoints.js";
 import { isPathInsideRoot } from "../roots.js";
+import { resolvePhysicalPath, samePhysicalPath } from "../physical-paths.js";
 import { textPage } from "../bounded-reply.js";
 import type { FileSummary, SessionId, SessionMember } from "./types.js";
 import type { SessionStore } from "./store.js";
@@ -154,9 +155,7 @@ export class SessionChangeCollector {
     });
     const files: OrdinaryBaselineFile[] = existing?.files ?? [];
     for (const path of knownPaths) {
-      const absolute = resolve(workingDirectory, path);
-      if (!isPathInsideRoot(absolute, member.root)) continue;
-      const relativePath = relative(member.root, absolute).replaceAll("\\", "/");
+      const { absolute, path: relativePath } = memberFile(member.root, path, workingDirectory);
       if (files.some((file) => file.path === relativePath)) continue;
       const nested = await getGitEligibility(dirname(absolute));
       if (nested.ok && nested.gitRoot) {
@@ -235,13 +234,15 @@ export class SessionChangeCollector {
     if (baselines.length === 0) return;
     const previous = JSON.stringify(this.readSummaries(sessionId, memberId, taskId));
     const files: Array<FileSummary & { patchRef: string; versionRef: string }> = [];
+    const memberRoot = resolvePhysicalPath(member.root);
     for (const baseline of baselines) {
-      if (baseline.repo_root === member.root && baseline.baseline_ref.startsWith("ordinary:")) {
+      if (baseline.baseline_ref.startsWith("ordinary:") && samePhysicalPath(baseline.repo_root, member.root)) {
         files.push(...await this.captureOrdinary(sessionId, member, baseline.baseline_ref, taskId));
       } else {
-        const scoped = changedPaths?.map(path => resolve(member.root, path))
-          .filter(path => isPathInsideRoot(path, baseline.repo_root))
-          .map(path => relative(baseline.repo_root, path).replaceAll("\\", "/"));
+        const repoRoot = resolvePhysicalPath(baseline.repo_root);
+        const scoped = changedPaths?.map(path => resolvePhysicalPath(resolve(memberRoot, path)))
+          .filter(path => isPathInsideRoot(path, repoRoot))
+          .map(path => relative(repoRoot, path).replaceAll("\\", "/"));
         if (scoped && !scoped.length) continue;
         files.push(...await this.captureGit(sessionId, member, baseline.repo_root,
           baseline.baseline_ref, baseline.latest_ref, taskId, scoped));
@@ -344,6 +345,7 @@ export class SessionChangeCollector {
     taskId?: string,
     changedPaths?: string[],
   ): Promise<Array<FileSummary & { patchRef: string; versionRef: string }>> {
+    const physicalRepoRoot = resolvePhysicalPath(repoRoot), memberRoot = resolvePhysicalPath(member.root);
     const current = await createWorkingTreeSnapshot(
       repoRoot,
       baselineRef,
@@ -367,11 +369,11 @@ export class SessionChangeCollector {
     const files: Array<FileSummary & { patchRef: string; versionRef: string }> = [];
     const owned = await readOwnedFiles(ownershipPath(this.stateDir, sessionId, member.id, taskId));
     for (const entry of numstat) {
-      const absolute = resolve(repoRoot, entry.path);
-      if (!isPathInsideRoot(absolute, member.root)) continue;
-      const displayPath = relative(member.root, absolute).replaceAll("\\", "/");
+      const absolute = resolve(physicalRepoRoot, entry.path);
+      if (!isPathInsideRoot(absolute, memberRoot)) continue;
+      const displayPath = relative(memberRoot, absolute).replaceAll("\\", "/");
       const proof = owned[displayPath];
-      const fromPath = entry.from ? relative(member.root, resolve(repoRoot, entry.from)).replaceAll("\\", "/") : null;
+      const fromPath = entry.from ? relative(memberRoot, resolve(physicalRepoRoot, entry.from)).replaceAll("\\", "/") : null;
       const fromProof = fromPath ? owned[fromPath] : undefined;
       const canRevert = Boolean(proof?.safe && sameFileState(proof.after, await readFileState(absolute))
         && (!fromPath || fromProof?.safe && sameFileState(fromProof.after, await readFileState(resolve(member.root, fromPath)))));
@@ -413,7 +415,7 @@ export class SessionChangeCollector {
     const files: Array<FileSummary & { patchRef: string; versionRef: string }> = [];
     const owned = await readOwnedFiles(ownershipPath(this.stateDir, sessionId, member.id, taskId));
     for (const before of baseline.files) {
-      const absolute = resolve(member.root, before.path);
+      const absolute = memberFile(member.root, before.path).absolute;
       const current = await readFile(absolute).catch((error: NodeJS.ErrnoException) => {
         if (error.code === "ENOENT") return null;
         throw error;
@@ -530,6 +532,6 @@ function digest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 function quaymeshSnapshotExcludes(repoRoot: string, workspaceRoot: string): string[] {
-  const relativePath = relative(repoRoot, join(workspaceRoot, ".quaymesh")).replaceAll("\\", "/");
+  const relativePath = relative(resolvePhysicalPath(repoRoot), join(resolvePhysicalPath(workspaceRoot), ".quaymesh")).replaceAll("\\", "/");
   return relativePath && relativePath !== ".." && !relativePath.startsWith("../") ? [relativePath] : [];
 }

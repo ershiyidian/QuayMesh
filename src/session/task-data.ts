@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { pidAlive } from "../process-liveness.js";
 import { canonicalWorkspaceRoot } from "../roots.js";
+import { samePhysicalPath } from "../physical-paths.js";
 import { LAST_RUN_OUTCOME_SQL } from "../work-outcome.js";
 import type { FileSummary, Snapshot } from "./types.js";
 
@@ -75,9 +76,14 @@ export class TaskDataStore {
 
   baseline(taskId: string, sessionId: string, memberId: string, root: string): TaskBaseline | null {
     this.requireScope(taskId, sessionId, memberId);
-    return this.db.prepare(`SELECT session_id,member_id,repo_root,baseline_ref,latest_ref,coverage
-      FROM qm_task_change_baselines WHERE task_id=? AND member_id=? AND repo_root=?`)
-      .get(taskId, memberId, canonicalWorkspaceRoot(root)) as TaskBaseline | undefined ?? null;
+    const query = this.db.prepare(`SELECT session_id,member_id,repo_root,baseline_ref,latest_ref,coverage
+      FROM qm_task_change_baselines WHERE task_id=? AND member_id=? AND repo_root=?`);
+    const row = (query.get(taskId, memberId, root)
+      ?? query.get(taskId, memberId, canonicalWorkspaceRoot(root))) as TaskBaseline | undefined;
+    if (row) return row;
+    const aliases = this.baselines(taskId, sessionId, memberId).filter(value => samePhysicalPath(value.repo_root, root));
+    if (aliases.length > 1) throw new Error("CHANGE_BASELINE_ALIAS_AMBIGUOUS");
+    return aliases[0] ?? null;
   }
 
   baselines(taskId: string, sessionId: string, memberId: string): TaskBaseline[] {
@@ -88,10 +94,14 @@ export class TaskDataStore {
 
   putBaseline(taskId: string, value: TaskBaseline): void {
     this.requireScope(taskId, value.session_id, value.member_id);
-    this.db.prepare(`INSERT INTO qm_task_change_baselines(task_id,session_id,member_id,repo_root,baseline_ref,latest_ref,coverage)
-      VALUES(?,?,?,?,?,?,?) ON CONFLICT(task_id,member_id,repo_root) DO UPDATE SET
-        latest_ref=excluded.latest_ref,coverage=excluded.coverage`)
-      .run(taskId, value.session_id, value.member_id, canonicalWorkspaceRoot(value.repo_root), value.baseline_ref, value.latest_ref, value.coverage);
+    this.db.transaction(() => {
+      const root = this.baseline(taskId, value.session_id, value.member_id, value.repo_root)?.repo_root
+        ?? canonicalWorkspaceRoot(value.repo_root);
+      this.db.prepare(`INSERT INTO qm_task_change_baselines(task_id,session_id,member_id,repo_root,baseline_ref,latest_ref,coverage)
+        VALUES(?,?,?,?,?,?,?) ON CONFLICT(task_id,member_id,repo_root) DO UPDATE SET
+          latest_ref=excluded.latest_ref,coverage=excluded.coverage`)
+        .run(taskId, value.session_id, value.member_id, root, value.baseline_ref, value.latest_ref, value.coverage);
+    }).immediate();
   }
 
   replaceFiles(taskId: string, sessionId: string, memberId: string, version: string, files: Array<FileSummary & { patchRef: string }>): void {

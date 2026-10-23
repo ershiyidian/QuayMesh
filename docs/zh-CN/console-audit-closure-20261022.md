@@ -11,13 +11,13 @@
 | 门禁 | 实际结果 |
 | --- | --- |
 | `pnpm install --frozen-lockfile` | 通过，使用锁定依赖与随包原生二进制 |
-| `pnpm typecheck` | 通过，012 批次 20.14 秒 |
-| 数据库、控制台服务、收尾、升级、归档、传输、卡片核心回归 | **128/128 通过**，012 批次 88.52 秒 |
-| `pnpm test:console` | **52/52 通过**，012 批次 91.95 秒 |
+| `pnpm typecheck` | 通过，015 批次 20.42 秒 |
+| 数据库、控制台服务、收尾、升级、归档、传输、卡片及路径别名核心回归 | **134/134 通过**，014 批次 99.36 秒 |
+| `pnpm test:console` | **52/52 通过**，015 批次 88.92 秒；三节点控制单独 **1/1 通过**，17.20 秒 |
 | `pnpm test:node` | **50/50 通过**，010 批次 3.44 秒；后续没有节点实现或节点夹具变更 |
-| `pnpm build` | 通过，012 批次 15.66 秒，包括控制台、会话卡片和 TypeScript 构建 |
-| `pnpm test:console:browser` | **9/9 通过**，012 批次 22.66 秒，真实 Chromium |
-| 扩展 Session / federation / reliability 回归 | **172/172 通过**，012 批次 250.38 秒，包含最终源码和真实后台进程的 Task 交接隔离 |
+| `pnpm build` | 通过，014 批次 14.45 秒，包括控制台、会话卡片和 TypeScript 构建 |
+| `pnpm test:console:browser` | **9/9 通过**，014 批次 27.17 秒，真实 Chromium |
+| 扩展 Session / federation / reliability 回归 | **177/177 通过**，014 批次 244.83 秒，包含最终生产源码、路径别名与真实后台进程的 Task 交接隔离 |
 | SQLite 关闭/GC 回归 | 真实 `node --expose-gc` 子进程中 **500 次**交替内存可写、文件只读打开/查询/关闭，正常退出 |
 | 视觉复核 | 实看深色总览、浅色会话、加载态、窄屏传输与任务详情；012 批次重新实看桌面采集中及窄屏真实采集失败，核对重复提示和错误待验收徽章均已消除 |
 | 补丁一致性 | `git diff --check` 通过；同步前逐文件比对已审核的内容哈希，未覆盖其它工作目录 |
@@ -25,13 +25,13 @@
 核心回归命令：
 
 ```text
-pnpm exec tsx --test --test-concurrency=1 src/db/*.test.ts src/console-workbench/*.test.ts src/session/console-lifecycle.test.ts src/session/admission-retry.test.ts src/session/revert.test.ts src/project-archive.test.ts src/federation/transfer-store.test.ts test/lifecycle-view.test.ts test/reliability-system/card-timing.test.ts
+pnpm exec tsx --test --test-concurrency=1 --test-timeout=120000 src/roots.test.ts src/session/path-alias.test.ts src/db/*.test.ts src/console-workbench/*.test.ts src/session/console-lifecycle.test.ts src/session/admission-retry.test.ts src/session/revert.test.ts src/project-archive.test.ts src/federation/transfer-store.test.ts test/lifecycle-view.test.ts test/reliability-system/card-timing.test.ts
 ```
 
 扩展回归命令：
 
 ```text
-pnpm exec tsx --test --test-concurrency=1 src/session/*.test.ts src/work-ledger.test.ts test/session-card/task-lifecycle.test.ts test/session-card/current-issues.test.ts test/session-card/current-federation.test.ts test/federation/core.test.ts test/federation/runtime.test.ts test/reliability-upgrade.test.ts
+pnpm exec tsx --test --test-concurrency=1 --test-timeout=120000 src/session/*.test.ts src/work-ledger.test.ts test/session-card/task-lifecycle.test.ts test/session-card/current-issues.test.ts test/session-card/current-federation.test.ts test/federation/core.test.ts test/federation/runtime.test.ts test/reliability-upgrade.test.ts
 ```
 
 上述组间存在重叠，不相加包装成“独立问题数”。GitHub CI 同步加入 Windows/Linux 核心回归和控制台回归，Linux 增加真实 Chromium 流程；此处记录的是提交前已经取得的 Windows 原生结果。
@@ -47,6 +47,10 @@ pnpm exec tsx --test --test-concurrency=1 src/session/*.test.ts src/work-ledger.
 
 - 扩展 Task 生命周期用例假定 `exec_command` 首响应总带短期进程编号；真实慢准备只先返回 operation_id 时，测试向 write_stdin 传入了空身份。现以实际进程启动标记确认后台已经运行，交接后查询原持久 operation_id 到终态，仍验证 A/B Task 的事件、文件及基准隔离；不重复提交命令。
 - 新撤销故障注入用例的 Windows 目标路径比较改用生产相同的规范化规则，确保真正命中“文件替换后抛错”。浏览器手动刷新模式通过实际刷新按钮取得新状态，集成撤销用例等待结构化采集状态回到 idle，而非只看到上一轮的文件就执行。
+
+后续提交 `713e8bf` 的 Linux 整条检查通过，但两份 Windows 检查在真实 Git 采集中出现空文件集合、基准查询为空及 `no_owned_changes`，等待发布回调的用例因此超时。停止本轮重复检查后读取完整日志，继续定位到正式工作区入口可达的 Windows 8.3 短名与 Git 长路径比较问题（E63）。这属于生产文件证据链的缺口，不能只把夹具临时目录改成长路径来取得通过。原有测试的回调等待也需同时观察真实采集终结，明确失败并释放 gate，避免错误被长期等待掩盖。
+
+014 批次的三节点控制用例另有一次 `409 revision_conflict / effect:none`。该拒绝发生于保存跨节点控制计划之前；worker 的控制拒绝则会进入逐项结果，不能把两者混为一谈。夹具此前没有等待补丁的持久终态和命令的真实启动输出，第一次详情读取也未要求 fresh，而控制入口会失效缓存后重读。回归改为等待原操作及真实启动证据；对读取后仍合法发生的版本变化，只在验证无控制计划、无目标控制回执且命令仍运行后，以新 key 建立有界的新意图。仍必须验证成功停止、原回执恢复，以及缺失节点情况下的逐项 partial 结果。015 批次单独用例和控制台整组均已通过；没有用重放未知操作取得成功。
 
 路径、操作等待与端口夹具的修正属于验收契约，不单独计作产品根因。007 批次的相关真实集成测试 **9/9**、浏览器 **8/8** 通过；端口检查及夹具修正后节点回归 **50/50** 通过。推送后的最终 CI 状态以对应提交的 GitHub Checks 为准。
 
@@ -65,7 +69,7 @@ pnpm exec tsx --test --test-concurrency=1 src/session/*.test.ts src/work-ledger.
 | A | `src/project-archive.test.ts`；真实 SQLite/资源声明，受控 provider 验证器，未知副作用不重放 |
 | O | `src/console-workbench/activity-usage.test.ts`、`src/federation/transfer-store.test.ts`、审计/迁移测试；真实持久历史 |
 | Q | `src/console-workbench/query-scoping.test.ts`；300 行真实 SQLite、EXPLAIN、候选分类计数、SQL/内存/游标排序一致性 |
-| P | `src/console-workbench/change-capture.test.ts`、`src/console-workbench/review-actions.test.ts`、`src/session/revert.test.ts`；真实 Git/文件、SQLite 与 HTTP/MCP，采集状态、历史隔离、预览版本、恢复副作用 |
+| P | `src/console-workbench/change-capture.test.ts`、`src/console-workbench/review-actions.test.ts`、`src/session/revert.test.ts`、`src/session/path-alias.test.ts`；真实 Git/文件、SQLite 与 HTTP/MCP，采集状态、历史隔离、预览版本、恢复副作用、Windows 路径别名及旧基准身份 |
 
 ## 原 85 项逐项处理
 
@@ -254,6 +258,7 @@ pnpm exec tsx --test --test-concurrency=1 src/session/*.test.ts src/work-ledger.
 | E60 | 卡片 `qm_patch` 没有采集状态及版本屏障，数字 offset 游标也允许把不同版本的页拼接。live 读取检查采集状态与前后 revision，游标绑定 session/member/Task、live/frozen 模式、证据版本及 offset；中途更新或关闭切换必须重新开始，冻结历史继续按原快照分页。 |
 | E61 | 撤销恢复可先替换文件、随后 chmod 等步骤失败；原事件因尚未登记 restored 而错误写成 not_started。现记录实际进入恢复的 attempted_paths：已确认部分完成为 partial，尝试后未获完成确认为 unknown，从未进入恢复才为 not_started；保留错误并禁止原请求盲重放。 |
 | E62 | 主状态与筛选已限制只有 completed 阶段需要验收，但 runBadges 的附加徽章仍把默认 pending 显示为“结果待验收”；仅执行读取的开放请求及没有交付结果的历史请求会误报。附加徽章现按阶段执行事实限制 pending，保留已有明确验收结论；真实浏览器和状态组合回归覆盖开放请求、执行中、未知及已结束阶段。 |
+| E63 | Windows 的 JS realpath 保留 8.3 短名，Git 返回长路径；正式工作区入口可把短名传给 member，造成基准查找失败、文件集合被越界比较误过滤、撤销误报无自有改动。新增独立的物理文件路径解析，Windows 使用 native realpath，并处理未创建/已删除的叶路径；文件证据及相对路径比较使用相同物理根，保留文件名大小写，拒绝坏链接和真实越界。基准先按原键查找，未命中才在同一 Session/member/Task 内找物理别名；事务内复用原 repo_root 和 baseline_ref，不迁移项目、成员或旧基准身份，不为历史缺失证据伪造归属。真实 Git、普通目录、junction/符号链接、旧 legacy/Task 基准、跨范围拒绝和只读原生 8.3 检查加入回归；测试保留原临时路径并输出实际路径诊断。 |
 
 ## Git 整合依据
 
@@ -275,5 +280,6 @@ pnpm exec tsx --test --test-concurrency=1 src/session/*.test.ts src/work-ledger.
 6. **观测与通知能力有真实边界。** 缺首响应的历史不伪造；未测速度不显示；用量按执行轮次完成日确认；通知依赖浏览器前台读取。
 7. **界面模块并非全部重写。** 状态/时间/回执/通知/配置合并已共享或拆出，主界面文件仍较大；技术对象导航仍存在。
 8. **本轮观察到连接作用域切换，以及桌面节点读取超时和短暂离线，原因尚未独立查明。** scope mismatch 后按当前授权会话重新附加；连接恢复后继续查询原 operation_id 并读取持久结果。这些观察不计作已经修复的源码缺陷。
+9. **路径别名修复保留无法证明的历史边界。** 同范围内有不可解析的旧基准根且精确键未命中时，拒绝猜选或另建基准；过去漏采且没有所有权证据的改动不会自动变成可撤销。物理路径解析使用同步文件系统调用，尚未量化网络目录上多基准、多路径的成本，不作该场景的性能改善承诺。
 
 界面逐项实现的补充索引见 [Console UI 修复映射](console-ui-audit-closure.md)。英文和简体中文用户指南已同步说明新的状态、回执、刷新、配置及用量语义。

@@ -31,9 +31,24 @@ test('cross-node stop preserves per-phase effects and reconciles the original ta
   const task=await invoke('start_session',{title:'跨节点控制回执',request_key:'cross-node-console-task'});
   const first=await invoke('open_workspace',{root_id:'worker-a/main'});
   const second=await invoke('attach_workspace',{root_id:'worker-b/main',session_id:task.session_id});
-  await invoke('apply_patch',{workspace_id:second.workspace_id,patch:'*** Begin Patch\n*** Add File: proof.txt\n+waiting phase\n*** End Patch'});
+  const patched=await invoke('apply_patch',{workspace_id:second.workspace_id,patch:'*** Begin Patch\n*** Add File: proof.txt\n+waiting phase\n*** End Patch'});
+  assert.equal(typeof patched.operation_id,'string',JSON.stringify(patched));
+  await until(async()=>{
+    const status=await invoke('workspace_context',{workspace_id:second.workspace_id,action:'status',operation_id:patched.operation_id});
+    if(['accepted','queued','running'].includes(String(status.operation_state)))return false;
+    assert.equal(status.operation_state,'succeeded',JSON.stringify(status));return true;
+  });
   for(const worker of [a,b])await writeFile(join(worker.project,'long.mjs'),"process.stdout.write('started\\n');setInterval(()=>{},1000);\n");
-  const start=async(worker:RealTestServer,workspace:unknown,key:string)=>invoke('exec_command',{workspace_id:workspace,cmd:`"${process.execPath}" "${join(worker.project,'long.mjs')}"`,operation_key:key,yield_time_ms:100});
+  const start=async(worker:RealTestServer,workspace:unknown,key:string)=>{
+    const operation=await invoke('exec_command',{workspace_id:workspace,cmd:`"${process.execPath}" "${join(worker.project,'long.mjs')}"`,operation_key:key,yield_time_ms:100});
+    assert.equal(typeof operation.operation_id,'string',JSON.stringify(operation));
+    await until(async()=>{
+      const output=await invoke('read_output',{workspace_id:workspace,operation_id:operation.operation_id,wait_ms:100});
+      assert.equal(output.process_done,false,JSON.stringify(output));
+      return /^started\r?$/m.test(String(output.result));
+    });
+    return operation;
+  };
   const operation=await start(a,first.workspace_id,'first-command');
   const login=await fetch(cloud.baseUrl+'/console/api/login',{method:'POST',headers:{'Content-Type':'application/json',Origin:cloud.baseUrl},body:JSON.stringify({password:'test-owner-token-that-is-long-enough'})});
   assert.equal(login.status,200);const cookie=login.headers.getSetCookie()[0].split(';')[0],{csrf}=await login.json() as {csrf:string};
@@ -45,9 +60,37 @@ test('cross-node stop preserves per-phase effects and reconciles the original ta
     const result=await request(path,body);assert.equal(result.status,200,JSON.stringify(result.value));return result.value;
   };
   const reference='qmtask:'+task.task_id,path='runs/'+encodeURIComponent(reference);
-  const detail=await api(path);assert.equal(detail.run.actions.interrupt,true);assert.equal(detail.phases.length,2);
-  const body={action:'interrupt',expectedRevision:detail.run.revision,requestKey:'stop-original-targets'};
-  const result=await api(path+'/control',body);assert.equal(result.effect,'applied');assert.equal(result.results.length,1);
+  const assertUndispatched=async(result:{status:number;value:any},key:string,operationId:unknown)=>{
+    assert.equal(result.status,409,JSON.stringify(result.value));assert.equal(result.value.code,'revision_conflict');assert.equal(result.value.effect,'none');
+    const proof=new WorkLedger(cloud.config.stateDir);
+    try{assert.equal((proof.db.prepare("SELECT COUNT(*) count FROM console_write_receipts WHERE scope=? AND request_key=?").get(`console-plan:/api/v4/${path}/control`,key) as {count:number}).count,0);}
+    finally{proof.close();}
+    for(const worker of [a,b]){
+      const target=new WorkLedger(worker.config.stateDir);
+      try{assert.equal((target.db.prepare("SELECT COUNT(*) count FROM console_write_receipts WHERE request_key=?").get(key) as {count:number}).count,0,'a rejected stale request must not dispatch a worker action');}
+      finally{target.close();}
+    }
+    const active=await invoke('read_output',{workspace_id:first.workspace_id,operation_id:operationId,wait_ms:0});
+    assert.equal(active.process_done,false,'a rejected stale request must not stop the known command');
+  };
+  // Operation completion precedes background file capture and owner-node publication.
+  await until(async()=>{
+    const detail=await api(path+'?fresh=1');
+    for(const capture of detail.changeCaptures)assert.notEqual(capture.state,'failed',JSON.stringify(capture));
+    return detail.complete&&detail.phases.length===2&&detail.files.some((file:any)=>file.path==='proof.txt')
+      &&['worker-a','worker-b'].every(node=>detail.changeCaptures.some((capture:any)=>capture.nodeId===node&&capture.state==='idle'));
+  });
+  let stopped:{body:{action:string;expectedRevision:number;requestKey:string};result:any}|undefined;
+  // A fresh cross-node read can still race a publication. A proven rejection needs a new intent.
+  for(let attempt=0;attempt<4;attempt++){
+    const detail=await api(path+'?fresh=1');assert.equal(detail.run.actions.interrupt,true);assert.equal(detail.phases.length,2);
+    const body={action:'interrupt',expectedRevision:detail.run.revision,requestKey:'stop-original-targets-'+attempt};
+    const result=await request(path+'/control',body);
+    if(result.status===200){stopped={body,result:result.value};break;}
+    await assertUndispatched(result,body.requestKey,operation.operation_id);
+  }
+  assert.ok(stopped,'fresh reads and bounded explicit retries must stop the original command');
+  const {body,result}=stopped;assert.equal(result.effect,'applied');assert.equal(result.results.length,1);
   await until(async()=>{const output=await invoke('read_output',{workspace_id:first.workspace_id,operation_id:operation.operation_id,wait_ms:100});return output.process_done===true;});
   const ledger=new WorkLedger(cloud.config.stateDir);
   try{
@@ -67,12 +110,7 @@ test('cross-node stop preserves per-phase effects and reconciles the original ta
     const key='stop-with-missing-node-'+attempt;
     const result=await request(path+'/control',{action:'interrupt',expectedRevision:current.run.revision,requestKey:key});
     if(result.status===200){partial=result.value;break;}
-    assert.equal(result.status,409,JSON.stringify(result.value));assert.equal(result.value.code,'revision_conflict');assert.equal(result.value.effect,'none');
-    const proof=new WorkLedger(cloud.config.stateDir);
-    try{assert.equal((proof.db.prepare("SELECT COUNT(*) count FROM console_write_receipts WHERE scope=? AND request_key=?").get(`console-plan:/api/v4/${path}/control`,key) as {count:number}).count,0);}
-    finally{proof.close();}
-    const active=await invoke('read_output',{workspace_id:first.workspace_id,operation_id:activeA.operation_id,wait_ms:0});
-    assert.equal(active.process_done,false,'a rejected stale request must not stop the known command');
+    await assertUndispatched(result,key,activeA.operation_id);
   }
   assert.ok(partial,'fresh reads and bounded explicit retries must permit stopping the reachable member');
   assert.equal(partial.effect,'partial');assert.ok(partial.results.some((value:any)=>value.nodeId==='worker-a'&&value.ok));
