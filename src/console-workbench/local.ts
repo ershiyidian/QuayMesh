@@ -38,7 +38,7 @@ export function permitted(config: ServerConfig, path: string): boolean {
 
 export function requireRun(config: ServerConfig, ledger: WorkLedger, id: string): WorkRunRow {
   const run = ledger.run(id);
-  if (!permitted(config, ledger.getProject(run.project_id).root)) throw new WorkbenchError("此项目不在当前允许访问的目录内", 403, "project_scope");
+  if (!permitted(config, ledger.getProject(run.project_id).root)) throw new WorkbenchError("此项目不在当前允许访问的目录内", 403, "project_scope", "none");
   return run;
 }
 
@@ -71,8 +71,8 @@ export function readLocalIndex(config: ServerConfig, runIds?: readonly string[])
     const projects = ledger.projects().filter((project) => permitted(config, project.root));
     const allowed = new Map(projects.map((project) => [project.id, project]));
     // 列表只读取摘要，不读取日志、代理回答或完整补丁，也不在刷新时导入历史。
-    const parameters = runIds ?? [];
-    const selected = (column: string) => runIds === undefined ? "1" : runIds.length ? `${column} IN (${runIds.map(() => "?").join(",")})` : "0";
+    const parameters = runIds?.length ? [JSON.stringify(runIds)] : [];
+    const selected = (column: string) => runIds === undefined ? "1" : runIds.length ? `${column} IN (SELECT value FROM json_each(?))` : "0";
     const rows = ledger.db.prepare(`SELECT r.*,i.title FROM console_work_runs r JOIN console_work_items i ON i.id=r.item_id
       WHERE ${selected("r.id")} ORDER BY r.created_at DESC,r.id`).all(...parameters) as WorkRunRow[];
     const operations = group(ledger.db.prepare(`SELECT id,run_id,kind,label,status,created_at,finished_at FROM console_operations WHERE ${selected("run_id")} ORDER BY rowid`).all(...parameters) as OperationRow[], (row) => row.run_id);
@@ -83,9 +83,11 @@ export function readLocalIndex(config: ServerConfig, runIds?: readonly string[])
       FROM qm_run_links l JOIN qm_session_members m ON m.id=l.member_id
       JOIN qm_sessions s ON s.id=l.session_id LEFT JOIN qm_tasks t ON t.id=l.task_id WHERE ${selected("l.run_id")}`).all(...parameters) as RunLink[];
     const linksByRun = new Map(links.map((link) => [link.run_id, link]));
-    const classified = runQuery(ledger,nodeId,[...allowed.keys()],{days:'0'},Date.now());
-    const states = new Map((ledger.db.prepare(`${classified.sql} SELECT id,execution,task_result,task_state,status,finished_ms FROM selected WHERE ${selected('id')}`)
-      .all(...classified.params,...parameters) as Array<{id:string;execution:string;task_result:string|null;task_state:string|null;status:string;finished_ms:number|null}>)
+    const classified = runIds?.length === 0 ? null : runQuery(ledger,nodeId,[...allowed.keys()],{days:'0'},Date.now(),{ids:runIds,counts:false});
+    const states = new Map((classified ? ledger.db.prepare(`${classified.sql} SELECT id,execution,task_result,task_state,status,finished_ms,
+      unresolved,failed_child,last_outcome,finalizing,finalization_requested_at,finalization_error FROM selected`)
+      .all(...classified.params) as Array<{id:string;execution:string;task_result:string|null;task_state:string|null;status:string;finished_ms:number|null;
+        unresolved:number;failed_child:number;last_outcome:string|null;finalizing:number;finalization_requested_at:string|null;finalization_error:string|null}> : [])
       .map(row=>[row.id,row]));
     const files = new Map((ledger.db.prepare(`SELECT f.member_id,COUNT(*) files,
       CASE WHEN COUNT(f.additions)=COUNT(*) THEN SUM(f.additions) END additions,
@@ -144,23 +146,38 @@ export function readLocalIndex(config: ServerConfig, runIds?: readonly string[])
       const origin = JSON.parse(row.origin) as { entryPoint?: string };
       const acceptance = classifiedState?.task_result === 'completed' && row.status !== 'completed' ? 'not_required'
         : row.acceptance === "passed" ? "accepted" : row.acceptance === "failed" ? "rejected" : row.acceptance === "not_applicable" ? "not_required" : row.acceptance;
+      const finalization:Run['finalization'] = classifiedState?.finalizing ? {
+        status:classifiedState.finalization_error ? 'failed' : 'pending',
+        requestedAt:Date.parse(classifiedState.finalization_requested_at!),error:classifiedState.finalization_error,
+      } : null;
+      const reason = finalization ? finalization.error ? `交付确认失败：${finalization.error}` : '执行结果正在进行最终确认'
+        : execution==='unknown' ? '执行结果或所属节点的最新状态尚未确认'
+        : execution==='waiting' ? '当前没有后台执行，请求仍然开放'
+        : execution==='stalled' ? '长时间没有新的执行进展；请求仍然开放'
+        : execution==='failed' ? row.summary || '最后一次受管执行失败，请检查执行记录'
+        : execution==='interrupted_recoverable' ? row.summary || '最后一次执行已停止；接续能力见可用操作'
+        : classifiedState?.task_result==='handed_off' ? '本次请求已交接，后台执行单独跟踪' : null;
       return {
         id: workspaceHandle(nodeId, row.id), localId: row.id, title: link?.task_title || row.title || project.name,
         nodeId, projectId: workspaceHandle(nodeId, project.id), projectLocalId: project.id, projectName: project.name, root: project.root,
         executionStatus: execution, acceptanceStatus: acceptance, startedAt: Date.parse(row.created_at),
-        finishedAt: classifiedState?.finished_ms ?? (row.finished_at ? Date.parse(row.finished_at) : null),
+        finishedAt: classifiedState ? classifiedState.finished_ms : (row.finished_at ? Date.parse(row.finished_at) : null),
         lastActivityAt: Date.parse(row.last_activity_at ?? row.finished_at ?? row.created_at),
         revision: row.revision, workspaceRevision: checkpoint?.revision ?? linked?.revision ?? row.revision,
         sessionId: link?.session_id ?? null, taskId: link?.task_id ?? null, memberId: link?.member_id ?? null,
+        requestState:classifiedState?.task_state ?? undefined,resultStatus:classifiedState?.task_result ?? null,finalization,
+        actionableInterruption:Boolean(classifiedState?.unresolved || ['failed','interrupted_recoverable'].includes(execution) && classifiedState?.failed_child),
         usage: convertUsage(execs), diff, origin: origin.entryPoint ?? "legacy_unknown",
         branch: workspace?.branch ?? null, baseSha: workspace?.baseSha ?? null,
         command: command?.label ?? null, agent: lastAgent?.agent_id ?? null,
-        reason: ["failed", "interrupted_recoverable"].includes(execution) ? row.summary || "执行结果需要核对" : null,
+        reason,
         reviewNote: (JSON.parse(row.evidence) as Array<{ label: string; reference: string }>).filter((entry) => entry.label === "用户验收").at(-1)?.reference ?? null,
-        actions: { interrupt: execs.some((entry) => ["starting", "queued", "running"].includes(entry.status)),
+        actions: { interrupt: execs.some((entry) => ["starting", "queued", "running"].includes(entry.status))
+            || ops.some(entry=>['command','exec_command','bash'].includes(entry.kind) && ['starting','queued','running'].includes(entry.status)),
           resume: execution === "interrupted_recoverable" && new Set(execs.map((entry) => entry.agent_id)).size === 1,
-          review: execution === "completed" && acceptance === "pending", complete: execution === "waiting",
-          revert: Boolean(linked && file?.files && pending.length === 0) }, warnings,
+          review: execution === "completed" && acceptance === "pending",
+          complete:classifiedState?.task_state==='active' ? pending.length===0 && !classifiedState.unresolved : execution==='waiting',
+          revert: Boolean(linked && file?.files && pending.length === 0 && !classifiedState?.unresolved) }, warnings,
         phaseRefs: [workspaceHandle(nodeId, row.id)], nodeIds: [nodeId], workspaceCount: 1,
         workspaces:[{nodeId,projectId:workspaceHandle(nodeId,project.id),memberId:link?.member_id ?? null,name:project.name,root:project.root}],
         currentPhase: link ? Boolean(linked) : true,
@@ -191,38 +208,4 @@ export function readLocalIndex(config: ServerConfig, runIds?: readonly string[])
   } finally { ledger.close(); }
 }
 
-export function readLocalActivity(config: ServerConfig, kind: string, query: { limit: number; q?: string; level?: string; hour?: string }): { items: WorkbenchEvent[]; total: number; bins: Array<{ start: number; count: number; errors: number; warnings: number }> } {
-  const ledger = new WorkLedger(config.stateDir);
-  try {
-    const nodeId = config.federation?.nodeId ?? "local";
-    const projects = ledger.projects().filter((project) => permitted(config, project.root)).map((project) => project.id);
-    if (projects.length === 0) return { items: [], total: 0, bins: [] };
-    const scope = projects.map(() => "?").join(",");
-    const level = "CASE WHEN o.status='failed' THEN 'error' WHEN o.status='reconciliation_required' THEN 'warn' ELSE 'info' END";
-    const hour = "CAST(strftime('%s',o.created_at) AS INTEGER)/3600";
-    const search = query.q?.toLocaleLowerCase() ?? "";
-    const filter = `r.project_id IN (${scope}) AND (?='' OR instr(lower(o.label||' '||i.title||' '||o.id),?)>0) AND (?='' OR ${level}=?)`;
-    const params = [...projects, search, search, query.level ?? "", query.level ?? ""];
-    const withHour = filter + ` AND (?='' OR ${hour}=CAST(? AS INTEGER))`;
-    const rowParams = [...params, query.hour ?? "", query.hour ?? ""];
-    const rows = ledger.db.prepare(`SELECT o.id,o.run_id,o.kind,o.label,o.status,o.created_at,o.finished_at,i.title,
-      (SELECT tool_name FROM qm_invocations i WHERE operation_id=o.id
-        AND NOT EXISTS(SELECT 1 FROM qm_invocations n WHERE n.retry_of_invocation_id=i.id) ORDER BY rowid DESC LIMIT 1) tool_name
-      FROM console_operations o JOIN console_work_runs r ON r.id=o.run_id
-      JOIN console_work_items i ON i.id=r.item_id WHERE ${withHour} ORDER BY o.created_at DESC,o.id LIMIT ?`).all(...rowParams, query.limit) as Array<OperationRow & { title: string; tool_name: string | null }>;
-    const total = (ledger.db.prepare(`SELECT COUNT(*) n FROM console_operations o JOIN console_work_runs r ON r.id=o.run_id JOIN console_work_items i ON i.id=r.item_id WHERE ${withHour}`).get(...rowParams) as { n: number }).n;
-    const bins = ledger.db.prepare(`SELECT ${hour}*3600000 start, COUNT(*) count, SUM(o.status='failed') errors,
-      SUM(o.status='reconciliation_required') warnings FROM console_operations o JOIN console_work_runs r ON r.id=o.run_id
-      JOIN console_work_items i ON i.id=r.item_id WHERE ${filter} AND o.created_at>=? GROUP BY ${hour}`)
-      .all(...params, new Date(Date.now() - 86_400_000).toISOString()) as Array<{ start: number; count: number; errors: number; warnings: number }>;
-    return { total, bins, items: rows.map((row) => ({
-      id: workspaceHandle(nodeId, row.id), time: Date.parse(row.created_at), nodeId,
-      level: row.status === "failed" ? "error" : row.status === "reconciliation_required" ? "warn" : "info",
-      message: row.label, details: { run: workspaceHandle(nodeId, row.run_id), task: row.title, status: row.status, kind: row.kind },
-      ...(kind === "calls" ? { tool: row.tool_name ?? row.kind, summary: row.label, rootId: null, state: row.status,
-        duration: row.finished_at ? Date.parse(row.finished_at) - Date.parse(row.created_at) : null,
-        ok: row.status === "completed" ? true : row.status === "failed" ? false : null,
-        error: row.status === "failed" ? "执行失败" : null } : {}),
-    })) };
-  } finally { ledger.close(); }
-}
+export { readLocalActivity } from "./activity.js";

@@ -29,6 +29,25 @@
 .state.ended,.session-dot.ended { color:var(--muted,#a1a1aa); }
 .session-content { min-width:0; }
 .project-item-sub { flex-wrap:wrap; gap:6px 10px; }
+.state.stalled,.state.finalizing,.state.unknown { color:var(--amber); }
+.state.handed_off { color:var(--purple); }
+.session-dot.stalled,.session-dot.finalizing,.session-dot.unknown { background:var(--amber); }
+.session-dot.handed_off { background:var(--purple); }
+.progress.indeterminate i { width:35%;background:var(--dim);opacity:.55; }
+.field-conflict { display:flex;gap:8px;flex-wrap:wrap;padding:10px;border:1px solid var(--amber);border-radius:6px;color:var(--amber); }
+.field-conflict>span { flex-basis:100%;overflow-wrap:anywhere; }
+.phase-list { display:grid;gap:10px;margin:16px 0; }
+.phase-card,.receipt-row { padding:14px;border:1px solid var(--border);border-radius:8px;display:grid;gap:10px;min-width:0; }
+.phase-card code { font-size:11px; }
+.phase-card p { margin:0;color:var(--muted); }
+.evidence-actions { grid-column:2/-1;display:flex;gap:6px;align-items:center; }
+.receipt-row { border-width:0 0 1px;border-radius:0; }
+.receipt-row pre { max-height:360px;overflow:auto; }
+.file-source { display:block;color:var(--muted);font-size:10px;overflow-wrap:anywhere;white-space:normal; }
+.task-state .badge { display:block;width:fit-content;margin-top:4px;font-size:9px; }
+.task-state .state { white-space:normal; }
+.result-heading,.card-footer-state { flex-wrap:wrap; }
+.overview-page .recent-row:has(.state) { grid-template-columns:130px minmax(0,1fr) auto; }
 @media(max-width:760px) {
   .conversation header { align-items:flex-start; }
   .conversation-task { grid-template-columns:minmax(0,1fr) auto; gap:8px; }

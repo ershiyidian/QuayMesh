@@ -57,7 +57,7 @@ const leaseExpiry = (at = Date.now()) => new Date(at + WORK_RUN_LEASE_MS).toISOS
 
 export class WorkFinishBlockedError extends Error {
   readonly nextAction = "Observe this run's children until terminal, then retry finish. For unresolved claims/waiters, ask their owner to reconcile and release them; never steal a lock.";
-  constructor(readonly blocking: "active_execution" | "active_operation" | "same_run_claim" | "unproven_claim", message: string) {
+  constructor(readonly blocking: "active_execution" | "active_operation" | "unresolved_execution" | "same_run_claim" | "unproven_claim", message: string) {
     super(message);
   }
 }
@@ -218,6 +218,13 @@ export class WorkLedger {
     const claims = this.db.prepare(`select owner_pid from execution_claims where agent_id in
       (select distinct agent_id from console_executions where run_id=?)`).all(runId) as { owner_pid: number }[];
     return claims.some((claim) => pidAlive(claim.owner_pid));
+  }
+
+  hasUnresolvedChild(runId: string): boolean {
+    return Boolean(this.db.prepare(`select 1 from console_work_runs where id=? and status='reconciliation_required'
+      union all select 1 from console_operations where run_id=? and status in ('unknown','reconciliation_required')
+      union all select 1 from console_executions where run_id=? and status in ('unknown','reconciliation_required') limit 1`)
+      .get(runId,runId,runId));
   }
 
   reconcileRun(runId: string): boolean {
@@ -533,7 +540,8 @@ export class WorkLedger {
   }
   requestStarted(executionId: string): void {
     const row = this.execution(executionId);
-    this.db.prepare("update console_executions set requested=1,status='running',usage_quality='unavailable' where id=?").run(executionId);
+    const updated = this.db.prepare("update console_executions set requested=1,status='running',usage_quality='unavailable' where id=? and status in ('starting','queued','running')").run(executionId);
+    if (!updated.changes) return;
     this.touch(row.run_id);
   }
   providerDispatchStarted(executionId: string): void {
@@ -603,7 +611,9 @@ export class WorkLedger {
   }
   endExecution(executionId: string, status: string): void {
     const row = this.execution(executionId);
-    this.db.prepare("update console_executions set status=?,finished_at=? where id=?").run(status, now(), executionId);
+    if (!active(row.status)) return;
+    const updated = this.db.prepare("update console_executions set status=?,finished_at=? where id=? and status in ('starting','queued','running')").run(status, now(), executionId);
+    if (!updated.changes) return;
     if (row.provider === "codex" && status === "completed" && !row.requested && !row.delta) {
       this.db.prepare("update console_executions set usage_quality='unavailable',boundary_reason='missing_lifecycle_events' where id=?").run(executionId);
     }
@@ -649,6 +659,7 @@ export class WorkLedger {
       }
       if (this.executions(runId).some((execution) => active(execution.status))) throw new WorkFinishBlockedError("active_execution", "Managed agent executions are not terminal.");
       if (this.db.prepare("select id from console_operations where run_id=? and status in ('starting','queued','running')").get(runId)) throw new WorkFinishBlockedError("active_operation", "Managed operations are still active.");
+      if (this.hasUnresolvedChild(runId)) throw new WorkFinishBlockedError("unresolved_execution", "Execution effects remain unconfirmed; reconcile their evidence before finishing.");
       const project = this.getProject(run.project_id);
       // Keep admission evidence and the terminal write in this immediate transaction.
       // Only a currently active execution can prove foreign ownership. In particular,

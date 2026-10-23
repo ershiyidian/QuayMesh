@@ -320,7 +320,10 @@ export class FederationRuntime extends EventEmitter {
         if (!this.config.capabilities.egress) throw new Error("EGRESS_CAPABILITY_REQUIRED"); const result = await this.hooks.mihomoImport(params.text, params.reload); if (this.config.egress.enabled) void this.probe(); return result; }
       case "mihomo.read":
         if (!this.config.capabilities.egress) throw new Error("EGRESS_CAPABILITY_REQUIRED"); return this.hooks.mihomoRead();
-      case "transfers.list": return this.transferStore.list();
+      case "transfers.list": return params.paged === true ? this.transferStore.page({
+        limit: Number(params.limit ?? 25), offset: Number(params.offset ?? 0),
+        q: typeof params.q === "string" ? params.q : undefined, status: typeof params.status === "string" ? params.status : undefined,
+      }) : this.transferStore.list();
       case "artifact.stat": return this.hooks.artifactStat(params);
       case "artifact.lookup": return this.transferStore.lookup(params);
       case "artifact.copy": return this.startCopy(params);

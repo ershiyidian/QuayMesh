@@ -16,6 +16,7 @@ import { desktopThreadLink } from "./codex-desktop-open.js";
 import { openDatabase } from "./db/client.js";
 import { getLocalConsoleOverview } from "./console-overview.js";
 import { mountConsoleWorkbench, workbenchSession } from "./console-workbench/router.js";
+import type { ProcessSessionManager } from "./process-sessions.js";
 import type { SessionRuntime } from "./session/runtime.js";
 
 interface SessionRow { token_hash: string; csrf: string; expires_at: number; created_at: string; last_used_at: string }
@@ -35,7 +36,7 @@ export function createProjectConsoleRouter(config: ServerConfig, options: {
   federation?: FederationRuntime; fleetDirectory?: string;
   assetDirectory: string; providerFactory?: () => ThreadControl; clock?: () => number;
   agentClient?: Pick<LocalAgentClient, "get" | "control">;
-  sessionRuntime?: SessionRuntime; relayConsoleEnabled?: boolean;
+  sessionRuntime?: SessionRuntime; processSessions?: ProcessSessionManager; relayConsoleEnabled?: boolean;
 }) {
   const router = express.Router();
   const operations = new ConsoleOperations(router);
@@ -264,7 +265,7 @@ export function createProjectConsoleRouter(config: ServerConfig, options: {
   operations.get("/api/projects/:projectId/archive", withLedger((req, ledger) => ({ batches: ledger.db.prepare(
     "select id,mode,status,created_at,updated_at from console_archive_batches where project_id=? order by created_at desc limit 50")
     .all(stringParam(req.params.projectId)) })));
-  mountConsoleWorkbench(router, operations, config, options.federation, options.sessionRuntime);
+  mountConsoleWorkbench(router, operations, config, options.federation, options.sessionRuntime, options.processSessions);
   router.use((error: unknown, _req: Request, res: Response, _next: express.NextFunction) => {
     if (!res.headersSent) res.status(400).json({ code: "CONSOLE_REQUEST_REJECTED" });
     void error;

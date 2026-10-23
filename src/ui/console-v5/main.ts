@@ -4,17 +4,21 @@ import { brand,workspaceSummary,conversationCards } from './workspace-presentati
 import { Resources } from "./resources.js";
 import { $, $$, updateHTML } from "./dom.js";
 import { dialog, formObject } from "./dialogs.js";
-import { consoleError, type ConsoleError, type ConsoleSession } from "./client.js";
+import { consoleError, validateSession, WriteIntent, type ConsoleError, type ConsoleSession } from "./client.js";
 import { icon } from './icons.js';
-import { setDisplayTimeZone, timeZone, tm, fullTime, day, smartTime, ago, duration, fmt, compact, bytes, csvCell } from './format.js';
-import { esc, clamp, stages, stage, status, btn, ib, badge, meter, smallTime, spark, usageText, diffStat, elapsed, QUALITY } from './presentation.js';
-import type { Run, RunDetail, RunPage, Overview, Fleet, Machine, ChangeFile, Command, FileDiff, PatchPage, Project, Root, ListResponse, Sessions, Thread, SourceState, UsageReport, ActivityPage, EventRow, TransferRow, AuditRow, RevertPreview, RevertReceipt, ArchivePreview, ReviewReceipt, Preferences, Route, CacheEntry } from './contracts.js';
+import { setDisplayTimeZone, timeZone, tm, fullTime, day, smartTime, ago, duration, fmt, compact, bytes, csvCell, timestamp } from './format.js';
+import { esc, clamp, stages, stage, status, btn, ib, badge, meter, smallTime, spark, usageText, diffStat, resultExplanation, elapsed as renderElapsed, transferPercent, percent, QUALITY } from './presentation.js';
+import type { Run, RunDetail, RunPage, Overview, Fleet, Machine, NodeSettingsSnapshot, ChangeFile, Command, FileDiff, PatchPage, Project, Root, ListResponse, Sessions, Thread, SourceState, UsageReport, ActivityPage, EventRow, TransferRow, AuditRow, RevertPreview, RevertReceipt, ArchivePreview, ReviewReceipt, ActionReceipt, ControlReceipt, Preferences, Route, CacheEntry } from './contracts.js';
 import Prism from "prismjs";
 import "prismjs/components/prism-typescript.js";
 import "prismjs/components/prism-python.js";
 import { createApi, ApiError } from "./client.js";
 import { cacheRatio, noncachedInput, usageParts } from "./usage.js";
 import { CommandOutputs } from "./command-output.js";
+import { sourceWarning, resourceHealth } from './source-state.js';
+import { readFields, fieldsFromHTML, refreshFields, type FieldValues } from './settings-form.js';
+import { EventNotifications, type NotificationMemory, type NotificationPage } from './notifications.js';
+import { receiptLabel, canQueryReceipt } from './receipt-presentation.js';
 import { workspaceHandle } from "../../federation/routing.js";
 import "./styles.css";
 import './experience.css';
@@ -38,7 +42,7 @@ const storage = { get<T>(k: string, d: T): T { try {
         localStorage.removeItem(k);
     }
     catch { } } };
-const DEFAULTS = { theme: 'dark', density: 'compact', sidebar: 'expanded', poll: 8, listWidth: 320, base: '/console/api/v4/', wrap: true, notifications: false, timeZone: 'local' };
+const DEFAULTS = { theme: 'dark', density: 'compact', sidebar: 'expanded', poll: 8, listWidth: 320, base: '/console/api/v4/', wrap: true, notifications: false, timeZone: 'local', taskLayout: 'list', machineLayout: 'cards', diffMode: 'unified' };
 const savedPreferences = storage.get('quaymesh.workbench.v5', {});
 let pref: Preferences = { ...DEFAULTS, ...Object.fromEntries(Object.entries(savedPreferences).filter(([key]) => key in DEFAULTS && key !== 'base')) };
 if (!['dark', 'light', 'system'].includes(pref.theme))
@@ -78,26 +82,33 @@ function savePref(p: Partial<Preferences>) { pref = { ...pref, ...p }; storage.s
 
 
 
-const API = createApi(() => { authRequired = true; schedulePaint(); });
-const resources = new Resources(API, { freshness, paint: schedulePaint, observe: observeStages, loaded(path) { if (path === 'projects' || path.startsWith('runs')) ensureRoute(); } });
+const API = createApi(() => { authRequired = true; schedulePaint(); }, () => { resources.invalidate(); ensureRoute(); schedulePaint(); });
+const resources = new Resources(API, { freshness, paint: schedulePaint, loaded(path) {
+    if (path === runPath() && route.p.cursor && CACHE.get(path)?.error?.code === 'cursor_expired') {
+        toast('列表快照已到期，已重新读取第一页。','warn'); param({cursor:null}); return;
+    }
+    if (path === 'projects' || path.startsWith('runs')) ensureRoute();
+    if (path === 'fleet/status') pollNotifications();
+} });
 const CACHE = resources.entries, selectedRuns = new Set<string>(), selectedThreads = new Set<string>(), expandedRoots = new Set<string>(), loadedBigFiles = new Set<string>(), expandedGroups = new Set<string>();
 let route: Route = parseRoute(), authRequired = false, booting = true, paintQueued = false, refreshTimer: ReturnType<typeof setTimeout> | undefined = undefined, failures = 0, refreshInFlight = false, backgroundPaused = false, activityPaused = false, activePaths = new Set<string>(), lastFocus: HTMLElement | null = null, paletteState: { close: () => void } | null = null;
 const diffLimits = new Map<string, number>();
-let pageSearch = '', sessionSearch = '', groupEvents = true, sortLayout = 'list', machineLayout = 'cards', diffMode = 'unified', writePending = new Set<string>();
+let pageSearch = '', sessionSearch = '', groupEvents = true, sortLayout = pref.taskLayout, machineLayout = pref.machineLayout, diffMode = pref.diffMode, writePending = new Set<string>();
 const NAV = [['overview', '运行总览', 'overview'], ['tasks', '任务', 'tasks'], ['changes', '改动审查', 'changes'], ['sessions', '会话', 'sessions'], ['machines', '机器', 'machines'], ['workspaces', '工作空间', 'workspaces'], ['activity', '活动', 'activity'], ['usage', '用量分析', 'usage'], ['settings', '设置', 'settings']];
 const titleOf = (v: string) => NAV.find(n => n[0] === v)?.[1] || '运行总览';
 function parseRoute() { const [v, q] = location.hash.replace(/^#\/?/, '').split('?'); return { view: ['overview', 'tasks', 'changes', 'sessions', 'machines', 'workspaces', 'activity', 'usage', 'settings'].includes(v) ? v : 'overview', p: Object.fromEntries(new URLSearchParams(q || '')) }; }
 function currentQuery(extra: Record<string, string | number | boolean | null | undefined> = {}): string {
   const p = route.p;
-  return queryString({ tz: timeZone() || deviceTimeZone, days: p.days ?? '0', node: p.node, project: p.project, q: p.q, status: p.status, sort: p.sort,
+  return queryString({ tz: timeZone() || deviceTimeZone, days: p.days ?? '0', node: p.node, project: p.project, q: p.q, status: p.status || (route.view === 'changes' && p.reviewMode !== 'all' ? 'review' : undefined), stage: p.stage, sort: p.sort,
     cursor: p.cursor, limit: p.limit || '25', changed: route.view === 'changes' ? '1' : p.changed, date: p.date, finishedDay: p.finishedDay,
-    execution: p.execution, attention: p.attention, ...extra });
+    execution: p.execution, attention: p.attention, usageDate:p.usageDate, usageDays:p.usageDays, ...extra });
 }
 function queryString(parameters: Record<string, string | number | boolean | null | undefined>): string {
   return new URLSearchParams(Object.entries(parameters).flatMap(([key, value]): Array<[string,string]> => value === undefined || value === null || value === '' ? [] : [[key,String(value)]])).toString();
 }
 const runPath = () => 'runs?' + currentQuery();
-const activityPath = () => 'activity?' + new URLSearchParams(Object.fromEntries(Object.entries({ kind: route.p.kind || 'events', q: route.p.q || '', node: route.p.node || '', level: route.p.level || '', cursor: route.p.cursor || '', hour: route.p.hour || '' }).filter(([, v]) => v)));
+const activityPath = () => route.p.kind === 'receipts' ? 'receipts?limit=50' : 'activity?' + new URLSearchParams(Object.fromEntries(Object.entries({ kind: route.p.kind || 'events', q: route.p.q || '', node: route.p.node || '', level: route.p.level || '', cursor: route.p.cursor || '', hour: route.p.hour || '' }).filter(([, v]) => v)));
+const conversationPath = () => 'conversations?' + queryString({q:route.p.q,node:route.p.node});
 const usagePath = () => 'usage?' + currentQuery({ days: route.p.days || '14', cursor: null, limit: null, status: null });
 const data = <T = unknown>(path: string): T | undefined => CACHE.get(path)?.data as T | undefined;
 const fleet = () => data<Fleet>('fleet/status');
@@ -112,8 +123,25 @@ const taskScope = (run: Run, short = true) => run.nodeIds && run.nodeIds.length 
 const canWrite = (cap = 'write') => !!API.session?.capabilities?.write && API.session.capabilities[cap] !== false;
 const writeAttrs = (cap = 'write') => canWrite(cap) ? '' : 'disabled title="当前接口或凭据不允许此操作"';
 const selectedRun = () => data<RunDetail>('runs/' + enc(route.p.run || ''))?.run;
+function resourceName(path: string) {
+    return path.startsWith('overview') ? '任务总览' : path === 'fleet/status' ? '节点状态' : path === 'projects' ? '项目' : path.startsWith('runs?') ? '任务列表' : path.startsWith('runs/') ? '任务详情' : path.includes('/sessions') ? '会话' : path.startsWith('usage') ? '用量' : path.startsWith('activity') ? '活动' : path === 'roots' ? '工作空间' : '数据';
+}
+function runObservation(run: Run) {
+    const matching = [...activePaths].map(path => CACHE.get(path)).filter((entry): entry is CacheEntry => {
+        if (!entry?.data) return false;
+        const value = entry.data as { run?: Run; items?: Run[]; active?: Run[]; waiting?: Run[]; recent?: Run[] };
+        return value.run?.id === run.id || [value.items, value.active, value.waiting, value.recent].some(rows => rows?.some(row => row.id === run.id));
+    }).sort((a, b) => b.time - a.time);
+    const entry = matching[0], sources = (entry?.data as { sources?: SourceState[] } | undefined)?.sources?.filter(source => (run.nodeIds || [run.nodeId]).includes(source.nodeId)) || [];
+    const observed = sources.map(source => source.observedAt).filter((at): at is number => at !== null);
+    const observedAt = run.observedAt !== undefined ? run.observedAt : (observed.length ? Math.min(...observed) : entry?.time || null);
+    return { stale: Boolean(run.stale || entry?.error) || sources.some(source => Boolean(sourceWarning(source))) || Boolean(observedAt && Date.now()-observedAt > 30_000 && ['running','stopping','queued'].includes(run.executionStatus)), observedAt };
+}
+function elapsed(run: Run): string { return renderElapsed(run,runObservation(run)); }
 function routePaths() {
-    const list = ['fleet/status', overviewPath(), 'projects'];
+    const list = ['fleet/status'];
+    if (['overview', 'machines'].includes(route.view)) list.push(overviewPath());
+    if (['overview', 'tasks', 'changes', 'sessions', 'workspaces', 'usage'].includes(route.view)) list.push('projects');
     if (['tasks', 'changes'].includes(route.view)) {
         list.push(runPath());
         if (route.p.run) {
@@ -126,8 +154,8 @@ function routePaths() {
                         list.push(path + '/files/' + enc(f.id));
         }
     }
-    else if (route.view === 'sessions' && route.p.project)
-        list.push('projects/' + enc(route.p.project) + '/sessions');
+    else if (route.view === 'sessions')
+        list.push(route.p.project ? 'projects/' + enc(route.p.project) + '/sessions' : conversationPath());
     else if (route.view === 'workspaces')
         list.push('roots');
     else if (route.view === 'activity' && !activityPaused)
@@ -155,14 +183,8 @@ function freshness(path: string) {
 
 async function load(path: string, force = false): Promise<unknown> { return resources.load(path, force); }
 function ensureRoute() {
-    if (authRequired || booting)
+    if (authRequired || booting || document.hidden || backgroundPaused)
         return;
-    if (route.view === 'sessions' && !route.p.project && route.p.picker !== '1' && projects().length) {
-        const saved = storage.get('quaymesh.last-project', null);
-        const chosen = projects().find(p => p.id === saved) || projects().slice().sort((a, b) => b.active - a.active || b.updatedAt - a.updatedAt)[0];
-        navigate('sessions', { project: chosen.id }, true);
-        return;
-    }
     if (route.view === 'changes' && !route.p.run && route.p.browse !== '1' && data<RunPage>(runPath())?.items.length) {
         navigate('changes', { run: data<RunPage>(runPath())!.items[0].id, tab: 'diff' }, true, true);
         return;
@@ -199,35 +221,50 @@ catch {
     setTimeout(() => { if (innerWidth <= 1000)
         $('#inspector-close')?.focus(); }, 30);
 } }
-function param(p: Record<string, string | number | boolean | null | undefined>) { if ('q' in p || 'status' in p || 'node' in p || 'project' in p || 'days' in p || 'sort' in p)
+function param(p: Record<string, string | number | boolean | null | undefined>) { if ('q' in p || 'status' in p || 'stage' in p || 'attention' in p || 'node' in p || 'project' in p || 'days' in p || 'usageDate' in p || 'usageDays' in p || 'sort' in p)
     p.cursor = null; selectedRuns.clear(); navigate(route.view, p, true, true); }
-function schedulePaint() { if (paintQueued)
-    return; paintQueued = true; requestAnimationFrame(() => { paintQueued = false; paint(); }); }
-async function refresh(manual = false) { if (refreshInFlight || booting || authRequired)
-    return; refreshInFlight = true; schedulePaint(); try {
-    const paths = routePaths().filter(p => !activityPaused || !p.startsWith('activity?'));
-    activePaths = new Set(routePaths());
-    await Promise.all([...paths.map(p => load(p, manual)), ...visibleCommandPaths().map(path => loadCommand(path, manual))]);
-    const errors = paths.filter(p => CACHE.get(p)?.error);
-    failures = errors.length ? Math.min(failures + 1, 4) : 0;
-    if (manual)
-        toast(errors.length ? `${errors.length} 个资源刷新失败，其余数据可用` : '已刷新当前视图', errors.length ? 'warn' : 'good');
+function schedulePaint() {
+    if (paintQueued) return;
+    paintQueued = true;
+    requestAnimationFrame(() => {
+        paintQueued = false;
+        try { paint(); }
+        catch (error) {
+            const message = consoleError(error).message;
+            updateHTML($('#view'), `<div class="page">${pageHead('当前页面暂时无法显示')}${empty('页面读取或显示失败', message, btn('重新读取', 'refresh') + btn('查看诊断', 'diagnostics'))}</div>`);
+            updateHTML($('#global-notice'), '<div class="notice warn">当前页面显示失败，已保留此前读取的记录。</div>');
+            updateHTML($('#statusbar'), '<span class="amber">页面显示失败</span>');
+        }
+    });
 }
-finally {
-    refreshInFlight = false;
-    schedulePaint();
-    schedulePoll();
-} }
-function schedulePoll() { clearTimeout(refreshTimer); if (!pref.poll || document.hidden || backgroundPaused || booting || authRequired)
-    return; const interval = Math.min(60000, pref.poll * 1000 * 2 ** failures); refreshTimer = setTimeout(() => refresh(), interval + (failures ? Math.random() * 1000 : 0)); }
+let refreshCount = 0;
+async function refresh(manual = false) {
+    if (booting || authRequired || document.hidden || backgroundPaused) return;
+    refreshCount++; refreshInFlight = true; schedulePaint(); schedulePoll();
+    pollNotifications();
+    try {
+        const paths = routePaths().filter(p => !activityPaused || !p.startsWith('activity?'));
+        activePaths = new Set(routePaths());
+        await Promise.all([...paths.map(p => load(p, manual)), ...visibleCommandPaths().map(path => loadCommand(path, manual))]);
+        const errors = paths.filter(p => CACHE.get(p)?.error);
+        if (manual) toast(errors.length ? `${errors.length} 个资源刷新失败，其余数据可用` : '已重新读取当前视图', errors.length ? 'warn' : 'good');
+    } finally {
+        refreshInFlight = --refreshCount > 0; schedulePaint();
+    }
+}
+function schedulePoll() {
+    clearTimeout(refreshTimer);
+    if (!pref.poll || document.hidden || backgroundPaused || booting || authRequired) return;
+    refreshTimer = setTimeout(() => void refresh(), pref.poll * 1000);
+}
 function resourceState(path: string) { const e = CACHE.get(path); if (e?.data)
     return ''; if (e?.error)
-    return `<div class="panel">${empty('读取失败', e.error.message, btn('重试', 'retry', `data-path="${esc(path)}"`))}</div>`; return `<div class="panel loading" aria-busy="true" aria-label="正在读取数据"><div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div></div>`; }
+    return `<div class="panel">${empty('读取失败', e.error.message, btn('重试', 'retry', `data-path="${esc(path)}"`))}</div>`; return `<div class="panel loading" aria-busy="true" aria-label="正在读取数据"><p><span class="spinner"></span> 正在读取${esc(resourceName(path))}…</p><div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div><p class="small muted">${e?.startedAt ? "开始于 " + esc(fullTime(e.startedAt)) : "等待数据返回"}</p></div>`; }
 function staleNotice(path: string) {
   const entry = CACHE.get(path);
-  const sources = (entry?.data as { sources?: SourceState[] } | null)?.sources?.filter(source => source.state === "error" || source.state === "offline" || (source.state === "loading" && !source.observedAt)) || [];
+  const sources = (entry?.data as { sources?: SourceState[] } | null)?.sources?.filter(source => sourceWarning(source)) || [];
   const warnings = (entry?.data as { warnings?: string[] } | null)?.warnings || [];
-  const messages = [entry?.error?.message, ...sources.map(source => (source.name || source.nodeId) + '：' + (source.error || '尚未取得数据')), ...warnings].filter(Boolean);
+  const messages = [entry?.error?.message, ...sources.map(source => (source.name || source.nodeId) + '：' + sourceWarning(source) + (source.observedAt ? ' · 最后确认 ' + fullTime(source.observedAt) : '')), ...warnings].filter(Boolean);
   if (!messages.length) return '';
   return '<div class="notice warn visually-spaced">' + icon('alert') + '<div>' + messages.map(esc).join('<br>') + '</div>' + btn('重试', 'retry', 'data-path="' + esc(path) + '"', 'small') + '</div>';
 }
@@ -252,29 +289,29 @@ function pagination(d: RunPage | ActivityPage<unknown>) {
 
 const deviceTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 function chrome() {
-    const ov = overview(), f = fleet(), fails = [...activePaths].filter(p => CACHE.get(p)?.error);
+    const ov = overview(), f = fleet(), health = resourceHealth([...activePaths].map(p => CACHE.get(p)));
     const nav = NAV.map(([v, t, i], index) => `${index === 4 ? '<div class="nav-label">基础设施</div>' : ''}${index === 8 ? '<div class="nav-divider"></div>' : ''}<button type="button" class="nav-item ${route.view === v ? 'active' : ''}" data-action="nav" data-view="${v}" ${route.view === v ? 'aria-current="page"' : ''} title="${t}">${icon(i, 16)}<span class="label">${t}</span>${v === 'tasks' && ov?.runningCount ? `<span class="nav-count" title="${ov.runningCount} 项运行中">${ov.runningCount}</span>` : ''}</button>`).join('');
     updateHTML($('#sidebar'), `<div class="brand">${brand()}<span class="brand-text">QuayMesh</span>${ib('panel', 'sidebar', '折叠侧栏')}</div><div class="nav-label">工作台</div><nav aria-label="主导航">${nav}</nav><div class="sidebar-bottom"><button class="nav-item" data-action="palette" title="搜索与命令">${icon('terminal')}<span class="label">命令面板</span><kbd class="nav-count">${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'} K</kbd></button><div class="profile"><span class="avatar">W</span><div class="profile-text"><b>${esc(API.session?.user?.name || 'Owner')}</b><small>${canWrite() ? '管理员' : '只读'}</small></div>${ib('settings', 'nav', '设置', 'data-view="settings"')}</div></div>`);
-    updateHTML($('#topbar'), `<button class="collapsed-toggle icon-btn" data-action="sidebar" aria-label="展开侧栏">${icon('panel')}</button><div class="breadcrumb"><span class="workspace-label">个人工作区</span><span class="slash">/</span><b>${esc(titleOf(route.view))}</b></div><button class="top-search" data-action="palette" aria-label="搜索与命令面板">${icon('search', 14)}<span>搜索任务或命令</span><kbd>${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'} K</kbd></button><button class="demo-tag" data-action="api-settings">API</button>${desktopActions()}${ib('refresh', 'refresh', '刷新当前页面', refreshInFlight ? 'disabled' : '')}${ib(document.documentElement.dataset.theme === 'dark' ? 'sun' : 'moon', 'theme', '切换主题', '', 'theme-top')}`);
+    updateHTML($('#topbar'), `<button class="collapsed-toggle icon-btn" data-action="sidebar" aria-label="展开侧栏">${icon('panel')}</button><div class="breadcrumb"><span class="workspace-label">个人工作区</span><span class="slash">/</span><b>${esc(titleOf(route.view))}</b></div><button class="top-search" data-action="palette" aria-label="搜索与命令面板">${icon('search', 14)}<span>搜索任务或命令</span><kbd>${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'} K</kbd></button><button class="demo-tag" data-action="diagnostics">诊断</button>${desktopActions()}${ib('refresh', 'refresh', refreshInFlight ? '重新发起当前页面读取' : '刷新当前页面')}${ib(document.documentElement.dataset.theme === 'dark' ? 'sun' : 'moon', 'theme', '切换主题', '', 'theme-top')}`);
     updateHTML($('#global-notice'), failureSummary());
-    updateHTML($('#statusbar'), `<span class="inline ${fails.length ? 'amber' : booting ? 'muted' : 'green'}"><i class="dot"></i>${booting ? '连接中' : authRequired ? '请登录' : bootstrapError ? '未连接' : fails.length ? '读取异常' : '已连接'}</span><button data-action="nav" data-view="machines">${f ? f.nodes.filter(n => n.online).length + '/' + f.nodes.length + ' 节点在线' : '读取节点'}</button><span>出网 ${esc(node(f?.gatewayId)?.short || '—')}</span><span class="spacer"></span><span>${document.hidden || backgroundPaused ? '已暂停' : pref.poll ? pref.poll + ' 秒刷新' : '手动刷新'}</span><span>${timeZone() || deviceTimeZone}</span><button data-action="shortcuts">快捷键</button>`);
+    updateHTML($('#statusbar'), `<span class="inline ${booting || authRequired || bootstrapError ? 'muted' : health.tone}" title="${esc(health.confirmedAt ? '本页最近确认：' + fullTime(health.confirmedAt) : '尚无已确认数据')}"><i class="dot"></i>${booting ? '连接中' : authRequired ? '请登录' : bootstrapError ? '未连接' : health.label}</span><button data-action="nav" data-view="machines">${f ? f.nodes.filter(n => n.online).length + '/' + f.nodes.length + ' 节点在线' : '读取节点'}</button><span>出网 ${esc(node(f?.gatewayId)?.short || '—')}</span><span class="spacer"></span><span>${document.hidden || backgroundPaused ? '已暂停' : pref.poll ? pref.poll + ' 秒检查更新' : '手动刷新'}</span><span>${timeZone() || deviceTimeZone}</span><button data-action="shortcuts">快捷键</button>`);
     updateHTML($('#bottom-nav'), [['overview', '总览', 'overview'], ['tasks', '任务', 'tasks'], ['sessions', '会话', 'sessions'], ['machines', '机器', 'machines'], ['more', '更多', 'more']].map(([v, t, i]) => `<button class="${v === route.view || v === 'more' && !['overview', 'tasks', 'sessions', 'machines'].includes(route.view) ? 'active' : ''}" data-action="${v === 'more' ? 'more' : 'nav'}" data-view="${v}" aria-label="${t}">${icon(i, 19)}<span>${t}</span></button>`).join(''));
 }
 function failureSummary() {
   if (authRequired) return '<div class="notice global-notice warn">' + icon('lock', 14) + '登录已过期</div>';
   const failed = [...activePaths].filter(path => CACHE.get(path)?.error);
   const sources = new Map();
-  for (const path of activePaths) for (const source of data<{ sources?: SourceState[] }>(path)?.sources || []) if (source.state === "error" || source.state === "offline") sources.set(source.nodeId, source);
+  for (const path of activePaths) for (const source of data<{ sources?: SourceState[] }>(path)?.sources || []) if (sourceWarning(source)) sources.set(source.nodeId, source);
   const notices = [];
   if (failed.length) notices.push(failed.length + ' 项读取失败');
   if (sources.size) notices.push([...sources.values()].map(source => source.name || source.nodeId).join('、') + '数据未更新，统计仅包含已读取记录');
+  if (pref.notifications && notificationGaps.size) notices.push([...notificationGaps].map(([id,message]) => (node(id)?.name || id) + '：' + message).join('；'));
   return notices.length ? '<div class="notice global-notice warn">' + icon('alert', 14) + '<span>' + esc(notices.join(' · ')) + '</span>' + btn('重试', 'refresh', '', 'small') + '</div>' : '';
 }
 let bootstrapError:ConsoleError|null=null;
 let bootstrapRetryTimer:ReturnType<typeof setTimeout>|undefined;
 let bootstrapAttempts=0;
 function paint() {
-    chrome();
     const root = $('#view')!;
     root.classList.toggle('split-view', ['tasks', 'changes', 'sessions'].includes(route.view));
     let html;
@@ -286,6 +323,7 @@ function paint() {
         html = `<div class="page">${pageHead('正在建立连接', '读取会话与接口能力')}${resourceState('session')}</div>`;
     else
         html = renderView();
+    chrome();
     updateHTML(root, `<div data-key="view-${route.view}-${authRequired ? 'login' : 'app'}" style="${['tasks', 'changes', 'sessions'].includes(route.view) && !authRequired ? 'height:100%;min-height:0' : ''}">${html}</div>`);
     const overlay = !!route.p.run && ['tasks', 'changes'].includes(route.view) && innerWidth <= 1000;
     ['#sidebar', '#topbar', '#bottom-nav', '#statusbar'].forEach(sel => { const el = $(sel); if (el)
@@ -304,6 +342,7 @@ function paint() {
     attachClock();
 }
 async function loadCommand(path: string, force = false) {
+  if (document.hidden || backgroundPaused) return;
   await commandReader.load(path, new Set(visibleCommandPaths()), force);
 }
 function visibleCommandPaths() {
@@ -336,7 +375,7 @@ document.addEventListener('toggle', event => {
 function renderView() { return ({ overview: overviewPage, tasks: tasksPage, changes: tasksPage, sessions: sessionsPage, machines: machinesPage, workspaces: workspacesPage, activity: activityPage, usage: usagePage, settings: settingsPage } as Record<string, () => string>)[route.view](); }
 function overviewRunCard(r: Run) {
     const state = stage(r);
-    return `<article class="run-card" data-key="active-${esc(r.id)}"><header><span class="session-symbol">${icon('changes', 16)}<i class="session-dot ${state}"></i></span><div class="run-card-title"><button class="run-title ellipsis" data-action="open-run" data-id="${esc(r.id)}" title="${esc(r.title)}">${esc(r.title)}</button><div class="run-sub">${taskScope(r, true)}${workspaceSummary(r)}</div></div>${ib('chevron', 'open-run', '打开任务', `data-id="${esc(r.id)}"`)}</header>${r.command ? `<button class="session-live" data-action="card-command" data-id="${esc(r.id)}"><span class="spinner"></span><span class="agent-label">${esc(r.agent)}</span><code title="${esc(r.command)}">${esc(r.command)}</code></button>` : ''}<footer>${status(state)}<span class="spacer"></span>${elapsed(r)}<span class="divider"></span>${usageText(r)}</footer></article>`;
+    return `<article class="run-card" data-key="active-${esc(r.id)}"><header><span class="session-symbol">${icon('changes', 16)}<i class="session-dot ${state}"></i></span><div class="run-card-title"><button class="run-title ellipsis" data-action="open-run" data-id="${esc(r.id)}" title="${esc(r.title)}">${esc(r.title)}</button><div class="run-sub">${taskScope(r, true)}${workspaceSummary(r)}</div></div>${ib('chevron', 'open-run', '打开任务', `data-id="${esc(r.id)}"`)}</header>${r.command ? `<button class="session-live" data-action="card-command" data-id="${esc(r.id)}"><span class="spinner"></span><span class="agent-label">${esc(r.agent)}</span><code title="${esc(r.command)}">${esc(r.command)}</code></button>` : ''}<footer>${runBadges(r)}<span class="spacer"></span>${elapsed(r)}<span class="divider"></span>${usageText(r)}</footer></article>`;
 }
 function overviewPage() {
     const o = overview(), f = fleet();
@@ -346,56 +385,82 @@ function overviewPage() {
     const detail = (value: number | null | undefined, suffix: string) => value == null ? '数据未完整取得' : value + suffix;
     const metric = (label: string, value: string | number | null, sub: string, action: string, tone = '') => `<button class="metric metric-button" data-action="${action}"><span class="metric-label">${label}</span><span class="metric-main"><b class="${tone}">${value}</b><small>${sub}</small></span></button>`;
     const active = o.active.filter(r => ['running','stopping'].includes(stage(r))), queue = o.active.filter(r => stage(r) === 'queued');
-    const running = `<section class="overview-active"><div class="section-line"><h3>当前工作 <span class="muted small">${o.runningCount ?? active.length}</span></h3><button class="link-btn" data-action="nav" data-view="tasks">全部任务 ${icon('arrow', 13)}</button></div><div class="active-card-grid">${active.map(overviewRunCard).join('') || empty('暂无当前工作')}</div>${queue.length ? `<div class="queue-strip">${icon('queued', 14)}<b>${o.queuedCount ?? queue.length} 项排队</b><span class="ellipsis">${esc(queue.map(r => r.title).join('、'))}</span>${btn('查看', 'queued-queue', '', 'small ghost')}</div>` : ''}</section>`;
-    const waiting = o.waiting.length ? panel('等待下一步 / 接续', o.waiting.map(r=>`<div class="recent-row"><span>${icon('waiting',14)}</span><div class="recent-name"><button class="run-title ellipsis" data-action="open-run" data-id="${esc(r.id)}">${esc(r.title)}</button>${workspaceSummary(r)}</div>${smallTime(r.lastActivityAt)}</div>`).join(''), btn('查看全部 '+(o.waitingCount ?? ''),'waiting-queue','','ghost small')) : '';
+    const running = `<section class="overview-active"><div class="section-line"><h3>当前工作 <span class="muted small">${o.runningCount ?? ('至少 ' + active.length)}</span></h3><button class="link-btn" data-action="nav" data-view="tasks">全部任务 ${icon('arrow', 13)}</button></div><div class="active-card-grid">${active.map(overviewRunCard).join('') || empty(o.coverage.tasks ? '暂无当前工作' : '已读取范围内暂无当前工作', o.coverage.tasks ? '' : '仍有节点数据待确认。')}</div>${queue.length ? `<div class="queue-strip">${icon('queued', 14)}<b>${o.queuedCount ?? ('至少 ' + queue.length)} 项排队</b><span class="ellipsis">${esc(queue.map(r => r.title).join('、'))}</span>${btn('查看', 'queued-queue', '', 'small ghost')}</div>` : ''}</section>`;
+    const waiting = o.waiting.length ? panel('当前无后台执行 / 交付确认', o.waiting.map(r=>`<div class="recent-row"><span>${status(stage(r))}</span><div class="recent-name"><button class="run-title ellipsis" data-action="open-run" data-id="${esc(r.id)}">${esc(r.title)}</button>${workspaceSummary(r)}${r.reason ? `<p class="small muted">${esc(r.reason)}</p>` : ''}</div>${smallTime(r.lastActivityAt)}</div>`).join(''), btn('查看全部 '+(o.waitingCount ?? ''),'waiting-queue','','ghost small')) : '';
     const recent = panel('最近结束', o.recent.map(r => `<div class="recent-row" data-key="recent-${esc(r.id)}"><span>${icon(stage(r), 14)}</span><div class="recent-name"><button class="run-title ellipsis" data-action="open-run" data-id="${esc(r.id)}">${esc(r.title)}</button>${workspaceSummary(r)}</div>${status(stage(r))}${smallTime(r.finishedAt || r.startedAt)}</div>`).join('') || empty('暂无执行记录'), btn('查看全部', 'nav', 'data-view="tasks"', 'ghost small'));
-    const attention = panel('需要处理', o.attention.slice(0, 3).map(a => `<div class="attention-row" data-key="attention-${esc(a.id)}"><span class="${a.kind === 'failed' ? 'red' : 'amber'}">${icon(a.kind, 16)}</span><div><button class="run-title" data-action="open-run" data-id="${esc(a.id)}">${esc(a.title)}</button><p title="${esc(a.detail)}">${esc(a.detail)}</p></div>${ib('chevron', 'open-run', '查看异常', `data-id="${esc(a.id)}"`)}</div>`).join('') || empty('没有执行异常'), o.attentionCount == null ? badge('数据未完整取得') : badge(o.attentionCount + ' 项', o.attentionCount ? 'warn' : ''), o.attentionCount != null && o.attentionCount > 3 ? `<button class="link-btn" data-action="attention-queue">全部 ${o.attentionCount} 项 ${icon('arrow', 13)}</button>` : '');
-    const fleetBody = f ? `<div class="fleet-labels"><span>节点</span><span>CPU</span><span>内存</span></div>${f.nodes.map(n => `<div class="fleet-row" data-key="fleet-${esc(n.id)}"><button class="run-title" data-action="node" data-id="${esc(n.id)}">${nodeTag(n.id)}<span class="small muted fleet-description">${n.id === f.gatewayId ? '当前出口' : n.online ? n.gpus.length + ' GPU' : '离线'}</span></button><div class="reading">${n.online && n.cpu != null ? fmt(n.cpu) + '%' : '—'}${meter(n.online ? n.cpu : 0)}</div><div class="reading">${n.online ? Math.round(n.memoryUsed / n.memoryTotal * 100) + '%' : '—'}${meter(n.online ? n.memoryUsed / n.memoryTotal * 100 : 0)}</div></div>`).join('')}` : resourceState('fleet/status');
+    const attention = panel('需要处理', o.attention.slice(0, 3).map(a => `<div class="attention-row" data-key="attention-${esc(a.id)}"><span class="${a.kind === 'failed' ? 'red' : 'amber'}">${icon(a.kind, 16)}</span><div><button class="run-title" data-action="open-run" data-id="${esc(a.id)}">${esc(a.title)}</button><p title="${esc(a.detail)}">${esc(a.detail)}</p></div>${ib('chevron', 'open-run', '查看异常', `data-id="${esc(a.id)}"`)}</div>`).join('') || empty(o.coverage.tasks ? '没有待处理事项' : '已读取范围内未发现待处理事项', o.coverage.tasks ? '' : '尚有数据待确认。'), o.attentionCount == null ? badge('数据未完整取得') : badge(o.attentionCount + ' 项', o.attentionCount ? 'warn' : ''), o.attentionCount != null && o.attentionCount > 3 ? `<button class="link-btn" data-action="attention-queue">全部 ${o.attentionCount} 项 ${icon('arrow', 13)}</button>` : '');
+    const fleetBody = f ? `<div class="fleet-labels"><span>节点</span><span>CPU</span><span>内存</span></div>${f.nodes.map(n => `<div class="fleet-row" data-key="fleet-${esc(n.id)}"><button class="run-title" data-action="node" data-id="${esc(n.id)}">${nodeTag(n.id)}<span class="small muted fleet-description">${n.id === f.gatewayId ? '当前出口' : n.online ? n.gpuSampled === false ? 'GPU 尚未采集' : n.gpus.length + ' GPU' : '离线'}</span></button><div class="reading">${n.online && n.cpu != null ? fmt(n.cpu) + '%' : '—'}${meter(n.online ? n.cpu : null)}</div><div class="reading">${n.online && percent(n.memoryUsed,n.memoryTotal) !== null ? Math.round(percent(n.memoryUsed,n.memoryTotal)!) + '%' : '—'}${meter(n.online ? percent(n.memoryUsed,n.memoryTotal) : null)}</div></div>`).join('')}` : resourceState('fleet/status');
     const machines = panel('机器', fleetBody, f ? `<button class="link-btn small" data-action="nav" data-view="machines">${f.nodes.filter(n => n.online).length}/${f.nodes.length} 在线 ${icon('chevron', 12)}</button>` : '');
     const gateway = f ? panel('连接', `<div class="connection-grid"><span class="muted">入口</span><span>${esc(node(f.ingressNodeId)?.short || '尚未配置')}</span>${f.ingressNodeId ? badge(node(f.ingressNodeId)?.online ? '在线' : '未连接', node(f.ingressNodeId)?.online ? 'good' : 'warn') : badge('入口未配置')}<span class="muted">出网</span><span>${esc(node(f.gatewayId)?.short || '—')} · ${esc(node(f.gatewayId)?.egress?.region || '—')}</span><span class="num small">${node(f.gatewayId)?.egress?.latency ?? '—'} ms</span></div><div class="endpoint"><code>${esc(f.mcpUrl || f.ingressLabel || (f.ingressNodeId ? '由该节点的托管 MCP 隧道提供' : '尚未配置 MCP 入口'))}</code>${ib('copy', 'copy', '复制 MCP 地址', `data-text="${esc(f.mcpUrl || '')}" ${f.mcpUrl ? '' : 'disabled'}`)}</div>`) : '';
-    const usage = panel('今日项目用量', o.projects.filter(p => (p.usage ?? 0) > 0).map(p => `<div class="usage-project-line"><button class="run-title ellipsis" data-action="project-tasks" data-id="${esc(p.id)}">${esc(p.name)}</button>${meter(o.todayUsage.total ? (p.usage ?? 0) / o.todayUsage.total * 100 : 0)}<span class="num">${compact(p.usage)}</span></div>`).join('') || empty('暂无用量'), btn('用量分析', 'usage-nav', '', 'small ghost'));
-    return `<div class="page overview-page">${pageHead('运行总览', `<span class="live-indicator"></span>${day(Date.now())}`, btn('待验收 ' + (o.reviewCount == null ? '数据未完整取得' : o.reviewCount), 'review-queue', '', 'small') + btn(icon('tasks', 14) + '全部任务', 'nav', 'data-view="tasks"', 'small'))}${staleNotice(overviewPath())}<section class="summary-grid">${metric('后台执行', shown(o.runningCount), detail(o.queuedCount, ' 项排队'), 'running-queue', 'accent')}${metric('待验收', shown(o.reviewCount), o.complete ? '' : '数据未完整取得', 'review-queue')}${metric('今日完成', shown(o.completedToday), detail(o.failedToday, ' 项失败'), 'completed-queue')}${metric('今日 Token', (o.todayUsage.partial || o.todayUsage.missing ? '≥ ' : '') + compact(o.todayUsage.total), o.todayUsage.missing ? o.todayUsage.missing + ' 项未知' : '', 'usage-nav')}</section><div class="overview-grid"><div class="stack">${running}${waiting}${recent}${usage}</div><div class="stack">${attention}${machines}${gateway}</div></div></div>`;
+    const usage = panel('今日项目用量', o.projects.filter(p => (p.usage ?? 0) > 0).map(p => `<div class="usage-project-line"><button class="run-title ellipsis" data-action="project-tasks" data-usage-days="1" data-id="${esc(p.id)}">${esc(p.name)}</button>${meter(o.todayUsage.total ? (p.usage ?? 0) / o.todayUsage.total * 100 : 0)}<span class="num">${compact(p.usage)}</span></div>`).join('') || empty('暂无用量'), btn('用量分析', 'usage-nav', '', 'small ghost'));
+    return `<div class="page overview-page">${pageHead('运行总览', `<span class="live-indicator"></span>${day(Date.now())}`, btn('待验收 ' + (o.reviewCount == null ? '数据未完整取得' : o.reviewCount), 'review-queue', '', 'small') + btn(icon('tasks', 14) + '全部任务', 'nav', 'data-view="tasks"', 'small'))}${staleNotice(overviewPath())}<section class="summary-grid">${metric('后台执行', shown(o.runningCount), detail(o.queuedCount, ' 项排队'), 'running-queue', 'accent')}${metric('待验收', shown(o.reviewCount), o.coverage.tasks ? '' : '任务来源未完整取得', 'review-queue')}${metric('今日完成', shown(o.completedToday), detail(o.failedToday, ' 项失败'), 'completed-queue')}${metric('今日 Token', (o.todayUsage.partial || o.todayUsage.missing ? '≥ ' : '') + compact(o.todayUsage.total), o.todayUsage.missing ? o.todayUsage.missing + ' 项未知' : '', 'usage-nav')}</section><div class="overview-grid"><div class="stack">${running}${waiting}${recent}${usage}</div><div class="stack">${attention}${machines}${gateway}</div></div></div>`;
 }
 function taskRow(r: Run) {
     const selected = selectedRuns.has(r.id), active = route.p.run === r.id;
     return `<tr class="${active ? 'selected' : ''}" data-key="row-${esc(r.id)}">
   <td class="check-cell"><label class="check-label"><input type="checkbox" data-select-run="${esc(r.id)}" ${selected ? 'checked' : ''} aria-label="选择任务 ${esc(r.title)}"></label></td>
   <td class="task-main"><button class="run-title ellipsis" data-action="open-run" data-id="${esc(r.id)}" title="${esc(r.title)}">${esc(r.title)}</button><div class="run-sub">${workspaceSummary(r)}${r.command ? `<code class="list-command ellipsis" title="${esc(r.command)}">${esc(r.command)}</code>` : ''}</div></td>
-  <td class="task-state">${status(stage(r))}</td><td class="task-node">${taskScope(r, true)}</td>
+  <td class="task-state">${runBadges(r)}</td><td class="task-node">${taskScope(r, true)}</td>
   <td class="task-diff">${r.diff ? diffStat(r) : '<span class="muted">—</span>'}</td>
   <td class="task-time align-right">${elapsed(r)}</td><td class="task-usage align-right">${usageText(r)}</td>
   <td class="task-start align-right">${smallTime(r.startedAt)}</td>
   <td class="task-open">${ib('chevron', 'open-run', '打开详情', `data-id="${esc(r.id)}"`, 'row-extra')}</td>
  </tr>`;
 }
+function taskScopeTabs(page?: RunPage) {
+    const counts = page?.counts;
+    const count = (key:string) => page?.complete ? counts?.[key] : undefined;
+    const current = route.p.attention ? 'attention' : route.p.stage === 'running,stopping,queued' ? 'active'
+        : route.p.stage === 'waiting,stalled,finalizing' ? 'open' : route.p.stage === 'done,accepted,rejected,review,failed,ended,cancelled,handed_off' ? 'ended' : '';
+    return tabs([['','全部',count('scopeAll')],['active','正在执行',count('scopeActive')],
+        ['attention','需要处理',count('scopeAttention')],['open','暂无后台执行',count('scopeWaiting')],['ended','结束与结果',count('scopeResults')]], current, 'task-scope');
+}
+function runBadges(run: Run): string {
+    const state = stage(run), observation = runObservation(run), result = [status(state)];
+    if (observation.stale) result.push(`<span class="badge warn" title="${esc('最后确认：'+fullTime(observation.observedAt))}">上次确认</span>`);
+    if (run.phaseExecutionStatus === 'completed' && run.executionStatus !== 'completed') result.push(badge('执行阶段已结束'));
+    if (['pending','accepted','passed','rejected','failed'].includes(run.acceptanceStatus) && !['review','accepted','rejected'].includes(state))
+        result.push(badge(run.acceptanceStatus === 'pending' ? '结果待验收' : ['accepted','passed'].includes(run.acceptanceStatus) ? '结果已验收' : '结果已驳回', ['accepted','passed'].includes(run.acceptanceStatus) ? 'good' : 'warn'));
+    if (run.resultStatus === 'handed_off' && state !== 'handed_off') result.push(badge('请求已交接'));
+    else if(run.requestState==='closed'&&['running','stopping','queued','unknown'].includes(run.executionStatus))
+        result.push(badge('请求已结束'+(run.resultStatus?' · '+({completed:'已记录完成',failed:'已记录失败',cancelled:'已记录取消'} as Record<string,string>)[run.resultStatus]:'')));
+    return result.join(' ');
+}
+
+function phaseCards(detail: RunDetail): string {
+    const phases = detail.phases || [];
+    if (phases.length <= 1 && (detail.run.phaseRefs?.length || 0) <= 1) return '';
+    const rows = phases.length ? phases.map(phase => `<article class="phase-card"><div class="inline"><b>${esc(phase.run.projectName)}</b>${nodeTag(phase.run.nodeId,true)}<span class="spacer"></span>${status(stage(phase.run))}</div><code class="break">${esc(phase.run.root)}</code><p>${esc(phase.summary || phase.run.reason || '暂无结果总结')}</p><div class="inline"><span class="small muted">${esc(phase.run.branch || '')} · ${esc(phase.run.baseSha?.slice(0,12) || '')}</span><span class="spacer"></span>${btn('查看执行与改动','open-run',`data-id="${esc(phase.id)}"`,'small')}</div></article>`).join('')
+        : (detail.run.phaseRefs || []).map(id => `<div class="phase-card"><code>${esc(id)}</code>${btn('查看执行与改动','open-run',`data-id="${esc(id)}"`,'small')}</div>`).join('');
+    return `<section class="phase-list"><h3>工作区与执行阶段</h3>${rows}</section>`;
+}
+
 function tasksPage() {
     const path = runPath(), d = data<RunPage>(path), review = route.view === 'changes', sel = route.p.run, counts = d?.counts || {};
-    const chosen = (d?.items || []).filter(r => selectedRuns.has(r.id)), eligible = chosen.filter(r => r.actions.review || r.actions.complete);
-    const states: Array<[string,string,number?]> = [['', '全部', counts.all], ...taskStages.map(([key,label]):[string,string,number?]=>[key,label,counts[key] ?? 0])];
+    const chosen = (d?.items || []).filter(r => selectedRuns.has(r.id)), eligible = chosen.filter(r => r.actions.review);
+    const states: Array<[string,string,number?]> = [['', '全部', counts.all], ...taskStages.map(([key,label]):[string,string,number?]=>[key,label,counts[key]])];
     const bulk = selectedRuns.size ? `<div class="bulkbar"><span>${selectedRuns.size} 项已选</span><span class="spacer"></span>${btn('验收' + (eligible.length ? ' ' + eligible.length : ''), 'bulk-accept', !eligible.length || !canWrite() ? 'disabled' : '', 'small')}${btn('驳回', 'bulk-reject', !eligible.length || !canWrite() ? 'disabled' : '', 'small')}${ib('copy', 'bulk-copy', '复制所选任务引用')}${ib('close', 'clear-selection', '取消选择')}</div>` : '';
-    const stateControls = sel ? `<select class="select queue-state" data-param="status" aria-label="任务状态">${states.map(([v, t, n]) => opt(v, t + (n == null ? '' : ' · ' + n), route.p.status || '')).join('')}</select>` : tabs(states, route.p.status || '', 'status');
-    const filters = `<div class="task-filters">${stateControls}<div class="toolbar list-search">${searchField(route.p.q, '搜索任务…')}${sel ? ib('filter', 'toggle-filters', '筛选任务', `aria-expanded="${route.p.filters === '1'}"`, route.p.filters === '1' ? 'active' : '') : ''}</div><div class="toolbar extended-filters ${sel && route.p.filters !== '1' ? 'hidden' : ''}">${scopes()}${rangeSelect(route.p.days ?? '0')}<select class="select" aria-label="任务排序" data-param="sort">${[['newest', '最新开始'], ['oldest', '最早开始'], ['tokens', '用量最高'], ['duration', '耗时最长']].map(([v, t]) => opt(v, t, route.p.sort || 'newest')).join('')}</select></div>${route.p.finishedDay ? `<div class="filter-chip">完成于 ${esc(route.p.finishedDay)} ${ib('close', 'clear-finished', '清除完成日期')}</div>` : ''}${route.p.attention ? `<div class="filter-chip">执行异常 ${ib('close', 'clear-attention', '清除异常筛选')}</div>` : ''}${route.p.date ? `<div class="filter-chip">${esc(route.p.date)} ${ib('close', 'clear-date', '清除日期筛选')}</div>` : ''}</div>`;
-    let list = !d ? resourceState(path) : !d.items.length ? `<div class="panel">${empty('没有匹配任务', '', btn('清除筛选', 'reset-filters'))}</div>` : sortLayout === 'timeline' && !sel ? timelineView(d) : `<div class="panel task-list-panel"><div class="table-wrap"><table class="data-table run-table"><colgroup><col style="width:34px"><col><col style="width:105px"><col style="width:58px"><col style="width:105px"><col style="width:86px"><col style="width:90px"><col style="width:94px"><col style="width:32px"></colgroup><thead><tr><th><label class="check-label"><input type="checkbox" data-select-all="runs" aria-label="选择本页全部任务" ${d.items.every(r => selectedRuns.has(r.id)) ? 'checked' : ''}></label></th><th>任务 / 项目</th><th>状态</th><th>节点</th><th>改动</th><th class="align-right">耗时</th><th class="align-right">Token</th><th class="align-right">开始</th><th></th></tr></thead><tbody>${d.items.map(taskRow).join('')}</tbody></table></div>${pagination(d)}</div>`;
-    const actions = sel ? ib('download', 'export-runs', '导出本页') : segmented([['list', icon('tasks', 14)], ['timeline', icon('activity', 14)]], sortLayout, 'layout') + btn(icon('download', 14) + '导出', 'export-runs', d?.items.length ? '' : 'disabled');
-    return `<div class="split ${sel ? 'has-detail' : 'no-detail'} ${review ? 'review-mode' : ''} ${route.p.focus === '1' ? 'detail-focus' : ''}"><section class="list-pane" aria-label="任务列表"><div class="page">${pageHead(review ? '改动审查' : '任务', '', actions)}${filters}${bulk}${staleNotice(path)}${list}</div></section>${sel ? '<button class="inspector-mask" data-action="close-inspector" aria-label="关闭详情"></button>' + inspector() : ''}</div>`;
+    const stateControls = sel ? `<select class="select queue-state" data-param="status" aria-label="任务状态">${states.map(([v, t, n]) => opt(v, t + (n == null ? '' : ' · ' + n), route.p.status || '')).join('')}</select>` : taskScopeTabs(d) + `<select class="select" data-param="status" aria-label="具体任务状态">${states.map(([v,t,n]) => opt(v,t + (n == null ? '' : ' · ' + n),route.p.status || '')).join('')}</select>`;
+    const filters = `<div class="task-filters">${stateControls}<div class="toolbar list-search">${searchField(route.p.q, '搜索任务…')}${sel ? ib('filter', 'toggle-filters', '筛选任务', `aria-expanded="${route.p.filters === '1'}"`, route.p.filters === '1' ? 'active' : '') : ''}</div><div class="toolbar extended-filters ${sel && route.p.filters !== '1' ? 'hidden' : ''}">${scopes()}${rangeSelect(route.p.days ?? '0')}<select class="select" aria-label="任务排序" data-param="sort">${[['newest', '最新开始'], ['oldest', '最早开始'], ['tokens', '用量最高'], ['duration', '耗时最长']].map(([v, t]) => opt(v, t, route.p.sort || 'newest')).join('')}</select></div>${route.p.finishedDay ? `<div class="filter-chip">完成于 ${esc(route.p.finishedDay)} ${ib('close', 'clear-finished', '清除完成日期')}</div>` : ''}${route.p.attention ? `<div class="filter-chip">执行异常 ${ib('close', 'clear-attention', '清除异常筛选')}</div>` : ''}${route.p.usageDate || route.p.usageDays ? `<div class="filter-chip">用量发生范围：${esc(route.p.usageDate || ('近 ' + route.p.usageDays + ' 天'))}${ib('close','clear-usage-range','清除用量发生范围')}</div>` : ''}${route.p.date ? `<div class="filter-chip">${esc(route.p.date)} ${ib('close', 'clear-date', '清除日期筛选')}</div>` : ''}</div>`;
+    let list = !d ? resourceState(path) : !d.items.length ? `<div class="panel">${empty(d.complete ? '没有匹配任务' : '已读取来源中没有匹配任务', d.complete ? '' : '部分节点尚未确认，完整结果仍待核对。', btn('清除筛选', 'reset-filters'))}</div>` : sortLayout === 'timeline' && !sel ? timelineView(d) : `<div class="panel task-list-panel"><div class="table-wrap"><table class="data-table run-table"><colgroup><col style="width:34px"><col><col style="width:105px"><col style="width:58px"><col style="width:105px"><col style="width:86px"><col style="width:90px"><col style="width:94px"><col style="width:32px"></colgroup><thead><tr><th><label class="check-label"><input type="checkbox" data-select-all="runs" aria-label="选择本页全部任务" ${d.items.every(r => selectedRuns.has(r.id)) ? 'checked' : ''}></label></th><th>任务 / 项目</th><th>状态</th><th>节点</th><th>改动</th><th class="align-right">耗时</th><th class="align-right">Token</th><th class="align-right">开始</th><th></th></tr></thead><tbody>${d.items.map(taskRow).join('')}</tbody></table></div>${pagination(d)}</div>`;
+    const actions = sel ? ib('download', 'export-runs', '导出本页') : segmented([['list', icon('tasks', 14)], ['timeline', icon('activity', 14)]], sortLayout, 'layout') + btn(icon('download', 14) + '导出本页', 'export-runs', d?.items.length ? '' : 'disabled');
+    return `<div class="split ${sel ? 'has-detail' : 'no-detail'} ${review ? 'review-mode' : ''} ${route.p.focus === '1' ? 'detail-focus' : ''}"><section class="list-pane" aria-label="任务列表"><div class="page">${pageHead(review ? '改动审查' : '任务', review ? '选择待验收结果，或切换查看所有文件改动。' : '', actions)}${review ? segmented([['review','待验收'],['all','全部改动']],route.p.reviewMode || 'review','review-mode') : ''}${filters}${bulk}${staleNotice(path)}${list}</div></section>${sel ? '<button class="inspector-mask" data-action="close-inspector" aria-label="关闭详情"></button>' + inspector() : ''}</div>`;
 }
 function timelineView(d: RunPage) {
-    const now = Date.now(), start = now - 864e5, pct = (t: number) => clamp((t - start) / 864e5 * 100, 0, 100);
+    const now = Date.now(), days = Math.max(1, Math.min(30, Number(route.p.days) || 1)), span = days * 864e5, start = now - span, pct = (time: number) => clamp((time - start) / span * 100, 0, 100);
+    const end = (run: Run) => run.finishedAt ?? (['running','stopping'].includes(run.executionStatus) && !run.stale ? Math.min(now,(run.observedAt || run.lastActivityAt) + 30_000) : run.lastActivityAt);
     const tracks = (fleet()?.nodes || []).map(n => {
-        const rows = d.items.filter(r => r.nodeId === n.id && r.startedAt < now && (r.finishedAt ?? now) >= start && r.executionStatus !== 'queued').sort((a, b) => a.startedAt - b.startedAt);
+        const rows = d.items.filter(r => (r.nodeIds || [r.nodeId]).includes(n.id) && r.startedAt < now && end(r) >= start).sort((a,b) => a.startedAt - b.startedAt);
         const ends: number[] = [], placed = rows.map(r => {
-            const left = pct(r.startedAt), right = pct(r.finishedAt ?? now), width = Math.min(100 - left, Math.max(1, right - left));
-            let lane = ends.findIndex(end => end <= left);
-            if (lane === -1) {
-                lane = ends.length;
-                ends.push(0);
-            }
-            ends[lane] = left + width + .4;
-            return { r, left, width, lane };
+            const left = pct(r.startedAt), right = pct(end(r)), width = Math.min(100 - left, Math.max(1, right - left));
+            let lane = ends.findIndex(value => value <= left);
+            if (lane === -1) { lane=ends.length; ends.push(0); }
+            ends[lane]=left+width+.4;
+            return {r,left,width,lane};
         });
-        return `<div class="timeline-track"><div class="timeline-track-name">${nodeTag(n.id)}</div><div class="timeline-track-body" style="height:${Math.max(1, ends.length) * 28 + 12}px">${placed.map(({ r, left, width, lane }) => `<button class="timeline-run ${stage(r)}" style="left:${left}%;width:${width}%;top:${lane * 28 + 6}px" data-action="open-run" data-id="${esc(r.id)}" title="${esc(r.title)} · ${fullTime(r.startedAt)}">${esc(r.title)}</button>`).join('')}</div></div>`;
+        return `<div class="timeline-track"><div class="timeline-track-name">${nodeTag(n.id)}</div><div class="timeline-track-body" style="height:${Math.max(1,ends.length)*28+12}px">${placed.map(({r,left,width,lane})=>`<button class="timeline-run ${stage(r)}" style="left:${left}%;width:${width}%;top:${lane*28+6}px" data-action="open-run" data-id="${esc(r.id)}" title="${esc(r.title)} · ${esc(stages[stage(r)])} · 记录截至 ${esc(fullTime(end(r)))}">${esc(r.title)}</button>`).join('')}</div></div>`;
     }).join('');
-    return `<div class="panel"><div class="panel-head"><h3>执行时间轴</h3><span class="meta">近 24 小时 · 本页 ${d.items.length} 项</span></div><div class="timeline-board">${tracks}</div><div class="chart-axis"><span>${tm(start)} 昨天</span><span>${tm(now)} 今天</span></div>${pagination(d)}</div>`;
+    return `<div class="panel"><div class="panel-head"><h3>任务记录时间分布</h3><span class="meta">近 ${days} 天 · 本页 ${d.items.length} 项</span></div><p class="panel-body small muted">条带从任务创建画至结束或最近活动；各节点展示同一任务的已知记录范围。</p><div class="timeline-board">${tracks}</div><div class="chart-axis"><span>${day(start)} ${tm(start)}</span><span>${day(now)} ${tm(now)}</span></div>${pagination(d)}</div>`;
 }
 function commandStatus(c: Command, r: Run) {
     if (c.status)
@@ -411,15 +476,15 @@ function inspector() {
     if (!d)
         return `<aside class="inspector" id="inspector" aria-label="执行详情"><header class="session-card-head"><span class="spacer"></span>${ib('close', 'close-inspector', '关闭详情', 'id="inspector-close"')}</header><div class="inspector-body">${resourceState(path)}</div></aside>`;
     const r = d.run;
-    const state = stage(r), running = d.commands.find(c => commandStatus(c, r) === 'running'), failed = [...d.commands].reverse().find(c => commandStatus(c, r) === 'failed'), live = running || failed;
+    const state = stage(r), running = d.commands.find(c => commandStatus(c, r) === 'running'), latest = d.commands.filter(c => !c.supersededBy).at(-1), failed = !['completed','ended','cancelled','handed_off'].includes(r.executionStatus) && latest && commandStatus(latest, r) === 'failed' ? latest : undefined, live = running || failed;
     const head = `<header class="session-card-head"><span class="session-symbol">${icon('changes', 17)}<i class="session-dot ${state}"></i></span><div class="session-heading"><h2 title="${esc(r.title)}">${esc(r.title)}</h2><div class="session-meta">${nodeTag(r.nodeId, true)}<span class="project-name">${esc(r.projectName)}</span><span class="branch-meta">${icon('changes', 12)}<code title="${esc(r.branch)}">${esc(r.branch)}</code></span></div></div><div class="session-stats">${r.diff ? diffStat(r) : ''}<span class="card-elapsed">${elapsed(r)}</span></div>${ib('external', 'focus-detail', route.p.focus === '1' ? '恢复分栏' : '展开详情', '', 'desktop-only')}${ib('close', 'close-inspector', '关闭详情（Esc）', 'id="inspector-close"')}</header>`;
-    const strip = live ? `<button class="session-live ${running ? '' : 'failed'}" data-action="live-command" data-id="${esc(live.id)}">${running ? '<span class="spinner"></span>' : icon('failed', 14)}<span class="agent-label">${esc(live.agent)}</span><code>${esc(live.command)}</code><span class="live-meta">${running ? '运行中' : '退出码 ' + live.exit}</span>${icon('chevron', 12)}</button>` : '';
+    const strip = live ? `<button class="session-live ${running ? '' : 'failed'}" data-action="live-command" data-id="${esc(live.id)}">${running ? '<span class="spinner"></span>' : icon('failed', 14)}<span class="agent-label">${esc(live.agent)}</span><code>${esc(live.command)}</code><span class="live-meta">${running ? '运行中' : live.exit == null ? '最近执行失败' : '最近退出码 ' + live.exit}</span>${icon('chevron', 12)}</button>` : '';
     const tabsHTML = tabs([['summary', icon('file', 14) + '概要'], ['diff', icon('changes', 14) + '改动', d.files.length], ['commands', icon('terminal', 14) + '命令', d.commands.length], ['agents', icon('bot', 14) + '代理', d.agents.length], ['context', icon('workspaces', 14) + '上下文']], tab, 'detail-tab');
     let body = '';
     if (tab === 'summary') {
-        body = `<section class="detail-section result-section"><div class="result-heading">${status(state)}<span class="spacer"></span><span class="small muted">${smallTime(r.startedAt)}</span></div><p class="execution-summary">${esc(d.summary)}</p>${r.reviewNote ? `<p class="review-note">验收记录：${esc(r.reviewNote)}</p>` : ''}</section>`;
+        body = `<section class="detail-section result-section"><div class="result-heading">${runBadges(r)}<span class="spacer"></span><span class="small muted">${smallTime(r.startedAt)}</span></div>${resultExplanation(d.summary,r.reason,state)}${r.resultStatus === 'handed_off' ? `<p>${badge('请求已交接')} ${r.executionStatus === 'running' ? '后台执行仍在继续' : esc(stages[state] || state)}</p>` : ''}${phaseCards(d)}${r.reviewNote ? `<p class="review-note">验收记录：${esc(r.reviewNote)}</p>` : ''}</section>`;
         if (d.evidence.length)
-            body += `<section class="detail-section"><h3>执行结果</h3><div class="evidence-list">${d.evidence.map(e => `<div class="evidence-row"><span class="${e.ok === true ? 'green' : e.ok === false ? 'red' : 'muted'}">${icon(e.ok === true ? 'accepted' : e.ok === false ? 'failed' : 'queued', 15)}</span><b>${esc(e.name)}</b><span>${esc(e.detail)}</span>${e.time ? smallTime(e.time) : ''}</div>`).join('')}</div></section>`;
+            body += `<section class="detail-section"><h3>执行结果</h3><div class="evidence-list">${d.evidence.map(e => `<div class="evidence-row"><span class="${e.ok === true ? 'green' : e.ok === false ? 'red' : 'muted'}">${icon(e.ok === true ? 'accepted' : e.ok === false ? 'failed' : 'queued', 15)}</span><b>${esc(e.name)}</b><span>${esc(e.detail)}</span>${e.time ? smallTime(e.time) : ''}<div class="evidence-actions">${ib('copy','copy','复制证据引用',`data-text="${esc(e.detail)}"`)}${btn('搜索相关活动','evidence-events',`data-reference="${esc(e.detail)}"`,'small')}</div></div>`).join('')}</div></section>`;
         if (r.usage?.quality !== 'not_used')
             body += `<section class="detail-section"><div class="section-line"><h3>Token 用量</h3>${badge(QUALITY[r.usage?.quality] || '未知', r.usage?.quality === 'partial' ? 'warn' : '')}</div><dl class="usage-mini">${([['总量', r.usage?.total], ['输入', r.usage?.input], ['输出', r.usage?.output]] as Array<[string, number | null | undefined]>).map(([k, v]) => `<div><dt>${k}</dt><dd>${v == null ? '未知' : compact(v)}</dd></div>`).join('')}</dl><div class="usage-breakdown"><span>输入含缓存 <b>${compact(r.usage?.cached)}</b></span><span>输出含推理 <b>${compact(r.usage?.reasoning)}</b></span></div></section>`;
         if (d.timeline.length)
@@ -428,17 +493,17 @@ function inspector() {
     else if (tab === 'diff')
         body = diffView(d);
     else if (tab === 'commands')
-        body = d.commands.length ? `<div class="command-list">${d.commands.map(c => { const cs = commandStatus(c, r); return `<details class="command command-card" data-key="${esc(c.id)}" id="command-${esc(c.id)}"><summary><span class="command-chevron">${icon('chevron', 12)}</span><span class="${cs === 'done' ? 'green' : cs === 'failed' ? 'red' : cs === 'running' ? 'accent' : 'muted'}">${cs === 'running' ? '<span class="spinner"></span>' : icon(cs === 'done' ? 'accepted' : cs, 14)}</span><code title="${esc(c.command)}">${esc(c.command)}</code><span class="agent-label">${esc(c.agent)}</span><span class="command-result">${c.exit == null ? esc(stages[cs] || '等待回执') : 'exit ' + c.exit}</span></summary><pre>${esc(commandOutputText(c, r.id))}</pre><div class="command-footer"><span>${c.ms == null ? '' : duration(c.ms)}</span>${commandOutputs.get('runs/' + enc(id) + '/commands/' + enc(c.id))?.hasMore ? btn('继续读取输出', 'more-command-output', 'data-id="' + esc(c.id) + '"', 'small') : ''}${ib('copy', 'copy', '复制命令', `data-text="${esc(c.command)}"`)}</div></details>`; }).join('')}</div>` : empty('暂无命令');
+        body = d.commands.length ? `<div class="command-list">${d.commands.map(c => { const cs = commandStatus(c, r); return `<details class="command command-card" data-key="${esc(c.id)}" id="command-${esc(c.id)}"><summary><span class="command-chevron">${icon('chevron', 12)}</span><span class="${cs === 'done' ? 'green' : cs === 'failed' ? 'red' : cs === 'running' ? 'accent' : 'muted'}">${cs === 'running' ? '<span class="spinner"></span>' : icon(cs === 'done' ? 'accepted' : cs, 14)}</span><code title="${esc(c.command)}">${esc(c.command)}</code><span class="agent-label">${esc(c.agent)}</span><span class="command-result">${c.exit == null ? esc(stages[cs] || '等待回执') : 'exit ' + c.exit}</span></summary><pre>${esc(commandOutputText(c, r.id))}</pre><div class="command-footer"><span>${c.ms == null ? '' : duration(c.ms)}</span>${c.supersededBy ? badge('已由后续执行取代') + ib('copy','copy','复制接续执行引用',`data-text="${esc(c.supersededBy)}"`) : ''}${commandOutputs.get('runs/' + enc(id) + '/commands/' + enc(c.id))?.hasMore ? btn('继续读取输出', 'more-command-output', 'data-id="' + esc(c.id) + '"', 'small') : ''}${ib('copy', 'copy', '复制命令', `data-text="${esc(c.command)}"`)}</div></details>`; }).join('')}</div>` : empty('暂无命令');
     else if (tab === 'agents')
         body = d.agents.length ? `<div class="agent-list">${d.agents.map(a => `<article class="agent-card"><span class="agent-avatar">${icon('bot', 17)}</span><div class="agent-main"><div class="section-line"><h3>${esc(a.name)}</h3>${status(a.status)}</div><p>${esc(a.role)}</p><div class="small muted">${a.tokens == null ? '用量未上报' : compact(a.tokens) + ' Token'}</div></div></article>`).join('')}</div>` : empty('暂无代理');
     else
-        body = `<section class="detail-section"><h3>工作区</h3><dl class="context-table">${[['项目', r.projectName], ['路径', r.root], ['节点', node(r.nodeId)?.name || r.nodeId], ['分支', r.branch], ['基线', r.baseSha], ['执行 ID', r.id], ['来源', r.origin], ['开始', fullTime(r.startedAt)], ['结束', r.finishedAt ? fullTime(r.finishedAt) : '—'], ['执行状态', r.executionStatus], ['验收状态', r.acceptanceStatus]].map(([k, v]) => `<div><dt>${k}</dt><dd title="${esc(v)}">${esc(v)}</dd></div>`).join('')}</dl></section><section class="detail-section"><h3>项目指令</h3><dl class="context-table">${(d.instructions || []).map(item => '<div><dt>' + esc(item.status === 'loaded' ? '已读取' : '可读取') + '</dt><dd>' + esc(item.path) + '</dd></div>').join('') || '<div class="muted">未发现项目指令</div>'}</dl><h3 class="section-gap">技能</h3><dl class="context-table">${(d.skills || []).map(item => '<div><dt>' + esc(item.state === 'read' ? '已使用' : '可使用') + '</dt><dd>' + esc(item.name) + '</dd></div>').join('') || '<div class="muted">未发现技能</div>'}</dl></section>`;
-    const footer = `<span class="card-footer-state">${status(state)}<span class="revision" title="回执版本">r${r.revision}</span></span><span class="spacer"></span>${['running', 'queued'].includes(state) ? btn(icon('stopping', 13) + (state === 'queued' ? '取消排队' : '中断'), 'run-control', `data-id="${esc(id)}" data-value="interrupt" ${r.actions?.interrupt ? writeAttrs() : 'disabled title="没有可控制的受管代理"'}`, 'danger small') : state === 'interrupted' ? btn(icon('running', 13) + '恢复', 'run-control', `data-id="${esc(id)}" data-value="resume" ${r.actions?.resume ? writeAttrs() : 'disabled title="需要从原工作入口继续"'}`, 'primary small') : ''}${state === 'waiting' && r.actions.complete ? btn('结束并验收', 'single-accept', `data-id="${esc(id)}" ${writeAttrs()}`, 'primary small') : ''}${state === 'review' ? btn('驳回', 'single-reject', `data-id="${esc(id)}" ${writeAttrs()}`, 'small') + btn(icon('check', 13) + '验收', 'single-accept', `data-id="${esc(id)}" ${writeAttrs()}`, 'primary small') : ''}${d.files.length && r.actions?.patch !== false ? btn(icon('download', 13) + '补丁', 'patch', `data-id="${esc(id)}"`, 'small') : ''}${d.files.length && r.actions?.revert && !['running', 'queued', 'stopping'].includes(state) ? ib('undo', 'revert', '还原文件', `data-id="${esc(id)}" ${writeAttrs('revert')}`) : ''}`;
-    return `<aside class="inspector" id="inspector" aria-label="执行详情" tabindex="-1"><button class="resize-handle" role="separator" aria-label="调整列表宽度" aria-orientation="vertical" aria-valuemin="270" aria-valuemax="520" aria-valuenow="${pref.listWidth}" title="拖动调整列表宽度"></button>${head}${strip}${tabsHTML}<div class="inspector-body" data-key="body-${esc(id)}-${tab}">${staleNotice(path)}${body}</div><footer class="inspector-footer">${footer}</footer></aside>`;
+        body = `${phaseCards(d)}<section class="detail-section"><h3>${r.phaseRefs && r.phaseRefs.length > 1 ? '任务汇总与主记录' : '工作区'}</h3><dl class="context-table">${[['项目', r.projectName], ['路径', r.root], ['节点', node(r.nodeId)?.name || r.nodeId], ['分支', r.branch], ['基线', r.baseSha], ['执行 ID', r.id], ['来源', r.origin], ['开始', fullTime(r.startedAt)], ['结束', r.finishedAt ? fullTime(r.finishedAt) : '—'], ['执行状态', r.executionStatus], ['验收状态', r.acceptanceStatus]].map(([k, v]) => `<div><dt>${k}</dt><dd title="${esc(v)}">${esc(v)}</dd></div>`).join('')}</dl></section><section class="detail-section"><h3>项目指令</h3><dl class="context-table">${(d.instructions || []).map(item => '<div><dt>' + esc(item.status === 'loaded' ? '已读取' : '可读取') + '</dt><dd>' + esc(item.path) + '</dd></div>').join('') || '<div class="muted">未发现项目指令</div>'}</dl><h3 class="section-gap">技能</h3><dl class="context-table">${(d.skills || []).map(item => '<div><dt>' + esc(item.state === 'read' ? '已使用' : '可使用') + '</dt><dd>' + esc(item.name) + '</dd></div>').join('') || '<div class="muted">未发现技能</div>'}</dl></section>`;
+    const footer = `<span class="card-footer-state">${runBadges(r)}<span class="revision" title="回执版本">r${r.revision}</span></span><span class="spacer"></span>${['running', 'queued', 'stopping'].includes(state) ? btn(icon('stopping', 13) + (state === 'queued' ? '取消排队' : '中断'), 'run-control', `data-id="${esc(id)}" data-value="interrupt" ${r.actions?.interrupt ? writeAttrs() : 'disabled title="当前节点没有可控制的后台执行句柄"'}`, 'danger small') : state === 'interrupted' ? btn(icon('running', 13) + '恢复', 'run-control', `data-id="${esc(id)}" data-value="resume" ${r.actions?.resume ? writeAttrs() : 'disabled title="需要从原工作入口继续"'}`, 'primary small') : ''}${r.actions.complete ? btn('结束请求', 'finish-task', `data-id="${esc(id)}" ${writeAttrs()}`, 'primary small') : ''}${r.actions.review ? btn('驳回', 'single-reject', `data-id="${esc(id)}" ${writeAttrs()}`, 'small') + btn(icon('check', 13) + '验收', 'single-accept', `data-id="${esc(id)}" ${writeAttrs()}`, 'primary small') : ''}${d.files.length && r.actions?.patch !== false ? btn(icon('download', 13) + '补丁', 'patch', `data-id="${esc(id)}"`, 'small') : ''}${d.files.length && r.actions?.revert && !['running', 'queued', 'stopping'].includes(state) ? ib('undo', 'revert', '还原文件', `data-id="${esc(id)}" ${writeAttrs('revert')}`) : ''}`;
+    return `<aside class="inspector" id="inspector" aria-label="执行详情" tabindex="-1"><button class="resize-handle" role="separator" aria-label="调整列表宽度" aria-orientation="vertical" aria-valuemin="270" aria-valuemax="520" aria-valuenow="${pref.listWidth}" title="拖动调整列表宽度"></button>${head}${strip}${tabsHTML}<div class="inspector-body" data-key="body-${esc(id)}-${tab}">${staleNotice(path)}${r.warnings?.length ? `<div class="notice warn">${r.warnings.map(esc).join('<br>')}</div>` : ''}${body}</div><footer class="inspector-footer">${footer}</footer></aside>`;
 }
 
 const highlightCache = new Map<string, string>(), diffOpen = new Map<string, Set<string>>();
-const commandReader = new CommandOutputs(path => API.get<import('./command-output.js').CommandOutputPage>(path), schedulePaint);
+const commandReader = new CommandOutputs((path, signal) => API.get<import('./command-output.js').CommandOutputPage>(path, signal), schedulePaint);
 const commandOutputs = commandReader.entries;
 let fileSearch = '';
 function visibleFiles(d: RunDetail) { const q = fileSearch.trim().toLowerCase(); return d.files.filter(f => !q || f.path.toLowerCase().includes(q)); }
@@ -501,7 +566,7 @@ function diffView(d: RunDetail) {
         return empty('暂无文件改动');
     const files = visibleFiles(d), opened = openFiles(d);
     const toolbar = `<div class="diff-toolbar">${searchField(fileSearch, '查找文件…', 'files')}<span class="spacer"></span><label class="switch"><input type="checkbox" data-diff-wrap ${pref.wrap ? 'checked' : ''} aria-label="代码自动换行">换行</label><span class="desktop-only">${segmented([['unified', '统一'], ['split', '并排']], diffMode, 'diff-mode')}</span>${ib('panel', 'files-toggle-all', '展开或收起文件', `aria-label="展开或收起文件"`)}</div>`;
-    return `<div class="session-diff">${toolbar}${files.map(f => { const on = opened.has(f.id), parts = f.path.split('/'), name = parts.pop(), dir = parts.join('/'); return `<section class="file-section ${on ? 'expanded' : ''}" data-key="file-${esc(d.run.id)}-${esc(f.id)}"><header class="file-header"><button class="file-toggle" data-action="toggle-file" data-id="${esc(f.id)}" aria-expanded="${on}" title="${esc(f.path)}">${icon(on ? 'down' : 'chevron', 13)}<span class="file-status ${f.kind}">${f.kind}</span><span class="file-path">${dir ? `<span>${esc(dir)}/</span>` : ''}<b>${esc(name)}</b></span><span class="diff-summary"><span class="green">+${fmt(f.add)}</span><span class="red">−${fmt(f.del)}</span></span></button>${ib('copy', 'copy-path', '复制文件路径', `data-text="${esc(f.path)}"`, 'file-copy')}</header>${on ? diffFile(d, f) : ''}</section>`; }).join('') || empty('没有匹配文件')}</div>`;
+    return `<div class="session-diff">${toolbar}${files.map(f => { const on = opened.has(f.id), parts = f.path.split('/'), name = parts.pop(), dir = parts.join('/'); return `<section class="file-section ${on ? 'expanded' : ''}" data-key="file-${esc(d.run.id)}-${esc(f.id)}"><header class="file-header"><button class="file-toggle" data-action="toggle-file" data-id="${esc(f.id)}" aria-expanded="${on}" title="${esc(f.path)}">${icon(on ? 'down' : 'chevron', 13)}<span class="file-status ${f.kind}">${f.kind}</span><span class="file-path">${dir ? `<span>${esc(dir)}/</span>` : ''}<b>${esc(name)}</b>${f.source ? `<small class="file-source">${esc(f.source.nodeId)} · ${esc(f.source.projectName)} · ${esc(f.source.root)}</small>` : ''}</span><span class="diff-summary"><span class="green">+${fmt(f.add)}</span><span class="red">−${fmt(f.del)}</span></span></button>${ib('copy', 'copy-path', '复制文件路径', `data-text="${esc(f.source ? f.source.root.replace(/[\\/]$/, '') + '/' + f.path : f.path)}"`, 'file-copy')}</header>${on ? diffFile(d, f) : ''}</section>`; }).join('') || empty('没有匹配文件')}</div>`;
 }
 function machinesPage() {
     const f = fleet();
@@ -516,7 +581,7 @@ function machinesPage() {
       return `<div class="discovery-node" data-key="discovery-${esc(n.id)}"><div class="inline">${nodeTag(n.id,true)}<span class="spacer"></span>${badge(!n.online ? '离线' : ready ? '就绪' : component?.state==='backoff' ? '等待重启' : '正在连接', ready ? 'good' : 'warn')}</div><div class="small muted">版本 ${esc(n.version ?? '未上报')}${component?.pid ? ` · PID ${component.pid}` : ''}</div>${n.discovery?.lastError ? `<div class="small amber">${esc(n.discovery.lastError)}</div>` : ''}</div>`;
     }).join('') || empty('尚未启用发现端')}</div></div>`);
     const egress = panel('连接与出网链路', `<div class="panel-body route-grid"><div><p class="small muted" style="margin-bottom:12px">MCP 入口连接</p><div class="endpoint">${nodeTag(f.ingressNodeId, true)}<code>${esc(f.mcpUrl || f.ingressLabel || (f.ingressNodeId ? '托管 MCP 隧道' : '尚未配置 MCP 入口'))}</code>${ib('copy', 'copy', '复制 MCP 地址', `data-text="${esc(f.mcpUrl || '')}" ${f.mcpUrl ? '' : 'disabled'}`)}</div></div><div><p class="small muted" style="margin-bottom:12px">出网候选 · 按优先级排序</p><div class="route-candidates">${candidates.map(n => `<div class="route-candidate ${n.id === f.gatewayId ? 'current' : ''}"><div class="inline">${nodeTag(n.id, true)}<span class="small muted">P${n.priority}</span></div>${n.id === f.gatewayId ? badge('当前出网', 'good') : !n.online ? badge('离线', 'bad') : n.egress?.healthy === false ? badge('探测失败', 'warn') : badge('待命')}<small class="muted">${n.egress?.region ? esc(n.egress.region) + ' · ' : ''}${n.egress?.latency != null ? Math.round(n.egress.latency) + ' ms' : n.egress?.healthy ? '探测正常' : '未探测'}</small></div>`).join('')}</div></div></div>`, '', '');
-    let inventory = machineLayout === 'table' ? `<div class="panel table-wrap"><table class="data-table matrix"><thead><tr><th style="width:25%">机器</th><th>状态</th><th>CPU</th><th>内存</th><th>GPU</th><th>延迟</th><th>版本</th><th></th></tr></thead><tbody>${nodes.map(n => `<tr data-key="node-table-${n.id}"><td><button class="run-title" data-action="node" data-id="${n.id}">${nodeTag(n.id)}</button></td><td>${status(n.online ? 'online' : 'offline')}</td><td class="num">${n.online && n.cpu != null ? Math.round(n.cpu) + '%' : '—'}</td><td class="num">${n.online ? Math.round(n.memoryUsed / n.memoryTotal * 100) + '%' : '—'}</td><td>${n.gpuSampled === false ? '未取得' : n.gpus.length || '无'}</td><td class="num">${n.online && n.latency != null ? Math.round(n.latency) + ' ms' : '—'}</td><td class="mono">${esc(n.version ?? '未上报')}</td><td>${ib('chevron', 'node', '查看节点', `data-id="${n.id}"`)}</td></tr>`).join('')}</tbody></table></div>` : `<div class="node-grid">${nodes.map(nodeCard).join('')}</div>`;
+    let inventory = machineLayout === 'table' ? `<div class="panel table-wrap"><table class="data-table matrix"><thead><tr><th style="width:25%">机器</th><th>状态</th><th>CPU</th><th>内存</th><th>GPU</th><th>延迟</th><th>版本</th><th></th></tr></thead><tbody>${nodes.map(n => `<tr data-key="node-table-${esc(n.id)}"><td><button class="run-title" data-action="node" data-id="${esc(n.id)}">${nodeTag(n.id)}</button></td><td>${status(n.online ? 'online' : 'offline')}${n.settingsState?.error ? badge('配置应用失败','warn') : n.settingsState?.pending ? badge('配置待应用','warn') : ''}</td><td class="num">${n.online && n.cpu != null ? Math.round(n.cpu) + '%' : '—'}</td><td class="num">${n.online && percent(n.memoryUsed,n.memoryTotal) !== null ? Math.round(percent(n.memoryUsed,n.memoryTotal)!) + '%' : '—'}</td><td>${n.gpuSampled === false ? '未取得' : n.gpus.length || '无'}</td><td class="num">${n.online && n.latency != null ? Math.round(n.latency) + ' ms' : '—'}</td><td class="mono">${esc(n.version ?? '未上报')}</td><td>${ib('chevron', 'node', '查看节点', `data-id="${esc(n.id)}"`)}</td></tr>`).join('')}</tbody></table></div>` : `<div class="node-grid">${nodes.map(nodeCard).join('')}</div>`;
     if (!nodes.length)
         inventory = `<div class="panel">${empty('没有匹配的机器', '', btn('清除搜索', 'reset-filters'))}</div>`;
     return `<div class="page">${pageHead('机器', `${f.nodes.filter(n => n.online).length} / ${f.nodes.length} 在线`, btn(icon('settings', 14) + '统一出口配置', 'egress-settings'))}${staleNotice('fleet/status')}${discovery}${egress}<div class="toolbar section-gap">${searchField(route.p.q, '搜索机器、能力或 ID…')}<span class="spacer"></span>${segmented([['cards', icon('overview', 14) + ' 卡片'], ['table', icon('tasks', 14) + ' 对比表']], machineLayout, 'machine-layout')}</div>${inventory}</div>`;
@@ -525,7 +590,10 @@ function nodeCard(n: Machine) {
     const tasks = overview()?.active || [];
     const stateOnNode = (r: Run) => r.nodeStates?.[n.id] ?? (r.nodeId === n.id ? r.executionStatus : null);
     const active = tasks.filter(r => ['running','queued','stopping'].includes(stateOnNode(r) || ''));
-    const waiting = tasks.filter(r => stateOnNode(r) === 'waiting');
+    const waiting = tasks.filter(r => ['waiting','stalled','finalizing'].includes(stateOnNode(r) || ''));
+    const totals = overview()?.nodeCounts?.[n.id];
+    const activeCount = totals?.running != null && totals?.queued != null ? String(totals.running + totals.queued) : '至少 ' + active.length;
+    const waitingCount = totals?.waiting != null ? String(totals.waiting) : '至少 ' + waiting.length;
     const disk = [...(n.disks || [])].sort((a,b) => b.used/b.total-a.used/a.total)[0];
     const resources: Array<[string, number | null | undefined, number | null | undefined, string]> = [
       ['CPU', n.cpu, 100, '%'],
@@ -533,12 +601,12 @@ function nodeCard(n: Machine) {
       [disk ? '磁盘 ' + disk.mount : '磁盘', disk?.used, disk?.total, 'GiB'],
     ];
     const resourceRows = resources.map(([label, value, total, unit]) => {
-      const hasValue = n.online && value != null && total != null;
-      const percent = hasValue ? value / total * 100 : 0;
+      const hasValue = n.online && value != null && total != null && total > 0 && Number.isFinite(value) && Number.isFinite(total);
+      const percent = hasValue ? value / total * 100 : null;
       const capacity = unit === '%'
         ? '采样 ' + tm(CACHE.get('fleet/status')?.time)
         : hasValue ? fmt(value) + ' / ' + fmt(total) + ' ' + unit : n.online ? '尚未采集' : '节点离线';
-      return `<div><span class="resource-name">${esc(label)}</span><span class="resource-value">${hasValue ? (unit === '%' ? fmt(value) : Math.round(percent)) + '%' : '—'}</span>${meter(percent, unit !== '%' && percent > 85 ? 'amber' : '')}<small class="muted" style="display:block;margin-top:6px">${capacity}</small></div>`;
+      return `<div><span class="resource-name">${esc(label)}</span><span class="resource-value">${hasValue ? (unit === '%' ? fmt(value) : Math.round(percent!)) + '%' : '—'}</span>${meter(percent, unit !== '%' && percent !== null && percent > 85 ? 'amber' : '')}<small class="muted" style="display:block;margin-top:6px">${capacity}</small></div>`;
     }).join('');
     const gpuRows = n.gpuSampled === false
       ? '<div class="small muted" style="padding:12px 0">GPU 数据未取得</div>'
@@ -546,14 +614,18 @@ function nodeCard(n: Machine) {
       ? `<div class="gpu-labels"><span>GPU</span><span>负载</span><span>显存 / GiB</span><span>温度</span></div>${n.gpus.map(g => `<div class="gpu-line"><span class="ellipsis" title="${esc(g.name)}">${esc(g.name)}</span><span>${n.online ? Math.round(g.util) + '%' : '—'}</span><span>${n.online ? g.used.toFixed(1) + ' / ' + g.total.toFixed(1) : '—'}</span><span class="${g.temp != null && g.temp >= 78 ? 'amber' : ''}">${n.online && g.temp != null ? Math.round(g.temp) + '°' : '—'}</span></div>`).join('')}`
       : '<div class="small muted" style="padding:12px 0">无 GPU</div>';
     const running = active.slice(0, 1).map(r => `<div class="panel-foot"><span class="accent">${icon('running', 13)}</span><button class="run-title ellipsis small" data-action="open-run" data-id="${esc(r.id)}">${esc(r.title)}</button></div>`).join('');
-    return `<article class="panel node-card" data-key="node-${esc(n.id)}"><header class="node-card-head"><span class="node-mark big ${n.online ? '' : 'offline'}">${esc(n.short)}</span><div style="min-width:0"><button class="run-title" data-action="node" data-id="${esc(n.id)}"><h3>${esc(n.name)}</h3></button><p>${esc(n.role)}</p></div><span class="spacer"></span>${status(n.online ? 'online' : 'offline')}${ib('more', 'node', '节点详情与设置', `data-id="${esc(n.id)}"`)}</header>${!n.online ? `<div class="notice warn" style="margin:12px">${icon('alert', 15)}最后在线 ${esc(fullTime(n.lastSeen))}</div>` : ''}<div class="node-resources">${resourceRows}</div><div class="gpu-list">${gpuRows}</div><div class="panel-foot"><span class="${active.length ? 'accent' : 'muted'}">${active.length} 项执行 / 排队${waiting.length ? ` · ${waiting.length} 项等待` : ''}</span><span class="spacer"></span><span>${n.online ? (n.latency != null ? Math.round(n.latency) : '—') + ' ms' : '最后心跳 ' + ago(n.lastSeen)}</span><span class="mono">v${esc(n.version ?? '未上报')}</span></div>${running}</article>`;
+    return `<article class="panel node-card" data-key="node-${esc(n.id)}"><header class="node-card-head"><span class="node-mark big ${n.online ? '' : 'offline'}">${esc(n.short)}</span><div style="min-width:0"><button class="run-title" data-action="node" data-id="${esc(n.id)}"><h3>${esc(n.name)}</h3></button><p>${esc(n.role)}</p></div><span class="spacer"></span>${status(n.online ? 'online' : 'offline')}${n.settingsState?.error ? badge('配置应用失败','warn') : n.settingsState?.pending ? badge('配置待应用','warn') : ''}${ib('more', 'node', '节点详情与设置', `data-id="${esc(n.id)}"`)}</header>${!n.online ? `<div class="notice warn" style="margin:12px">${icon('alert', 15)}最后在线 ${esc(fullTime(n.lastSeen))}</div>` : ''}<div class="node-resources">${resourceRows}</div><div class="gpu-list">${gpuRows}</div><div class="panel-foot"><span class="${active.length ? 'accent' : 'muted'}">${activeCount} 项执行 / 排队 · ${waitingCount} 项暂无后台执行${totals?.complete ? '' : ' · 覆盖待确认'}</span><span class="spacer"></span><span>${n.online ? (n.latency != null ? Math.round(n.latency) : '—') + ' ms' : '最后心跳 ' + ago(n.lastSeen)}</span><span class="mono">v${esc(n.version ?? '未上报')}</span></div>${running}</article>`;
 }
 function sessionsPage() {
     const ps = projects().filter(p => !sessionSearch || [p.name, p.path, p.nodeId].join(' ').toLowerCase().includes(sessionSearch.toLowerCase()));
     const p = projects().find(p => p.id === route.p.project), key = p ? 'projects/' + enc(p.id) + '/sessions' : '', d = p ? data<Sessions>(key) : null;
-    const left = `<aside class="project-list" aria-label="项目列表"><div class="project-list-head"><h3>项目 <span class="count">${projects().length}</span></h3>${searchField(sessionSearch, '查找项目…', 'session-project')}</div>${ps.map(x => `<button class="project-item ${p?.id === x.id ? 'active' : ''}" data-action="session-project" data-id="${esc(x.id)}" data-key="project-${esc(x.id)}"><span class="project-item-icon">${icon('workspaces', 16)}</span><span><b class="ellipsis">${esc(x.name)}</b><span class="project-item-sub">${nodeTag(x.nodeId, true)}<span>${x.sessionCount ?? 0} 个会话</span>${x.active ? `<span class="accent">${x.active} 项运行</span>` : ''}${x.review ? `<span>${x.review} 待验收</span>` : ''}</span></span>${icon('chevron', 12)}</button>`).join('') || empty('没有匹配项目')}</aside>`;
-    if (!p)
-        return `<div class="session-layout">${left}<section class="session-content">${route.p.project ? empty('项目不存在', '', btn('选择项目', 'session-back')) : resourceState('projects')}</section></div>`;
+    const left = `<aside class="project-list" aria-label="项目列表"><div class="project-list-head"><h3>项目 <span class="count">${projects().length}</span></h3>${searchField(sessionSearch, '查找项目…', 'session-project')}</div><button class="project-item ${!p ? 'active' : ''}" data-action="global-sessions">${icon('sessions',16)}<b>全部会话</b></button>${ps.map(x => `<button class="project-item ${p?.id === x.id ? 'active' : ''}" data-action="session-project" data-id="${esc(x.id)}" data-key="project-${esc(x.id)}"><span class="project-item-icon">${icon('workspaces', 16)}</span><span><b class="ellipsis">${esc(x.name)}</b><span class="project-item-sub">${nodeTag(x.nodeId, true)}<span>${x.sessionCount ?? 0} 个会话</span>${x.active ? `<span class="accent">${x.active} 项运行</span>` : ''}${x.review ? `<span>${x.review} 待验收</span>` : ''}</span></span>${icon('chevron', 12)}</button>`).join('') || empty('没有匹配项目')}</aside>`;
+    if (!p) {
+        const path = conversationPath(), global = data<ListResponse<Sessions['conversations'][number]>>(path);
+        const body = route.p.project ? empty('项目不存在', '', btn('查看全部会话','global-sessions')) : !global ? resourceState(path)
+            : global.items.length ? conversationCards(global.items) : empty(global.complete ? '没有匹配会话' : '已读取范围内没有匹配会话', global.complete ? '可按会话标题或 ID 搜索，或从左侧选择项目。' : '仍有节点数据待确认。');
+        return `<div class="session-layout">${left}<section class="session-content"><div class="page">${pageHead('全部会话','按聊天标题、会话 ID 查找；项目用于缩小范围。')}<div class="toolbar">${searchField(route.p.q,'搜索会话标题或 ID…')}${scopes(false)}</div>${staleNotice(path)}${body}</div></section></div>`;
+    }
     const filter = route.p.state || 'active', items = d?.items.filter(t => filter === 'all' ? true : filter === 'protected' ? t.protected : t.archiveState === filter) || [], tab = route.p.tab || 'sessions';
     let body;
     if (!d)
@@ -563,20 +635,31 @@ function sessionsPage() {
     else if (tab === 'batches')
         body = `<div class="panel">${d.batches.map(b => `<div class="recent-row"><span>${icon('archive', 16)}</span><div class="recent-name"><b>${b.mode === 'archive' ? '归档' : '恢复'}批次</b><span class="mono small muted">${esc(b.id)}</span></div>${badge(b.status === 'completed' ? '已完成' : b.status === 'partial' ? '部分失败' : '待确认', b.status === 'completed' ? 'good' : b.status === 'partial' ? 'warn' : '')}${smallTime(b.createdAt)}</div>`).join('') || empty('暂无归档批次')}</div>`;
     else if (tab === 'claims')
-        body = '<div class="panel">'+d.executionClaims.map(c=>`<div class="claim-row"><b>${esc(c.title || c.kind)}</b><span>${c.state==='queued'?'排队':'执行中'}</span><code>${esc(c.operationId || c.id)}</code><div>${c.scopes.map(s=>`<div class="resource-path"><span>${s.access==='write'?'写入':'读取'}</span><code>${esc(s.kind==='named'?s.key:s.path)}</code></div>`).join('')}</div></div>`).join('')+'</div>';
+        body = '<div class="panel">'+d.executionClaims.map(c=>`<div class="claim-row"><b>${esc(c.title || c.kind)}</b><span>${c.state==='queued'?'等待执行许可':'持有资源记录'}</span><div class="small muted">进程 ${c.ownerPid} · 取得于 ${esc(fullTime(c.acquiredAt ? Date.parse(c.acquiredAt) : null))}</div>${c.taskId ? btn('查看所属任务','open-run',`data-id="${esc('qmtask:'+c.taskId)}"`,'small') : ''}<p class="small muted">${c.state==='queued'?'等待以下资源的执行许可。':'中断后的占用记录需要核对所属任务与进程结果。'}</p>${c.waiting ? `<div class="notice warn"><span>${c.waiting.reason === 'claim_or_prior_waiter' ? '等待现有占用或前序排队释放：' : '等待执行许可或调度：'}${c.waiting.owners.map(owner => `${esc(owner.claimId)} (${owner.state === 'queued' ? '前序排队' : '持有记录'})`).join('、')}${c.waiting.ownersTruncated ? '，其余阻塞项见原入口' : ''}</span></div>` : ''}<code>${esc(c.operationId || c.id)}</code><div>${c.scopes.map(s=>`<div class="resource-path"><span>${s.access==='write'?'写入':'读取'}</span><code>${esc(s.kind==='named'?s.key:s.path)}</code></div>`).join('')}</div></div>`).join('')+'</div>';
 
     else
         body = `<div class="toolbar">${segmented([['active', '未归档'], ['archived', '已归档'], ['protected', '已保留'], ['all', '全部']], filter, 'session-filter')}<span class="spacer"></span>${btn(icon('archive', 14) + (filter === 'archived' ? '恢复' : '归档'), 'archive-preview', `data-value="${filter === 'archived' ? 'restore' : 'archive'}" ${writeAttrs('archive')}`)}</div>${selectedThreads.size ? `<div class="bulkbar">${selectedThreads.size} 个会话已选<span class="spacer"></span>${btn('取消选择', 'clear-threads', '', 'small')}</div>` : ''}<div class="session-card-grid">${items.map((t, i) => `<article class="session-card" data-key="session-${esc(t.id)}"><label class="check-label session-selection"><input type="checkbox" data-select-thread="${esc(t.id)}" ${selectedThreads.has(t.id) ? 'checked' : ''} aria-label="选择会话 ${esc(t.title)}"></label><details open data-key="session-details-${esc(t.id)}"><summary class="session-summary"><span class="session-symbol">${icon('changes', 16)}<i class="session-dot ${t.control === 'quaymesh' ? 'running' : t.control === 'desktop' ? 'review' : 'done'}"></i></span><span class="session-heading"><b title="${esc(t.title)}">${esc(t.title)}</b><span class="session-meta"><code>${esc(t.turnId)}</code><span>·</span><span>${t.runIds.length} 次执行</span>${t.protected ? badge('保留') : ''}</span></span><span class="summary-chevron">${icon('chevron', 13)}</span></summary><div class="session-runs">${t.runs.map(r => `<button class="session-run-link" data-action="open-run" data-id="${esc(r.id)}"><span class="${r.status === 'failed' ? 'red' : r.status === 'running' ? 'accent' : 'muted'}">${icon(r.status, 14)}</span><span class="ellipsis">${esc(r.title || r.id)}</span><span class="small muted">${esc(stages[r.status] || r.status)}</span>${icon('chevron', 12)}</button>`).join('')}</div></details><footer><span class="session-owner ${t.control === 'quaymesh' ? 'accent' : 'muted'}">${icon(t.control === 'idle' ? 'unlock' : 'lock', 12)}${t.control === 'quaymesh' ? 'QuayMesh' : t.control === 'desktop' ? 'Desktop' : '空闲'}</span>${!t.verified ? badge('归属待确认', 'warn') : t.external ? badge('外部续写', 'warn') : ''}<span class="spacer"></span>${t.control === 'quaymesh' ? btn('转向', 'session-control', `data-value="steer" data-id="${esc(t.id)}" ${writeAttrs()}`, 'small ghost') + btn('接管', 'session-control', `data-value="takeover" data-id="${esc(t.id)}" ${writeAttrs()}`, 'small') : t.control === 'desktop' ? btn('归还', 'session-control', `data-value="return" data-id="${esc(t.id)}" ${writeAttrs()}`, 'small') : ''}${ib('pin', 'protect', t.protected ? '取消保留' : '保留会话', `data-id="${esc(t.id)}" ${writeAttrs()}`, t.protected ? 'accent' : '')}${ib('more', 'session-info', '会话详情', `data-id="${esc(t.id)}"`)}</footer></article>`).join('') || empty('暂无会话')}</div>`;
     return `<div class="session-layout has-project">${left}<section class="session-content"><div class="page"><div class="mobile-only">${btn(icon('back', 14) + '项目', 'session-back', '', 'ghost')}</div>${pageHead(p.name, `${nodeTag(p.nodeId, true)} <code title="${esc(p.path)}">${esc(p.path)}</code>`)}${tabs([['sessions', '会话', d?.conversations.length], ['threads', '代理会话', d?.items.length], ['batches', '代理归档', d?.batches.length], ['claims', '资源占用', d?.executionClaims.length]], tab, 'session-tab')}${staleNotice(key)}<div class="section-gap">${body}</div></div></section></div>`;
 }
 function workspacesPage() {
-    const d = data<ListResponse<Root>>('roots'), q = (route.p.q || '').toLowerCase(), roots = (d?.items || []).filter(r => (!route.p.node || r.nodeId === route.p.node) && (!q || [r.name, r.id, r.path, r.description, ...r.tags].join(' ').toLowerCase().includes(q))), orphans = projects().filter(p => !p.rootId && (!route.p.node || p.nodeId === route.p.node));
-    const content = !d ? resourceState('roots') : `<div class="panel root-panel"><div class="root-labels"><span></span><span>根目录</span><span>路径</span><span>状态</span><span></span></div>${roots.map(r => { const ps = projects().filter(p => p.rootId === r.id), open = expandedRoots.has(r.id), online = node(r.nodeId)?.online; return `<section data-key="root-${esc(r.id)}"><div class="root-row">${ib(open ? 'down' : 'chevron', 'root-expand', (open ? '收起' : '展开') + '项目', `data-id="${esc(r.id)}" aria-expanded="${open}" ${ps.length ? '' : 'disabled'}`)}<div class="root-name"><h3>${esc(r.name)}</h3><p>${nodeTag(r.nodeId, true)}<span>${ps.length} 项目</span>${r.readOnly ? badge('只读') : ''}${r.tags.slice(0, 2).map(t => badge(t)).join('')}</p></div><div class="root-path"><code title="${esc(r.path)}">${esc(r.path)}</code><span class="mono muted">${esc(r.id)}</span></div><span class="root-status">${badge(!r.enabled ? '已停用' : online ? '可用' : '离线', !r.enabled ? '' : online ? 'good' : 'warn')}</span><div class="root-actions">${ib('copy', 'copy', '复制根目录引用', `data-text="${esc(r.reference)}"`)}${ib('settings', 'root-edit', '编辑根目录', `data-id="${esc(r.id)}" ${writeAttrs('settings')}`)}</div></div>${open ? `<div class="root-projects">${ps.map(p => `<div class="root-project">${icon('workspaces', 14)}<button class="run-title" data-action="project-tasks" data-id="${esc(p.id)}">${esc(p.name)}</button><span class="small muted ellipsis">${esc(p.path)}</span><span class="spacer"></span><span class="small muted">${p.total} 次执行</span>${p.active ? badge(p.active + ' 活跃') : ''}</div>`).join('')}</div>` : ''}</section>`; }).join('') || empty('没有匹配根目录', '', btn('清除筛选', 'reset-filters'))}</div>`;
-    return `<div class="page">${pageHead('工作空间', `${roots.length} 个根目录 · ${projects().length} 个项目`, btn(icon('plus', 14) + '添加根目录', 'root-edit', writeAttrs('settings'), 'primary'))}<div class="toolbar">${searchField(route.p.q, '搜索目录、路径或标签…')}${scopes(false)}</div>${staleNotice('roots')}${content}${orphans.length ? `<section class="section-gap">${panel('未分配根目录', orphans.map(p => `<div class="recent-row"><span class="amber">${icon('workspaces', 16)}</span><div class="recent-name"><h3>${esc(p.name)}</h3><code class="small muted">${esc(p.path)}</code></div>${nodeTag(p.nodeId, true)}${btn('查看任务', 'project-tasks', `data-id="${esc(p.id)}"`, 'small')}</div>`).join(''), badge(orphans.length + ' 项', 'warn'))}</section>` : ''}</div>`;
+    const d = data<ListResponse<Root>>('roots'), q = (route.p.q || '').toLowerCase(), roots = (d?.items || []).filter(r => (!route.p.node || r.nodeId === route.p.node) && (!q || [r.name, r.id, r.path, r.description, ...r.tags].join(' ').toLowerCase().includes(q))), orphans = projects().filter(p => !p.rootId && (!route.p.node || p.nodeId === route.p.node) && [p.id,p.name,p.path].join(' ').toLowerCase().includes(q));
+    const content = !d ? resourceState('roots') : `<div class="panel root-panel"><div class="root-labels"><span></span><span>根目录</span><span>路径</span><span>状态</span><span></span></div>${roots.map(r => { const ps = projects().filter(p => p.rootId === r.id), open = expandedRoots.has(r.id), online = node(r.nodeId)?.online; return `<section data-key="root-${esc(r.id)}"><div class="root-row">${ib(open ? 'down' : 'chevron', 'root-expand', (open ? '收起' : '展开') + '项目', `data-id="${esc(r.id)}" aria-expanded="${open}" ${ps.length ? '' : 'disabled'}`)}<div class="root-name"><h3>${esc(r.name)}</h3><p>${nodeTag(r.nodeId, true)}<span>${ps.length} 项目</span>${r.readOnly ? badge('只读') : ''}${r.tags.slice(0, 2).map(t => badge(t)).join('')}</p></div><div class="root-path"><code title="${esc(r.path)}">${esc(r.path)}</code><span class="mono muted">${esc(r.id)}</span></div><span class="root-status">${badge(r.settingsError ? '配置应用失败' : r.settingsPending ? '配置待应用' : !r.enabled ? '已停用' : online ? '可用' : '离线', r.settingsError || r.settingsPending ? 'warn' : !r.enabled ? '' : online ? 'good' : 'warn')}</span><div class="root-actions">${ib('copy', 'copy', '复制根目录引用', `data-text="${esc(r.reference)}"`)}${ib('settings', 'root-edit', '编辑根目录', `data-id="${esc(r.id)}" ${writeAttrs('settings')}`)}</div></div>${open ? `<div class="root-projects">${ps.map(p => `<div class="root-project">${icon('workspaces', 14)}<button class="run-title" data-action="project-tasks" data-id="${esc(p.id)}">${esc(p.name)}</button><span class="small muted ellipsis">${esc(p.path)}</span><span class="spacer"></span><span class="small muted">${p.total} 次执行</span>${p.active ? badge(p.active + ' 活跃') : ''}</div>`).join('')}</div>` : ''}</section>`; }).join('') || empty('没有匹配根目录', '', btn('清除筛选', 'reset-filters'))}</div>`;
+    return `<div class="page">${pageHead('工作空间', `${roots.length} 个匹配根目录 · ${projects().filter(p => roots.some(r => r.id === p.rootId)).length + orphans.length} 个相关项目`, btn(icon('plus', 14) + '添加根目录', 'root-edit', writeAttrs('settings'), 'primary'))}<div class="toolbar">${searchField(route.p.q, '搜索目录、路径或标签…')}${scopes(false)}</div>${staleNotice('roots')}${content}${orphans.length ? `<section class="section-gap">${panel('未分配根目录', orphans.map(p => `<div class="recent-row"><span class="amber">${icon('workspaces', 16)}</span><div class="recent-name"><h3>${esc(p.name)}</h3><code class="small muted">${esc(p.path)}</code></div>${nodeTag(p.nodeId, true)}${btn('查看任务', 'project-tasks', `data-id="${esc(p.id)}"`, 'small')}</div>`).join(''), badge(orphans.length + ' 项', 'warn'))}</section>` : ''}</div>`;
+}
+function eventLinks(event: EventRow): string {
+    const details = event.details || {}, taskId = event.taskId || (typeof details.taskId === 'string' ? details.taskId : typeof details.task_id === 'string' ? details.task_id : null);
+    const runId = event.runId || (typeof details.runId === 'string' ? details.runId : null), operationId = event.operationId || (typeof details.operationId === 'string' ? details.operationId : null);
+    return '<div class="actions">' + (taskId ? btn('查看任务','open-run',`data-id="${esc(taskId.startsWith('qmtask:') ? taskId : 'qmtask:'+taskId)}"`,'small') : runId ? btn('查看执行','open-run',`data-id="${esc(runId.startsWith('qm:') ? runId : workspaceHandle(event.nodeId,runId))}"`,'small') : '')
+        + (operationId ? ib('copy','copy','复制操作引用',`data-text="${esc(operationId)}"`) : '') + (event.requestId ? ib('copy','copy','复制请求引用',`data-text="${esc(event.requestId)}"`) : '') + '</div>';
+}
+function receiptsPage(tabsHTML: string): string {
+    const path = activityPath(), receipts = data<{items:ActionReceipt[]}>(path);
+    return `<div class="page">${pageHead('活动','最近 50 次操作回执；记录每个目标的处理结果。',btn('重新核对','refresh'))}${tabsHTML}${staleNotice(path)}${!receipts ? resourceState(path) : receipts.items.length ? `<div class="panel">${receipts.items.map(receipt=>`<article class="receipt-row"><div class="inline"><b>${esc(receiptLabel(receipt))}</b><span class="spacer"></span>${smallTime(timestamp(receipt.finishedAt ?? receipt.createdAt))}</div><code class="break">${esc(receipt.path)}</code><p class="small muted">请求 ${esc(receipt.requestKey)} · ${esc(receipt.scope)}</p>${receipt.error ? `<p class="amber">${esc(typeof receipt.error === 'string' ? receipt.error : receipt.error.message || receipt.error.code)}</p>` : ''}<details><summary>查看逐项结果</summary><pre class="code-block">${esc(JSON.stringify(receipt.response ?? {effect:receipt.effect},null,2))}</pre></details>${canQueryReceipt(receipt) ? btn('查询原请求结果','receipt-query',`data-id="${esc(receipt.requestKey)}" data-path="${esc(receipt.path)}" data-target="${esc(receipt.scope.slice(('console:'+receipt.path+':').length))}"`,'small') : ''}</article>`).join('')}</div>` : empty('暂无操作回执')}</div>`;
 }
 function activityPage() {
     const path = activityPath(), d = data<ActivityPage>(path), kind = route.p.kind || 'events';
-    const tabsHTML = tabs([['events', '系统事件'], ['calls', 'MCP 调用'], ['transfers', '文件传输'], ['audit', '配置审计']], kind, 'activity-kind');
+    const tabsHTML = tabs([['events', '系统事件'], ['calls', 'MCP 调用'], ['transfers', '文件传输'], ['audit', '操作审计'], ['receipts', '操作回执']], kind, 'activity-kind');
+    if (kind === 'receipts') return receiptsPage(tabsHTML);
     let body;
     if (!d)
         body = resourceState(path);
@@ -589,12 +672,12 @@ function activityPage() {
         else
             groups.push({ item: e, items: [e] }); });
         const max = Math.max(1, ...d.bins.map(b => b.count));
-        body = `<div class="panel"><div class="histogram" aria-label="近 24 小时事件分布">${d.bins.map(b => `<button class="${b.errors ? 'bad' : b.warnings ? 'warn' : ''}" style="height:${Math.max(3, b.count / max * 52)}px" data-action="event-hour" data-value="${Math.floor(b.start / 3600000)}" title="${fullTime(b.start)} · ${b.count} 条 · ${b.errors} 错误" aria-label="筛选 ${tm(b.start)} 的 ${b.count} 条事件"></button>`).join('')}</div><div class="chart-axis"><span>24 小时前</span><span>现在</span></div>${groups.map(({ item: e, items }) => `<div class="event-row" data-key="event-${esc(e.id)}"><time title="${fullTime(e.time)}">${tm(e.time)}</time><span class="${e.level === 'error' ? 'red' : e.level === 'warn' ? 'amber' : 'muted'}">${icon(e.level === 'error' ? 'failed' : e.level === 'warn' ? 'alert' : 'info', 15)}</span><span class="node-mark">${esc(node(e.nodeId)?.short || e.nodeId)}</span><details><summary>${esc(e.message)}</summary><p>${esc(node(e.nodeId)?.name || e.nodeId)} · ${esc(e.level)} · ${items.length} 条原始记录</p><pre>${esc(JSON.stringify(items, null, 2))}</pre></details>${items.length > 1 ? badge('×' + items.length) : '<span></span>'}</div>`).join('')}${pagination(d)}</div>`;
+        body = `<div class="panel"><div class="histogram" aria-label="近 24 小时事件分布">${d.bins.map(b => `<button class="${b.errors ? 'bad' : b.warnings ? 'warn' : ''}" style="height:${Math.max(3, b.count / max * 52)}px" data-action="event-hour" data-value="${Math.floor(b.start / 3600000)}" title="${fullTime(b.start)} · ${b.count} 条 · ${b.errors} 错误" aria-label="筛选 ${tm(b.start)} 的 ${b.count} 条事件"></button>`).join('')}</div><div class="chart-axis"><span>24 小时前</span><span>现在</span></div>${groups.map(({ item: e, items }) => `<div class="event-row" data-key="event-${esc(e.id)}"><time title="${fullTime(e.time)}">${tm(e.time)}</time><span class="${e.level === 'error' ? 'red' : e.level === 'warn' ? 'amber' : 'muted'}">${icon(e.level === 'error' ? 'failed' : e.level === 'warn' ? 'alert' : 'info', 15)}</span><span class="node-mark">${esc(node(e.nodeId)?.short || e.nodeId)}</span><details><summary>${esc(e.message)}</summary><p>${esc(node(e.nodeId)?.name || e.nodeId)} · ${esc(e.level)} · ${items.length} 条原始记录</p>${eventLinks(e)}<pre>${esc(JSON.stringify(items, null, 2))}</pre></details>${items.length > 1 ? badge('×' + items.length) : '<span></span>'}</div>`).join('')}${pagination(d)}</div>`;
     }
     else if (kind === 'calls')
-        body = `<div class="panel">${d.items.map(c => `<div class="event-row" data-key="call-${esc(c.id)}"><time title="${fullTime(c.time)}">${tm(c.time)}</time><span class="${c.ok === true ? 'green' : c.ok === false ? 'red' : 'muted'}">${icon(c.ok === true ? 'check' : c.ok === false ? 'failed' : 'queued', 14)}</span><span class="node-mark">${esc(node(c.nodeId)?.short || '?')}</span><details><summary><code>${esc(c.tool)}</code> <span class="small muted">${esc(c.summary)}</span></summary><p>路由 ${esc(c.nodeId)} / ${esc(c.rootId)} · request ${esc(c.id)}</p><pre>${esc(JSON.stringify(c, null, 2))}</pre></details><span class="mono small ${c.ok === false ? 'red' : 'muted'}">${c.ok === true ? (c.duration == null ? '未记录时长' : c.duration + ' ms') : c.ok === false ? esc(c.error) : c.state === 'running' ? '运行中' : '状态待核对'}</span></div>`).join('')}${pagination(d)}</div>`;
+        body = `<div class="panel">${d.items.map(c => `<div class="event-row" data-key="call-${esc(c.id)}"><time title="${fullTime(c.time)}">${tm(c.time)}</time><span class="${c.ok === true ? 'green' : c.ok === false ? 'red' : 'muted'}">${icon(c.ok === true ? 'check' : c.ok === false ? 'failed' : 'queued', 14)}</span><span class="node-mark">${esc(node(c.nodeId)?.short || '?')}</span><details><summary><code>${esc(c.tool)}</code> <span class="small muted">${esc(c.summary)}</span></summary><p>节点 ${esc(c.nodeId)} / ${esc(c.rootId)} · 请求 ${esc(c.requestId || c.id)}</p>${eventLinks(c)}<pre>${esc(JSON.stringify(c, null, 2))}</pre></details><span class="mono small ${c.ok === false ? 'red' : 'muted'}">${c.ok === true ? (c.duration == null ? '未记录时长' : c.duration + ' ms') : c.ok === false ? esc(c.error) : c.state === 'pending' ? '等待响应' : c.state === 'responded' ? (c.responseRecorded === false ? '已响应 · 历史结果未保存' : '已响应') : '状态待核对'}</span></div>`).join('')}${pagination(d)}</div>`;
     else if (kind === 'transfers')
-        body = `<div class="panel">${(d.items as unknown as TransferRow[]).map(t => `<article class="transfer" data-key="transfer-${esc(t.id)}"><div class="inline"><h3>${t.source.split(/[\\/]/).pop()}</h3><span class="spacer"></span>${status(t.status === 'completed' ? 'done' : t.status)}</div><div class="transfer-path" style="margin-top:11px"><span class="muted">来源</span><span class="break">${esc(t.source)}</span><span class="muted">目标</span><span class="break">${esc(t.destination)}</span></div>${meter(t.bytes / t.total * 100, t.status === 'failed' ? 'red' : '')}<div class="inline"><span class="small muted num">${bytes(t.bytes)} / ${bytes(t.total)} · ${(t.bytes / t.total * 100).toFixed(1)}%</span><span class="spacer"></span>${t.status === 'running' ? `<span class="small muted">${bytes(t.speed)}/s</span>${btn('取消传输', 'cancel-transfer', `data-id="${esc(t.id)}" ${writeAttrs()}`, 'small danger')}` : t.error ? `<span class="small red">${esc(t.error)}</span>` : ''}</div></article>`).join('')}${pagination(d)}</div>`;
+        body = `<div class="panel">${(d.items as unknown as TransferRow[]).map(t => `<article class="transfer" data-key="transfer-${esc(t.id)}"><div class="inline"><h3>${esc(t.source.split(/[\\/]/).pop())}</h3><span class="spacer"></span>${status(t.status === 'completed' ? 'done' : t.status)}</div><div class="transfer-path" style="margin-top:11px"><span class="muted">来源</span><span class="break">${esc(t.source)}</span><span class="muted">目标</span><span class="break">${esc(t.destination)}</span></div>${meter(transferPercent(t), t.status === 'failed' ? 'red' : '')}<div class="inline"><span class="small muted num">${bytes(t.bytes)} / ${bytes(t.total)} · ${transferPercent(t) === null ? '总量待确认' : transferPercent(t)!.toFixed(1) + '%'}</span><span class="spacer"></span>${t.status === 'running' ? `${t.speed == null ? '' : `<span class="small muted">${bytes(t.speed)}/s</span>`}${btn('取消传输', 'cancel-transfer', `data-id="${esc(t.id)}" ${writeAttrs()}`, 'small danger')}` : t.error ? `<span class="small red">${esc(t.error)}</span>` : ''}</div></article>`).join('')}${pagination(d)}</div>`;
     else
         body = `<div class="panel">${(d.items as unknown as AuditRow[]).map(a => `<div class="event-row" data-key="audit-${esc(a.id)}"><time title="${fullTime(a.time)}">${tm(a.time)}</time><span class="muted">${icon('shield', 15)}</span><span class="node-mark">AUD</span><details><summary><code>${esc(a.action)}</code> · ${esc(a.target)}</summary><p>${esc(a.actor)} · request ${esc(a.requestKey)}</p><pre>${esc(JSON.stringify({ before: a.before, after: a.after }, null, 2))}</pre></details><span></span></div>`).join('')}${pagination(d)}</div>`;
     return `<div class="page">${pageHead('活动', '', btn(icon(activityPaused ? 'running' : 'interrupted', 14) + (activityPaused ? '恢复刷新' : '暂停刷新'), 'activity-pause') + btn(icon('download', 14) + '导出本页', 'export-activity', d?.items.length ? '' : 'disabled'))}${tabsHTML}<div class="toolbar">${searchField(route.p.q, '搜索消息、工具、目标或 ID…')}${kind === 'events' || kind === 'calls' ? scopes(false) : ''}${kind === 'events' ? `<select class="select" data-param="level" aria-label="事件级别">${[['', '全部级别'], ['error', '错误'], ['warn', '警告'], ['info', '信息']].map(([v, t]) => opt(v, t, route.p.level)).join('')}</select><label class="switch"><input type="checkbox" data-merge-events ${groupEvents ? 'checked' : ''}>合并连续重复</label>` : ''}<span class="spacer"></span><span class="small ${activityPaused ? 'amber' : 'muted'}">${activityPaused ? '当前列表已暂停' : '自动更新'}${d ? ' · ' + d.total + ' 条' : ''}</span></div>${route.p.hour ? `<div class="inline visually-spaced">${badge('小时过滤：' + tm(Number(route.p.hour) * 3600000), 'warn')}${btn('清除小时过滤', 'clear-hour', '', 'small')}</div>` : ''}${staleNotice(path)}${body}</div>`;
@@ -605,11 +688,11 @@ function usagePage() {
         return `<div class="page">${pageHead('用量分析')}${resourceState(path)}</div>`;
     const mx = Math.max(1, ...u.daily.map(x => x.total ?? 0)), ratio = cacheRatio(u);
     const metric = (label: string, value: string, hint: string) => `<div class="metric"><span class="metric-label">${label}</span><div class="metric-main"><b>${value}</b><small>${hint}</small></div></div>`;
-    const chart = panel('每日用量', `<div class="chart-topline"><span>${compact(mx)}</span><span>Token</span></div><div class="usage-chart" aria-label="每日 Token">${u.daily.map(d => `<div class="usage-column"><button class="usage-bar" style="height:${Math.max(1, (d.total ?? 0) / mx * 140)}px" data-action="usage-date" data-value="${esc(d.day)}" title="${d.day}\n总量 ${fmt(d.total)}\n非缓存输入 ${fmt(noncachedInput(d))}\n缓存输入 ${fmt(d.cached)}\n输出 ${fmt(d.output)}" aria-label="${d.day} 用量 ${fmt(d.total)}，查看任务"><i class="part output" style="height:${usageParts(d).output}%"></i><i class="part input" style="height:${usageParts(d).input}%"></i><i class="part cache" style="height:${usageParts(d).cache}%"></i></button><span class="day">${d.day.slice(5)}</span></div>`).join('')}</div>`, `<div class="legend"><span><i></i>非缓存输入</span><span><i class="cache"></i>缓存</span><span><i class="output"></i>输出</span></div>`);
+    const chart = panel('每日已结束轮次用量', `<div class="chart-topline"><span>${compact(mx)}</span><span>Token</span></div><div class="usage-chart" aria-label="每日 Token">${u.daily.map(d => `<div class="usage-column"><button class="usage-bar" style="height:${Math.max(1, (d.total ?? 0) / mx * 140)}px" data-action="usage-date" data-value="${esc(d.day)}" title="${d.day}\n总量 ${fmt(d.total)}\n非缓存输入 ${fmt(noncachedInput(d))}\n缓存输入 ${fmt(d.cached)}\n输出 ${fmt(d.output)}" aria-label="${d.day} 用量 ${fmt(d.total)}，查看任务"><i class="part output" style="height:${usageParts(d).output}%"></i><i class="part input" style="height:${usageParts(d).input}%"></i><i class="part cache" style="height:${usageParts(d).cache}%"></i></button><span class="day">${d.day.slice(5)}</span></div>`).join('')}</div>`, `<div class="legend"><span><i></i>非缓存输入</span><span><i class="cache"></i>缓存</span><span><i class="output"></i>输出</span></div>`);
     const quality = panel('统计明细', `<div class="usage-summary"><div class="section-line"><span class="muted">输入缓存占比</span><b class="ratio">${ratio === null ? '未知' : ratio.toFixed(1) + '%'}</b></div>${meter(ratio)}<div class="usage-breakdown"><span>${compact(u.cached)} / ${compact(u.input)}</span></div><dl class="quality-list"><div><dt>完整记录</dt><dd>${u.records - u.missing - u.partial - u.notUsed}</dd></div><div><dt>部分记录</dt><dd class="${u.partial ? 'amber' : ''}">${u.partial}</dd></div><div><dt>用量未知</dt><dd class="${u.missing ? 'amber' : ''}">${u.missing}</dd></div><div><dt>未调用模型</dt><dd>${u.notUsed}</dd></div></dl></div>`);
     const byProject = panel('项目用量', `<div class="usage-ranking table-wrap"><table class="data-table"><colgroup><col><col style="width:116px"><col style="width:116px"><col style="width:66px"></colgroup><thead><tr><th>项目</th><th class="align-right">Token</th><th>占比</th><th class="align-right">执行</th></tr></thead><tbody>${u.projects.map(p => `<tr><td><button class="run-title" data-action="project-tasks" data-id="${esc(p.id)}">${esc(p.name)}</button><div class="run-sub">${nodeTag(p.nodeId, true)}${p.missing || p.partial ? badge('部分记录') : ''}</div></td><td class="align-right num">${p.partial || p.missing ? '≥ ' : ''}${compact(p.total)}</td><td><div class="share-cell">${meter(u.total ? (p.total ?? 0) / u.total * 100 : 0)}<span class="muted num">${(u.total ? (p.total ?? 0) / u.total * 100 : 0).toFixed(1)}%</span></div></td><td class="align-right num">${p.records}</td></tr>`).join('')}</tbody></table></div>`);
     const top = panel('高用量任务', `<div class="panel-body">${u.top.map((r, i) => `<div class="rank-row"><span class="rank-number">${String(i + 1).padStart(2, '0')}</span><div style="min-width:0"><button class="run-title ellipsis" data-action="open-run" data-id="${esc(r.id)}" title="${esc(r.title)}">${esc(r.title)}</button><p class="small muted">${esc(r.projectName)}</p></div>${usageText(r)}</div>`).join('') || empty('暂无用量')}</div>`);
-    return `<div class="page">${pageHead('用量分析', '', btn(icon('download', 14) + '导出统计', 'export-usage'))}<div class="toolbar">${scopes()}${rangeSelect(route.p.days || '14', false)}<span class="spacer"></span><span class="small muted">${u.records} 次执行</span></div>${staleNotice(path)}<section class="summary-grid">${metric('已记录 Token', (u.partial || u.missing ? '≥ ' : '') + compact(u.total), '')}${metric('输入', compact(u.input), '缓存 ' + compact(u.cached))}${metric('输出', compact(u.output), '推理 ' + compact(u.reasoning))}${metric('执行记录', fmt(u.records), u.notUsed + ' 次未调用模型')}</section><div class="usage-grid">${chart}${quality}</div><div class="usage-grid">${byProject}${top}</div></div>`;
+    return `<div class="page">${pageHead('用量分析', '按代理执行轮次结束日统计，使用当前选择的时区。', btn(icon('download', 14) + '导出完整统计', 'export-usage'))}<div class="toolbar">${scopes()}${rangeSelect(route.p.days || '14', false)}<span class="spacer"></span><span class="small muted">${u.records} 个已结束轮次</span></div>${staleNotice(path)}${u.pendingUsage.records || u.undatedUsage.records ? `<div class="notice warn visually-spaced">未结束轮次 ${u.pendingUsage.records} 个（已记录 ${compact(u.pendingUsage.total)} Token）；结束时间缺失 ${u.undatedUsage.records} 个（已记录 ${compact(u.undatedUsage.total)} Token）。这些记录保留在此处，日期图表尚未计入。</div>` : ''}<section class="summary-grid">${metric('已记录 Token', (u.partial || u.missing ? '≥ ' : '') + compact(u.total), '')}${metric('输入', compact(u.input), '缓存 ' + compact(u.cached))}${metric('输出', compact(u.output), '推理 ' + compact(u.reasoning))}${metric('已结束轮次', fmt(u.records), u.notUsed + ' 次未调用模型')}</section><div class="usage-grid">${chart}${quality}</div><div class="usage-grid">${byProject}${top}</div></div>`;
 }
 const SETTINGS = [['appearance', '外观'], ['data', '刷新与通知'], ['connection', '数据连接'], ['egress', '统一出口'], ['security', '登录与权限'], ['shortcuts', '快捷键']];
 const settingRow = (title: string, desc: string, control: string) => `<div class="setting-row"><div><h3>${title}</h3>${desc ? `<p>${desc}</p>` : ''}</div><div class="control">${control}</div></div>`;
@@ -619,9 +702,9 @@ function settingsPage() {
     if (sec === 'appearance')
         body = `<div class="section-heading"><h2>外观</h2></div><div class="panel">${settingRow('主题', '', segmented([['system', '系统'], ['light', '浅色'], ['dark', '深色']], pref.theme, 'preference', 'data-key="theme"'))}${settingRow('行密度', '', segmented([['compact', '紧凑'], ['comfortable', '舒适']], pref.density, 'preference', 'data-key="density"'))}${settingRow('侧栏', '', segmented([['expanded', '展开'], ['collapsed', '折叠']], pref.sidebar, 'preference', 'data-key="sidebar"'))}${settingRow('时区', '', `<select class="select" data-pref-select="timeZone" aria-label="时区">${[['local', '跟随设备'], ['Asia/Shanghai', '北京时间'], ['America/New_York', '纽约时间'], ['UTC', '协调世界时 UTC']].map(([v, t]) => opt(v, t, pref.timeZone)).join('')}</select>`)}${settingRow('代码换行', '', `<label class="switch"><input type="checkbox" data-pref-check="wrap" ${pref.wrap ? 'checked' : ''}>自动换行</label>`)}</div>`;
     else if (sec === 'data')
-        body = `<div class="section-heading"><h2>刷新与通知</h2></div><div class="panel">${settingRow('刷新频率', '', segmented([['0', '手动'], ['8', '8 秒'], ['15', '15 秒'], ['30', '30 秒'], ['60', '1 分钟']], pref.poll, 'preference', 'data-key="poll"'))}${settingRow('任务失败通知', '', `<label class="switch"><input type="checkbox" data-notifications ${pref.notifications ? 'checked' : ''}>浏览器通知</label>`)}${settingRow('缓存资源', '', `<span class="mono muted">${CACHE.size} 项</span>`)}${settingRow('本机偏好', '', btn('恢复默认', 'reset-preferences', '', 'danger'))}</div>`;
+        body = `<div class="section-heading"><h2>刷新与通知</h2></div><div class="panel">${settingRow('刷新频率', '', segmented([['0', '手动'], ['8', '8 秒'], ['15', '15 秒'], ['30', '30 秒'], ['60', '1 分钟']], pref.poll, 'preference', 'data-key="poll"'))}${settingRow('错误事件通知', '按节点补读真实错误事件；断开期间保留进度，恢复后继续。随刷新频率检查。', `<label class="switch"><input type="checkbox" data-notifications ${pref.notifications ? 'checked' : ''}>浏览器通知</label>`)}${settingRow('缓存资源', '', `<span class="mono muted">${CACHE.size} 项</span>`)}${settingRow('本机偏好', '', btn('恢复默认', 'reset-preferences', '', 'danger'))}</div>`;
     else if (sec === 'connection')
-        body = `<div class="section-heading"><h2>数据连接</h2></div><div class="panel">${settingRow('当前接口', 'quaymesh.console.v4', `<code>${esc(API.base())}</code>`)}${settingRow('任务来源', '各节点已保存的 QuayMesh 工作记录', badge('实时数据', 'good'))}${settingRow('刷新状态', '', btn('重新读取', 'refresh'))}</div>`;
+        body = `<div class="section-heading"><h2>数据连接</h2></div><div class="panel">${settingRow('当前接口', 'quaymesh.console.v4', `<code>${esc(API.base())}</code>`)}${settingRow('任务来源', '各节点已保存的 QuayMesh 工作记录', badge(resourceHealth([...activePaths].map(path => CACHE.get(path))).label, resourceHealth([...activePaths].map(path => CACHE.get(path))).tone === 'green' ? 'good' : 'warn'))}${settingRow('刷新状态', '各资源独立更新，读取失败保留最近确认记录。', btn('重新读取', 'refresh') + btn('查看诊断','diagnostics'))}</div>`;
     else if (sec === 'egress')
         body = `<div class="section-heading"><h2>统一出口</h2></div><form id="egress-form" data-preserve="egress-settings" class="panel"><div class="panel-body field-grid"><label class="field">来源节点<select class="select" name="sourceNodeId">${(fleet()?.nodes || []).map(n => opt(n.id, n.name, fleet()?.gatewayId)).join('')}</select></label><label class="field">上传配置<input type="file" name="config" accept=".yaml,.yml,text/yaml"><small>上传后使用文件配置 · 最大 256 KiB</small></label><div class="field full"><span>目标节点</span><div class="target-grid">${(fleet()?.nodes || []).map(n => `<label class="switch"><input type="checkbox" name="targets" value="${esc(n.id)}" ${n.online && n.egress.enabled ? 'checked' : ''} ${!n.online ? 'disabled' : ''}>${esc(n.name)} ${n.online ? '' : '（离线）'}</label>`).join('')}</div></div><label class="switch"><input type="checkbox" name="reload" checked>校验后热加载</label><div class="error-text full" data-form-error></div></div><div class="dialog-footer">${btn('同步配置', 'egress-sync', writeAttrs('settings'), 'primary')}</div></form><div class="section-gap panel">${(fleet()?.nodes || []).map(n => settingRow(esc(n.name), `优先级 ${n.priority} · 端口 ${n.egress.port}`, btn('节点设置', 'node', `data-id="${esc(n.id)}" data-tab="settings"`, 'small'))).join('')}</div>`;
     else if (sec === 'security')
@@ -631,38 +714,16 @@ function settingsPage() {
     return `<div class="page settings-page">${pageHead('设置')}<div class="settings-layout"><nav class="settings-nav" aria-label="设置分区">${SETTINGS.map(([id, text]) => `<button class="${id === sec ? 'active' : ''}" data-action="settings-section" data-value="${id}" ${id === sec ? 'aria-current="page"' : ''}>${text}</button>`).join('')}</nav><div class="settings-content">${body}</div></div></div>`;
 }
 const KEYS = [['⌘ / Ctrl K', '搜索与命令面板'], ['/', '聚焦当前页搜索'], ['G → O / T / C', '总览 / 任务 / 改动'], ['G → S / M / W', '会话 / 机器 / 工作空间'], ['G → A / U / ,', '活动 / 用量 / 设置'], ['J / K', '下一项 / 上一项任务'], ['Esc', '关闭详情或对话框'], ['[', '折叠 / 展开侧栏'], ['R', '刷新当前视图'], ['T', '切换深浅主题'], ['← / →', '聚焦分隔线时调整宽度'], ['?', '显示快捷键']];
-const CONTRACT = `quaymesh.console.v4 · base /console/api/v4/
-GET  session → {contract, user, csrf, capabilities}
-POST login {password} → session
-GET  fleet/status → {nodes[], gatewayId, ingressNodeId, observedAt}
-GET  overview → {active[], recent[], attention[], reviewCount, ...}
-GET  projects / roots → {items[]}
-GET  runs?node=&project=&q=&status=&days=&sort=&cursor=&limit=
-     → {items[], total, counts, nextCursor, offset, limit}
-GET  runs/:id → {run, summary, evidence[], files[], commands[], ...}
-GET  runs/:id/files/:file → {file:{rows,totalRows,revision,...}, complete,nextCursor}
-GET  runs/:id/patch → {patch, complete:true}
-POST runs/review {refs:[{id,expectedRevision}],verdict,note,requestKey}
-POST runs/:id/control {action,expectedRevision,requestKey}
-POST runs/revert/preview {id,files[],expectedRevision,requestKey}
-POST runs/revert/commit {previewId,confirmationHash,requestKey}
-GET  projects/:id/sessions → {items[],batches[],claims[]}
-POST sessions/:id/control {action,expectedRevision,expectedTurnId,prompt?,requestKey}
-POST sessions/:id/protect {protected,expectedRevision,requestKey}
-POST archive/preview {projectId,ids[],mode,requestKey}
-POST archive/commit {previewId,confirmationHash,externalIdleConfirmed,requestKey}
-POST nodes/:id/settings {settings,expectedRevision,requestKey}
-POST roots/save {root,expectedRevision,requestKey}
-GET  activity?kind=&q=&node=&level=&hour=&cursor= → paged items
-GET  usage?days=&node=&project= → totals, daily[], projects[], top[]
-POST transfers/cancel {id,expectedRevision,requestKey}
-POST egress/sync {sourceNodeId|text,nodeIds[],reload,requestKey}
-POST logout / sessions/revoke-all {requestKey}
-
-Writes: Cookie + X-QuayMesh-CSRF + requestKey.
-Errors: {message,code}, HTTP 401 / 403 / 409 / 422 / 5xx.
-Control/revert results must distinguish accepted vs completed.
-Read failures preserve the last confirmed data and report affected nodes.`;
+function diagnosticSnapshot() {
+    return {capturedAt:new Date().toISOString(),view:route,contract:API.session?.contract,assets:[...document.scripts].map(script=>script.src).filter(Boolean),
+        health:resourceHealth([...activePaths].map(path=>CACHE.get(path))),pendingRequests:API.pending.size,requestCount:API.requestCount,
+        nodes:(fleet()?.nodes || []).map(n=>({id:n.id,version:n.version,online:n.online,lastSeen:n.lastSeen})),
+        resources:[...activePaths].map(path=>{const entry=CACHE.get(path);return {path,loading:entry?.loading,lastReadAt:entry?.time,durationMs:entry?.duration,error:entry?.error?.message,sources:(entry?.data as {sources?:SourceState[]}|undefined)?.sources};})};
+}
+async function diagnostics() {
+    const snapshot = diagnosticSnapshot();
+    await dialog({title:'连接与页面诊断',wide:true,confirm:null,cancel:'关闭',body:`<p>${esc(snapshot.health.label)} · ${snapshot.pendingRequests} 个请求正在等待。</p><div class="panel">${snapshot.resources.map(item=>`<div class="panel-foot"><code class="break">${esc(item.path)}</code><span>${item.loading ? '读取中' : item.error ? '读取失败' : '已读取'}</span><span>${item.durationMs == null ? '—' : duration(item.durationMs)}</span>${smallTime(item.lastReadAt)}</div>`).join('')}</div><div class="form-actions">${btn('导出诊断记录','export-diagnostics')}</div><details><summary>版本与来源详情</summary><pre class="code-block">${esc(JSON.stringify(snapshot,null,2))}</pre></details>`});
+}
 function loginPage() { return `<div class="page"><form id="login-form" class="login-panel" data-preserve="login">${brand(48)}<h1>连接 QuayMesh</h1><p>请输入管理口令</p><label class="field">管理口令<input class="input" type="password" name="password" autocomplete="current-password" required maxlength="2048"></label><div class="error-text" data-form-error></div><button type="submit" class="btn primary">验证并进入</button></form></div>`; }
 function toast(message: string, tone = 'info') { if (tone !== 'bad') { for (const current of $$('#toasts .toast')) { if ((current as HTMLElement).dataset.message === message) current.remove(); } } const el = document.createElement('div'); el.className = 'toast'; el.dataset.message = message; el.setAttribute('role', tone === 'bad' ? 'alert' : 'status'); el.innerHTML = `<span class="${tone === 'bad' ? 'red' : tone === 'warn' ? 'amber' : tone === 'good' ? 'green' : 'accent'}">${icon(tone === 'bad' ? 'alert' : tone === 'good' ? 'check' : 'info', 17)}</span><span>${esc(message)}</span>`; $('#toasts')!.append(el); while ($('#toasts')!.children.length > 4)
     $('#toasts')!.firstElementChild?.remove(); setTimeout(() => el.remove(), tone === 'bad' ? 9000 : 5000); }
@@ -682,29 +743,22 @@ catch {
 const confirmAction = (title: string, body: string, confirm = '确认', danger = true) => dialog({ title, body, confirm, danger });
 function ensureWritable(cap = 'write') { if (!canWrite(cap))
     throw new ApiError('当前凭据或接口能力不允许执行此操作。', 403, 'forbidden'); }
-async function invalidateAfterWrite() { for (const [path, e] of CACHE) {
-    if (path !== 'projects') {
-        e.time = 0;
-    }
-    else
-        e.time = 0;
-} await refresh(true); ensureRoute(); }
-async function withLock(key: string, fn: () => unknown | Promise<unknown>) { if (writePending.has(key))
-    return; writePending.add(key); try {
+async function invalidateAfterWrite() { resources.invalidate(); await refresh(true); ensureRoute(); }
+async function withLock(key: string, fn: () => unknown | Promise<unknown>) { if (writePending.has(key)) { toast('该操作正在处理，请等待当前结果。'); return; } writePending.add(key); schedulePaint(); try {
     return await fn();
 }
 finally {
-    writePending.delete(key);
+    writePending.delete(key); schedulePaint();
 } }
 function findLoadedRun(id: string) { return data<RunDetail>('runs/' + enc(id))?.run || data<RunPage>(runPath())?.items?.find(r => r.id === id) || overview()?.active.find(r => r.id === id) || overview()?.recent.find(r => r.id === id); }
 async function reviewRuns(ids: string[], verdict: 'accept' | 'reject') {
     ensureWritable();
-    const rs = ids.map(findLoadedRun).filter((r): r is Run => Boolean(r && (r.actions.review || r.actions.complete)));
+    const rs = ids.map(findLoadedRun).filter((r): r is Run => Boolean(r && r.actions.review));
     if (!rs.length)
         return toast('所选任务没有可验收的结果', 'warn');
-    let requestKey = uid();
-    const refs = rs.map(r => ({ id: r.id, expectedRevision: r.revision, completeExecution: r.actions.complete === true }));
-    const result = await dialog({ title: verdict === 'accept' ? `结束并验收 ${rs.length} 项结果` : `结束并驳回 ${rs.length} 项结果`, danger: verdict === 'reject', confirm: verdict === 'accept' ? '确认验收' : '确认驳回', body: `<div class="panel" style="margin-bottom:16px">${rs.map(r => `<div class="panel-foot"><span class="ellipsis">${esc(r.title)}</span><span class="spacer"></span><span class="mono">rev ${r.revision}</span></div>`).join('')}</div><label class="field">${verdict === 'reject' ? '驳回原因（必填）' : '验收说明（可选）'}<textarea name="note" ${verdict === 'reject' ? 'required' : ''} placeholder="记录你核对过的证据与结论…" maxlength="4000"></textarea></label>`, onSubmit: form => API.post<ReviewReceipt>('runs/review', { refs, verdict, note: formObject(form).note?.trim() || '' }, requestKey) });
+    const intent = new WriteIntent(API, 'runs/review');
+    const refs = rs.map(r => ({ id: r.id, expectedRevision: r.revision }));
+    const result = await dialog({ title: verdict === 'accept' ? `验收 ${rs.length} 项结果` : `驳回 ${rs.length} 项结果`, danger: verdict === 'reject', confirm: verdict === 'accept' ? '确认验收' : '确认驳回', body: `<div class="panel" style="margin-bottom:16px">${rs.map(r => `<div class="panel-foot"><span class="ellipsis">${esc(r.title)}</span><span class="spacer"></span><span class="mono">rev ${r.revision}</span></div>`).join('')}</div><label class="field">${verdict === 'reject' ? '驳回原因（必填）' : '验收说明（可选）'}<textarea name="note" ${verdict === 'reject' ? 'required' : ''} placeholder="记录你核对过的证据与结论…" maxlength="4000"></textarea></label>`, onSubmit: form => intent.submit<ReviewReceipt>({ refs, verdict, note: formObject(form).note?.trim() || '' }) });
     if (!result)
         return;
     if (!Array.isArray(result.results))
@@ -719,94 +773,204 @@ async function runControl(id: string, action: string) {
     let r = findLoadedRun(id);
     if (!r)
         r = (await API.get<RunDetail>('runs/' + enc(id))).run;
-    const queued = stage(r) === 'queued', label = action === 'resume' ? '恢复执行' : queued ? '取消排队' : '中断执行', key = uid();
-    const result = await dialog({ title: label + '？', confirm: label, danger: action === 'interrupt', body: `<p><b>${esc(r.title)}</b></p><p>${action === 'resume' ? '继续从检查点执行，工作区可能产生修改。' : queued ? '从等待队列移除这个任务。' : '停止当前执行，保留工作区和执行记录。'}</p>`, onSubmit: () => API.post<{ status: string }>('runs/' + enc(id) + '/control', { action, expectedRevision: r.revision }, key) });
+    const queued = stage(r) === 'queued', label = action === 'resume' ? '恢复执行' : queued ? '取消排队' : '中断执行', intent = new WriteIntent(API, 'runs/' + enc(id) + '/control');
+    const result = await dialog({ title: label + '？', confirm: label, danger: action === 'interrupt', body: `<p><b>${esc(r.title)}</b></p><p>${action === 'resume' ? '继续从检查点执行，工作区可能产生修改。' : queued ? '从等待队列移除这个任务。' : '停止当前执行，保留工作区和执行记录。'}</p>`, onSubmit: () => intent.submit<ControlReceipt>({ action, expectedRevision: r.revision }) });
     if (!result)
         return;
     await invalidateAfterWrite();
-    toast(result.status === 'completed' ? (queued ? '已取消排队' : action === 'resume' ? '已恢复执行' : '已中断执行') : '请求已接收，等待回执', result.status === 'completed' ? 'good' : 'info');
+    const descriptions:Record<string,string> = {completed:queued ? '已取消排队' : action === 'resume' ? '已恢复执行' : '已确认停止',accepted:'请求已接收，等待最终回执',partial:'部分目标已处理，仍有目标需要核对',rejected:'所有目标均未执行，请查看拒绝原因',unknown:'执行结果待核对'};
+    toast(descriptions[result.status] || '控制结果已记录，请查看操作回执', ['partial','unknown','rejected'].includes(result.status) ? 'warn' : result.status === 'completed' ? 'good' : 'info');
+    if (result.targets?.length || result.results?.length || result.missingNodes?.length) await dialog({title:'控制目标与结果',confirm:null,cancel:'关闭',body:controlTargets(result)});
+}
+function controlTargets(receipt: ControlReceipt): string {
+    const targets = [...(receipt.targets || []),...(receipt.results || []).flatMap(result => result.targets?.map(target=>({...target,nodeId:result.nodeId})) || [{id:result.phaseId || result.nodeId || '执行阶段',kind:'phase',status:result.status || 'unknown',error:result.error,nodeId:result.nodeId}])];
+    return `<div class="panel">${targets.map(target => `<div class="panel-foot">${target.nodeId ? nodeTag(target.nodeId,true) : ''}<code class="break">${esc(target.id)}</code><span>${esc(target.kind === 'command' ? '命令' : target.kind === 'agent' ? '代理' : '执行阶段')}</span><b>${esc(({completed:'已确认',accepted:'已接收',rejected:'已拒绝',unknown:'待核对',failed:'失败'} as Record<string,string>)[target.status] || target.status)}</b>${target.error ? `<span class="amber">${esc(target.error)}</span>` : ''}</div>`).join('')}</div>${receipt.missingNodes?.length ? `<p class="notice warn">以下节点尚未确认：${receipt.missingNodes.map(id=>esc(node(id)?.name || id)).join('、')}</p>` : ''}<p class="form-caption">完整记录保存在“活动 → 操作回执”。</p>`;
+}
+async function finishTask(id: string) {
+    ensureWritable();
+    const run = findLoadedRun(id) || (await API.get<RunDetail>('runs/' + enc(id))).run;
+    const intent = new WriteIntent(API, 'runs/' + enc(id) + '/finish');
+    const result = await dialog({title:'结束本次请求',confirm:'保存结束结果',body:`<p><b>${esc(run.title)}</b></p><p>记录本次请求的交付结果。验收可以在检查结果后单独进行。</p><label class="field">结果<select name="result" class="select"><option value="completed">工作已完成</option><option value="failed">工作失败</option><option value="cancelled">已取消</option><option value="handed_off">已交接</option></select></label><label class="field">结果说明<textarea name="summary" required maxlength="4000" placeholder="说明已完成的工作、未完成部分或交接对象。"></textarea></label>`,
+        onSubmit: form => intent.submit({expectedRevision:run.revision,...formObject(form)})});
+    if (result) { await invalidateAfterWrite(); toast('请求结束结果已记录，可继续查看或验收。','good'); }
 }
 async function getPatch(id: string) {
+  const controller = new AbortController();
+  const view: {progress?: HTMLElement | null} = {};
+  let finished = false;
+  void dialog({title:'正在导出补丁',body:'<p data-download-progress>正在读取第一部分…</p>',confirm:null,cancel:'取消下载',onMount: d => { view.progress = d.querySelector('[data-download-progress]'); }})
+    .then(() => { if (!finished) controller.abort(); });
   let cursor = null, revision = null;
   const chunks = [];
+  try {
   do {
-    const payload: PatchPage = await API.get<PatchPage>('runs/' + enc(id) + '/patch' + (cursor ? '?cursor=' + enc(cursor) : ''));
+    const payload: PatchPage = await API.get<PatchPage>('runs/' + enc(id) + '/patch' + (cursor ? '?cursor=' + enc(cursor) : ''), controller.signal);
     if (typeof payload.patch !== 'string') throw new ApiError('补丁读取失败', 0, 'invalid_patch');
     if (revision !== null && revision !== payload.revision) throw new ApiError('下载期间文件发生变化，请重新下载', 409, 'revision_conflict');
     revision = payload.revision;
     chunks.push(payload.patch);
+    if (view.progress) view.progress.textContent = `已读取 ${chunks.length} 部分 · ${bytes(chunks.reduce((sum, part) => sum + new TextEncoder().encode(part).length, 0))}`;
     if (payload.complete) break;
     if (!payload.nextCursor || payload.nextCursor === cursor) throw new ApiError('补丁分页缺少下一页', 0, 'invalid_cursor');
     cursor = payload.nextCursor;
   } while (cursor);
+  if (controller.signal.aborted) return;
   download(id.replaceAll(':', '-') + '.patch', chunks.join(''), 'text/x-diff;charset=utf-8');
+  finished = true;
+  if (view.progress) {
+    view.progress.textContent = '补丁已生成并下载。';
+    const close = view.progress.closest('dialog')?.querySelector<HTMLElement>('footer [data-dialog-close]');
+    if (close) close.textContent = '关闭';
+  }
+  } catch (error) {
+    finished = true;
+    if (view.progress) view.progress.textContent = controller.signal.aborted ? '下载已取消。' : '读取失败：' + consoleError(error).message;
+    if (!controller.signal.aborted) throw error;
+  }
 }
-async function revertRun(id: string) { ensureWritable('revert'); const d = data<RunDetail>('runs/' + enc(id)) || await API.get<RunDetail>('runs/' + enc(id)), r = d.run; const pkey = uid(); const preview = await dialog({ title: '选择要还原的文件', wide: true, confirm: '检查还原计划', body: `<div class="panel">${d.files.map(f => `<label class="panel-foot" style="cursor:pointer"><input type="checkbox" name="files" value="${esc(f.id)}" ${f.revertible ? 'checked' : 'disabled'}><code class="break">${esc(f.path)}</code><span class="spacer"></span><span class="green">+${f.add}</span><span class="red">−${f.del}</span></label>`).join('')}</div>`, onSubmit: form => { const files = new FormData(form).getAll('files'); if (!files.length)
-        throw new Error('至少选择一个文件'); return API.post<RevertPreview>('runs/revert/preview', { id, files, expectedRevision: r.revision }, pkey); } }); if (!preview)
-    return; const key = uid(); const result = await dialog({ title: '确认还原计划', danger: true, confirm: '确认还原所选文件', body: `<p>将还原 <b>${preview.files.length}</b> 个文件。预览有效期至 ${esc(fullTime(preview.expiresAt))}。</p><pre class="code-block">执行：${esc(id)}\n文件：${preview.files.length}</pre>`, onSubmit: () => API.post<RevertReceipt>('runs/revert/commit', { previewId: preview.id, confirmationHash: preview.hash }, key) }); if (result) {
+async function revertRun(id: string) { ensureWritable('revert'); const d = data<RunDetail>('runs/' + enc(id)) || await API.get<RunDetail>('runs/' + enc(id)), r = d.run; const previewIntent = new WriteIntent(API,'runs/revert/preview'); const preview = await dialog({ title: '选择要还原的文件', wide: true, confirm: '检查还原计划', body: `<div class="panel">${d.files.map(f => `<label class="panel-foot" style="cursor:pointer"><input type="checkbox" name="files" value="${esc(f.id)}" ${f.revertible ? 'checked' : 'disabled'}><code class="break">${esc(f.path)}</code><span class="spacer"></span><span class="green">+${f.add}</span><span class="red">−${f.del}</span></label>`).join('')}</div>`, onSubmit: form => { const files = new FormData(form).getAll('files'); if (!files.length)
+        throw new Error('至少选择一个文件'); return previewIntent.submit<RevertPreview>({ id, files, expectedRevision: r.revision }); } }); if (!preview)
+    return; const intent = new WriteIntent(API,'runs/revert/commit'); const result = await dialog({ title: '确认还原计划', danger: true, confirm: '确认还原所选文件', body: `<p>将还原 <b>${preview.files.length}</b> 个文件。预览有效期至 ${esc(fullTime(preview.expiresAt))}。</p><pre class="code-block">执行：${esc(id)}\n文件：${preview.files.length}</pre>`, onSubmit: () => intent.submit<RevertReceipt>({ previewId: preview.id, confirmationHash: preview.hash }) }); if (result) {
     await invalidateAfterWrite();
     toast(result.status === 'completed' ? '还原回执已确认，文件已恢复' : '还原请求已接收，等待结果', 'info');
 } }
 function currentSessions() { return data<Sessions>('projects/' + enc(route.p.project || '') + '/sessions'); }
 async function sessionControl(id: string, action: string) { ensureWritable(); const t = currentSessions()?.items.find(t => t.id === id); if (!t)
-    throw new Error('会话未加载'); const key = uid(); const result = await dialog({ title: action === 'steer' ? '向当前轮次补充指令' : action === 'takeover' ? '接管到 Codex Desktop？' : '归还会话控制权？', confirm: action === 'steer' ? '发送指令' : action === 'takeover' ? '确认接管' : '确认归还', danger: action === 'takeover', body: `<p>${esc(t.title)}</p><p>${action === 'steer' ? '指令将发送给当前执行中的代理。' : action === 'takeover' ? '当前任务将中断，随后交由 Codex Desktop 控制。' : '会话将返回空闲状态。'}</p>${action === 'steer' ? '<label class="field">补充指令<textarea name="prompt" required maxlength="12000" placeholder="例如：先修复失败测试，保留现有工作区改动。"></textarea></label>' : ''}`, onSubmit: form => API.post<{ status: string }>('sessions/' + enc(id) + '/control', { action, expectedRevision: t.revision, expectedTurnId: t.turnId, ...(action === 'steer' ? { prompt: formObject(form).prompt.trim() } : {}) }, key) }); if (result) {
+    throw new Error('会话未加载'); const intent = new WriteIntent(API,'sessions/' + enc(id) + '/control'); const result = await dialog({ title: action === 'steer' ? '向当前轮次补充指令' : action === 'takeover' ? '接管到 Codex Desktop？' : '归还会话控制权？', confirm: action === 'steer' ? '发送指令' : action === 'takeover' ? '确认接管' : '确认归还', danger: action === 'takeover', body: `<p>${esc(t.title)}</p><p>${action === 'steer' ? '指令将发送给当前执行中的代理。' : action === 'takeover' ? '当前任务将中断，随后交由 Codex Desktop 控制。' : '会话将返回空闲状态。'}</p>${action === 'steer' ? '<label class="field">补充指令<textarea name="prompt" required maxlength="12000" placeholder="例如：先修复失败测试，保留现有工作区改动。"></textarea></label>' : ''}`, onSubmit: form => intent.submit<{ status: string }>({ action, expectedRevision: t.revision, expectedTurnId: t.turnId, ...(action === 'steer' ? { prompt: formObject(form).prompt.trim() } : {}) }) }); if (result) {
     await invalidateAfterWrite();
     toast(result.status === 'completed' ? '已收到会话控制回执' : '请求已接收，等待控制权回执', result.status === 'completed' ? 'good' : 'info');
 } }
-async function archivePreview(mode: string) { ensureWritable('archive'); const projectId = route.p.project; if (!projectId)
-    throw new Error('请先选择项目'); const preview = await API.post<ArchivePreview>('archive/preview', { projectId, mode, ids: [...selectedThreads] }); const ready = preview.entries.filter(e => e.ready), confirmationHash = preview.confirmationHash, key = uid(); if (ready.length && !confirmationHash) throw new ApiError('归档预览缺少确认凭据。', 0, 'invalid_response'); const result = await dialog({ title: mode === 'restore' ? '恢复会话预览' : '归档会话预览', wide: true, confirm: ready.length ? `确认${mode === 'restore' ? '恢复' : '归档'} ${ready.length} 项` : null, cancel: '关闭', body: `<p>可执行 ${ready.length} 项，跳过 ${preview.entries.length - ready.length} 项。预览有效期 ${esc(fullTime(preview.expiresAt))}。归档不删除任务、文件或用量历史。</p><div class="panel">${preview.entries.map(e => `<div class="panel-foot"><span style="flex:1;min-width:0">${esc(e.title)}</span>${e.ready ? badge('可执行', 'good') : badge(e.reason ?? '不可执行', 'warn')}</div>`).join('') || empty('没有符合条件的会话')}</div>${ready.length ? '<label class="switch" style="margin-top:16px"><input type="checkbox" name="externalIdle" required>已暂停此项目在其他客户端中的操作</label>' : ''}`, onSubmit: async form => {
-    let result;
-    for (let step = 0; step < ready.length; step++) {
-      result = await API.post<{ batch: ArchivePreview }>('archive/commit', { previewId: preview.id, confirmationHash: confirmationHash!,
-        externalIdleConfirmed: new FormData(form).has('externalIdle') }, key + ':' + step);
-      if (result.batch.status !== 'executing') break;
+async function archivePreview(mode: string) {
+    ensureWritable('archive');
+    const projectId = route.p.project;
+    if (!projectId) throw new Error('请先选择项目');
+    const request = {projectId,mode,ids:[...selectedThreads]};
+    let preview = await API.post<ArchivePreview>('archive/preview',request);
+    const missingUsage = preview.entries.filter(entry => entry.reason === 'usage_incomplete');
+    if (missingUsage.length) {
+        const choice = await dialog({title:'用量记录尚不完整',confirm:'继续查看归档计划',body:`<p>${missingUsage.length} 个代理会话缺少完整用量记录。选择下项后会保留缺失标记，并重新检查其余归档条件。</p><label class="switch"><input type="checkbox" name="acceptPartial">允许用量不完整的会话参加归档检查</label>`,onSubmit:form=>({acceptPartial:new FormData(form).has('acceptPartial')})});
+        if (!choice) return;
+        if (choice.acceptPartial) preview=await API.post<ArchivePreview>('archive/preview',{...request,acceptPartial:true});
     }
-    return result;
-  } }); if (result) {
-    const batch = result.batch;
-    if (!batch?.results)
-        throw new ApiError('未收到归档回执。', 0, 'invalid_response');
-    selectedThreads.clear();
+    const ready=preview.entries.filter(entry=>entry.ready), confirmationHash=preview.confirmationHash;
+    if (ready.length && !confirmationHash) throw new ApiError('归档预览缺少确认凭据。',0,'invalid_response');
+    let step=0;
+    const intents=new Map<number,WriteIntent>();
+    let latest:{batch:ArchivePreview}|undefined;
+    const result=await dialog({title:mode==='restore'?'恢复代理会话预览':'归档代理会话预览',wide:true,confirm:ready.length?`确认${mode==='restore'?'恢复':'归档'} ${ready.length} 项`:null,cancel:'关闭',
+        body:`<p>可执行 ${ready.length} 项，跳过 ${preview.entries.length-ready.length} 项。预览有效期 ${esc(fullTime(preview.expiresAt))}。${preview.acceptPartial?'已允许保留不完整用量记录。':''}</p><p>本操作管理代理会话的归档状态，任务、文件和用量历史继续保留。</p><div class="panel">${preview.entries.map(entry=>`<div class="panel-foot"><span class="ellipsis">${esc(entry.title)}</span>${badge(entry.ready?'可执行':entry.reason || '不可执行',entry.ready?'good':'warn')}</div>`).join('') || empty('没有符合条件的代理会话')}</div>${ready.length?'<label class="switch visually-spaced"><input type="checkbox" name="externalIdle" required>已暂停这些代理会话在其他客户端中的操作</label>':''}<p data-archive-progress class="small muted"></p>`,
+        onSubmit:async(form,d)=>{
+            while(step<ready.length) {
+                let intent=intents.get(step); if(!intent){intent=new WriteIntent(API,'archive/commit');intents.set(step,intent);}
+                latest=await intent.submit<{batch:ArchivePreview}>({previewId:preview.id,confirmationHash:confirmationHash!,externalIdleConfirmed:new FormData(form).has('externalIdle')});
+                step++;
+                const progress=d.querySelector<HTMLElement>('[data-archive-progress]');
+                if(progress)progress.textContent=`已确认 ${latest.batch.succeededCount} 项，待核对 ${latest.batch.reconciliationCount} 项，待执行 ${latest.batch.readyCount} 项。`;
+                if(!latest.batch.readyCount)break;
+            }
+            return latest;
+        }});
     await invalidateAfterWrite();
-    const ok = batch.results.filter(r => r.ok).length;
-    const pending = batch.results.filter(r => r.pending).length;
-    toast(`${ok} 项已${mode === 'restore' ? '恢复' : '归档'}，${batch.results.length - ok - pending} 项跳过 / 未完成${pending ? '，' + pending + ' 项等待处理' : ''}`, batch.results.every(r => r.ok) ? 'good' : 'warn');
+    if (!result) return;
+    if(!result.batch?.results)throw new ApiError('未收到归档回执。',0,'invalid_response');
+    selectedThreads.clear();
+    const batch=result.batch;
+    toast(`${batch.succeededCount} 项已${mode==='restore'?'恢复':'归档'}，${batch.reconciliationCount} 项待核对，${batch.readyCount} 项待执行，${batch.skippedCount} 项跳过`,batch.reconciliationCount||batch.readyCount?'warn':'good');
 }
-else {
-    await load('projects/' + enc(projectId) + '/sessions', true);
-} }
 function nodeDetailsBody(n: Machine, tab: string) {
     if (tab === 'settings')
-        return `<div class="field-grid"><label class="field">节点昵称<input class="input" name="name" value="${esc(n.name)}" required maxlength="100"></label><label class="field">出网优先级<input class="input" type="number" name="priority" value="${n.priority}" min="0" max="1000" step="1" required></label><label class="field full">mihomo 配置路径<input class="input mono" name="config" value="${esc(n.egress.config)}"></label><label class="field">代理端口<input class="input" type="number" name="port" value="${n.egress.port}" min="1" max="65535" required></label><label class="field">回切等待（秒）<input class="input" type="number" name="recovery" value="${n.egress.recovery}" min="0" max="300" required></label><label class="field full">探测 URL<input class="input mono" name="probe" type="url" value="${esc(n.egress.probe)}" required></label><label class="switch"><input type="checkbox" name="enabled" ${n.egress.enabled ? 'checked' : ''}>参与出网候选</label><label class="switch"><input type="checkbox" name="inherit" ${n.egress.inherit ? 'checked' : ''}>新进程继承代理</label></div><p class="form-caption">代理设置对新进程生效。</p>`;
-    return `<div class="inline visually-spaced"><span class="node-mark big">${esc(n.short)}</span><div><h2>${esc(n.name)}</h2><p class="small muted">${esc(n.role)} · ${esc(n.os)}</p></div><span class="spacer"></span>${status(n.online ? 'online' : 'offline')}</div><dl class="key-values"><div><dt>CPU</dt><dd>${n.online && n.cpu != null ? n.cpu + '%' : '未上报'}</dd></div><div><dt>内存</dt><dd>${n.online ? n.memoryUsed + ' / ' + n.memoryTotal + ' GiB' : '数据过期'}</dd></div><div><dt>连接延迟</dt><dd>${n.online && n.latency != null ? n.latency + ' ms' : '未上报'}</dd></div><div><dt>版本 / 配置版本</dt><dd>${esc(n.version ?? '未上报')} · rev ${n.revision}</dd></div><div><dt>优先级</dt><dd>${n.priority}</dd></div><div><dt>出口 IP</dt><dd>${esc(n.egress.ip || '未配置')}</dd></div><div><dt>出网探测</dt><dd>${!n.egress.enabled ? '未参与' : n.egress.healthy === true ? '正常' : n.egress.healthy === false ? '失败' : '未上报'}</dd></div><div><dt>最后采样</dt><dd>${esc(fullTime(n.lastSeen))}</dd></div></dl><h3 class="section-gap">磁盘</h3>${n.disks.map(d => `<div class="section-gap"><div class="inline small"><code>${esc(d.mount)}</code><span class="spacer"></span><span>${n.online ? fmt(d.total - d.used) + ' / ' + fmt(d.total) + ' GiB 可用' : '数据过期'}</span></div>${meter(n.online ? d.used / d.total * 100 : 0, d.used / d.total > .85 ? 'amber' : '')}</div>`).join('')}<h3 class="section-gap">GPU</h3>${n.gpus.length ? n.gpus.map(g => `<div class="section-gap"><div class="inline"><b class="small">${esc(g.name)}</b><span class="spacer"></span><span class="small">${n.online ? g.util + '% · ' + g.temp + '°C' : '数据过期'}</span></div><p class="form-caption">显存 ${n.online ? g.used + ' / ' + g.total + ' GiB' : '未更新'}</p>${meter(n.online ? g.used / g.total * 100 : 0)}</div>`).join('') : '<p class="form-caption">无 GPU，正常。</p>'}<h3 class="section-gap">统一出口</h3><pre class="code-block">配置：${esc(n.egress.config)}\n端口：${n.egress.port}\n探测：${esc(n.egress.probe)}\n回切等待：${n.egress.recovery}s</pre>`;
+        return `<div class="field-grid"><label class="field">节点昵称<input class="input" name="name" value="${esc(n.name)}" required maxlength="100"></label><label class="field">出网优先级<input class="input" type="number" name="priority" value="${n.priority}" min="0" max="1000" step="1" required></label><label class="field full">mihomo 配置路径<input class="input mono" name="config" value="${esc(n.egress.config)}"></label><label class="field">代理端口<input class="input" type="number" name="port" value="${n.egress.port ?? ''}" min="1" max="65535" required></label><label class="field">回切等待（秒）<input class="input" type="number" name="recovery" value="${n.egress.recovery ?? ''}" min="0" max="300" required></label><label class="field full">探测 URL<input class="input mono" name="probe" type="url" value="${esc(n.egress.probe)}" required></label><label class="switch"><input type="checkbox" name="enabled" ${n.egress.enabled ? 'checked' : ''}>参与出网候选</label><label class="switch"><input type="checkbox" name="inherit" ${n.egress.inherit ? 'checked' : ''}>新进程继承代理</label></div><p class="form-caption">代理设置对新进程生效。</p>`;
+    return `<div class="inline visually-spaced"><span class="node-mark big">${esc(n.short)}</span><div><h2>${esc(n.name)}</h2><p class="small muted">${esc(n.role)} · ${esc(n.os)}</p></div><span class="spacer"></span>${status(n.online ? 'online' : 'offline')}${n.settingsState?.error ? badge('配置应用失败','warn') : n.settingsState?.pending ? badge('配置待应用','warn') : ''}</div><dl class="key-values"><div><dt>CPU</dt><dd>${n.online && n.cpu != null ? n.cpu + '%' : '未上报'}</dd></div><div><dt>内存</dt><dd>${n.online ? n.memoryUsed + ' / ' + n.memoryTotal + ' GiB' : '数据过期'}</dd></div><div><dt>连接延迟</dt><dd>${n.online && n.latency != null ? n.latency + ' ms' : '未上报'}</dd></div><div><dt>版本 / 配置版本</dt><dd>${esc(n.version ?? '未上报')} · rev ${n.revision}</dd></div><div><dt>优先级</dt><dd>${n.priority}</dd></div><div><dt>出口 IP</dt><dd>${esc(n.egress.ip || '未配置')}</dd></div><div><dt>出网探测</dt><dd>${!n.egress.enabled ? '未参与' : n.egress.healthy === true ? '正常' : n.egress.healthy === false ? '失败' : '未上报'}</dd></div><div><dt>最后采样</dt><dd>${esc(fullTime(n.lastSeen))}</dd></div></dl><h3 class="section-gap">磁盘</h3>${n.disks.map(d => `<div class="section-gap"><div class="inline small"><code>${esc(d.mount)}</code><span class="spacer"></span><span>${n.online ? fmt(d.total - d.used) + ' / ' + fmt(d.total) + ' GiB 可用' : '数据过期'}</span></div>${meter(n.online ? percent(d.used,d.total) : null, (percent(d.used,d.total) ?? 0) > 85 ? 'amber' : '')}</div>`).join('')}<h3 class="section-gap">GPU</h3>${n.gpuSampled === false ? '<p class="form-caption">GPU 数据尚未取得。</p>' : n.gpus.length ? n.gpus.map(g => `<div class="section-gap"><div class="inline"><b class="small">${esc(g.name)}</b><span class="spacer"></span><span class="small">${n.online ? g.util + '% · ' + g.temp + '°C' : '数据过期'}</span></div><p class="form-caption">显存 ${n.online ? g.used + ' / ' + g.total + ' GiB' : '未更新'}</p>${meter(n.online ? percent(g.used,g.total) : null)}</div>`).join('') : '<p class="form-caption">无 GPU，正常。</p>'}<h3 class="section-gap">统一出口</h3><pre class="code-block">配置：${esc(n.egress.config)}\n端口：${n.egress.port}\n探测：${esc(n.egress.probe)}\n回切等待：${n.egress.recovery}s</pre>`;
 }
-async function openNode(id: string, tab = 'overview') { let n = node(id); if (!n)
-    throw new Error('节点数据未加载'); n = clone(n); if (tab === 'settings') {
-    ensureWritable('settings');
-    if (!n.online)
-        throw new ApiError('节点离线，暂时无法修改。', 503, 'node_offline');
-    let revision = n.revision, key = uid();
-    const result = await dialog({ title: n.name + ' · 节点设置', drawer: true, confirm: '保存节点设置', body: nodeDetailsBody(n, 'settings'), refresh: async () => { const next = await API.get<Fleet>('fleet/status'), current = next.nodes.find(x => x.id === id); if (!current)
-            throw new Error('节点不存在'); revision = current.revision; key = uid(); }, onSubmit: async (form) => { const fd = new FormData(form), settings = { name: String(fd.get('name')).trim(), priority: Number(fd.get('priority')), egress: { enabled: fd.has('enabled'), inherit: fd.has('inherit'), config: String(fd.get('config')).trim(), port: Number(fd.get('port')), probe: String(fd.get('probe')).trim(), recovery: Number(fd.get('recovery')) } }; if (id === fleet()?.gatewayId && (!settings.egress.enabled || settings.priority === 0)) {
-            const ok = await confirmAction('将影响当前出网节点', '<p>当前节点正在承载出网。此修改可能触发切换，并造成短暂连接中断。</p>', '仍然保存');
-            if (!ok)
-                throw new Error('已取消出网变更，输入保留');
-        } return API.post<{ saved?: boolean; ok?: boolean }>('nodes/' + enc(id) + '/settings', { settings, expectedRevision: revision }, key); } });
-    if (result) {
-        await invalidateAfterWrite();
-        toast('节点配置已保存', 'good');
+function settingsStateNotice(state: {savedRevision?:number|null;appliedRevision?:number|null;pending?:boolean|null;error?:string|null} | undefined): string {
+    const known=state?.savedRevision != null, applied=known && state?.appliedRevision===state.savedRevision && state.pending===false && !state.error;
+    const title=!known ? '配置版本尚未取得' : state?.error ? '运行配置应用失败' : state?.pending ? '配置已保存，运行配置待应用' : applied ? '配置已保存并应用' : '配置已保存，应用状态待确认';
+    return `<div class="notice ${applied?'':'warn'} visually-spaced"><div><b>${title}</b><p class="small">已保存 ${known?'r'+state!.savedRevision:'未知'} · 已应用 ${state?.appliedRevision == null?'未知':'r'+state.appliedRevision}</p>${state?.error?`<p>${esc(state.error)}</p>`:''}</div></div>`;
+}
+function allowSettingsSave(d: HTMLDialogElement, allowed: boolean) {
+    const button=d.querySelector<HTMLButtonElement>('[data-dialog-confirm]');
+    if(button){button.dataset.available=String(allowed);button.disabled=!allowed;}
+}
+async function readNodeSettings(id: string): Promise<NodeSettingsSnapshot> {
+    const snapshot=await API.get<NodeSettingsSnapshot>('nodes/'+enc(id)+'/settings');
+    if(!snapshot.settings || !Array.isArray(snapshot.roots)) throw new ApiError('节点持久配置尚未取得，请重试读取。',503,'settings_unavailable',{effect:'none'});
+    const settings=snapshot.settings, cached=node(id);
+    if(cached){
+        cached.name=settings.nickname;cached.priority=settings.priority;cached.revision=settings.revision;
+        Object.assign(cached.egress,settings.egress);
+        cached.settingsState={savedRevision:settings.savedRevision??settings.revision,appliedRevision:settings.appliedRevision??null,pending:settings.pending??null,error:settings.error??null};
     }
+    return snapshot;
 }
-else {
-    await dialog({ title: '节点详情', drawer: true, body: nodeDetailsBody(n, 'overview') + `<div class="form-actions">${btn(icon('settings', 14) + '编辑节点设置', 'node-edit-from-drawer', `data-id="${esc(id)}" ${writeAttrs('settings')}`)}</div>`, confirm: null, cancel: '关闭' });
-} }
-async function editRoot(id: string | undefined) { ensureWritable('settings'); let roots = data<ListResponse<Root>>('roots'); if (!roots) { await load('roots', true); roots = data<ListResponse<Root>>('roots'); } const existing = roots?.items.find(r => r.id === id), n = node(existing?.nodeId || fleet()?.nodes?.[0]?.id || ''); let revision = existing?.revision || 0, key = uid(); const result = await dialog({ title: existing ? '编辑根目录' : '添加根目录', wide: true, confirm: '保存根目录', body: `<div class="field-grid"><label class="field">所在机器<select class="select" name="nodeId" ${existing ? 'disabled' : ''}>${(fleet()?.nodes || []).map(n => opt(n.id, n.name, existing?.nodeId || fleet()?.nodes?.[0]?.id || '')).join('')}</select></label><label class="field">稳定 ID<input class="input mono" name="id" value="${esc(existing?.localId || '')}" pattern="[-a-zA-Z0-9_.]{1,64}" required ${existing ? 'readonly' : ''} placeholder="s1-research"></label><label class="field full">目录昵称<input class="input" name="name" value="${esc(existing?.name || '')}" required maxlength="100"></label><label class="field full">该机器上的绝对路径<input class="input mono" name="path" value="${esc(existing?.path || '')}" required placeholder="/data/projects 或 E:\\Projects"></label><label class="field full">用途说明<textarea name="description" rows="2" maxlength="1000">${esc(existing?.description || '')}</textarea></label><label class="field full">标签（逗号分隔）<input class="input" name="tags" value="${esc(existing?.tags.join(', ') || '')}" maxlength="300"></label><label class="switch"><input type="checkbox" name="enabled" ${existing?.enabled !== false ? 'checked' : ''}>向 MCP 提供</label><label class="switch"><input type="checkbox" name="readOnly" disabled title="执行节点当前不支持根目录级只读设置" ${existing?.readOnly ? 'checked' : ''}>只读访问</label></div>`, refresh: existing ? async () => { const latest = await API.get<ListResponse<Root>>('roots'), r = latest.items.find(r => r.id === id); if (!r)
-        throw new Error('目录已被移除'); revision = r.revision; key = uid(); } : null, onSubmit: form => { const f = formObject(form), fd = new FormData(form), nodeId = existing?.nodeId || f.nodeId, root = { id: existing?.id || f.id.trim(), nodeId, name: f.name.trim(), path: f.path.trim(), description: f.description.trim(), tags: [...new Set(f.tags.split(/[,，]/).map(t => t.trim()).filter(Boolean))], enabled: fd.has('enabled'), readOnly: fd.has('readOnly') }; const windows = node(nodeId)?.os === 'windows'; if (windows ? !/^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)/.test(root.path) : !root.path.startsWith('/'))
-        throw new Error(windows ? '请填写 Windows 绝对路径，例如 E:\\Projects' : '请填写 Linux 绝对路径，例如 /data/projects'); return API.post<{ saved?: boolean; ok?: boolean }>('roots/save', { root, expectedRevision: revision }, key); } }); if (result) {
-    await load('roots', true);
-    await invalidateAfterWrite();
-    toast('根目录已保存', 'good');
-} }
+async function openNode(id: string, tab = 'overview') {
+    const loaded=node(id);if(!loaded)throw new Error('节点数据未加载');
+    const n=clone(loaded);
+    if(tab!=='settings'){
+        const body=()=>nodeDetailsBody(n,'overview')+`<div data-settings-state>${settingsStateNotice(n.settingsState)}</div><div class="form-actions">${btn(icon('settings',14)+'编辑节点设置','node-edit-from-drawer',`data-id="${esc(id)}" ${writeAttrs('settings')}`)}</div>`;
+        await dialog({title:'节点详情',drawer:true,body:body(),confirm:null,cancel:'关闭',refreshLabel:'读取配置状态',refresh:async d=>{
+            await readNodeSettings(id);Object.assign(n,node(id));updateHTML(d.querySelector('.dialog-body'),body());return '已读取该节点保存的配置与应用状态。';
+        }});return;
+    }
+    ensureWritable('settings');
+    let revision:number|null=null,intent=new WriteIntent(API,'nodes/'+enc(id)+'/settings'),baseline=fieldsFromHTML(nodeDetailsBody(n,'settings'));
+    const result=await dialog({title:n.name+' · 节点设置',drawer:true,confirm:'保存节点设置',
+        body:`<div data-settings-state>${settingsStateNotice(undefined)}</div>`+nodeDetailsBody(n,'settings'),
+        onMount:d=>{allowSettingsSave(d,false);d.querySelector<HTMLButtonElement>('[data-dialog-refresh]')!.click();},
+        refresh:async d=>{
+            revision=null;allowSettingsSave(d,false);
+            const snapshot=await readNodeSettings(id),settings=snapshot.settings!;
+            const current={...n,name:settings.nickname,priority:settings.priority,revision:settings.revision,egress:{...n.egress,...settings.egress}};
+            const remote=fieldsFromHTML(nodeDetailsBody(current,'settings'));
+            const message=refreshFields(d.querySelector('form')!,baseline,remote);baseline=remote;revision=settings.revision;
+            updateHTML(d.querySelector('[data-settings-state]'),settingsStateNotice({...settings,savedRevision:settings.savedRevision??settings.revision}));
+            allowSettingsSave(d,revision!==null);intent=new WriteIntent(API,'nodes/'+enc(id)+'/settings');
+            return revision===null?'尚未取得可保存的配置版本，请重试读取。':message;
+        },onSubmit:async form=>{
+            if(revision===null)throw new ApiError('请先读取该节点的当前配置版本。',409,'settings_unavailable',{effect:'none'});
+            const fd=new FormData(form),settings={name:String(fd.get('name')).trim(),priority:Number(fd.get('priority')),egress:{enabled:fd.has('enabled'),inherit:fd.has('inherit'),config:String(fd.get('config')).trim(),port:Number(fd.get('port')),probe:String(fd.get('probe')).trim(),recovery:Number(fd.get('recovery'))}};
+            if(id===fleet()?.gatewayId&&(!settings.egress.enabled||settings.priority===0)&&!await confirmAction('将影响当前出网节点','<p>当前节点正在承载出网。此修改可能触发切换，并造成短暂连接中断。</p>','仍然保存'))throw new Error('已取消出网变更，输入保留');
+            return intent.submit<{saved?:boolean;revision?:number;appliedRevision?:number;pending?:boolean}>({settings,expectedRevision:revision});
+        }});
+    if(result){await invalidateAfterWrite();toast(result.pending?'节点配置已保存，运行配置待应用；可在节点详情读取配置状态。':`节点配置已保存${result.appliedRevision != null?'，已应用至版本 '+result.appliedRevision:'，应用状态可在节点详情核对'}`,result.pending?'warn':'good');}
+}
+async function editRoot(id: string | undefined) {
+    ensureWritable('settings');let roots=data<ListResponse<Root>>('roots');
+    if(!roots){await load('roots',true);roots=data<ListResponse<Root>>('roots');}
+    const existing=roots?.items.find(root=>root.id===id);
+    if(id&&!existing)throw new Error('根目录当前不可读取，请刷新工作空间后重试。');
+    let revision:number|null=null,baseline:FieldValues={},snapshot:NodeSettingsSnapshot|undefined,intent=new WriteIntent(API,'roots/save');
+    const result=await dialog({title:existing?'编辑根目录':'添加根目录',wide:true,confirm:'保存根目录',
+        body:`<div data-settings-state>${settingsStateNotice(undefined)}</div><div class="field-grid"><label class="field">所在机器<select class="select" name="nodeId" ${existing?'disabled':''}>${(fleet()?.nodes||[]).map(n=>opt(n.id,n.name,existing?.nodeId||fleet()?.nodes?.[0]?.id||'')).join('')}</select></label><label class="field">稳定 ID<input class="input mono" name="id" value="${esc(existing?.localId||'')}" pattern="[-a-zA-Z0-9_.]{1,64}" required ${existing?'readonly':''} placeholder="s1-research"></label><label class="field full">目录昵称<input class="input" name="name" value="${esc(existing?.name||'')}" required maxlength="100"></label><label class="field full">该机器上的绝对路径<input class="input mono" name="path" value="${esc(existing?.path||'')}" required placeholder="/data/projects 或 E:/Projects"></label><label class="field full">用途说明<textarea name="description" rows="2" maxlength="1000">${esc(existing?.description||'')}</textarea></label><label class="field full">标签（逗号分隔）<input class="input" name="tags" value="${esc(existing?.tags.join(', ')||'')}" maxlength="300"></label><label class="switch"><input type="checkbox" name="enabled" ${existing?.enabled!==false?'checked':''}>向 MCP 提供</label><label class="switch"><input type="checkbox" name="readOnly" disabled title="执行节点当前不支持根目录级只读设置" ${existing?.readOnly?'checked':''}>只读访问</label></div>`,
+        onMount:d=>{
+            baseline=readFields(d.querySelector('form')!);allowSettingsSave(d,false);
+            const refresh=d.querySelector<HTMLButtonElement>('[data-dialog-refresh]')!;
+            d.querySelector('[name=nodeId]')?.addEventListener('change',()=>refresh.click());refresh.click();
+        },refresh:async d=>{
+            revision=null;allowSettingsSave(d,false);
+            const select=d.querySelector<HTMLSelectElement>('[name=nodeId]')!;select.disabled=true;
+            try{
+                snapshot=await readNodeSettings(select.value);const settings=snapshot.settings!;
+                let message='已读取所选节点的当前配置，新的目录输入已保留。';
+                if(existing){
+                    const remoteRoot=snapshot.roots.find(root=>root.id===existing.id);
+                    if(!remoteRoot)throw new Error('此根目录已从保存的配置中移除，请关闭后重新查看。');
+                    const remote:FieldValues={nodeId:remoteRoot.nodeId,id:remoteRoot.localId,name:remoteRoot.name,path:remoteRoot.path,description:remoteRoot.description,tags:remoteRoot.tags.join(', '),enabled:remoteRoot.enabled,readOnly:remoteRoot.readOnly};
+                    message=refreshFields(d.querySelector('form')!,baseline,remote);baseline=remote;
+                }
+                revision=settings.revision;updateHTML(d.querySelector('[data-settings-state]'),settingsStateNotice({...settings,savedRevision:settings.savedRevision??settings.revision}));
+                allowSettingsSave(d,revision!==null);intent=new WriteIntent(API,'roots/save');
+                return revision===null?'尚未取得可保存的配置版本，请重试读取。':message;
+            }finally{select.disabled=Boolean(existing);}
+        },onSubmit:form=>{
+            if(revision===null||!snapshot)throw new ApiError('请先读取所选节点的当前配置版本。',409,'settings_unavailable',{effect:'none'});
+            const f=formObject(form),fd=new FormData(form),nodeId=existing?.nodeId||f.nodeId;
+            const root={id:existing?.id||f.id.trim(),nodeId,name:f.name.trim(),path:f.path.trim(),description:f.description.trim(),tags:[...new Set(f.tags.split(/[,，]/).map(tag=>tag.trim()).filter(Boolean))],enabled:fd.has('enabled'),readOnly:baseline.readOnly===true};
+            if(!existing&&snapshot.roots.some(value=>value.localId===root.id))throw new Error('该节点已有相同稳定 ID 的根目录，请选择不同 ID 或编辑原目录。');
+            const windows=node(nodeId)?.os==='windows';if(windows?!/^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)/.test(root.path):!root.path.startsWith('/'))throw new Error(windows?'请填写 Windows 绝对路径，例如 E:/Projects':'请填写 Linux 绝对路径，例如 /data/projects');
+            return intent.submit<{saved?:boolean;pending?:boolean;appliedRevision?:number}>({root,create:!existing,expectedRevision:revision});
+        }});
+    if(result){await invalidateAfterWrite();toast(result.pending?'根目录配置已保存，仍待节点应用；可在节点详情读取配置状态。':'根目录配置已保存，可在节点详情核对应用版本。',result.pending?'warn':'good');}
+}
 async function syncEgress() {
     ensureWritable('settings');
     const form = $<HTMLFormElement>('#egress-form')!;
@@ -819,11 +983,11 @@ async function syncEgress() {
     if (upload && upload.size > 256 * 1024) throw new Error('配置文件上限为 256 KiB');
     const text = upload ? await upload.text() : null;
     const request = { ...(text ? { text } : { sourceNodeId }), nodeIds, reload: fd.has('reload') };
-    const key = uid();
+    const intent = new WriteIntent(API,'egress/sync');
     const result = await dialog({
       title: '确认同步出口配置', wide: true, danger: true, confirm: '校验并同步',
       body: `<p>来源：${text ? '上传文件 ' + esc(upload!.name) : esc(node(sourceNodeId)?.name)}。目标 ${nodeIds.length} 台；${request.reload ? '校验通过后热加载' : '仅保存，不热加载'}。</p><div class="panel">${nodeIds.map(id => `<div class="panel-foot">${nodeTag(id)}<span class="spacer"></span><code class="break">${esc(node(id)?.egress?.config)}</code></div>`).join('')}</div>`,
-      onSubmit: () => API.post<{ results: Array<{ nodeId: string; ok: boolean; reloaded: boolean; error?: string }> }>('egress/sync', request, key),
+      onSubmit: () => intent.submit<{ results: Array<{ nodeId: string; ok: boolean; reloaded: boolean; error?: string }> }>(request),
     });
     if (!result) return;
     if (!Array.isArray(result.results)) throw new ApiError('缺少逐节点同步回执', 0, 'invalid_response');
@@ -883,40 +1047,48 @@ const ACTIONS = {
     'files-toggle-all': () => { const d = data<RunDetail>('runs/' + enc(route.p.run))!, opened = openFiles(d), files = visibleFiles(d), expand = files.some(f => !opened.has(f.id)); files.forEach(f => expand ? opened.add(f.id) : opened.delete(f.id)); ensureRoute(); schedulePaint(); },
     'skip-content': () => $('#view')!.focus(), nav: (el: HTMLElement) => navigate(el.dataset.view!), 'nav-dialog': (el: HTMLElement) => { closeTopDialog(); navigate(el.dataset.view!); }, more: navigationDialog,
     'open-run': (el: HTMLElement) => { if (route.p.run !== el.dataset.id!)
-        fileSearch = ''; navigate(route.view === 'changes' ? 'changes' : 'tasks', { run: el.dataset.id!, tab: route.view === 'changes' ? 'diff' : 'summary', file: null }, false, route.view === 'tasks' || route.view === 'changes'); },
+        fileSearch = ''; navigate(route.view === 'changes' ? 'changes' : 'tasks', {run:el.dataset.id!,tab:route.view === 'changes' ? 'diff' : 'summary',file:null,...(route.view === 'usage' ? {days:'0',usageDays:route.p.days || '14',node:route.p.node,project:route.p.project} : route.view === 'sessions' ? {project:route.p.project,node:route.p.node} : {})}, false, route.view === 'tasks' || route.view === 'changes'); },
     'close-inspector': () => { navigate(route.view, { run: null, tab: null, file: null, focus: null, browse: '1' }, false, true); setTimeout(() => { if (lastFocus?.isConnected)
         lastFocus.focus({ preventScroll: true });
     else
         $('.list-pane .run-title')?.focus({ preventScroll: true }); }, 30); },
     'detail-tab': (el: HTMLElement) => navigate(route.view, { tab: el.dataset.value! }, true, true), file: (el: HTMLElement) => navigate(route.view, { file: el.dataset.id! }, true, true),
     'load-big': (el: HTMLElement) => { loadedBigFiles.add(el.dataset.run! + ':' + el.dataset.id!); ensureRoute(); schedulePaint(); }, 'copy-path': (el: HTMLElement) => copy(el.dataset.text!), 'copy-link': () => copy(location.href), copy: (el: HTMLElement) => copy(el.dataset.text!),
-    'more-diff': (el: HTMLElement) => { const key = el.dataset.run! + ':' + el.dataset.id!; diffLimits.set(key, (diffLimits.get(key) || 400) + 400); schedulePaint(); }, 'diff-mode': (el: HTMLElement) => { diffMode = el.dataset.value!; schedulePaint(); }, layout: (el: HTMLElement) => { sortLayout = el.dataset.value!; schedulePaint(); }, 'machine-layout': (el: HTMLElement) => { machineLayout = el.dataset.value!; schedulePaint(); },
-    'running-queue': () => navigate('tasks', { status: 'running' }), 'review-queue': () => navigate('tasks', { status: 'review', days: '0' }), 'completed-queue': () => navigate('tasks', { days: '0', execution: 'completed', finishedDay: day(Date.now()) }), 'attention-queue': () => navigate('tasks', { days: '1', attention: '1' }), 'usage-nav': () => navigate('usage'),
-    status: (el: HTMLElement) => param({ status: el.dataset.value! }), 'reset-filters': () => navigate(route.view, {}, true), 'clear-date': () => param({ date: null }), 'clear-finished': () => param({ finishedDay: null, execution: null }), 'clear-attention': () => param({ attention: null }), page: (el: HTMLElement) => { selectedRuns.clear(); param({ cursor: el.dataset.value! || null }); $('.list-pane')?.scrollTo({ top: 0 }); $('#view')!.scrollTo({ top: 0 }); },
+    'more-diff': (el: HTMLElement) => { const key = el.dataset.run! + ':' + el.dataset.id!; diffLimits.set(key, (diffLimits.get(key) || 400) + 400); schedulePaint(); }, 'diff-mode': (el: HTMLElement) => { diffMode = el.dataset.value!; savePref({diffMode}); schedulePaint(); }, layout: (el: HTMLElement) => { sortLayout = el.dataset.value!; savePref({taskLayout:sortLayout}); schedulePaint(); }, 'machine-layout': (el: HTMLElement) => { machineLayout = el.dataset.value!; savePref({machineLayout}); schedulePaint(); },
+    'running-queue': () => navigate('tasks', { stage: 'running,stopping', days:'0' }), 'review-queue': () => navigate('tasks', { status: 'review', days: '0' }), 'completed-queue': () => navigate('tasks', { days: '0', execution: 'completed', finishedDay: day(Date.now()) }), 'attention-queue': () => navigate('tasks', { days: '0', attention: '1' }), 'usage-nav': () => navigate('usage'),
+    status: (el: HTMLElement) => param({ status: el.dataset.value!, stage:null, attention:null }), 'reset-filters': () => navigate(route.view, {}, true), 'clear-date': () => param({ date: null }), 'clear-finished': () => param({ finishedDay: null, execution: null }), 'clear-attention': () => param({ attention: null }), page: (el: HTMLElement) => { selectedRuns.clear(); param({ cursor: el.dataset.value! || null }); $('.list-pane')?.scrollTo({ top: 0 }); $('#view')!.scrollTo({ top: 0 }); },
     'clear-selection': () => { selectedRuns.clear(); schedulePaint(); }, 'clear-threads': () => { selectedThreads.clear(); schedulePaint(); },
     'single-accept': (el: HTMLElement) => reviewRuns([el.dataset.id!], 'accept'), 'single-reject': (el: HTMLElement) => reviewRuns([el.dataset.id!], 'reject'), 'bulk-accept': () => reviewRuns([...selectedRuns], 'accept'), 'bulk-reject': () => reviewRuns([...selectedRuns], 'reject'),
     'bulk-copy': () => copy([...selectedRuns].map(id => { const r = findLoadedRun(id); return r ? r.nodeId + '/exec/' + r.id : id; }).join('\n')),
     'run-control': (el: HTMLElement) => runControl(el.dataset.id!, el.dataset.value!), patch: (el: HTMLElement) => getPatch(el.dataset.id!), revert: (el: HTMLElement) => revertRun(el.dataset.id!),
     refresh: () => refresh(true), retry: (el: HTMLElement) => load(el.dataset.path!, true), theme: () => { savePref({ theme: document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark' }); schedulePaint(); }, sidebar: () => { savePref({ sidebar: pref.sidebar === 'expanded' ? 'collapsed' : 'expanded' }); schedulePaint(); }, palette: openPalette,
     node: (el: HTMLElement) => openNode(el.dataset.id!, el.dataset.tab), 'node-edit-from-drawer': (el: HTMLElement) => { const id = el.dataset.id!; closeTopDialog(); return openNode(id, 'settings'); },
-    'project-tasks': (el: HTMLElement) => navigate('tasks', { project: el.dataset.id! }), 'session-project': (el: HTMLElement) => { selectedThreads.clear(); storage.set('quaymesh.last-project', el.dataset.id!); navigate('sessions', { project: el.dataset.id! }); }, 'session-back': () => navigate('sessions', { picker: '1' }),
+    'project-tasks': (el: HTMLElement) => navigate('tasks', { project: el.dataset.id!, node:route.p.node, days:route.view === 'usage' || el.dataset.usageDays ? '0' : route.p.days || '0', date:route.p.date, usageDays:el.dataset.usageDays || (route.view === 'usage' ? route.p.days || '14' : route.p.usageDays),usageDate:route.p.usageDate }), 'session-project': (el: HTMLElement) => { selectedThreads.clear(); storage.set('quaymesh.last-project', el.dataset.id!); navigate('sessions', { project: el.dataset.id! }); }, 'session-back': () => navigate('sessions', { picker: '1' }),
     'session-tab': (el: HTMLElement) => param({ tab: el.dataset.value! }), 'session-filter': (el: HTMLElement) => { selectedThreads.clear(); param({ state: el.dataset.value! }); }, 'session-control': (el: HTMLElement) => sessionControl(el.dataset.id!, el.dataset.value!), 'session-info': (el: HTMLElement) => { const t = currentSessions()?.items.find(t => t.id === el.dataset.id!); if (!t)
         throw new Error('会话未加载'); return dialog({ title: '会话身份与归档条件', confirm: null, cancel: '关闭', body: `<dl class="key-values"><div><dt>会话 ID</dt><dd class="mono">${esc(t.id)}</dd></div><div><dt>当前轮次</dt><dd class="mono">${esc(t.turnId)}</dd></div><div><dt>资源版本</dt><dd>rev ${t.revision}</dd></div><div><dt>当前控制权</dt><dd>${esc(t.control)}</dd></div><div><dt>归属已核实</dt><dd>${t.verified ? '是' : '否'}</dd></div><div><dt>归档保护</dt><dd>${esc(t.skipReason || '当前无阻止条件')}</dd></div></dl>` }); },
     protect: async (el: HTMLElement) => { ensureWritable(); const t = currentSessions()?.items.find(t => t.id === el.dataset.id!); if (!t)
         throw new Error('会话未加载'); await API.post<{ saved?: boolean; ok?: boolean }>('sessions/' + enc(t.id) + '/protect', { protected: !t.protected, expectedRevision: t.protectRevision }); await invalidateAfterWrite(); toast(t.protected ? '已取消保留' : '已保留会话', 'good'); }, 'archive-preview': (el: HTMLElement) => archivePreview(el.dataset.value!),
     'root-expand': (el: HTMLElement) => { expandedRoots.has(el.dataset.id!) ? expandedRoots.delete(el.dataset.id!) : expandedRoots.add(el.dataset.id!); schedulePaint(); }, 'root-edit': (el: HTMLElement) => editRoot(el.dataset.id!),
     'activity-kind': (el: HTMLElement) => { activityPaused = false; navigate('activity', { kind: el.dataset.value! }); }, 'activity-pause': () => { activityPaused = !activityPaused; ensureRoute(); schedulePaint(); }, 'event-hour': (el: HTMLElement) => param({ hour: el.dataset.value!, cursor: null }), 'clear-hour': () => param({ hour: null, cursor: null }),
-    'usage-date': (el: HTMLElement) => navigate('tasks', { date: el.dataset.value!, days: '0', node: route.p.node, project: route.p.project }),
+    'usage-date': (el: HTMLElement) => navigate('tasks', { usageDate:el.dataset.value!,usageDays:route.p.days || '14',days:'0',node:route.p.node,project:route.p.project }),
+    'clear-usage-range':()=>param({usageDate:null,usageDays:null}),
+    'evidence-events':(el:HTMLElement)=>navigate('activity',{kind:'events',q:el.dataset.reference}),
+    diagnostics,
+    'finish-task': (el:HTMLElement) => finishTask(el.dataset.id!),
+    'receipt-query': async (el:HTMLElement) => { await API.get('receipts/' + enc(el.dataset.id) + '?path=' + enc(el.dataset.path) + '&target=' + enc(el.dataset.target)); await load('receipts?limit=50',true); toast('已查询原请求结果'); },
+    'global-sessions': () => navigate('sessions', {q:route.view === 'sessions' ? route.p.q : undefined,node:route.p.node}),
+    'task-scope': (el:HTMLElement) => { const key=el.dataset.value!; param({status:null,attention:key === 'attention' ? '1' : null,stage:key === 'active' ? 'running,stopping,queued' : key === 'open' ? 'waiting,stalled,finalizing' : key === 'ended' ? 'done,accepted,rejected,review,failed,ended,cancelled,handed_off' : null}); },
+    'review-mode':(el:HTMLElement)=>param({reviewMode:el.dataset.value!,status:null,stage:null,attention:null,run:null,cursor:null}),
     'settings-section': (el: HTMLElement) => navigate('settings', { section: el.dataset.value! }), 'api-settings': () => navigate('settings', { section: 'connection' }), 'egress-settings': () => navigate('settings', { section: 'egress' }),
     preference: (el: HTMLElement) => { const k = el.dataset.key!, v = k === 'poll' ? Number(el.dataset.value!) : el.dataset.value!; savePref({ [k]: v }); if (k === 'poll')
         schedulePoll(); schedulePaint(); },
     'egress-sync': syncEgress,
     'reset-preferences': async () => { if (!await confirmAction('恢复本机默认偏好？', '<p>将恢复当前浏览器的外观与刷新设置。</p>', '恢复默认'))
-        return; pref = { ...DEFAULTS }; savePref(pref); CACHE.clear(); await bootstrap(); },
+        return; notificationReader?.cancel(); notificationReader = null; notificationGaps.clear(); if (notificationStorageKey) storage.del(notificationStorageKey); pref = { ...DEFAULTS }; savePref(pref); CACHE.clear(); await bootstrap(); },
     reconnect: () => bootstrap(),
     'desktop-browser': () => notifyDesktop('external'),
     'desktop-settings': () => notifyDesktop('settings'),
-    'waiting-queue': () => navigate('tasks', { status:'waiting', days:'0' }),
+    'waiting-queue': () => navigate('tasks', { stage:'waiting,stalled,finalizing', days:'0' }),
     logout: async () => { if (!await confirmAction('退出当前浏览器？', '<p>不会退出托盘、停止隧道或取消任务。</p>', '退出登录'))
         return; await API.post<{ saved?: boolean; ok?: boolean }>('logout'); API.session = null; API.csrf = null; authRequired = true; API.abortAll(); clearTimeout(refreshTimer); schedulePaint(); },
     'revoke-all': async () => { ensureWritable(); const key = uid(); const result = await dialog({ title: '撤销所有 Console 会话？', danger: true, confirm: '撤销所有会话', body: '<p>所有浏览器和 Console 客户端需要重新登录，包括当前页面。已有执行进程与网关服务不受影响。</p><label class="field">输入 REVOKE 确认<input class="input mono" name="confirm" required pattern="REVOKE" autocomplete="off"></label>', onSubmit: () => API.post<{ saved?: boolean; ok?: boolean }>('sessions/revoke-all', {}, key) }); if (result) {
@@ -927,7 +1099,7 @@ const ACTIONS = {
         schedulePaint();
     } },
     'cancel-transfer': async (el: HTMLElement) => { ensureWritable(); const t = data<ActivityPage<TransferRow>>(activityPath())?.items.find(x => x.id === el.dataset.id!); if (!t)
-        throw new Error('传输记录未加载'); const key = uid(); const result = await dialog({ title: '取消文件传输？', danger: true, confirm: '取消传输', body: `<p>${esc(t.source)} → ${esc(t.destination)}</p><p>已传输的文件将保留。</p>`, onSubmit: () => API.post<{ transfer?: { status: string } }>('transfers/cancel', { id: t.id, expectedRevision: t.revision }, key) }); if (result) {
+        throw new Error('传输记录未加载'); const intent = new WriteIntent(API,'transfers/cancel'); const result = await dialog({ title: '取消文件传输？', danger: true, confirm: '取消传输', body: `<p>${esc(t.source)} → ${esc(t.destination)}</p><p>已传输的文件将保留。</p>`, onSubmit: () => intent.submit<{ transfer?: { status: string } }>({ id: t.id, expectedRevision: t.revision }) }); if (result) {
         await invalidateAfterWrite();
         toast(result.transfer?.status === 'cancelled' ? '已收到取消回执' : '取消已请求，等待回执', 'info');
     } },
@@ -936,8 +1108,8 @@ const ACTIONS = {
     'export-activity': () => { const d = data<ActivityPage>(activityPath()); if (d)
         download('quaymesh-activity-page.json', JSON.stringify(d, null, 2), 'application/json'); },
     'export-usage': () => { const u = data<UsageReport>(usagePath()); if (u)
-        download('quaymesh-usage.csv', '\ufeff' + [['project', 'node', 'knownTokens', 'records', 'partial', 'unknown'], ...u.projects.map(p => [p.name, p.nodeId, p.total, p.records, p.partial, p.missing])].map(r => r.map(csvCell).join(',')).join('\r\n'), 'text/csv;charset=utf-8'); },
-    'export-contract': () => download('quaymesh-v4-api-contract.txt', CONTRACT), shortcuts: () => dialog({ title: '工作台快捷键', wide: true, confirm: null, cancel: '关闭', body: `<div class="key-grid">${KEYS.map(([k, t]) => `<div><span>${t}</span><kbd>${k}</kbd></div>`).join('')}</div>` })
+        download('quaymesh-usage.json', JSON.stringify({exportedAt:new Date().toISOString(),query:usagePath(),timeZone:timeZone() || deviceTimeZone,...u},null,2), 'application/json'); },
+    'export-diagnostics': () => download('quaymesh-console-diagnostics.json', JSON.stringify(diagnosticSnapshot(),null,2), 'application/json'), shortcuts: () => dialog({ title: '工作台快捷键', wide: true, confirm: null, cancel: '关闭', body: `<div class="key-grid">${KEYS.map(([k, t]) => `<div><span>${t}</span><kbd>${k}</kbd></div>`).join('')}</div>` })
 };
 document.addEventListener('click', e => { const el = (e.target as HTMLElement).closest<HTMLElement>('[data-action]'); if (!el || (el instanceof HTMLButtonElement && el.disabled))
     return; const action = ACTIONS[el.dataset.action! as keyof typeof ACTIONS]; if (!action)
@@ -973,7 +1145,7 @@ document.addEventListener('change', async (e) => {
     try {
         if (el.dataset.param) {
             const key = el.dataset.param;
-            param({ [key]: el.value, ...(key === 'node' ? { project: null } : {}) });
+            param({ [key]: el.value, ...(key === 'node' ? { project: null } : {}), ...(key === 'status' ? {stage:null,attention:null} : {}) });
         }
         else if (el.dataset.selectRun) {
             el.checked ? selectedRuns.add(el.dataset.selectRun) : selectedRuns.delete(el.dataset.selectRun);
@@ -1019,6 +1191,9 @@ document.addEventListener('change', async (e) => {
                     throw new Error('浏览器没有授予通知权限');
             }
             savePref({ notifications: el.checked });
+            notificationReader?.cancel(); notificationReader = null; notificationGaps.clear();
+            if (notificationStorageKey) storage.del(notificationStorageKey);
+            pollNotifications();
             schedulePaint();
         }
     }
@@ -1040,7 +1215,7 @@ document.addEventListener('submit', async (e) => {
     try {
       const password = new FormData(form).get('password');
       const session = await API.request<ConsoleSession>('POST', 'login', { password });
-      if (session.contract !== 'quaymesh.console.v4') throw new Error('会话响应缺少 v4 契约声明');
+      validateSession(session);
       API.session = session;
       API.csrf = session.csrf;
       authRequired = false;
@@ -1160,8 +1335,7 @@ document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
         clearTimeout(refreshTimer);
         clearTimeout(clockTimer);
-        for (const path of activePaths)
-            CACHE.get(path)?.ctl?.abort();
+        resources.cancelAll(); commandReader.cancelAll(); notificationReader?.cancel();
     }
     else {
         attachClock();
@@ -1170,20 +1344,34 @@ document.addEventListener('visibilitychange', () => {
         schedulePoll();
     }
 });
-addEventListener('pagehide', () => { clearTimeout(refreshTimer); clearTimeout(clockTimer); for (const path of activePaths)
-    CACHE.get(path)?.ctl?.abort(); });
+addEventListener('pagehide', () => { clearTimeout(refreshTimer); clearTimeout(clockTimer); resources.cancelAll(); commandReader.cancelAll(); notificationReader?.cancel(); });
 addEventListener('online', () => { backgroundPaused = false; refresh(); schedulePoll(); });
-addEventListener('offline', () => { backgroundPaused = true; clearTimeout(refreshTimer); toast('浏览器离线，保留已读取的内容。', 'warn'); schedulePaint(); });
-let previousStages = new Map<string, string>();
-function observeStages(snapshot: Overview) { for (const r of [...snapshot.active, ...snapshot.recent]) {
-    const prior = previousStages.get(r.id), next = stage(r);
-    if (prior && next === 'failed' && prior !== 'failed' && pref.notifications) {
-        toast('任务失败：' + r.title, 'bad');
-        if (globalThis.Notification?.permission === 'granted')
-            new Notification('QuayMesh · 执行失败', { body: r.title, tag: r.id });
+addEventListener('offline', () => { backgroundPaused = true; clearTimeout(refreshTimer); resources.cancelAll(); commandReader.cancelAll(); notificationReader?.cancel(); toast('浏览器离线，保留已读取的内容。', 'warn'); schedulePaint(); });
+let notificationReader: EventNotifications | null = null, notificationStorageKey = '';
+const notificationGaps = new Map<string,string>();
+function pollNotifications() {
+    if (!pref.notifications || !API.session || document.hidden || backgroundPaused || authRequired || booting) return;
+    const key = 'quaymesh.notifications.v1:' + API.base() + ':' + API.session.user.name;
+    if (!notificationReader || notificationStorageKey !== key) {
+        notificationReader?.cancel(); notificationStorageKey = key; notificationGaps.clear();
+        notificationReader = new EventNotifications({
+            memory:storage.get<NotificationMemory>(key,{}),
+            read:(nodeId,cursor,signal) => API.get<NotificationPage>('activity?' + queryString({kind:'events',level:'error',limit:100,node:nodeId,after:cursor?.after,afterId:cursor?.afterId}),signal),
+            save:memory=>storage.set(key,memory),
+            gap:(nodeId,message)=>{ if (message) notificationGaps.set(nodeId,message); else notificationGaps.delete(nodeId); schedulePaint(); },
+            emit:(nodeId,events)=>{
+                if (!pref.notifications || authRequired) return;
+                const title = (node(nodeId)?.name || nodeId) + ' · ' + events.length + ' 条新错误';
+                toast(title,'bad');
+                if (globalThis.Notification?.permission === 'granted') {
+                    const notification = new Notification('QuayMesh · ' + title,{body:events.slice(0,3).map(event=>event.message).join('\n'),tag:'quaymesh-errors-'+nodeId});
+                    notification.onclick=()=>{ window.focus(); navigate('activity',{kind:'events',level:'error',node:nodeId}); notification.close(); };
+                }
+            },
+        });
     }
-    previousStages.set(r.id, next);
-} }
+    void notificationReader.poll((fleet()?.nodes || []).map(item=>item.id));
+}
 let clockTimer: ReturnType<typeof setTimeout> | undefined, clockNodes: HTMLElement[] = [];
 function tickClock() {
     clearTimeout(clockTimer);
@@ -1192,7 +1380,9 @@ function tickClock() {
     const now = Date.now();
     clockNodes = clockNodes.filter((el: HTMLElement) => el.isConnected);
     for (const el of clockNodes) {
-        const text = duration(now - Number(el.dataset.elapsed));
+        const observed = Number(el.dataset.observed), stale = observed > 0 && now - observed > 30_000;
+        const text = duration((stale ? observed : now) - Number(el.dataset.elapsed)) + (stale ? ' · 待核对' : '');
+        if (stale) el.title = '截至最后确认 ' + fullTime(observed);
         if (el.textContent !== text)
             el.textContent = text;
     }
@@ -1221,7 +1411,7 @@ async function migrateConsoleLink() {
     const view = values.view || (values.run || values.project ? 'tasks' : 'machines');
     delete values.view;
     delete values.exec;
-    if (values.run && !values.run.startsWith('qm:')) values.run = workspaceHandle(nodeId, values.run);
+    if (values.run && !/^(?:qm|qmtask|task):/.test(values.run)) values.run = workspaceHandle(nodeId, values.run);
     if (values.project && !values.project.startsWith('qm:')) values.project = workspaceHandle(nodeId, values.project);
     if (values.run && values.file) {
         const detail = await API.get<RunDetail>('runs/' + enc(values.run));
@@ -1235,12 +1425,11 @@ async function migrateConsoleLink() {
 async function bootstrap(readSession = true) { clearTimeout(bootstrapRetryTimer); bootstrapError=null; booting = true; authRequired = false; API.abortAll(); clearTimeout(refreshTimer); schedulePaint(); try {
     if (readSession) {
         const session = await API.get<ConsoleSession>('session');
-        if (session.contract !== 'quaymesh.console.v4' || !session.capabilities?.conversations
-            || !session.capabilities.taskLifecycle || !session.capabilities.workspaceLocations)
-            throw new ApiError('控制台与协调端版本不一致，请更新协调端服务。', 409, 'contract_mismatch');
+        validateSession(session);
         API.session = session;
         API.csrf = session.csrf;
     }
+    if (API.session) validateSession(API.session);
     bootstrapAttempts=0; CACHE.delete('session');
     await migrateConsoleLink();
     booting = false;

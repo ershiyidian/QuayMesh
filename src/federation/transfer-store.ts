@@ -83,6 +83,20 @@ export class TransferStore {
       .all(limit) as TransferRow[]).map(row => this.view(row));
   }
 
+  page(input: { limit?: number; offset?: number; q?: string; status?: string } = {}) {
+    const number = (value: number | undefined, fallback: number, maximum: number) => Number.isFinite(value)
+      ? Math.min(maximum, Math.max(0, Math.trunc(value!))) : fallback;
+    const limit = Math.max(1, number(input.limit, 25, 1_000_100)), offset = number(input.offset, 0, 1_000_000);
+    const search = (input.q ?? "").trim().toLocaleLowerCase(), status = input.status ?? "";
+    const where = `(?='' OR instr(lower(id||' '||operation_id||' '||source_node||' '||source_path||' '||destination_path||' '||COALESCE(task_id,'')),?)>0)
+      AND (?='' OR status=?)`;
+    const parameters = [search, search, status, status];
+    const total = (this.database.sqlite.prepare(`SELECT COUNT(*) total FROM qm_transfers WHERE ${where}`).get(...parameters) as { total: number }).total;
+    const items = (this.database.sqlite.prepare(`SELECT * FROM qm_transfers WHERE ${where} ORDER BY started_at DESC,id DESC LIMIT ? OFFSET ?`)
+      .all(...parameters, limit, offset) as TransferRow[]).map(row => this.view(row));
+    return { items, total, offset, limit };
+  }
+
   active(): TransferRow[] {
     return this.database.sqlite.prepare("SELECT * FROM qm_transfers WHERE status='running'").all() as TransferRow[];
   }

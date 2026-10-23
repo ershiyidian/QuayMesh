@@ -156,10 +156,15 @@ export class SessionService {
     return this.store.adoptRemoteTask(sessionId, taskId, title, createdAt, sourceTaskId);
   }
 
-  async finishTask(ownerId: string, taskId: string, status: "completed"|"failed"|"cancelled"|"handed_off", summary: string): Promise<TaskRecord> {
+  async finishTask(ownerId: string, taskId: string, status: "completed"|"failed"|"cancelled"|"handed_off", summary: string, expectedTaskRevision?: number): Promise<TaskRecord> {
+    this.store.requireSession(ownerId,this.store.getTask(taskId).session_id);
     const pending=this.finalizing.get(taskId);
-    if(pending)return pending;
-    const work=this.completeTask(ownerId,taskId,status,summary).finally(()=>this.finalizing.delete(taskId));
+    if(pending){
+      const intent=this.store.taskData.finalization(taskId);
+      if(intent && (intent.status!==status || intent.summary!==summary))throw new Error('TASK_FINALIZATION_CONFLICT');
+      return pending;
+    }
+    const work=this.completeTask(ownerId,taskId,status,summary,expectedTaskRevision).finally(()=>this.finalizing.delete(taskId));
     this.finalizing.set(taskId,work);
     return work;
   }
@@ -177,13 +182,19 @@ export class SessionService {
     if(status!=="handed_off" && (this.localBackground(taskId).length || this.store.taskData.activeWork(taskId))) {
       throw new Error(`TASK_HAS_ACTIVE_EXECUTIONS: ${taskId}`);
     }
+    if(status!=="handed_off" && this.ledger && this.store.runIdsForTask(taskId).some(id=>this.ledger!.hasUnresolvedChild(id))) {
+      throw new Error(`TASK_RECONCILIATION_REQUIRED: ${taskId}`);
+    }
   }
 
-  private async completeTask(ownerId: string, taskId: string, status: TaskFinalStatus, summary: string): Promise<TaskRecord> {
+  private async completeTask(ownerId: string, taskId: string, status: TaskFinalStatus, summary: string, expectedTaskRevision?: number): Promise<TaskRecord> {
     const task=this.store.getTask(taskId);
     this.store.requireSession(ownerId,task.session_id);
-    if(task.state==="closed"&&task.result_status) return task;
-    this.store.taskData.requestFinalization(taskId,status,summary);
+    if(task.state==="closed"&&task.result_status) {
+      if(task.result_status!==status)throw new Error('TASK_ALREADY_FINISHED_WITH_DIFFERENT_RESULT');
+      return task;
+    }
+    this.store.taskData.requestFinalization(taskId,status,summary,expectedTaskRevision);
     try {
       this.assertTaskIdle(taskId,status);
       const remote=this.store.taskMemberIds(taskId).map(id=>this.store.getMember(task.session_id,id)).filter(member=>member.node_id!==this.nodeId);
@@ -199,8 +210,7 @@ export class SessionService {
       this.assertTaskIdle(taskId,status);
       await this.captureTask(task,true);
       this.finishLocalRuns(taskId,status,summary);
-      this.store.taskData.finishFinalization(taskId);
-      return this.store.closeTask(taskId,status,summary);
+      return this.store.completeTaskFinalization(taskId,status,summary);
     } catch(error) {
       this.store.taskData.finishFinalization(taskId,error instanceof Error?error.message:String(error));
       throw error;
@@ -221,11 +231,17 @@ export class SessionService {
   }
 
   async finishOwnedTask(ownerId: string, taskId: string, status: TaskFinalStatus, summary: string): Promise<TaskOwnerReceipt> {
+    this.store.requireSession(ownerId,this.store.getTask(taskId).session_id);
     const pending=this.finalizingLocal.get(taskId);
-    if(pending)return pending;
+    if(pending){
+      const intent=this.store.taskData.finalization(taskId);
+      if(intent && (intent.status!==status || intent.summary!==summary))throw new Error('TASK_FINALIZATION_CONFLICT');
+      return pending;
+    }
     const work=(async()=>{
       const task=this.store.getTask(taskId);
       this.store.requireSession(ownerId,task.session_id);
+      if(task.state==='closed' && task.result_status && task.result_status!==status)throw new Error('TASK_ALREADY_FINISHED_WITH_DIFFERENT_RESULT');
       if(!(task.state==="closed"&&task.result_status)) {
         this.store.taskData.requestFinalization(taskId,status,summary);
         try {
@@ -233,8 +249,7 @@ export class SessionService {
           await this.captureTask(task,false);
           this.assertTaskIdle(taskId,status);
           this.finishLocalRuns(taskId,status,summary);
-          this.store.taskData.finishFinalization(taskId);
-          this.store.closeTask(taskId,status,summary);
+          this.store.completeTaskFinalization(taskId,status,summary);
         } catch(error) {
           this.store.taskData.finishFinalization(taskId,error instanceof Error?error.message:String(error));
           throw error;

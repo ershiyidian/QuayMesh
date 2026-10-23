@@ -5,6 +5,7 @@ import { canonicalWorkspaceRoot, canonicalPathIdentity } from "../roots.js";
 import { resolve } from "node:path";
 import { TaskDataStore, type ContextReadInput } from "./task-data.js";
 import { retryableAdmission } from "./outcome.js";
+import { aggregateReviewStates } from "./review-state.js";
 import {
   ExecutionState,
   HostState,
@@ -41,6 +42,7 @@ interface InvocationRow {
   created_at: string;
   finished_at: string | null;
   response_at: string | null;
+  response_json: string | null;
 }
 
 interface EventAppendResult {
@@ -173,7 +175,7 @@ export class SessionStore {
         VALUES (?,?,?,0,'active',?,?,?,NULL,?,?,?)`)
         .run(id, session.id, value, Number(sequence.sequence ?? 0), now, now, requestKey ?? null, sourceTaskId ?? null, "user_request");
       this.db.prepare(`UPDATE qm_sessions
-        SET current_task_id=?,revision=revision+1,last_activity_at=? WHERE id=?`)
+        SET current_task_id=?,review_state='unknown',revision=revision+1,last_activity_at=? WHERE id=?`)
         .run(id, now, session.id);
       return this.getTask(id);
     }).immediate();
@@ -220,6 +222,16 @@ export class SessionStore {
       last_activity_at=?,result_status=?,summary=? WHERE id=?`)
       .run(now,now,now,now,status,summary,taskId);
     return this.getTask(taskId);
+  }
+
+  completeTaskFinalization(taskId: string, status: NonNullable<TaskRecord['result_status']>, summary: string): TaskRecord {
+    return this.db.transaction(() => {
+      const intent=this.taskData.finalization(taskId);
+      if(!intent || intent.status!==status || intent.summary!==summary)throw new Error('TASK_FINALIZATION_CONFLICT');
+      // 最终确认和 Task 终态一起提交，写入失败时仍保留可接续的收尾意图。
+      this.taskData.finishFinalization(taskId);
+      return this.closeTask(taskId,status,summary);
+    }).immediate();
   }
 
   archiveTask(taskId:string,reason:"superseded"|"legacy_archive"|"recovered"="superseded"):TaskRecord {
@@ -282,7 +294,7 @@ export class SessionStore {
     }
     const current=this.currentTask(sessionId);
     if (!existing && (!current || Date.parse(this.getTask(taskId).created_at) >= Date.parse(current.created_at)))
-      this.db.prepare("UPDATE qm_sessions SET current_task_id=? WHERE id=?").run(taskId, sessionId);
+      this.db.prepare("UPDATE qm_sessions SET current_task_id=?,review_state='unknown' WHERE id=?").run(taskId, sessionId);
     return this.getTask(taskId);
   }
 
@@ -1265,6 +1277,59 @@ export class SessionStore {
     for (const { event, result, taskId } of saved) this.notifyEvent(event, result, taskId);
   }
 
+  setTaskReviewState(sessionId: SessionId, taskId: string, memberId: string, runId: string, state: ReviewState): void {
+    this.commitTaskReviewState(sessionId, taskId, memberId, runId, state, this.db, () => undefined);
+  }
+
+  /** Run 验收与精确 Task 事件使用同一连接提交，原 Store 只在提交后通知监听器。 */
+  commitTaskReviewState<T>(sessionId: SessionId, taskId: string, memberId: string, runId: string, state: ReviewState,
+    database: Database.Database, commit: () => T): T {
+    if(database.inTransaction)throw Object.assign(new Error('SQLITE_WRITE_OUTER_TRANSACTION: Review notifications require a committed transaction.'),
+      {code:'SQLITE_WRITE_OUTER_TRANSACTION'});
+    const scoped = database === this.db ? this : new SessionStore(database);
+    let saved: { event: Omit<SessionEvent, 'sequence'>; result: EventAppendResult; taskId?: string; value: T };
+    try { saved=database.transaction(()=>{
+      scoped.taskData.requireScope(taskId,sessionId,memberId);
+      if(!database.prepare('SELECT 1 FROM qm_run_links WHERE session_id=? AND task_id=? AND member_id=? AND run_id=?')
+        .get(sessionId,taskId,memberId,runId))throw new Error('TASK_RUN_MISMATCH');
+      const result = commit();
+      const session=scoped.getSession(sessionId);
+      const event:Omit<SessionEvent,'sequence'>={session_id:sessionId,task_id:taskId,member_id:memberId,type:'verification_recorded',
+        source_id:`task-review:${runId}:${state}`,timestamp:new Date().toISOString(),payload:{decision:state,run_id:runId}};
+      const persisted=scoped.persistEvent(event);
+      if(session.current_task_id===taskId)database.prepare('UPDATE qm_sessions SET review_state=? WHERE id=?').run(scoped.taskReviewState(taskId),sessionId);
+      return {event,...persisted,value:result};
+    }).immediate(); }
+    catch (error) {
+      // commit 回调只允许写入这个 SQLite 事务；回滚后没有验收副作用。
+      if (error && typeof error === 'object' && !('effect' in error)) Object.assign(error, { effect: 'not_started' });
+      throw error;
+    }
+    this.notifyEvent(saved.event,saved.result,saved.taskId);
+    return saved.value;
+  }
+
+  taskReviewState(taskId: string, memberId?: string): ReviewState {
+    const task=this.getTask(taskId);
+    if(memberId)this.taskData.requireScope(taskId,task.session_id,memberId);
+    const members=memberId ? [memberId] : this.taskMemberIds(taskId);
+    const states=members.map(id=>{
+      const run=this.db.prepare(`SELECT r.id,r.status,r.acceptance FROM qm_run_links l JOIN console_work_runs r ON r.id=l.run_id
+        WHERE l.task_id=? AND l.member_id=? ORDER BY l.rowid DESC LIMIT 1`).get(taskId,id) as {id:string;status:string;acceptance:string}|undefined;
+      const event=this.db.prepare(`SELECT json_extract(data_json,'$.decision') decision FROM qm_events
+        WHERE task_id=? AND member_id=? AND event_type='verification_recorded'
+          AND (json_extract(data_json,'$.run_id') IS NULL OR json_extract(data_json,'$.run_id')=?)
+        ORDER BY sequence DESC LIMIT 1`).get(taskId,id,run?.id ?? null) as {decision:string}|undefined;
+      const decision=event?.decision ?? run?.acceptance;
+      if(decision==='passed')return ReviewState.passed;
+      if(decision==='failed')return ReviewState.failed;
+      if(decision==='needs_review'||decision==='pending'&&run?.status==='completed')return ReviewState.needs_review;
+      if(decision==='not_applicable')return ReviewState.not_applicable;
+      return ReviewState.unknown;
+    });
+    return aggregateReviewStates(states);
+  }
+
   private persistReviewState(sessionId: SessionId, state: ReviewState, expectedTaskId?: string | null): Array<{
     event: Omit<SessionEvent, "sequence">; result: EventAppendResult; taskId?: string;
   }> {
@@ -1291,7 +1356,7 @@ export class SessionStore {
     const row = this.db
       .prepare(
         `SELECT id, owner_id, transport_instance_id, request_id, session_id, member_id, tool_name,
-                arguments_json, operation_id, task_id, retry_of_invocation_id, state, effect, result_ref, result_json, created_at, finished_at, response_at
+                arguments_json, operation_id, task_id, retry_of_invocation_id, state, effect, result_ref, result_json, created_at, finished_at, response_at, response_json
          FROM qm_invocations
          WHERE owner_id = ? AND transport_instance_id = ? AND request_id = ?`,
       )
@@ -1303,7 +1368,7 @@ export class SessionStore {
     const row = this.db
       .prepare(
         `SELECT id, owner_id, transport_instance_id, request_id, session_id, member_id, tool_name,
-                arguments_json, operation_id, task_id, retry_of_invocation_id, state, effect, result_ref, result_json, created_at, finished_at, response_at
+                arguments_json, operation_id, task_id, retry_of_invocation_id, state, effect, result_ref, result_json, created_at, finished_at, response_at, response_json
          FROM qm_invocations AS i
          WHERE owner_id = ? AND operation_id = ?
            AND NOT EXISTS (SELECT 1 FROM qm_invocations n WHERE n.retry_of_invocation_id=i.id)
@@ -1317,7 +1382,7 @@ export class SessionStore {
     const row = this.db
       .prepare(
         `SELECT id, owner_id, transport_instance_id, request_id, session_id, member_id, tool_name,
-                arguments_json, operation_id, task_id, retry_of_invocation_id, state, effect, result_ref, result_json, created_at, finished_at, response_at
+                arguments_json, operation_id, task_id, retry_of_invocation_id, state, effect, result_ref, result_json, created_at, finished_at, response_at, response_json
          FROM qm_invocations AS i
          WHERE operation_id = ?
            AND NOT EXISTS (SELECT 1 FROM qm_invocations n WHERE n.retry_of_invocation_id=i.id)
@@ -1437,7 +1502,7 @@ export class SessionStore {
       const regresses = input.state !== undefined && input.state !== current.state && (final
         || terminal && [OperationState.accepted, OperationState.queued, OperationState.running].includes(input.state));
       this.db.prepare(`UPDATE qm_invocations SET state=?,effect=?,operation_id=?,result_ref=?,result_json=?,
-        finished_at=?,response_at=? WHERE owner_id=? AND transport_instance_id=? AND request_id=?`)
+        finished_at=?,response_at=?,response_json=? WHERE owner_id=? AND transport_instance_id=? AND request_id=?`)
         .run(
           regresses ? current.state : input.state ?? current.state,
           regresses ? current.effect : input.effect ?? current.effect,
@@ -1446,6 +1511,8 @@ export class SessionStore {
           input.result === undefined ? current.result_json : JSON.stringify(input.result),
           current.finished_at ?? (input.finished ? new Date().toISOString() : null),
           current.response_at ?? (input.responded ? new Date().toISOString() : null),
+          current.response_at || !input.responded ? current.response_json
+            : input.result === undefined ? current.result_json : JSON.stringify(input.result),
           input.ownerId,input.transportInstanceId,input.requestId,
         );
       return this.findInvocation(input.ownerId,input.transportInstanceId,input.requestId)!;

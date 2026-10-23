@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { canonicalExecutionRoot, ExecutionCoordinator } from "./execution-coordinator.js";
+import { ExecutionCoordinator } from "./execution-coordinator.js";
+import { canonicalWorkspaceRoot } from "./roots.js";
 import { WorkLedger, digest, type ManagedThreadRow } from "./work-ledger.js";
 import type { ThreadControl, ThreadSnapshot } from "./codex-thread-control.js";
 
@@ -8,9 +9,10 @@ interface BatchRow {
   accept_partial: number; external_idle: number; created_at: string; expires_at: string; updated_at: string;
 }
 interface EntryRow { batch_id: string; managed_thread_id: string; expected_revision: number; expected_snapshot: string | null; status: string; reason: string | null; updated_at: string }
+interface StepRow { managed_thread_id: string | null; before_status: string; expected_revision: number | null }
 const at = () => new Date().toISOString();
 const snapshotHash = (snapshot: ThreadSnapshot) => digest([snapshot.instanceId, snapshot.threadId,
-  canonicalExecutionRoot(snapshot.cwd), snapshot.turnIds.slice().sort(), snapshot.archived,
+  canonicalWorkspaceRoot(snapshot.cwd), snapshot.turnIds.slice().sort(), snapshot.archived,
   snapshot.openDescendantIds.slice().sort(), snapshot.inventoryComplete, snapshot.turnsClosed]);
 
 export class ProjectArchive {
@@ -27,9 +29,11 @@ export class ProjectArchive {
     const active = this.ledger.db.prepare("select id from local_agent_sessions where id=? and status in ('starting','queued','running')").get(thread.agent_id);
     if (active) return "managed_agent_active";
     const runs = this.ledger.threadRuns(thread.id);
-    if (!runs.length || runs.some((run) => !["completed", "cancelled"].includes(run.status) || !["passed", "not_applicable"].includes(run.acceptance))) return "open_or_unaccepted_work";
+    if (!runs.length || runs.some(run => !["completed", "failed", "cancelled"].includes(run.status)
+      || run.status === "completed" && !["passed", "failed", "not_applicable"].includes(run.acceptance))) return "open_or_unaccepted_work";
+    if (runs.some(run => this.unfinishedChild(run.id) || this.ledger.hasUnresolvedChild(run.id))) return "thread_execution_unresolved";
     if (!acceptPartial && runs.some((run) => !["complete", "not_used"].includes(this.ledger.receipt(run.id).usageStatus))) return "usage_incomplete";
-    if (this.coordinator.inspect(this.ledger.getProject(thread.project_id).root).length) return "active_execution_claim";
+    if (this.coordinator.inspect(this.ledger.getProject(thread.project_id).root).some(claim => claim.agentId === thread.agent_id)) return "active_execution_claim";
     if (mode === "restore" && !this.ledger.db.prepare(`select e.batch_id from console_archive_entries e
       join console_archive_batches b on e.batch_id=b.id where e.managed_thread_id=? and e.status='succeeded' and b.mode='archive'`).get(thread.id)) return "not_archived_by_quaymesh";
     return undefined;
@@ -37,7 +41,7 @@ export class ProjectArchive {
   private remoteReason(thread: ManagedThreadRow, snapshot: ThreadSnapshot): string | undefined {
     if (!snapshot.identityVerified || snapshot.instanceId !== thread.instance_id || snapshot.threadId !== thread.thread_id) return "provider_instance_changed";
     if (!snapshot.inventoryComplete) return "incomplete_descendant_inventory";
-    if (canonicalExecutionRoot(snapshot.cwd) !== this.ledger.getProject(thread.project_id).root) return "provider_project_mismatch";
+    if (canonicalWorkspaceRoot(snapshot.cwd) !== this.ledger.getProject(thread.project_id).root) return "provider_project_mismatch";
     if (!["idle", "notLoaded"].includes(snapshot.status) || !snapshot.turnsClosed) return "provider_thread_active_or_unknown";
     if (snapshot.openDescendantIds.length) return "unarchived_descendants_require_review";
     const expected = this.ledger.expectedTurnIds(thread.id).sort();
@@ -87,35 +91,55 @@ export class ProjectArchive {
     if (!batch) throw new Error("Archive batch not found for this project.");
     const entries = this.ledger.db.prepare(`select e.*,t.title,t.thread_id from console_archive_entries e join console_threads t on t.id=e.managed_thread_id where e.batch_id=? order by t.title`)
       .all(batchId) as (EntryRow & { title: string; thread_id: string })[];
+    const succeededCount = entries.filter(entry => entry.status === "succeeded").length;
+    const reconciliationCount = entries.filter(entry => ["executing", "reconciliation_required"].includes(entry.status)).length;
     return { batchId: batch.id, projectId, mode: batch.mode, status: batch.status, confirmationHash: batch.request_hash,
+      effect: reconciliationCount ? succeededCount ? "partial" as const : "unknown" as const : "applied" as const,
       expiresAt: batch.expires_at, acceptPartial: Boolean(batch.accept_partial),
       requiresExternalIdleConfirmation: true,
       entries: entries.map((entry) => ({ managedThreadId: entry.managed_thread_id, title: entry.title, status: entry.status, reason: entry.reason })),
       readyCount: entries.filter((entry) => entry.status === "ready").length,
-      succeededCount: entries.filter((entry) => entry.status === "succeeded").length,
+      succeededCount, reconciliationCount,
+      skippedCount: entries.filter(entry => entry.status === "skipped").length,
       warning: "This changes only proven QuayMesh chats using Codex archive APIs; it is not task cancellation. Independent Codex clients must be idle. Active, mixed, unverified and descendant-bearing sessions are skipped." };
   }
 
+  step(projectId: string, batchId: string, requestKey: string) {
+    return this.ledger.db.prepare(`SELECT s.managed_thread_id,s.before_status,s.expected_revision,e.status
+      FROM console_archive_steps s JOIN console_archive_batches b ON b.id=s.batch_id
+      LEFT JOIN console_archive_entries e ON e.batch_id=s.batch_id AND e.managed_thread_id=s.managed_thread_id
+      WHERE b.project_id=? AND s.batch_id=? AND s.request_key=?`).get(projectId,batchId,requestKey) as (StepRow & {status:string|null}) | undefined;
+  }
+
   /** One entry per HTTP step: bounded, resumable and tied to the exact confirmed plan. */
-  async execute(projectId: string, batchId: string, confirmationHash: string, externalIdle: boolean) {
+  async execute(projectId: string, batchId: string, confirmationHash: string, externalIdle: boolean, requestKey?: string) {
     const batch = this.ledger.db.prepare("select * from console_archive_batches where id=? and project_id=?").get(batchId, projectId) as BatchRow | undefined;
     if (!batch || batch.request_hash !== confirmationHash || !externalIdle) throw new Error("Exact batch confirmation and external-client quiescence are required.");
     if (batch.status === "planned" && batch.expires_at <= at()) throw new Error("The preview expired; create a new plan.");
-    if (batch.status === "succeeded") return this.view(projectId, batchId);
-    // Guard the entire lifecycle step from overlapping HTTP retries and managed resumes.
+    // 批次按步串行，归档只占用目标代理及批次，不阻塞同项目的独立工作。
     const root = this.ledger.getProject(projectId).root;
-    const claim = this.coordinator.acquire({ workspaceRoot: root, kind: "mutation", resources: [`archive:${batchId}`] });
-    try {
-      const entry = this.ledger.db.prepare("select * from console_archive_entries where batch_id=? and status in ('ready','executing','reconciliation_required') order by case status when 'ready' then 1 else 0 end,managed_thread_id limit 1")
+    const prior = requestKey ? this.step(projectId,batchId,requestKey) : undefined;
+    const selected = prior ? prior.managed_thread_id ? this.ledger.db.prepare("SELECT * FROM console_archive_entries WHERE batch_id=? AND managed_thread_id=?")
+      .get(batchId,prior.managed_thread_id) as EntryRow | undefined : undefined
+      : this.ledger.db.prepare("select * from console_archive_entries where batch_id=? and status in ('ready','executing','reconciliation_required') order by case status when 'ready' then 0 else 1 end,updated_at,managed_thread_id limit 1")
         .get(batchId) as EntryRow | undefined;
+    const thread = selected ? this.ledger.thread(selected.managed_thread_id) : undefined;
+    const claim = this.coordinator.acquire({ workspaceRoot: root, kind: "mutation", scopes: [],
+      agentId: thread?.agent_id, resources: [`archive:${batchId}`] });
+    try {
+      const saved = requestKey ? this.step(projectId,batchId,requestKey) : undefined;
+      if (saved && saved.managed_thread_id !== (selected?.managed_thread_id ?? null)) throw Object.assign(
+        new Error("Archive step was reserved by another request; read the original receipt."), { effect: "not_started" });
+      const entry = selected ? this.ledger.db.prepare("select * from console_archive_entries where batch_id=? and managed_thread_id=? and status in ('ready','executing','reconciliation_required')")
+        .get(batchId, selected.managed_thread_id) as EntryRow | undefined : undefined;
+      if (requestKey && !saved) this.ledger.db.prepare(`INSERT INTO console_archive_steps
+        (batch_id,request_key,managed_thread_id,before_status,expected_revision,created_at) VALUES(?,?,?,?,?,?)`)
+        .run(batchId,requestKey,selected?.managed_thread_id ?? null,selected?.status ?? "none",selected?.expected_revision ?? null,at());
       this.ledger.db.prepare("update console_archive_batches set status='executing',external_idle=1,updated_at=? where id=?").run(at(), batchId);
       if (entry) {
         const thread = this.ledger.thread(entry.managed_thread_id);
         const reconciling = entry.status !== "ready";
         let reason: string | undefined;
-        // localReason's claim check intentionally excludes our own lifecycle claim.
-        const allClaims = this.coordinator.inspect(root).filter((row) => row.id !== claim.id);
-        if (allClaims.length) reason = "active_execution_claim";
         if (!reason) {
           const local = this.localReasonWithoutClaim(thread, batch.mode, Boolean(batch.accept_partial), reconciling);
           if (local) reason = local;
@@ -155,20 +179,23 @@ export class ProjectArchive {
         }
       }
       const states = this.ledger.db.prepare("select status from console_archive_entries where batch_id=?").all(batchId) as { status: string }[];
-      const status = states.some((row) => row.status === "reconciliation_required" || row.status === "executing") ? "reconciliation_required"
-        : states.some((row) => row.status === "ready") ? "executing" : states.every((row) => row.status === "succeeded") ? "succeeded" : "partial";
+      const status = states.some(row => row.status === "ready") ? "executing"
+        : states.some(row => row.status === "reconciliation_required" || row.status === "executing") ? "reconciliation_required"
+          : states.every(row => row.status === "succeeded") ? "succeeded" : "partial";
       this.ledger.db.prepare("update console_archive_batches set status=?,updated_at=? where id=?").run(status, at(), batchId);
       return this.view(projectId, batchId);
     } finally { claim.release(); }
   }
   private localReasonWithoutClaim(thread: ManagedThreadRow, mode: BatchRow["mode"], acceptPartial: boolean, reconciling: boolean) {
-    // Do not remove a live claim just to inspect eligibility.
+    // 目标代理的占用由 execute 持有，检查资格时保留该占用。
     if (!thread.created_here || !thread.identity_verified) return "unproven_creation_or_instance";
     if (thread.external_activity || (mode === "archive" && thread.protected)) return "externally_changed_or_protected";
     if (!reconciling && thread.archive_state !== (mode === "archive" ? "active" : "archived")) return "archive_state_ineligible";
     if (this.ledger.db.prepare("select id from local_agent_sessions where id=? and status in ('starting','queued','running')").get(thread.agent_id)) return "managed_agent_active";
     const runs = this.ledger.threadRuns(thread.id);
-    if (!runs.length || runs.some((run) => !["completed", "cancelled"].includes(run.status) || !["passed", "not_applicable"].includes(run.acceptance))) return "open_or_unaccepted_work";
+    if (!runs.length || runs.some(run => !["completed", "failed", "cancelled"].includes(run.status)
+      || run.status === "completed" && !["passed", "failed", "not_applicable"].includes(run.acceptance))) return "open_or_unaccepted_work";
+    if (runs.some(run => this.unfinishedChild(run.id) || this.ledger.hasUnresolvedChild(run.id))) return "thread_execution_unresolved";
     if (!acceptPartial && runs.some((run) => !["complete", "not_used"].includes(this.ledger.receipt(run.id).usageStatus))) return "usage_incomplete";
     if (mode === "restore" && !this.ledger.db.prepare(`select e.batch_id from console_archive_entries e join console_archive_batches b on b.id=e.batch_id
       where e.managed_thread_id=? and e.status='succeeded' and b.mode='archive'`).get(thread.id)) return "not_archived_by_quaymesh";
@@ -177,6 +204,10 @@ export class ProjectArchive {
   private updateEntry(batch: string, thread: string, status: string, reason?: string) {
     this.ledger.db.prepare("update console_archive_entries set status=?,reason=?,updated_at=? where batch_id=? and managed_thread_id=?")
       .run(status, reason ?? null, at(), batch, thread);
+  }
+  private unfinishedChild(runId: string): boolean {
+    return Boolean(this.ledger.db.prepare(`SELECT 1 FROM console_operations WHERE run_id=? AND status IN ('starting','queued','running')
+      UNION ALL SELECT 1 FROM console_executions WHERE run_id=? AND status IN ('starting','queued','running') LIMIT 1`).get(runId, runId));
   }
   private markSucceeded(batch: BatchRow, thread: ManagedThreadRow) {
     this.ledger.db.transaction(() => {

@@ -1285,7 +1285,7 @@ export function createServer(
       uptimeSec: Math.floor(process.uptime()), port: config.port, database: "ok" });
   });
 
-  projectConsole = createProjectConsoleRouter(config, { assetDirectory: uiBuildDirectory(), federation, sessionRuntime, relayConsoleEnabled: true,
+  projectConsole = createProjectConsoleRouter(config, { assetDirectory: uiBuildDirectory(), federation, sessionRuntime, processSessions, relayConsoleEnabled: true,
     fleetDirectory: fileURLToPath(new URL("./ui/fleet/", import.meta.url)) });
   app.get(/^\/console$/, (req, res) => res.redirect(303, `/console/${req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : ""}`));
   app.use("/console", async (req, res, next) => {

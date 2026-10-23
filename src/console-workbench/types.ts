@@ -1,3 +1,5 @@
+import type { TaskFinalizationView } from '../console-task-state.js';
+
 export interface Usage {
   total: number | null;
   input: number | null;
@@ -26,6 +28,14 @@ export interface Run {
   sessionId: string | null;
   taskId: string | null;
   sourceTaskId?: string | null;
+  requestState?: string;
+  taskRevision?: number;
+  phaseExecutionStatus?: string;
+  resultStatus?: string | null;
+  finalization?: TaskFinalizationView | null;
+  actionableInterruption?: boolean;
+  observedAt?: number | null;
+  stale?: boolean;
   memberId: string | null;
   usage: Usage;
   diff: { files: number; add: number | null; del: number | null } | null;
@@ -76,6 +86,8 @@ export interface Root {
   enabled: boolean;
   readOnly: boolean;
   revision: number;
+  settingsPending?:boolean|null;
+  settingsError?:string|null;
 }
 
 export interface LocalIndex {
@@ -84,7 +96,7 @@ export interface LocalIndex {
   projects: Project[];
   roots: Root[];
   observedAt: number;
-  settings?: { revision: number; nickname: string; priority: number; egress: {
+  settings?: { revision: number|null; savedRevision?:number|null;appliedRevision?:number|null;pending?:boolean|null;error?:string|null; nickname: string; priority: number; egress: {
     enabled: boolean; config: string | null; port: number; probe: string; recovery: number; inherit: boolean;
   } };
 }
@@ -117,7 +129,8 @@ export interface WorkbenchEvent {
 }
 
 export class WorkbenchError extends Error {
-  constructor(message: string, readonly status = 409, readonly code = "operation_rejected") {
+  constructor(message: string, readonly status = 409, readonly code = "operation_rejected",
+    readonly effect: 'none' | 'applied' | 'partial' | 'unknown' = 'unknown') {
     super(message);
   }
 }

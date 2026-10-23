@@ -1,5 +1,5 @@
 import type { FleetIndex, Run, Usage } from "./types.js";
-import { taskStage,activeExecution } from '../console-task-state.js';
+import { taskStage,activeExecution,needsAttention } from '../console-task-state.js';
 
 export type Query = Record<string, string | undefined>;
 const dayFormatters = new Map<string, Intl.DateTimeFormat>();
@@ -34,12 +34,13 @@ export function filterRuns(runs: Run[], query: Query, now = Date.now()): Run[] {
     && (!query.root || run.root === query.root)
     && (!query.changed || run.diff !== null)
     && (!query.execution || run.executionStatus === query.execution)
+    && (!query.stage || query.stage.split(',').includes(stage(run)))
     && (!query.date || dayAt(run.startedAt, zone) === query.date)
     && (!query.finishedDay || run.finishedAt !== null && dayAt(run.finishedAt, zone) === query.finishedDay)
-    && (!query.attention || ["failed", "interrupted_recoverable", "unknown"].includes(run.executionStatus))
+    && (!query.attention || needsAttention(run))
     && (!search || [run.title, run.localId, run.id, run.projectName, run.nodeId].some((value) => value.toLocaleLowerCase().includes(search)))
     && (!days || run.startedAt >= now - days * 86_400_000 || active(run)
-      || Boolean(query.attention && run.executionStatus === "interrupted_recoverable")));
+      || run.executionStatus==='waiting' || needsAttention(run)));
 }
 
 export function totals(runs: Pick<Run, "usage">[]) {

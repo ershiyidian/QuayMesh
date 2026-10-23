@@ -24,4 +24,9 @@ jobs:
       - run: pnpm test:node
       - run: pnpm typecheck
       - run: pnpm build
-      - run: pnpm exec tsx --test src/db/migrations.test.ts
+      - run: pnpm exec tsx --test --test-concurrency=1 src/db/*.test.ts src/console-workbench/*.test.ts src/session/console-lifecycle.test.ts src/session/admission-retry.test.ts src/project-archive.test.ts src/federation/transfer-store.test.ts test/lifecycle-view.test.ts test/reliability-system/card-timing.test.ts
+      - run: pnpm test:console
+      - if: runner.os == 'Linux'
+        run: pnpm exec playwright install --with-deps chromium
+      - if: runner.os == 'Linux'
+        run: pnpm test:console:browser

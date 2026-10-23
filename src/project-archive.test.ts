@@ -7,6 +7,10 @@ import { LocalAgentStore } from "./local-agent-store.js";
 import { WorkLedger } from "./work-ledger.js";
 import { ProjectArchive } from "./project-archive.js";
 import type { ThreadControl, ThreadSnapshot } from "./codex-thread-control.js";
+import { ExecutionCoordinator } from "./execution-coordinator.js";
+import { LocalActions } from "./console-workbench/actions.js";
+import { WriteReceipts } from "./console-workbench/receipts.js";
+import type { ServerConfig } from "./config.js";
 
 function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), "quaymesh-archive-")); const project = join(root, "project");
@@ -91,4 +95,90 @@ test("changed preview, active reuse and cross-project selections never mutate pr
   const b = f.create("active-later"); const another = await f.service.plan(b.run.project_id, { mode: "archive", threadKeys: [b.threadKey] });
   f.store.update(b.agent.id, { status: "queued" });
   await f.service.execute(b.run.project_id, another.batchId, another.confirmationHash, true); assert.equal(f.called.length, 0);
+});
+
+test("an uncertain entry does not starve independent ready threads or replay its side effect", async t => {
+  const f = fixture(t), a = f.create("uncertain-batch-a"); f.create("uncertain-batch-b");
+  const plan = await f.service.plan(a.run.project_id, { mode: "archive" });
+  f.failAs("before_side_effect");
+  const first = await f.service.execute(a.run.project_id, plan.batchId, plan.confirmationHash, true);
+  assert.equal(first.status, "executing");
+  assert.equal(first.readyCount, 1); assert.equal(first.reconciliationCount, 1);
+  assert.equal(first.effect, "unknown");
+  const uncertainCall = f.called[0];
+  f.failAs("ok");
+  const second = await f.service.execute(a.run.project_id, plan.batchId, plan.confirmationHash, true);
+  assert.equal(second.succeededCount, 1); assert.equal(second.reconciliationCount, 1);
+  assert.equal(second.readyCount, 0); assert.equal(second.status, "reconciliation_required");
+  assert.equal(second.effect, "partial");
+  await f.service.execute(a.run.project_id, plan.batchId, plan.confirmationHash, true);
+  assert.equal(f.called.filter(call => call === uncertainCall).length, 1);
+});
+
+test("an archive request key binds one exact step and read-only reconciliation cannot advance the batch", async t => {
+  const f = fixture(t), first = f.create("step-one"); f.create("step-two");
+  const plan = await f.service.plan(first.run.project_id, { mode: "archive" });
+  const actions = new LocalActions({ stateDir: f.ledger.stateDir, allowedRoots: [f.project] } as ServerConfig);
+  const result = await f.service.execute(first.run.project_id, plan.batchId, plan.confirmationHash, true, "step-request-1");
+  assert.equal(result.succeededCount, 1); assert.equal(result.readyCount, 1);
+  const target = f.service.step(first.run.project_id, plan.batchId, "step-request-1")!;
+  assert.equal(target.status, "succeeded");
+  const verified = await actions.reconcileArchive(first.run.project_id, plan.batchId, "step-request-1");
+  assert.equal(verified.verified, true); assert.equal(verified.effect, "applied");
+  assert.equal(verified.response?.readyCount, 1); assert.equal(f.called.length, 1);
+  assert.equal((await actions.reconcileArchive(first.run.project_id, plan.batchId, "missing-request")).verified, false);
+  const replay = await f.service.execute(first.run.project_id, plan.batchId, plan.confirmationHash, true, "step-request-1");
+  assert.equal(replay.succeededCount, 1); assert.equal(replay.readyCount, 1); assert.equal(f.called.length, 1);
+  await f.service.execute(first.run.project_id, plan.batchId, plan.confirmationHash, true, "step-request-2");
+  assert.equal(f.called.length, 2);
+});
+
+test("archive unknown and partial outcomes stay unresolved in durable HTTP receipts", async t => {
+  const f = fixture(t), first = f.create("unknown-step-one"); f.create("unknown-step-two");
+  const plan = await f.service.plan(first.run.project_id, { mode: "archive" });
+  const receipts = new WriteReceipts(f.ledger.stateDir);
+  f.failAs("before_side_effect");
+  await receipts.execute("archive", "unknown", "/archive", { batchId: plan.batchId },
+    () => f.service.execute(first.run.project_id, plan.batchId, plan.confirmationHash, true, "unknown"));
+  assert.equal(receipts.get("archive", "unknown")?.state, "unknown");
+  f.failAs("ok");
+  await receipts.execute("archive", "partial", "/archive", { batchId: plan.batchId },
+    () => f.service.execute(first.run.project_id, plan.batchId, plan.confirmationHash, true, "partial"));
+  assert.equal(receipts.get("archive", "partial")?.state, "partial");
+  const actions = new LocalActions({ stateDir: f.ledger.stateDir, allowedRoots: [f.project] } as ServerConfig);
+  assert.equal((await actions.reconcileArchive(first.run.project_id, plan.batchId, "unknown")).verified, false);
+  assert.equal(f.called.length, 2);
+});
+
+test("archiving an idle thread keeps unrelated live work and its claim intact", async t => {
+  const f = fixture(t), a = f.create("independent-thread");
+  const execution = new ExecutionCoordinator(f.ledger.stateDir);
+  const claim = execution.acquire({ workspaceRoot: f.project, kind: "command", operationId: "other-task-command", taskId: "other-task" });
+  try {
+    const plan = await f.service.plan(a.run.project_id, { mode: "archive", threadKeys: [a.threadKey] });
+    assert.equal(plan.readyCount, 1);
+    const completed = await f.service.execute(a.run.project_id, plan.batchId, plan.confirmationHash, true);
+    assert.equal(completed.succeededCount, 1);
+    assert.ok(execution.inspect(f.project).some(value => value.id === claim.id));
+  } finally { claim.release(); execution.close(); }
+});
+
+test("terminal failed history can be archived and incomplete usage needs explicit confirmation", async t => {
+  const f = fixture(t), a = f.create("failed-history");
+  f.ledger.db.prepare("UPDATE console_work_runs SET status='failed',acceptance='failed' WHERE id=?").run(a.run.id);
+  assert.equal((await f.service.plan(a.run.project_id, { mode: "archive" })).readyCount, 1);
+  f.ledger.db.prepare("UPDATE console_executions SET delta=NULL,usage_quality='unavailable' WHERE run_id=?").run(a.run.id);
+  const skipped = await f.service.plan(a.run.project_id, { mode: "archive" });
+  assert.equal(skipped.entries[0]?.reason, "usage_incomplete");
+  const accepted = await f.service.plan(a.run.project_id, { mode: "archive", acceptPartial: true });
+  assert.equal(accepted.readyCount, 1); assert.equal(accepted.acceptPartial, true);
+});
+
+test("provider cwd is checked at the exact project directory within a checkout", async t => {
+  const f = fixture(t), a = f.create("exact-root");
+  const nested = join(f.project, "nested"); mkdirSync(nested);
+  f.snapshots.get("exact-root")!.cwd = nested;
+  const plan = await f.service.plan(a.run.project_id, { mode: "archive" });
+  assert.equal(plan.readyCount, 0);
+  assert.equal(plan.entries[0]?.reason, "provider_project_mismatch");
 });

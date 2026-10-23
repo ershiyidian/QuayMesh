@@ -9,7 +9,6 @@ function morph(old: Node, next: Node): void {
   if (old.nodeType !== next.nodeType || old.nodeName !== next.nodeName) { old.parentNode!.replaceChild(next.cloneNode(true), old); return; }
   if (old.nodeType === Node.TEXT_NODE) { if (old.nodeValue !== next.nodeValue) old.nodeValue = next.nodeValue; return; }
   if (!(old instanceof Element) || !(next instanceof Element) || old.isEqualNode(next)) return;
-  if (old.hasAttribute("data-elapsed") && old.getAttribute("data-elapsed") === next.getAttribute("data-elapsed")) return;
   if (old.hasAttribute("data-preserve") && old.getAttribute("data-preserve") === next.getAttribute("data-preserve")) return;
   const focused = old === document.activeElement;
   const preservedAttribute = (name: string) => name === "open" && old instanceof HTMLDetailsElement || focused && (name === "value" || name === "checked");

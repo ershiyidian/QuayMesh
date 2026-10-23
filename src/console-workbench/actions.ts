@@ -1,10 +1,12 @@
+import { ConsoleAudit } from "./audit.js";
+export { ConsoleAudit } from "./audit.js";
+import type { ProcessSessionManager } from "../process-sessions.js";
+import { controlRun, reconcileControl, type ControlInput } from "./control-actions.js";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync } from "node:fs";
 import type { ServerConfig } from "../config.js";
 import { WorkLedger } from "../work-ledger.js";
 import { LocalAgentStore } from "../local-agent-store.js";
-import { createLocalAgentClient } from "../local-agent-client.js";
 import { workspaceHandle } from "../federation/routing.js";
 import type { SessionRuntime } from "../session/runtime.js";
 import { ReviewState } from "../session/types.js";
@@ -17,11 +19,7 @@ import { readRunCheckpoint, saveRunCheckpoint, type RunCheckpoint } from "../ses
 import { aggregateTasks,taskReference } from './task-aggregation.js';
 import { activeExecution } from '../console-task-state.js';
 import { ExecutionCoordinator } from '../execution-coordinator.js';
-
-interface AuditEntry {
-  id: string; time: number; nodeId: string; action: string; target: string; actor: string;
-  before: unknown; after: unknown; requestKey: string;
-}
+import { taskView } from "../task-view.js";
 
 interface RevertPreview {
   id: string; runId: string; sessionId: string; memberId: string; owner: string;
@@ -29,24 +27,21 @@ interface RevertPreview {
   taskId?:string;
 }
 
-export class ConsoleAudit {
-  private readonly path: string;
-  constructor(stateDir: string, readonly nodeId: string) {
-    this.path = join(stateDir, "console-workbench-audit.json");
-  }
-  entries(): AuditEntry[] { return existsSync(this.path) ? JSON.parse(readFileSync(this.path, "utf8")) : []; }
-  record(action: string, target: string, before: unknown, after: unknown, requestKey: string): void {
-    const entries = this.entries();
-    entries.unshift({ id: randomUUID(), time: Date.now(), nodeId: this.nodeId, action, target, actor: "owner", before, after, requestKey });
-    const temporary = this.path + ".tmp";
-    writeFileSync(temporary, JSON.stringify(entries.slice(0, 250)), { mode: 0o600 });
-    renameSync(temporary, this.path);
-  }
+function archiveResponse(result: ReturnType<ProjectArchive["view"]>) {
+  return { id: result.batchId, projectId: result.projectId, mode: result.mode, effect: result.effect,
+    status: result.status === "succeeded" ? "completed" : result.status,
+    confirmationHash: result.confirmationHash, expiresAt: Date.parse(result.expiresAt),
+    readyCount: result.readyCount, succeededCount: result.succeededCount, reconciliationCount: result.reconciliationCount,
+    skippedCount: result.skippedCount, acceptPartial: result.acceptPartial,
+    entries: result.entries.map(entry => ({ id: entry.managedThreadId, title: entry.title, ready: entry.status === "ready", reason: entry.reason, status: entry.status })),
+    results: result.entries.map(entry => ({ id: entry.managedThreadId, ok: entry.status === "succeeded", state: entry.status,
+      error: entry.reason, pending: ["ready", "executing", "reconciliation_required"].includes(entry.status) })),
+  };
 }
 
 export class LocalActions {
   readonly audit: ConsoleAudit;
-  constructor(readonly config: ServerConfig, readonly session?: SessionRuntime) {
+  constructor(readonly config: ServerConfig, readonly session?: SessionRuntime, readonly processSessions?: ProcessSessionManager) {
     mkdirSync(config.stateDir, { recursive: true });
     this.audit = new ConsoleAudit(config.stateDir, config.federation?.nodeId ?? "local");
   }
@@ -55,26 +50,26 @@ export class LocalActions {
     const ledger = new WorkLedger(this.config.stateDir);
     try {
       const original = requireRun(this.config, ledger, ref.id);
-      if (original.revision !== ref.expectedRevision) throw new WorkbenchError("任务已更新，请刷新后再次确认", 409, "revision_conflict");
+      if (original.revision !== ref.expectedRevision) throw new WorkbenchError("任务已更新，请刷新后再次确认", 409, "revision_conflict", "none");
       const link = linkForRun(ledger, ref.id);
       let checkpoint: RunCheckpoint | null = null;
       if (original.status === "running") {
         if (!ref.completeExecution || !this.session || link?.latest_run !== original.id) {
-          throw new WorkbenchError("请明确确认结束当前工作后再验收", 409, "completion_confirmation_required");
+          throw new WorkbenchError("请明确确认结束当前工作后再验收", 409, "completion_confirmation_required", "none");
         }
-        if (ledger.hasActiveChild(original.id)) throw new WorkbenchError("当前工作仍有执行中的操作或代理", 409, "work_active");
+        if (ledger.hasActiveChild(original.id)) throw new WorkbenchError("当前工作仍有执行中的操作或代理", 409, "work_active", "none");
         const unresolved = ledger.db.prepare("SELECT 1 FROM console_operations WHERE run_id=? AND status IN ('unknown','reconciliation_required') LIMIT 1").get(original.id);
-        if (unresolved) throw new WorkbenchError("存在尚未确认的操作结果，请先核对", 409, "work_unresolved");
+        if (unresolved) throw new WorkbenchError("存在尚未确认的操作结果，请先核对", 409, "work_unresolved", "none");
         checkpoint = await this.session.service.prepareRunCheckpoint(link.session_id, link.member_id,link.task_id ?? undefined);
       }
-      ledger.db.transaction(() => {
+      const commitReview = () => {
         const run = requireRun(this.config, ledger, ref.id);
-        if (run.revision !== ref.expectedRevision) throw new WorkbenchError("任务已更新，请刷新后再次确认", 409, "revision_conflict");
+        if (run.revision !== ref.expectedRevision) throw new WorkbenchError("任务已更新，请刷新后再次确认", 409, "revision_conflict", "none");
         if (run.status === "running" && ref.completeExecution) {
           const currentRevision = ledger.db.prepare("SELECT revision FROM qm_session_members WHERE id=?")
             .get(link!.member_id) as { revision: number };
           if (!checkpoint || (checkpoint.snapshot.changeRev ?? checkpoint.revision) !== currentRevision.revision) {
-            throw new WorkbenchError("工作内容已更新，请重新核对后验收", 409, "revision_conflict");
+            throw new WorkbenchError("工作内容已更新，请重新核对后验收", 409, "revision_conflict", "none");
           }
           ledger.finish(run.id, { status: "completed", acceptance: verdict === "accept" ? "passed" : "failed",
             summary: note || "用户已确认当前工作结束", evidence: [{ label: "用户验收", reference: note || "用户在控制台明确结束并验收当前工作", outcome: verdict === "accept" ? "passed" : "failed" }] });
@@ -82,13 +77,15 @@ export class LocalActions {
             review_status: verdict === "accept" ? ReviewState.passed : ReviewState.failed } });
           return;
         }
-        if (run.status !== "completed" || run.acceptance !== "pending") throw new WorkbenchError("只有执行完成且待验收的任务可以验收");
+        if (run.status !== "completed" || run.acceptance !== "pending") throw new WorkbenchError("只有执行完成且待验收的任务可以验收", 409, "operation_rejected", "none");
         const evidence = JSON.parse(run.evidence);
         evidence.push({ label: "用户验收", reference: note || "用户在控制台确认执行结果", outcome: verdict === "accept" ? "passed" : "failed" });
         ledger.db.prepare("UPDATE console_work_runs SET acceptance=?, evidence=?, revision=revision+1 WHERE id=? AND revision=?")
           .run(verdict === "accept" ? "passed" : "failed", JSON.stringify(evidence), run.id, run.revision);
-      }).immediate();
-      if (this.session && link?.latest_run === ref.id) this.session.store.setReviewState(link.session_id, verdict === "accept" ? ReviewState.passed : ReviewState.failed);
+      };
+      if (this.session && link?.task_id) this.session.store.commitTaskReviewState(link.session_id, link.task_id, link.member_id, ref.id,
+        verdict === "accept" ? ReviewState.passed : ReviewState.failed, ledger.db, commitReview);
+      else ledger.db.transaction(commitReview).immediate();
       this.audit.record("run.review", ref.id, { acceptance: "pending" }, { verdict, note }, requestKey);
       return { id: ref.id, ok: true, revision: ref.expectedRevision + 1 };
     } finally { ledger.close(); }
@@ -99,7 +96,7 @@ export class LocalActions {
     const agents = new LocalAgentStore(this.config.stateDir);
     try {
       const project = ledger.getProject(projectId);
-      if (!permitted(this.config, project.root)) throw new WorkbenchError("项目不在允许访问的范围内", 403, "project_scope");
+      if (!permitted(this.config, project.root)) throw new WorkbenchError("项目不在允许访问的范围内", 403, "project_scope", "none");
       const node = this.config.federation?.nodeId ?? "local";
       const projectRunIds = (ledger.db.prepare("SELECT id FROM console_work_runs WHERE project_id=?").all(projectId) as Array<{ id: string }>).map((row) => row.id);
       const runs = readLocalIndex(this.config, projectRunIds).runs;
@@ -119,7 +116,7 @@ export class LocalActions {
           executionStatus:task.executionStatus,acceptanceStatus:task.acceptanceStatus,lastActivityAt:task.lastActivityAt,
           startedAt:task.startedAt,finishedAt:task.finishedAt,hasRun:true}));
         for(const task of taskRows)if(!tasks.some(value=>value.taskId===task.id)){
-          const execution=task.state==='closed' ? ['completed','failed','cancelled'].includes(task.result_status ?? '') ? task.result_status! : 'ended' : 'waiting';
+          const execution=taskView({requestState:task.state,result:task.result_status,execution:'waiting',lastProgressAt:Date.parse(task.last_activity_at),now:Date.now()}).status;
           tasks.push({id:taskReference(task.id),taskId:task.id,title:task.title,status:stage({executionStatus:execution,acceptanceStatus:'not_required'}),
             root:project.root,workspaces:[{nodeId:node,projectId:workspaceHandle(node,projectId),memberId:null,name:project.name,root:project.root}],
             executionStatus:execution,acceptanceStatus:'not_required',lastActivityAt:Date.parse(task.last_activity_at),startedAt:Date.parse(task.created_at),
@@ -148,77 +145,62 @@ export class LocalActions {
       });
       const batches = ledger.db.prepare("SELECT id,mode,status,created_at FROM console_archive_batches WHERE project_id=? ORDER BY created_at DESC LIMIT 50").all(projectId) as Array<{ id: string; mode: string; status: string; created_at: string }>;
       const execution=new ExecutionCoordinator(this.config.stateDir);
-      let executionClaims:ReturnType<ExecutionCoordinator['inspect']>;
-      try { executionClaims=execution.inspect(project.root); } finally { execution.close(); }
+      let executionClaims:Array<ReturnType<ExecutionCoordinator['inspect']>[number] & {waiting?:ReturnType<ExecutionCoordinator['waitingState']>}>;
+      try { executionClaims=execution.inspect(project.root).map(claim=>({...claim,
+        ...(claim.state==='queued' && claim.agentId ? {waiting:execution.waitingState(project.root,claim.agentId)} : {})})); }
+      finally { execution.close(); }
       return { conversations,executionClaims,items, batches: batches.map((batch) => ({ id: workspaceHandle(node, batch.id), mode: batch.mode,
         status: batch.status === "succeeded" ? "completed" : batch.status, createdAt: Date.parse(batch.created_at) })),
         claims: items.filter((thread) => thread.control !== "idle").map((thread) => ({ id: thread.id, owner: thread.control, turnId: thread.turnId, updatedAt: thread.updatedAt })) };
     } finally { agents.close(); ledger.close(); }
   }
 
-  async runControl(id: string, input: { action: "resume" | "interrupt"; expectedRevision: number; requestKey: string }) {
+  runControl(id: string, input: ControlInput) {
+    return controlRun(this.config, this.session, this.processSessions, id, input);
+  }
+
+  reconcileControl(id: string, requestKey: string) {
+    return reconcileControl(this.config, id, requestKey);
+  }
+
+  reconcileReview(id: string, verdict: "accept" | "reject", note: string) {
     const ledger = new WorkLedger(this.config.stateDir);
-    const store = new LocalAgentStore(this.config.stateDir);
     try {
       const run = requireRun(this.config, ledger, id);
-      if (run.revision !== input.expectedRevision) throw new WorkbenchError("任务已更新，请刷新后继续", 409, "revision_conflict");
-      const executions = ledger.executions(id);
-      const latest = executions.at(-1);
-      const agent = latest ? store.getById(latest.agent_id) : undefined;
-      if (!agent) throw new WorkbenchError("这个记录没有可控制的受管代理，请从原来的工作入口继续", 409, "agent_unavailable");
-      const scope = { workspaceId: agent.workspaceId, workspaceRoot: agent.workspaceRoot };
-      const client = createLocalAgentClient(this.config);
-      if (input.action === "resume") {
-        if (!["interrupted", "reconciliation_required"].includes(run.status)) throw new WorkbenchError("当前任务不处于可恢复的中断状态");
-        if (new Set(executions.map((entry) => entry.agent_id)).size !== 1) throw new WorkbenchError("此任务包含多个代理，请从原工作入口选择要继续的部分");
-        ledger.resume(id);
-        const result = await client.continue(agent.id, "继续完成当前任务。先检查已经保存的工作进度和执行结果，再完成尚未结束的部分。", { workRunId: id, requestKey: input.requestKey }, scope);
-        if (result.isErr()) {
-          if (!ledger.hasActiveChild(id)) ledger.db.prepare("UPDATE console_work_runs SET status='reconciliation_required',summary=?,revision=revision+1 WHERE id=? AND status='running'")
-            .run(`恢复请求尚未确认：${result.error.message}`, id);
-          throw result.error;
-        }
-      } else {
-        const activeIds = [...new Set(executions.filter((entry) => ["starting", "queued", "running"].includes(entry.status)).map((entry) => entry.agent_id))];
-        if (!activeIds.length) throw new WorkbenchError("当前任务已经没有执行中的受管代理");
-        for (const agentId of activeIds) {
-          const current = store.getById(agentId);
-          if (!current) throw new WorkbenchError("受管代理记录已不存在，请刷新任务状态");
-          const agentScope = { workspaceId: current.workspaceId, workspaceRoot: current.workspaceRoot };
-          if (current.status === "queued" || current.status === "starting") {
-            const cancelled = await client.cancelQueued(current.id, agentScope);
-            if (cancelled.isErr()) throw cancelled.error;
-          } else {
-            const interrupted = await client.control({ agentId: current.id, action: "interrupt", workRunId: id,
-              requestKey: input.requestKey, expectedTurnId: current.providerTurnId, scope: agentScope });
-            if (interrupted.isErr()) throw interrupted.error;
-          }
-        }
-      }
-      this.audit.record(`run.${input.action}`, id, null, { agent: agent.id, status: "accepted" }, input.requestKey);
-      return { status: "accepted", agentId: agent.id };
-    } finally { store.close(); ledger.close(); }
+      const target = verdict === "accept" ? "passed" : "failed";
+      const evidence = JSON.parse(run.evidence) as Array<{label: string; reference: string; outcome: string}>;
+      const link = linkForRun(ledger, id);
+      const taskRecorded = !this.session || !link?.task_id || Boolean(ledger.db.prepare(`SELECT 1 FROM qm_events
+        WHERE session_id=? AND task_id=? AND member_id=? AND event_type='verification_recorded'
+          AND json_extract(data_json,'$.run_id')=? AND json_extract(data_json,'$.decision')=? LIMIT 1`)
+        .get(link.session_id, link.task_id, link.member_id, id, target));
+      const verified = run.status === "completed" && run.acceptance === target
+        && taskRecorded
+        && evidence.some(value => value.label === "用户验收" && value.outcome === target
+          && (note ? value.reference === note : ["用户在控制台确认执行结果", "用户在控制台明确结束并验收当前工作"].includes(value.reference)));
+      return { verified, effect: "applied" as const, response: { id, ok: true, revision: run.revision } };
+    } finally { ledger.close(); }
   }
 
   async revertPreview(id: string, files: string[], expectedRevision: number) {
-    if (!this.session) throw new WorkbenchError("运行版本尚未提供会话撤销", 409, "revert_unavailable");
+    if (!this.session) throw new WorkbenchError("运行版本尚未提供会话撤销", 409, "revert_unavailable", "none");
     const ledger = new WorkLedger(this.config.stateDir);
     try {
       const run = requireRun(this.config, ledger, id);
-      if (run.revision !== expectedRevision) throw new WorkbenchError("任务已经更新", 409, "revision_conflict");
+      if (run.revision !== expectedRevision) throw new WorkbenchError("任务已经更新", 409, "revision_conflict", "none");
       const link = linkForRun(ledger, id);
-      if (!link) throw new WorkbenchError("此任务没有可自动撤销的会话写入证据");
+      if (!link) throw new WorkbenchError("此任务没有可自动撤销的会话写入证据", 409, "operation_rejected", "none");
       const checkpoint = readRunCheckpoint(ledger.db, id);
-      if (!checkpoint && !link.task_id && link.latest_run !== id) throw new WorkbenchError("此历史任务没有保存可验证的文件版本，无法自动撤销");
+      if (!checkpoint && !link.task_id && link.latest_run !== id) throw new WorkbenchError("此历史任务没有保存可验证的文件版本，无法自动撤销", 409, "operation_rejected", "none");
       if (checkpoint) {
         const current = this.session.store.fileSummaries(link.session_id, link.member_id,link.task_id ?? undefined);
         if (files.some((id) => {
           const recorded = checkpoint.files.find((file) => file.id === id);
           return !recorded || !current.some((file) => file.id === id && file.hash === recorded.hash);
-        })) throw new WorkbenchError("文件已不再是这段工作保存的版本，请重新查看改动", 409, "revision_conflict");
+        })) throw new WorkbenchError("文件已不再是这段工作保存的版本，请重新查看改动", 409, "revision_conflict", "none");
       }
       const eligibility = await this.session.reverter.eligibility(link.owner_id, link.session_id, link.member_id, files,link.task_id ?? undefined);
-      if (!eligibility.allowed) throw new WorkbenchError(`当前无法撤销：${eligibility.reason}`);
+      if (!eligibility.allowed) throw new WorkbenchError(`当前无法撤销：${eligibility.reason}`, 409, "operation_rejected", "none");
       ledger.db.prepare("DELETE FROM console_revert_previews WHERE expires_at<=?").run(Date.now());
       const preview: RevertPreview = { id: randomUUID(), runId: id, sessionId: link.session_id, memberId: link.member_id,
         owner: link.owner_id,taskId:link.task_id ?? undefined, revision: eligibility.revision, files, expiresAt: Date.now() + 300_000 };
@@ -233,29 +215,36 @@ export class LocalActions {
     try {
       const saved = ledger.db.prepare("SELECT data_json FROM console_revert_previews WHERE id=?").get(previewId) as { data_json: string } | undefined;
       const preview = saved ? JSON.parse(saved.data_json) as RevertPreview : null;
-      if (!preview || preview.id !== confirmation || preview.expiresAt <= Date.now()) throw new WorkbenchError("撤销预览已失效，请重新确认", 409, "preview_expired");
-      if (!this.session) throw new WorkbenchError("当前服务没有会话撤销能力");
+      if (!preview || preview.id !== confirmation || preview.expiresAt <= Date.now()) throw new WorkbenchError("撤销预览已失效，请重新确认", 409, "preview_expired", "none");
+      if (!this.session) throw new WorkbenchError("当前服务没有会话撤销能力", 409, "operation_rejected", "none");
       const result = await this.session.reverter.revert(preview.owner, preview.sessionId, preview.memberId, preview.revision, true, preview.files,preview.taskId);
       ledger.db.prepare("DELETE FROM console_revert_previews WHERE id=?").run(previewId);
-      this.audit.record("run.revert", preview.runId, null, { files: result.changed_paths }, requestKey);
+      this.audit.record("run.revert", preview.runId, null, {previewId, files: result.changed_paths,revision:result.revision}, requestKey);
       return { status: "completed", files: result.changed_paths, revision: result.revision };
     } finally { ledger.close(); }
   }
 
-  async archive(projectId: string, input: { mode?: "archive" | "restore"; ids?: string[]; batchId?: string; confirmationHash?: string; externalIdleConfirmed?: boolean }) {
+  async reconcileArchive(projectId: string, batchId: string, requestKey: string) {
     const ledger = new WorkLedger(this.config.stateDir);
     const service = new ProjectArchive(ledger, new CodexThreadControl());
     try {
-      if (!permitted(this.config, ledger.getProject(projectId).root)) throw new WorkbenchError("项目不在允许访问的范围内", 403, "project_scope");
+      if (!permitted(this.config, ledger.getProject(projectId).root)) throw new WorkbenchError("项目不在允许访问的范围内", 403, "project_scope", "none");
+      const step = service.step(projectId, batchId, requestKey);
+      if (!step || step.managed_thread_id && !["succeeded", "skipped"].includes(step.status ?? "")) return { verified: false };
+      const response = archiveResponse(service.view(projectId, batchId));
+      return { verified: true, effect: response.effect, response };
+    } finally { await service.close(); ledger.close(); }
+  }
+
+  async archive(projectId: string, input: { mode?: "archive" | "restore"; ids?: string[]; batchId?: string; confirmationHash?: string; externalIdleConfirmed?: boolean; acceptPartial?: boolean; requestKey?: string }) {
+    const ledger = new WorkLedger(this.config.stateDir);
+    const service = new ProjectArchive(ledger, new CodexThreadControl());
+    try {
+      if (!permitted(this.config, ledger.getProject(projectId).root)) throw new WorkbenchError("项目不在允许访问的范围内", 403, "project_scope", "none");
       const result = input.batchId
-        ? await service.execute(projectId, input.batchId, input.confirmationHash!, input.externalIdleConfirmed === true)
-        : await service.plan(projectId, { mode: input.mode!, threadKeys: input.ids });
-      return { id: result.batchId, projectId, mode: result.mode,
-        status: result.status === "succeeded" ? "completed" : result.status,
-        confirmationHash: result.confirmationHash, expiresAt: Date.parse(result.expiresAt),
-        entries: result.entries.map((entry) => ({ id: entry.managedThreadId, title: entry.title, ready: entry.status === "ready", reason: entry.reason, status: entry.status })),
-        results: result.entries.map((entry) => ({ id: entry.managedThreadId, ok: entry.status === "succeeded", error: entry.reason, pending: entry.status === "ready" })),
-      };
+        ? await service.execute(projectId, input.batchId, input.confirmationHash!, input.externalIdleConfirmed === true, input.requestKey)
+        : await service.plan(projectId, { mode: input.mode!, threadKeys: input.ids, acceptPartial: input.acceptPartial });
+      return archiveResponse(result);
     } finally { await service.close(); ledger.close(); }
   }
 }

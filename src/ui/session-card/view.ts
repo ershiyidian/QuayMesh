@@ -199,7 +199,7 @@ export function createCardView(doc: Document, state: CardState, onIntent:CardInt
 
   function contextMarkup():string {
     const snapshot=state.snapshot;if(!snapshot)return"";
-    const rows:Array<[string,string]>=[["Session",snapshot.sessionId],["Task",snapshot.taskId??""],["状态",statusLabel(cardPresentation(snapshot,cardNow(state)).status)]];
+    const rows:Array<[string,string]>=[["Session",snapshot.sessionId],["Task",snapshot.taskId??""],["状态",cardPresentation(snapshot,cardNow(state)).label]];
     for(const workspace of snapshot.workspaces)rows.push([workspace.node_id,workspace.root]);
     let html=rows.map(([key,value])=>kv(key,value)).join("");
     const instructions=selectedInstructions(state);
@@ -273,7 +273,6 @@ export function createCardView(doc: Document, state: CardState, onIntent:CardInt
 }
 
 function statusIcon(status:CardStatus):string{return status==="running"?icon("run","spin"):status==="stalled"?icon("warn"):status==="failed"?icon("fail"):status==="success"?icon("ok"):status==="cancelled"?icon("stop"):icon("run");}
-function statusLabel(status:CardStatus):string{return{running:"运行中",stalled:"长时间无工具活动",failed:"失败",success:"已完成",cancelled:"已停止",handed_off:"已交接",finalizing:"正在确认结束",archived:"已归档",idle:"等待下一步",unavailable:"状态暂不可用"}[status];}
 function statusClass(status:CommandSummary["status"]):string{return status==="run"||status==="queued"?"running":status==="ok"?"ok":status==="fail"?"failed":"cancelled";}
 function commandIcon(status:CommandSummary["status"]):string{return status==="run"?icon("run","spin"):status==="ok"?icon("ok"):status==="fail"?icon("fail"):icon("stop");}
 function agentDot(status:AgentSummary["state"]):string{return status==="working"?"working":status==="done"?"done":status==="failed"?"failed":"";}

@@ -18,10 +18,11 @@ test("初始数据库创建全部工作区、任务和认证表", () => {
     migrateDatabase(db);
     assert.deepEqual(db.prepare("SELECT version,name FROM qm_schema_migrations").all(),
       [{version:1,name:"quaymesh-initial"},{version:2,name:"quaymesh-runtime-ownership"},{version:3,name:"quaymesh-durable-results"},{version:4,name:"quaymesh-task-lifecycle"},
-        {version:5,name:"quaymesh-execution-observation"},{version:6,name:"quaymesh-invocation-attempts"}]);
+        {version:5,name:"quaymesh-execution-observation"},{version:6,name:"quaymesh-invocation-attempts"},{version:7,name:"quaymesh-console-audit"}]);
     for (const name of ["workspace_sessions","oauth_clients","console_work_runs","execution_claims",
       "local_agent_sessions","qm_sessions","qm_tasks","qm_task_members","qm_task_snapshots","qm_task_context",
-      "qm_runtime_work","qm_runtime_admission","qm_transfers","qm_task_change_baselines","qm_task_file_changes","qm_task_finalizations"]) {
+      "qm_runtime_work","qm_runtime_admission","qm_transfers","qm_task_change_baselines","qm_task_file_changes","qm_task_finalizations",
+      "console_audit","console_archive_steps"]) {
       assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(name));
     }
     assert.equal(db.pragma("foreign_keys",{simple:true}),1);
@@ -190,7 +191,11 @@ test("首次建表和旧版本升级失败均回滚全部迁移，再次升级�
     old.exec(`DROP INDEX qm_invocations_retry_of;
       ALTER TABLE qm_invocations DROP COLUMN retry_of_invocation_id;
       ALTER TABLE qm_invocations DROP COLUMN task_id;
-      DELETE FROM qm_schema_migrations WHERE version=6;
+      ALTER TABLE qm_invocations DROP COLUMN response_json;
+      DROP TABLE console_archive_steps;
+      DROP TABLE console_audit;
+      DROP TABLE console_audit_imports;
+      DELETE FROM qm_schema_migrations WHERE version>=6;
       CREATE TRIGGER reject_upgrade BEFORE INSERT ON qm_schema_migrations WHEN NEW.version=6
         BEGIN SELECT RAISE(ABORT,'migration stopped'); END;`);
     assert.throws(()=>migrateDatabase(old),/migration stopped/);
@@ -202,4 +207,30 @@ test("首次建表和旧版本升级失败均回滚全部迁移，再次升级�
     assert.equal(old.prepare("SELECT max(version) FROM qm_schema_migrations").pluck().get(),LATEST_DATABASE_VERSION);
     assert.equal(old.pragma("integrity_check",{simple:true}),"ok");
   } finally {fresh.close();old.close();}
+});
+
+test("版本六调用保留历史结果，升级不把当前终态结果冒充首响应", () => {
+  const db = new Database(":memory:");
+  try {
+    migrateDatabase(db);
+    db.exec(`ALTER TABLE qm_invocations DROP COLUMN response_json;
+      DROP TABLE console_archive_steps;
+      DROP TABLE console_audit;
+      DROP TABLE console_audit_imports;
+      DELETE FROM qm_schema_migrations WHERE version=7;`);
+    const at = "2026-10-20T01:00:00.000Z", result = JSON.stringify({ kind: "error", message: "later process failure" });
+    db.prepare("INSERT INTO qm_sessions(id,owner_id,title,created_at,last_activity_at) VALUES(?,?,?,?,?)")
+      .run("history-session", "owner", "Historical call", at, at);
+    db.prepare(`INSERT INTO qm_session_members(id,session_id,node_id,workspace_id,root,mode,recovery_root,first_seen_at,last_observed_at)
+      VALUES(?,?,?,?,?,?,?,?,?)`).run("history-member", "history-session", "local", "workspace", "/work", "checkout", "/work", at, at);
+    db.prepare(`INSERT INTO qm_invocations(id,owner_id,transport_instance_id,request_id,session_id,member_id,tool_name,arguments_json,
+      state,effect,result_json,created_at,response_at,finished_at) VALUES(?,?,?,?,?,?,?,'{}','failed','completed',?,?,?,?)`)
+      .run("history-call", "owner", "transport", "request", "history-session", "history-member", "exec_command", result, at, at, at);
+    migrateDatabase(db);
+    const call = db.prepare("SELECT result_json,response_json,response_at FROM qm_invocations WHERE id='history-call'").get() as {
+      result_json: string; response_json: string | null; response_at: string;
+    };
+    assert.equal(call.result_json, result); assert.equal(call.response_json, null); assert.equal(call.response_at, at);
+    assert.equal(db.pragma("integrity_check", { simple: true }), "ok");
+  } finally { db.close(); }
 });

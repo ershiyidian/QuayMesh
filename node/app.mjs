@@ -426,6 +426,7 @@ export class QuayMeshNode {
           settings.appliedRevision=this.config.node.settingsRevision;
           settings.applied=settings.savedRevision===settings.appliedRevision;
           settings.pending=!settings.applied;
+          settings.applicationError=this.errors.snapshot().current.find(error=>error.source==="settings")?.message??null;
           settings.federationPort=this.config.node.peerPort;
           settings.ingressPort=this.config.cluster.discovery.localPort;
           settings.publicBaseUrl=this.config.cluster.discovery.resourceUrl??null;

@@ -1,7 +1,7 @@
 import * as z from "zod/v4";
 import { jsonReply, REPLY_BYTES, replyBytes } from "../bounded-reply.js";
 import { currentInvocation } from "../session/invocations.js";
-import { OperationState } from "../session/types.js";
+import { cancelManagedCommand } from "../managed-command-control.js";
 import { mapConcurrent } from "../concurrency.js";
 import type { ToolRegistrationContext } from "./types.js";
 
@@ -105,22 +105,7 @@ export function registerOperationTools(context:ToolRegistrationContext):void {
   },async({workspace_id,operation_id})=>{
     const invocation=currentInvocation();if(!invocation)throw new Error("MISSING_OPERATION_CONTEXT");
     const workspace=await context.workspaces.getWorkspace(workspace_id);
-    const recorded=runtime.store.requireCommand(invocation.owner_id,context.config.federation?.nodeId??"local",workspace.canonicalRoot,operation_id);
-    const active=processSessions.findOperation(operation_id);
-    if(["completed","failed","cancelled"].includes(recorded.status))return jsonReply({operation_id,state:recorded.status,cancel_requested:false});
-    const saved = runtime.store.findInvocationByOperation(invocation.owner_id, operation_id)!;
-    if (saved.effect === "not_started" && !active) {
-      const result = jsonReply({ operation_id, result: "命令在启动前已取消。", running: false,
-        accepted: true, state: "cancelled", effect: "not_started" });
-      runtime.store.updateInvocation({ ownerId: saved.owner_id, transportInstanceId: saved.transport_instance_id,
-        requestId: saved.request_id, state: OperationState.cancelled, effect: "not_started",
-        result: { kind: "result", value: result }, finished: true, responded: true });
-      await runtime.service.finishOperationById(operation_id, { status: OperationState.cancelled,
-        effect: "not_started", result_ref: operation_id });
-      return jsonReply({ operation_id, state: "cancelled", cancel_requested: true });
-    }
-    if(!active?.running)throw new Error("COMMAND_NOT_ATTACHED: inspect existing process ownership before cancelling");
-    processSessions.terminate(active.workspace_id,operation_id);
-    return jsonReply({operation_id,state:"stopping",cancel_requested:true});
+    return jsonReply(await cancelManagedCommand({ runtime, processSessions, ownerId: invocation.owner_id,
+      nodeId: context.config.federation?.nodeId ?? "local", workspaceRoot: workspace.canonicalRoot, operationId: operation_id }));
   });
 }

@@ -7,7 +7,7 @@ import { runOperations, runTimeline } from "../console-run-data.js";
 import { LocalAgentStore } from "../local-agent-store.js";
 import type { SessionRuntime } from "../session/runtime.js";
 import { linkForRun, readLocalIndex, requireRun } from "./local.js";
-import { WorkbenchError } from "./types.js";
+import { WorkbenchError, type SourceState } from "./types.js";
 import { diffPage } from "./diff.js";
 import { readRunCheckpoint } from "../session/run-checkpoints.js";
 
@@ -23,6 +23,7 @@ interface FileRow {
   id: string; path: string; kind: string; add: number | null; del: number | null;
   generated: boolean; revision: number | string; binary: boolean; revertible: boolean;
   operationId?: string; fileIndex?: number;
+  source?:{runId:string;nodeId:string;projectName:string;root:string};
 }
 
 const commandState = (value: string) => value === "ok" || value === "completed" ? "done"
@@ -106,11 +107,12 @@ export async function readRunDetail(config: ServerConfig, id: string, runtime?: 
         provider: latest.provider, status: commandState(latest.status),
         tokens: own.every((execution) => execution.delta !== null) ? own.reduce((sum, execution) => sum + (JSON.parse(execution.delta!).totalTokens ?? 0), 0) : null };
     });
+    const summary=row.summary||run.reason||(run.executionStatus==='running'?'任务正在执行':run.executionStatus==='waiting'?'当前没有后台执行，请求尚未结束':'查看下方保存的执行记录');
     return {
-      run, summary: row.summary || (run.executionStatus === "running" ? "任务正在执行" : run.executionStatus === "idle" ? "当前操作已结束，等待下一步指令" : "查看下方保存的执行记录"),
+      run,summary,phases:[{id:run.id,run,summary}],complete:true,sources:[] as SourceState[],missingPhases:[] as Array<{id:string;nodeId:string;error:string}>,
       evidence: (JSON.parse(row.evidence) as Array<{ label: string; reference: string; outcome: string }>).map((evidence) => ({
         name: evidence.label, detail: evidence.reference, ok: evidence.outcome === "passed" ? true : evidence.outcome === "failed" ? false : null, time: run.finishedAt,
-      })), files, commands, agents: agentRows,
+      })), files:files.map(file=>({...file,source:{runId:run.id,nodeId:run.nodeId,projectName:run.projectName,root:run.root}})), commands, agents: agentRows,
       timeline: runTimeline(row, operations, executions).map((event) => ({ time: Date.parse(event.time), text: [event.title, event.detail].filter(Boolean).join(" · "), tone: event.type === "error" ? "red" : "muted" })),
       instructions: snapshot?.instructions ?? [], skills: snapshot?.skills ?? [],
       warnings, revision: row.revision,

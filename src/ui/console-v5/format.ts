@@ -1,5 +1,8 @@
 let selectedZone = 'local';
-export const setDisplayTimeZone = (zone: string) => { selectedZone = zone; };
+export const setDisplayTimeZone = (zone: string) => {
+    try { if (zone !== 'local') new Intl.DateTimeFormat('en', { timeZone: zone }).format(0); selectedZone = zone; }
+    catch { selectedZone = 'local'; }
+};
 export const timeZone = () => selectedZone === 'local' ? undefined : selectedZone;
 
 let formatterZone: string | undefined;
@@ -25,11 +28,17 @@ function dateFormatters() {
     return formatters;
 }
 
-export const tm = (t: number | null | undefined) => t ? dateFormatters().time.format(t) : '—';
+export const validTime = (t: number | null | undefined): t is number => typeof t === 'number' && Number.isFinite(t) && Math.abs(t) <= 8.64e15;
+export function timestamp(value: number | string | null | undefined): number | null {
+    const time = typeof value === 'number' ? value : typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value) ? Date.parse(value) : null;
+    return validTime(time) ? time : null;
+}
+export const tm = (t: number | null | undefined) => validTime(t) ? dateFormatters().time.format(t) : '—';
 
-export const fullTime = (t: number | null | undefined) => t ? dateFormatters().full.format(t) : '未上报';
+export const fullTime = (t: number | null | undefined) => validTime(t) ? dateFormatters().full.format(t) : '未上报';
 
 export function day(t: number): string {
+    if (!validTime(t)) return '未知日期';
     const f = dateFormatters(), key = Math.floor(t / 60000);
     if (dayCache.has(key))
         return dayCache.get(key)!;
@@ -41,18 +50,18 @@ export function day(t: number): string {
     return value;
 }
 
-export const smartTime = (t: number | null | undefined) => !t ? '—' : day(t) === day(Date.now()) ? tm(t) : dateFormatters().short.format(t);
+export const smartTime = (t: number | null | undefined) => !validTime(t) ? '—' : day(t) === day(Date.now()) ? tm(t) : dateFormatters().short.format(t);
 
-export const ago = (t: number | null | undefined) => !t ? '未知' : Date.now() - t < 60000 ? '刚刚' : Date.now() - t < 3600000 ? Math.floor((Date.now() - t) / 60000) + ' 分钟前' : Date.now() - t < 86400000 ? Math.floor((Date.now() - t) / 3600000) + ' 小时前' : Math.floor((Date.now() - t) / 86400000) + ' 天前';
+export const ago = (t: number | null | undefined) => !validTime(t) ? '未知' : Date.now() - t < 60000 ? '刚刚' : Date.now() - t < 3600000 ? Math.floor((Date.now() - t) / 60000) + ' 分钟前' : Date.now() - t < 86400000 ? Math.floor((Date.now() - t) / 3600000) + ' 小时前' : Math.floor((Date.now() - t) / 86400000) + ' 天前';
 
-export function duration(ms: number | null | undefined): string { if (ms == null || ms < 0)
+export function duration(ms: number | null | undefined): string { if (ms == null || !Number.isFinite(ms) || ms < 0)
     return '—'; const s = Math.floor(ms / 1000); return s < 60 ? s + 's' : s < 3600 ? Math.floor(s / 60) + 'm ' + String(s % 60).padStart(2, '0') + 's' : Math.floor(s / 3600) + 'h ' + String(Math.floor(s / 60) % 60).padStart(2, '0') + 'm'; }
 
-export const fmt = (n: number | null | undefined): string => n == null ? '未知' : numberFormatter.format(Math.round(n));
+export const fmt = (n: number | null | undefined): string => n == null || !Number.isFinite(n) ? '未知' : numberFormatter.format(Math.round(n));
 
-export const compact = (n: number | null | undefined): string => n == null ? '未知' : n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : fmt(n);
+export const compact = (n: number | null | undefined): string => n == null || !Number.isFinite(n) ? '未知' : n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : fmt(n);
 
-export function bytes(n: number | null | undefined): string { if (n == null)
+export function bytes(n: number | null | undefined): string { if (n == null || !Number.isFinite(n) || n < 0)
     return '未上报'; const u = ['B', 'KiB', 'MiB', 'GiB', 'TiB']; let i = 0; while (n >= 1024 && i < 4) {
     n /= 1024;
     i++;

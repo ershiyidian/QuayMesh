@@ -1,5 +1,5 @@
 import { consoleError, type createApi } from "./client.js";
-import type { CacheEntry, RunDetail, RunPage, Overview, FileDiff } from "./contracts.js";
+import type { CacheEntry, RunDetail, RunPage, FileDiff } from "./contracts.js";
 
 export class Resources {
   readonly entries = new Map<string, CacheEntry>();
@@ -7,20 +7,26 @@ export class Resources {
     freshness(path: string): number;
     paint(): void;
     loaded(path: string): void;
-    observe(snapshot: Overview): void;
   }) {}
 
   data<T>(path: string): T | undefined { return this.entries.get(path)?.data as T | undefined; }
 
   async load(path: string, force = false): Promise<unknown> {
     let entry = this.entries.get(path);
-    if (entry?.promise) return entry.promise;
+    if (entry?.promise && !force) return entry.promise;
+    if (entry?.promise || force && entry?.loading) {
+      entry.ctl?.abort();
+      entry = { ...entry, promise: null, ctl: undefined, loading: false };
+      this.entries.set(path, entry);
+    }
     if (!force && entry?.error && Date.now() < (entry.retryAt ?? 0)) return entry.data;
     if (!force && entry?.data && Date.now() - entry.time < this.options.freshness(path)) return entry.data;
     if (!entry) { entry = { data: null, time: 0, error: null, loading: false }; this.entries.set(path, entry); }
     const current = entry, controller = new AbortController();
-    current.loading = true; current.error = null; current.ctl = controller;
-    current.promise = this.api.get<unknown>(path, controller.signal).then((value) => {
+    current.loading = true; current.error = null; current.ctl = controller; current.startedAt = Date.now();
+    const requestPath = force && !['session','login','logout','sessions/revoke-all'].includes(path.split('?')[0])
+      ? path + (path.includes('?') ? '&' : '?') + 'fresh=1' : path;
+    current.promise = this.api.get<unknown>(requestPath, controller.signal).then((value) => {
       if (controller.signal.aborted || this.entries.get(path) !== current) return;
       this.validate(path, value);
       if (/^runs\/[^/?]+$/.test(path)) {
@@ -36,41 +42,68 @@ export class Resources {
         const detail = this.entries.get("runs/" + encodeURIComponent(run.id)) as CacheEntry<RunDetail> | undefined;
         if (detail?.data && (detail.data.run.revision !== run.revision || detail.data.run.workspaceRevision !== run.workspaceRevision)) detail.time = 0;
       }
-      current.data = value; current.time = Date.now(); current.error = null; current.retryAt = 0;
-      if (path.startsWith("overview")) this.options.observe(value as Overview);
+      current.data = value; current.time = Date.now(); current.error = null; current.retryAt = 0; current.failures = 0;
+      current.duration = current.time - current.startedAt!;
       return value;
     }).catch((failure: unknown) => {
+      if (controller.signal.aborted || this.entries.get(path) !== current) return null;
       const error = consoleError(failure);
-      if (error.name !== "AbortError") { current.error = error; current.retryAt = Date.now() + Math.max(8000, this.options.freshness(path)); }
+      if (error.name !== "AbortError") {
+        current.error = error; current.failures = (current.failures || 0) + 1;
+        current.retryAt = Date.now() + Math.min(60_000, Math.max(8000, Math.min(30_000, this.options.freshness(path))) * 2 ** Math.min(current.failures - 1, 3));
+      }
       return null;
-    }).finally(() => { current.loading = false; current.promise = null; this.options.paint(); this.options.loaded(path); });
+    }).finally(() => {
+      if (this.entries.get(path) !== current) return;
+      current.loading = false; current.promise = null; this.options.paint();
+      if (!controller.signal.aborted) this.options.loaded(path);
+    });
     if (!current.data) this.options.paint();
     return current.promise;
+  }
+
+  cancelAll(): void { for (const entry of this.entries.values()) entry.ctl?.abort(); }
+
+  invalidate(): void {
+    for (const [path, entry] of this.entries) {
+      entry.ctl?.abort();
+      this.entries.set(path, { ...entry, time: 0, promise: null, ctl: undefined, loading: false, retryAt: 0 });
+    }
   }
 
   async moreFile(path: string): Promise<number | null> {
     const entry = this.entries.get(path) as CacheEntry<FileDiff> | undefined;
     if (!entry || !entry.data?.nextCursor || entry.loading) return null;
     const previous = entry.data;
-    entry.loading = true;
+    const controller = new AbortController(); entry.ctl = controller; entry.loading = true;
     try {
-      const next = await this.api.get<FileDiff>(path + "?cursor=" + encodeURIComponent(previous.nextCursor!));
-      if (this.entries.get(path) !== entry) return null;
+      const next = await this.api.get<FileDiff>(path + "?cursor=" + encodeURIComponent(previous.nextCursor!),controller.signal);
+      if (controller.signal.aborted || this.entries.get(path) !== entry) return null;
+      this.validate(path,next);
       if (next.file.revision !== previous.file.revision) throw new Error("文件已变化，请刷新后重新查看");
+      if (next.nextCursor && next.nextCursor === previous.nextCursor) throw new Error("文件分页游标没有推进，请重新读取文件");
       const rows = [...previous.file.rows, ...next.file.rows];
       entry.data = { ...next, file: { ...next.file, rows } }; entry.error = null;
       return rows.length;
-    } catch (failure) { entry.error = consoleError(failure); return null; }
-    finally { entry.loading = false; this.options.paint(); }
+    } catch (failure) { if (!controller.signal.aborted && this.entries.get(path) === entry) entry.error = consoleError(failure); return null; }
+    finally { if (this.entries.get(path) === entry) { entry.loading = false; this.options.paint(); } }
   }
 
   private validate(path: string, value: unknown): asserts value is Record<string, unknown> {
     if (!value || typeof value !== "object") throw new Error("接口响应结构无效");
     const data = value as Record<string, unknown>, base = path.split("?")[0];
-    if (["runs", "projects", "roots", "activity"].includes(base) && !Array.isArray(data.items)) throw new Error("接口缺少记录列表");
-    if (base === "fleet/status" && !Array.isArray(data.nodes)) throw new Error("接口缺少节点列表");
-    if (base === "overview" && !Array.isArray(data.active)) throw new Error("接口缺少活动任务");
-    if (/^runs\/[^/]+$/.test(base) && (!data.run || !Array.isArray(data.files) || !Array.isArray(data.commands))) throw new Error("执行详情结构不完整");
-    if (base === "usage" && !Array.isArray(data.daily)) throw new Error("接口缺少每日用量");
+    if (["runs", "projects", "roots", "activity", "conversations", "receipts"].includes(base) && !Array.isArray(data.items)) throw new Error("接口缺少记录列表");
+    const arrays = (keys: string[]) => keys.every(key => Array.isArray(data[key]));
+    if (base === "fleet/status" && (!Array.isArray(data.nodes) || data.nodes.some((node: unknown) => {
+      if (!node || typeof node !== 'object') return true;
+      const n = node as Record<string, unknown>;
+      return !['disks', 'gpus', 'components'].every(key => Array.isArray(n[key])) || !n.egress || !n.capabilities;
+    }))) throw new Error("节点详情结构不完整");
+    if (base === "overview" && (!arrays(['active', 'waiting', 'recent', 'attention', 'projects']) || !data.todayUsage)) throw new Error("总览响应结构不完整");
+    if (/^runs\/[^/]+$/.test(base) && (!data.run || !arrays(['files', 'commands', 'agents', 'evidence', 'timeline']))) throw new Error("执行详情结构不完整");
+    if (/^runs\/[^/]+\/files\//.test(base) && (!data.file || !Array.isArray((data.file as FileDiff['file']).rows))) throw new Error("文件响应结构不完整");
+    if (/^projects\/[^/]+\/sessions$/.test(base) && !arrays(['items', 'conversations', 'batches', 'executionClaims'])) throw new Error("会话响应结构不完整");
+    if (base === "usage" && !arrays(['daily', 'projects', 'top'])) throw new Error("用量响应结构不完整");
+    if (base === "activity" && !arrays(['items', 'bins'])) throw new Error("活动响应结构不完整");
   }
 }

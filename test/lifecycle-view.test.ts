@@ -22,11 +22,26 @@ function snapshot(value:Partial<Snapshot>={}):Snapshot{return {
 for(const result of ["completed","failed","cancelled"] as const){
   test(`卡片和 Console 采用相同的明确终态 ${result}`,()=>{
     const task={id:"task",sessionId:"session",title:"Task",state:"closed",resultStatus:result,revision:8,finishedAt:now,lastActivityAt:now};
-    const run=withTaskLifecycle({taskId:"task",executionStatus:"running",acceptanceStatus:"pending",finishedAt:null,lastActivityAt:now},task);
-    const view=cardPresentation(snapshot({taskState:"closed",taskResult:result,commands:[command],runningCommand:command}),now);
+    const run=withTaskLifecycle({taskId:"task",executionStatus:result,acceptanceStatus:"pending",finishedAt:now,lastActivityAt:now},task);
+    const view=cardPresentation(snapshot({taskState:"closed",taskResult:result,commands:[command],runningCommand:command,
+      executionObservation:{observedAt:now,activeOperationIds:[],preparingOperationIds:[],staleOperationIds:[]}}),now);
     assert.equal(run.executionStatus,result);
     assert.equal(view.status,result==="completed"?"success":result);
     assert.equal(view.taskClockDynamic,false);
+  });
+  test(`历史交付 ${result} 不掩盖实时后台活动与待核对事实`,()=>{
+    const task={id:"task",sessionId:"session",title:"Task",state:"closed",resultStatus:result,revision:8,finishedAt:now,lastActivityAt:now};
+    const run=withTaskLifecycle({taskId:"task",executionStatus:"running",acceptanceStatus:"pending",finishedAt:null,lastActivityAt:now},task);
+    assert.equal(run.executionStatus,'running');
+    const active=snapshot({taskState:'closed',taskResult:result,commands:[command],runningCommand:command,
+      executionObservation:{observedAt:now,activeOperationIds:['op'],preparingOperationIds:[],staleOperationIds:[]}});
+    const activeView=cardPresentation(active,now);
+    assert.equal(activeView.status,'running');assert.match(activeView.label,/请求已结束/);
+    assert.equal(activeView.taskClockDynamic,false);assert.equal(activeView.commandClockDynamic,true);
+    assert.equal(isFinal(active,now),false);
+    const unknown={...active,executionObservation:{observedAt:now,activeOperationIds:[],preparingOperationIds:[],staleOperationIds:['op']}};
+    assert.equal(cardPresentation(unknown,now).status,'unavailable');assert.equal(isFinal(unknown,now),false);
+    assert.equal(withTaskLifecycle({...run,executionStatus:'unknown'},task).executionStatus,'unknown');
   });
 }
 
@@ -50,7 +65,7 @@ test("同一快照失去活性观察后显示待确认，不把时间当成进�
 });
 
 test("明确中断不会因一分钟前的工具活动又显示等待下一步",()=>{
-  assert.equal(cardPresentation(snapshot({execution_status:ExecutionState.interrupted}),now).label,"执行中断，等待接续");
+  assert.equal(cardPresentation(snapshot({execution_status:ExecutionState.interrupted}),now).label,"执行已中断");
 });
 
 test("不同来源的观察分别过期，新鲜来源可确认相同操作",()=>{

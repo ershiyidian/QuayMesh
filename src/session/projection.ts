@@ -1,6 +1,8 @@
 import { activityTimes, currentOperationEvents, latestActivity } from "./activity.js";
 import { join } from "node:path";
 import { ExecutionState, ReviewState, HostState } from "./types.js";
+import { aggregateReviewStates } from './review-state.js';
+import { taskView } from '../task-view.js';
 import type {
   AgentSummary,
   CommandSummary,
@@ -58,7 +60,8 @@ export class SessionProjector {
       }
       const value:ExecutionObservation={observedAt:at,activeOperationIds:[],preparingOperationIds:[],staleOperationIds:[]};
       for(const row of this.store.taskData.operationObservations(taskId,id)){
-        if(!row.observed_at||at-Date.parse(row.observed_at)>EXECUTION_OBSERVATION_TTL_MS)value.staleOperationIds.push(row.id);
+        const observedAt=Date.parse(row.observed_at??'');
+        if(['unknown','reconciliation_required'].includes(row.status)||!Number.isFinite(observedAt)||at-observedAt>EXECUTION_OBSERVATION_TTL_MS)value.staleOperationIds.push(row.id);
         else if(row.effect==='not_started'||row.status==='queued')value.preparingOperationIds.push(row.id);
         else value.activeOperationIds.push(row.id);
       }
@@ -103,8 +106,15 @@ export class SessionProjector {
     const agents = this.agents(events, member.id);
     const instructions = this.instructions(sessionId, member.id, task?.id);
     const skills = this.skills(sessionId, member.id, task?.id);
-    const executionState = session.execution_state;
+    // 验收随 Task 和执行成员保存；当前会话的后续任务不能改写历史卡片。
+    const reviewState = task ? this.store.taskReviewState(task.id, memberId) : session.review_state;
     const localMember = this.localNodeId === undefined || member.node_id === this.localNodeId;
+    const observation = task ? this.observeTask(task.id,member.id) : undefined;
+    // 执行结果同样绑定本 Task/member；Session 当前状态可能属于后续请求。
+    const executionState = task ? localMember
+      ? memberExecutionState(this.store,task.id,member.id,observation!)
+      : this.store.taskData.projection(task.id,member.id)?.snapshot.execution_status ?? ExecutionState.idle
+      : session.execution_state;
     const revert = !localMember
       ? { allowed: false, reason: "remote_member", revision: member.revision }
       : this.revertEligibility
@@ -126,7 +136,7 @@ export class SessionProjector {
     const snapshot: Snapshot = {
       sessionId,
       taskId: task?.id ?? null,
-      ...(task?{sourceTaskId:task.source_task_id??null,executionObservation:this.observeTask(task.id,member.id)}:{}),
+      ...(task?{sourceTaskId:task.source_task_id??null,executionObservation:observation}:{}),
       taskState:task?.state,
       taskResult:task?.result_status,
       lastOperation,
@@ -146,9 +156,9 @@ export class SessionProjector {
       rev: revisionBefore,
       changeRev: memberRevisionBefore,
       title: task?.title ?? session.title,
-      status: task?.state === "closed" ? task.result_status === "completed" ? "done" : task.result_status === "failed" ? "failed" : "idle" : outerStatus(session),
+      status: task?.state === "closed" ? task.result_status === "completed" ? "done" : task.result_status === "failed" ? "failed" : "idle" : outerStatus(session,reviewState,executionState),
       execution_status: executionState,
-      review_status: session.review_state,
+      review_status: reviewState,
       host_status: session.host_state,
       startedAt: Date.parse(task?.created_at ?? session.created_at),
       endedAt: task ? (task.delivery_ended_at ? Date.parse(task.delivery_ended_at) : null)
@@ -209,12 +219,13 @@ export class SessionProjector {
       const current = await Promise.all(selected.map(async item => {
         const member=this.store.getMember(session.id,item.memberId);
         const cached=this.store.taskData.projection(task.id,item.memberId);
-        const events=this.store.eventsForTask(task.id).filter(event=>event.member_id===item.memberId);
-        const changed=events.some(event=>Date.parse(event.timestamp)>item.snapshot.observedAt);
-        if(changed && (this.localNodeId===undefined||member.node_id===this.localNodeId))return this.materialize(session.id,item.memberId,task.id);
+        // 同一毫秒内也可能收到验收或执行终态；版本比较不会漏掉这些更新。
+        const revision=Math.max(item.revision,cached?.revision??-1);
+        if(task.revision>revision && (this.localNodeId===undefined||member.node_id===this.localNodeId))return this.materialize(session.id,item.memberId,task.id);
         return cached && cached.revision>item.revision ? cached.snapshot : item.snapshot;
       }));
-      const snapshot = this.aggregateTaskSnapshot(task, session, current, this.store.taskMemberIds(task.id));
+      const taskMembers=this.store.taskMemberIds(task.id);
+      const snapshot = this.aggregateTaskSnapshot(task, session, current, taskMembers, memberId?[memberId]:taskMembers);
       return { unchanged: false, snapshot: pageSnapshot({...snapshot,executionObservation:observation}, cursor), rev: task.revision, observation };
     }
 
@@ -229,13 +240,14 @@ export class SessionProjector {
       if(cached)return {...cached.snapshot,workspace:cached.snapshot.workspace ? {...cached.snapshot.workspace,online:member.online,observedAt:Date.parse(member.last_observed_at)} : null,
         host_status:member.online?HostState.connected:HostState.disconnected,workspaces:session.members};
       const empty=emptySnapshot(this.store,session.id,id,member.revision,member.root,member.source_root,member.mode,this.consoleUrl);
-      return {...empty,taskId:task.id,title:task.title,notices:[...empty.notices,"尚未取得所属节点的任务数据"]};
+      return {...empty,taskId:task.id,title:task.title,execution_status:ExecutionState.idle,review_status:ReviewState.unknown,
+        notices:[...empty.notices,"尚未取得所属节点的任务数据"]};
     }));
-    const snapshot = this.aggregateTaskSnapshot(task, session, snapshots, taskMembers);
+    const snapshot = this.aggregateTaskSnapshot(task, session, snapshots, taskMembers,selectedIds);
     return { unchanged: false, snapshot: pageSnapshot({...snapshot,executionObservation:observation}, cursor), rev: task.revision, observation };
   }
 
-  private aggregateTaskSnapshot(task: TaskRecord, session: SessionRecord, snapshots: Snapshot[], taskMemberIds: string[]): Snapshot {
+  private aggregateTaskSnapshot(task: TaskRecord, session: SessionRecord, snapshots: Snapshot[], taskMemberIds: string[], selectedMemberIds=taskMemberIds): Snapshot {
     const membersById = new Map((task.state === "closed" ? snapshots.flatMap(item=>item.workspaces) : session.members).map((member) => [member.id, member]));
     const members = [...new Set(taskMemberIds)].flatMap((id) => membersById.get(id) ? [membersById.get(id)!] : []);
     const files = snapshots.flatMap((snapshot) => snapshot.files);
@@ -254,7 +266,19 @@ export class SessionProjector {
     const lastExecutionActivityAt=maxTime(snapshots.map(snapshot=>snapshot.lastExecutionActivityAt));
     const lastOutputAt=maxTime(snapshots.map(snapshot=>snapshot.lastOutputAt));
     const finalization=this.store.taskData.finalization(task.id);
-    if(finalization&&!finalization.completed_at)notices.push(finalization.error?`任务结束尚未确认：${finalization.error}`:"正在确认各节点的任务结果");
+    const finalizing=Boolean(finalization&&(!finalization.completed_at||task.state==='active'));
+    if(finalizing)notices.push(finalization!.error?`任务结束尚未确认：${finalization!.error}`:"正在确认各节点的任务结果");
+    const reviewStates=snapshots.map(snapshot=>snapshot.review_status);
+    if(snapshots.length<selectedMemberIds.length)reviewStates.push(ReviewState.unknown);
+    const reviewState=aggregateReviewStates(reviewStates);
+    const executionState=aggregateExecutionStates(snapshots.map(snapshot=>{
+      const member=snapshot.workspace?membersById.get(snapshot.workspace.id):undefined;
+      // 旧版本可能持久化了同 revision 的 idle；完整读取仍按本地账本核对，
+      // 无须等待下一次业务事件才能修正当前展示。远端只使用所属节点的快照。
+      return member&&(this.localNodeId===undefined||member.node_id===this.localNodeId)
+        ? memberExecutionState(this.store,task.id,member.id,this.observeTask(task.id,member.id))
+        : snapshot.execution_status;
+    }));
     if(task.closure_reason==="superseded")notices.push("上一请求已归档，未收到明确交付结果");
     if(task.change_summary_state==="incomplete")notices.push(`文件变化摘要未完整取得${task.change_summary_error?`：${task.change_summary_error}`:""}`);
     if (members.length === 0) notices.push("No workspace has been used in this task yet.");
@@ -282,9 +306,9 @@ export class SessionProjector {
       rev: task.revision,
       changeRev: snapshots.length === 1 ? snapshots[0]?.changeRev ?? null : null,
       title: task.title,
-      status: active ? "running" : task.state === "closed" ? task.result_status === "completed" ? "done" : task.result_status === "failed" ? "failed" : "idle" : outerStatus(session),
-      execution_status: task.state === "closed" ? (task.result_status === "failed" ? ExecutionState.failed : ExecutionState.idle) : session.execution_state,
-      review_status: task.state === "closed" ? snapshots[0]?.review_status ?? session.review_state : session.review_state,
+      status: active ? "running" : task.state === "closed" ? task.result_status === "completed" ? "done" : task.result_status === "failed" ? "failed" : "idle" : outerStatus(session,reviewState,executionState),
+      execution_status: executionState,
+      review_status: reviewState,
       // A member-scoped Task card reports the selected Worker's current
       // connectivity. The aggregate conversation state can still be unknown.
       host_status: snapshots.length === 1 ? snapshots[0]!.host_status : session.host_state,
@@ -304,7 +328,7 @@ export class SessionProjector {
       totals: { files: files.length, commands: commands.length, agents: agents.filter((agent) => agent.role !== "main").length },
       cursors: { files: null, commands: null, agents: null },
       capabilities: {
-        refresh: task.state === "active" || active || Boolean(finalization&&!finalization.completed_at),
+        refresh: task.state === "active" || active || finalizing,
         revert: task.state === "active" && snapshots.length === 1 && Boolean(snapshots[0]?.capabilities.revert),
         continue: task.state === "active" && agents.some((agent) => agent.result_available || agent.state === "working" || agent.state === "queued"),
         open_file: files.length > 0,
@@ -607,10 +631,25 @@ function decodeCursor(cursor?: string): { files: string | null; commands: string
   };
 }
 
-function outerStatus(session: SessionRecord): Snapshot["status"] {
-  if (session.execution_state === ExecutionState.active) return "running";
-  if (session.execution_state === ExecutionState.failed) return "failed";
-  if (session.review_state === ReviewState.passed) return "done";
+function memberExecutionState(store:SessionStore,taskId:string,memberId:string,observation:ExecutionObservation):ExecutionState {
+  const result=store.taskData.latestRunResult(taskId,memberId);
+  const status=taskView({execution:result?.status??'idle',lastOutcome:result?.last_outcome,
+    active:observation.activeOperationIds.length>0,queued:observation.preparingOperationIds.length>0,
+    unresolved:observation.staleOperationIds.length>0}).status;
+  if(['running','queued','stopping'].includes(status))return ExecutionState.active;
+  if(status==='failed')return ExecutionState.failed;
+  if(['unknown','interrupted_recoverable','cancelled'].includes(status))return ExecutionState.interrupted;
+  return ExecutionState.idle;
+}
+
+function aggregateExecutionStates(states:ExecutionState[]):ExecutionState {
+  return [ExecutionState.active,ExecutionState.failed,ExecutionState.interrupted].find(state=>states.includes(state))??ExecutionState.idle;
+}
+
+function outerStatus(session: SessionRecord, reviewState=session.review_state,executionState=session.execution_state): Snapshot["status"] {
+  if (executionState === ExecutionState.active) return "running";
+  if (executionState === ExecutionState.failed) return "failed";
+  if (reviewState === ReviewState.passed) return "done";
   return "idle";
 }
 function emptySnapshot(

@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { pidAlive } from "../process-liveness.js";
 import { canonicalWorkspaceRoot } from "../roots.js";
+import { LAST_RUN_OUTCOME_SQL } from "../work-outcome.js";
 import type { FileSummary, Snapshot } from "./types.js";
 
 export interface TaskBaseline {
@@ -27,13 +28,23 @@ export interface TaskFinalization {
 export class TaskDataStore {
   constructor(private readonly db: Database.Database) {}
 
+  latestRunResult(taskId: string, memberId: string): {run_id:string;status:string;last_outcome:string|null} | null {
+    return this.db.prepare(`select r.id run_id,r.status,${LAST_RUN_OUTCOME_SQL} last_outcome
+      from qm_run_links l join console_work_runs r on r.id=l.run_id
+      where l.task_id=? and l.member_id=? order by l.rowid desc limit 1`)
+      .get(taskId,memberId) as {run_id:string;status:string;last_outcome:string|null} | undefined ?? null;
+  }
+
   operationObservations(taskId: string, memberId: string): Array<{id:string;status:string;effect:string|null;observed_at:string|null}> {
     return this.db.prepare(`select o.id,o.status,i.effect,o.observed_at from console_operations o
       join qm_run_links l on l.run_id=o.run_id left join qm_invocations i on i.operation_id=o.id
         and not exists(select 1 from qm_invocations n where n.retry_of_invocation_id=i.id)
-      where l.task_id=? and l.member_id=? and o.status in ('starting','queued','running')
-      and (i.finished_at is null or i.state not in ('succeeded','failed','cancelled'))`)
-      .all(taskId,memberId) as Array<{id:string;status:string;effect:string|null;observed_at:string|null}>;
+      where l.task_id=? and l.member_id=? and o.status in ('starting','queued','running','unknown','reconciliation_required')
+      and (o.status in ('unknown','reconciliation_required') or i.finished_at is null or i.state not in ('succeeded','failed','cancelled'))
+      union all select 'execution:'||e.id id,e.status,null effect,e.observed_at from console_executions e
+      join qm_run_links l on l.run_id=e.run_id
+      where l.task_id=? and l.member_id=? and e.status in ('starting','queued','running','unknown','reconciliation_required')`)
+      .all(taskId,memberId,taskId,memberId) as Array<{id:string;status:string;effect:string|null;observed_at:string|null}>;
   }
 
   observeProjection(taskId: string, memberId: string, observation: import("../execution-observation.js").ExecutionObservation): void {
@@ -46,7 +57,7 @@ export class TaskDataStore {
 
   pendingFinalizations(limit = 4, after?: Pick<TaskFinalization, "requested_at" | "task_id">): TaskFinalization[] {
     const read = (cursor?: typeof after) => this.db.prepare(`select f.* from qm_task_finalizations f join qm_tasks t on t.id=f.task_id
-      where f.completed_at is null and t.state='active'
+      where (t.state='active' OR f.completed_at IS NULL)
       ${cursor ? "and (f.requested_at,f.task_id)>(?,?)" : ""}
       order by f.requested_at,f.task_id limit ?`)
       .all(...(cursor ? [cursor.requested_at,cursor.task_id,limit] : [limit])) as TaskFinalization[];
@@ -177,14 +188,22 @@ export class TaskDataStore {
     return active;
   }
 
-  requestFinalization(taskId: string, status: TaskFinalStatus, summary: string): TaskFinalization {
+  requestFinalization(taskId: string, status: TaskFinalStatus, summary: string, expectedRevision?: number): TaskFinalization {
     return this.db.transaction(() => {
+      if(expectedRevision!==undefined) {
+        const task=this.db.prepare('SELECT revision FROM qm_tasks WHERE id=?').get(taskId) as {revision:number}|undefined;
+        if(!task || task.revision!==expectedRevision)throw Object.assign(new Error('TASK_REVISION_CONFLICT'),{code:'TASK_REVISION_CONFLICT'});
+      }
       const existing = this.finalization(taskId);
       if (existing) {
         if (existing.completed_at && (existing.status !== status || existing.summary !== summary)) throw new Error("TASK_FINALIZATION_ALREADY_CONFIRMED");
-        if (!existing.completed_at) this.db.prepare("UPDATE qm_task_finalizations SET status=?,summary=?,error=NULL WHERE task_id=?")
-          .run(status, summary, taskId);
-        return existing;
+        if (!existing.completed_at && !existing.error && (existing.status!==status || existing.summary!==summary))throw new Error('TASK_FINALIZATION_CONFLICT');
+        if (!existing.completed_at) {
+          const updated=this.db.prepare("UPDATE qm_task_finalizations SET status=?,summary=?,error=NULL WHERE task_id=? AND (status!=? OR summary!=? OR error IS NOT NULL)")
+            .run(status, summary, taskId,status,summary);
+          if(updated.changes)this.bumpDisplay(taskId);
+        }
+        return this.finalization(taskId)!;
       }
       this.db.prepare("INSERT INTO qm_task_finalizations(task_id,status,summary,requested_at) VALUES(?,?,?,?)")
         .run(taskId, status, summary, new Date().toISOString());

@@ -30,7 +30,8 @@ test("Console remote GET budget covers healthy 6–10 second Desktop reads", asy
   assert.equal(result.projects[0].name,"Desktop");
 });
 
-test("stale data returns immediately; only one remote refresh runs, and new data replaces it",async () => {
+test("TTL refresh returns a timestamped snapshot while one remote refresh replaces it",async t => {
+  t.mock.timers.enable({apis:['Date'],now:Date.now()});
   let requests = 0;
   let release!: (reply: unknown) => void;
   const feed = new WorkbenchFeed(config,stub(async () => {
@@ -39,8 +40,7 @@ test("stale data returns immediately; only one remote refresh runs, and new data
     return new Promise(resolve => { release = resolve; });
   }));
   assert.equal((await feed.metadata()).projects[0].name,"old");
-  // Explicit user refresh bypasses the normal snapshot TTL.
-  feed.invalidate();
+  t.mock.timers.tick(13_000);
   const start = performance.now();
   const first = await feed.metadata();
   assert.ok(performance.now()-start < 500,"stale cache must not wait for a blocked remote RPC");
@@ -60,6 +60,28 @@ test("stale data returns immediately; only one remote refresh runs, and new data
   assert.equal(updated.projects[0].name,"new");
 });
 
+test('a write invalidation waits for a fresh read and an older pending GET cannot repopulate the cache',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:Date.now()});
+  let requests=0;
+  const replies:Array<(reply:unknown)=>void>=[];
+  const feed=new WorkbenchFeed(config,stub(async()=>{
+    requests++;
+    return requests===1?payload('before'):new Promise(resolve=>replies.push(resolve));
+  }));
+  await feed.metadata();t.mock.timers.tick(13_000);
+  assert.equal((await feed.metadata()).projects[0].name,'before');
+  await delay(1);
+  feed.invalidate();
+  let settled=false;
+  const after=feed.metadata().then(value=>{settled=true;return value;});
+  await delay(1);assert.equal(settled,false);
+  replies.shift()!(payload('obsolete'));
+  await delay(1);assert.equal(settled,false);assert.equal(requests,3);
+  replies.shift()!(payload('after'));
+  assert.equal((await after).projects[0].name,'after');
+  assert.equal((await feed.metadata()).projects[0].name,'after');
+});
+
 test("failed remote reads return explicit errors and do not hammer a sleeping node",async () => {
   let requests = 0;
   const feed = new WorkbenchFeed(config,stub(async () => {
@@ -71,4 +93,16 @@ test("failed remote reads return explicit errors and do not hammer a sleeping no
   assert.equal(first.sources[0].state,"error");
   await feed.metadata();
   assert.equal(requests,1,"a recent failed read must respect retry backoff");
+});
+
+test('explicit refresh bypasses a valid TTL and a failed read backoff without discarding saved evidence',async()=>{
+  let requests=0,fail=false;
+  const feed=new WorkbenchFeed(config,stub(async()=>{
+    requests++;if(fail)throw new Error('temporary read failure');return payload('version-'+requests);
+  }));
+  assert.equal((await feed.metadata()).projects[0].name,'version-1');
+  assert.equal((await feed.metadata(true)).projects[0].name,'version-2');
+  fail=true;const failed=await feed.metadata(true);assert.equal(failed.projects[0].name,'version-2');assert.equal(failed.sources[0].state,'error');
+  fail=false;assert.equal((await feed.metadata()).projects[0].name,'version-2');assert.equal(requests,3);
+  assert.equal((await feed.metadata(true)).projects[0].name,'version-4');
 });

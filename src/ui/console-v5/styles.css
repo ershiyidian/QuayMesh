@@ -161,8 +161,11 @@ textarea { width:100%;line-height:1.6;resize:vertical;min-height:72px }
 .notice.warn { background:var(--warn-bg);color:var(--amber);border-color:color-mix(in srgb,var(--amber) 24%,var(--border)) }
 .notice.bad { background:var(--bad-bg);color:var(--red) }
 .global-notice { margin:0;border-radius:0;border-width:0 0 1px;padding:6px 18px }
-.loading { display:flex;align-items:center;justify-content:center;gap:8px;padding:30px;color:var(--muted) }
-.skeleton { height:12px;background:var(--raised);border-radius:4px;margin:12px 0 }
+.loading { display:flex;flex-direction:column;align-items:stretch;justify-content:center;gap:12px;padding:30px;color:var(--muted);min-height:180px }
+.loading p { display:flex;align-items:center;gap:8px;margin:0 }
+.skeleton { height:12px;width:100%;min-width:40px;background:var(--raised);border-radius:4px;margin:4px 0 }
+.skeleton:nth-of-type(2) { width:85% }
+.skeleton:nth-of-type(3) { width:65% }
 .spinner { width:12px;height:12px;border:1.5px solid var(--border-strong);border-top-color:var(--accent);border-radius:50%;animation:spin .9s linear infinite;flex-shrink:0 }
 @keyframes spin { to { transform:rotate(360deg) } }
 .run-title { display:block;border:0;background:none;color:var(--text);text-align:left;font-size:12px;font-weight:550;line-height:1.45;max-width:100%;padding:0 }

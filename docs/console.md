@@ -18,6 +18,28 @@ Command output is retained with the operation that produced it. A task can conta
 
 File differences belong to their task. Completed tasks retain their recorded files and output for later viewing.
 
+### Understand task state
+
+A request, its background executions, and its review have separate states. Finishing one command or workspace phase does not close the request. A request can also be handed off while its background execution continues. The details retain the delivery result alongside the current execution state.
+
+“No background execution” means there is no confirmed active command or agent. It does not imply a request for user input. A failed or stopped last execution remains visible until further work supersedes it. Unresolved effects and stale observations stay in the attention view, including those from an older phase or a closed request. Finalization failures show their recorded cause.
+
+Use **Finish request** to record a delivery result. Review acceptance and rejection are separate actions. Finishing requires confirmation that all relevant task members have no active or unresolved execution. An unrelated offline node does not block the task's controls.
+
+### Controls and receipts
+
+Stop controls include managed commands and agents in all relevant phases. A batch preserves each target's outcome, including partial success and unavailable nodes. The original target plan and request identity are saved before dispatch. The operation receipts view can inspect the original request after a lost response without replaying successful targets.
+
+Receipts distinguish no effect, applied, partial, and unknown effects. Acknowledging a stop request does not assert that its process has exited. When a write outcome is unknown, the form retains the original intent for reconciliation. A new edited intent receives a new request identity after a confirmed rejection.
+
+### History, settings, and usage
+
+Conversation search spans projects and nodes, and requests without an execution phase remain accessible. Multi-workspace task details identify each file's source and provide phase links for workspace-specific patch and revert operations. Task pagination preserves the chosen ordering for fifteen minutes; refresh the first page to include later tasks or a new ordering.
+
+Settings forms read the saved configuration with its revision, including changes awaiting application. Refresh compares the original values, local edits, and the newly saved values. Conflicting fields require an explicit choice. Saved and applied revisions, pending application, and application errors remain distinct.
+
+Usage is assigned to each agent execution's completion date in the selected timezone. Running executions and records without a completion time are reported separately. Drilldowns retain the contributing execution date range, and task rankings combine all contributing phases before choosing the top tasks. Exports include their filters, timezone, and source coverage.
+
 ## Sign in
 
 Use the owner password generated with your site configuration. Console sessions persist across browser visits, and the Windows application stores its session through the current user's encrypted storage.
@@ -33,6 +55,10 @@ The tray, Host, browser favicon, and desktop application share the project icon 
 ## Connection state
 
 The console reports node connectivity and the freshness of displayed data. Previously received data remains visible while the next refresh runs.
+
+Resources refresh independently. Hiding the page or losing the connection cancels unnecessary reads; returning resumes them. A stale active observation becomes “Needs verification,” and its elapsed display stops at the last confirmed observation. Known counts and missing coverage are shown separately. The diagnostics panel provides resource timings, versions, source state, and an exportable record.
+
+Failure notifications use a separate saved event cursor for each node. An unavailable node keeps its cursor so events can be read when it returns. Notifications do not depend on the small sample shown in the overview.
 
 Node status and component logs are available for investigating a disconnected machine. See [installation](INSTALL.md#inspect-a-node).
 

@@ -1,5 +1,7 @@
+import {readWorkbenchMetadata} from "./metadata.js";
+import { randomUUID } from "node:crypto";
 import type { ServerConfig } from "../config.js";
-import { withTaskLifecycle,activeExecution,observeSourceStates,type TaskLifecycle } from '../console-task-state.js';
+import { withTaskLifecycle,activeExecution,needsAttention,observeSourceStates,type TaskLifecycle } from '../console-task-state.js';
 import type { LocalActions } from './actions.js';
 import type { FederationRuntime } from "../federation/runtime.js";
 import type { ConsoleReply, NodeView } from "../federation/types.js";
@@ -7,19 +9,22 @@ import { mapConcurrent } from "../concurrency.js";
 import { parseWorkspaceHandle } from "../federation/routing.js";
 import { sampleHealth } from "../federation/health.js";
 import { capabilities, capabilityLabels } from "../federation/capabilities.js";
-import { readLocalMetadata, readLocalOverview, readLocalRunSummaries, readLocalSessionTitles, readLocalTaskIndex, readLocalUsage } from "./local-queries.js";
+import { readLocalMetadata, readLocalOverviewUsage, readLocalRunSummaries, readLocalSessionTitles, readLocalTaskIndex, readLocalUsage } from "./local-queries.js";
 import { decodeBoundary, pageCursor } from "./run-query.js";
 import { dayAt, mergeTotals, type Query } from "./query.js";
-import { aggregateTaskIndex, aggregateTasks, applyRunTitles, applyTaskTitles, compareTaskIndex, fallbackTask, filterTaskIndex, resolveSessionTitles, taskKey, taskStage, type TaskIndex } from "./task-aggregation.js";
+import { aggregateTaskIndex, aggregateTasks, applyRunTitles, applyTaskTitles, compareTaskIndex, fallbackTask, taskOnlyIndex, filterTaskIndex, resolveSessionTitles, taskKey, taskStage, type TaskIndex } from "./task-aggregation.js";
 import { WorkbenchError, type Run, type SourceReadState, type SourceState } from "./types.js";
 
 interface CachedResource { data: unknown; loadedAt: number; error: string | null; wait: boolean; retryAt: number; failures: number }
+interface PageSnapshot { keys: string[]; counts: Record<string, number>; at: number; query: string; expiresAt: number }
 interface NodeResource<T> { source: SourceState; data: T | null }
 type NodeIdentity = { id: string; nickname: string; online: boolean };
 
 export class WorkbenchFeed {
   private readonly cache = new Map<string, CachedResource>();
-  private readonly pending = new Map<string, Promise<NodeResource<unknown>>>();
+  private readonly pending = new Map<string, {generation:number; promise:Promise<NodeResource<unknown>>}>();
+  private readonly pages = new Map<string, PageSnapshot>();
+  private generation = 0;
   constructor(readonly config: ServerConfig, readonly runtime?: FederationRuntime) {}
   private get localId() { return this.config.federation?.nodeId ?? "local"; }
   private nodes(): NodeIdentity[] {
@@ -30,6 +35,7 @@ export class WorkbenchFeed {
       state: node.online ? "loading" : "offline", stale: !node.online, observedAt: null, error: node.online ? null : "节点离线" }));
   }
   invalidate(): void {
+    this.generation++;
     for (const cached of this.cache.values()) {
       // 失效只触发重取；保留上次真实观察时间供离线界面显示。
       cached.retryAt = 0;
@@ -43,14 +49,20 @@ export class WorkbenchFeed {
     // shorter than healthy Desktop reads after Modern Standby (6–10 seconds).
     const reply = await this.runtime.request<ConsoleReply>(nodeId, "console", { method: body === undefined ? "GET" : "POST", path, body }, body === undefined ? 20_000 : undefined);
     if (reply.status >= 400) {
-      const error = reply.body as { message?: string; code?: string } | null;
-      throw new WorkbenchError(error?.message || "节点操作失败", reply.status, error?.code || "node_operation_failed");
+      const error = reply.body as { message?: string; code?: string; effect?: WorkbenchError["effect"] } | null;
+      throw new WorkbenchError(error?.message || "节点操作失败", reply.status, error?.code || "node_operation_failed", error?.effect ?? "unknown");
     }
     return reply.body as T;
   }
 
-  private async load<T>(node: NodeIdentity, path: string, local: () => T, ttl: number): Promise<NodeResource<T>> {
+  private async load<T>(node: NodeIdentity, path: string, local: () => T|Promise<T>, ttl: number, fresh=false): Promise<NodeResource<T>> {
     const key = node.id + ":" + path;
+    if(fresh){
+      // 先等旧读取落定，再读取此资源；显式刷新不清除其它页面的缓存。
+      await this.pending.get(key)?.promise;
+      const previous=this.cache.get(key);
+      if(previous){previous.wait=true;previous.retryAt=0;}
+    }
     const cached = this.cache.get(key);
     // Console commonly polls every eight seconds. A one-second per-node TTL
     // otherwise makes every page paint report all sources as "refreshing".
@@ -58,20 +70,26 @@ export class WorkbenchFeed {
     const previous = (state: SourceReadState, error: string | null): NodeResource<T> => ({ data: cached?.data as T ?? null,
       source: { nodeId: node.id, name: node.nickname, online: node.online, state, observedAt: cached?.loadedAt || null, stale: state === "refreshing" || state === "offline" || state === "error", error } });
     if (!node.online) return previous("offline", "节点离线");
-    if (cached?.error && Date.now() < cached.retryAt) return previous("error", cached.error);
+    if (cached?.error && !cached.wait && Date.now() < cached.retryAt) return previous("error", cached.error);
     if (cached && !cached.wait && !cached.error && Date.now() - cached.loadedAt < effectiveTtl) return previous("ready", null);
-    const existing = this.pending.get(key) as Promise<NodeResource<T>> | undefined;
+    const existing = this.pending.get(key);
     if (existing) {
-      // Do not hold a page refresh on a slow remote request when usable
-      // previously observed data exists. Freshness remains explicit.
-      return cached?.data != null ? previous("refreshing", cached.error) : existing;
+      if (existing.generation !== this.generation) {
+        await existing.promise;
+        return this.load(node,path,local,ttl);
+      }
+      return cached?.data != null && !cached.wait ? previous("refreshing",cached.error) : existing.promise as Promise<NodeResource<T>>;
     }
     {
+      const generation = this.generation;
+      const requireFresh = cached?.wait === true;
       const job: Promise<NodeResource<T>> = Promise.resolve().then(async () => {
         try {
-          const data = node.id === this.localId ? local() : await this.call<T>(node.id, path);
+          const data = node.id === this.localId ? await local() : await this.call<T>(node.id, path);
           const loadedAt = Date.now();
-          this.cache.delete(key); this.cache.set(key, { data, loadedAt, error: null, wait: false, retryAt: 0, failures: 0 });
+          if (generation === this.generation) {
+            this.cache.delete(key); this.cache.set(key, { data, loadedAt, error: null, wait: false, retryAt: 0, failures: 0 });
+          }
           while (this.cache.size > 160) this.cache.delete(this.cache.keys().next().value!);
           const source: SourceState = { nodeId: node.id, name: node.nickname, online: true, state: "ready", observedAt: loadedAt, stale: false, error: null };
           return { data, source };
@@ -81,14 +99,13 @@ export class WorkbenchFeed {
           // A disconnected or sleeping node should not be hammered on every
           // Console poll. Per-node/path backoff is bounded and resets on success.
           const retryDelay = Math.min(60_000, 3000 * 2 ** (failures - 1));
-          this.cache.set(key,{data:cached?.data ?? null,loadedAt:cached?.loadedAt ?? 0,
+          if (generation === this.generation) this.cache.set(key,{data:cached?.data ?? null,loadedAt:cached?.loadedAt ?? 0,
             error:message,wait:false,retryAt:Date.now()+retryDelay,failures});
           return previous("error", message);
         }
-      }).finally(() => this.pending.delete(key));
-      this.pending.set(key, job);
-      if (cached) cached.wait = false;
-      if (cached?.data != null) {
+      }).finally(() => { if (this.pending.get(key)?.promise === job) this.pending.delete(key); });
+      this.pending.set(key, { generation, promise:job });
+      if (cached?.data != null && !requireFresh) {
         // Background refresh owns its error handling; response uses an
         // acknowledged stale snapshot rather than blocking for an RPC.
         void job;
@@ -98,12 +115,16 @@ export class WorkbenchFeed {
     }
   }
 
-  private async collect<T>(path: string, local: () => T, query: Query = {}, ttl = 5000) {
+  private async collect<T>(path: string, local: () => T|Promise<T>, query: Query = {}, ttl = 5000, nodeIds?:ReadonlySet<string>, fresh=false) {
     const projectNode = query.project ? parseWorkspaceHandle(query.project)?.node : undefined;
-    const nodes = this.nodes().filter((node) => (!query.node || node.id === query.node) && (!projectNode || node.id === projectNode));
+    const known=this.nodes();
+    for(const id of [...(nodeIds??[]),...(query.node?[query.node]:[]),...(projectNode?[projectNode]:[])]){
+      if(!known.some(node=>node.id===id))known.push({id,nickname:id,online:false});
+    }
+    const nodes = known.filter((node) => (!query.node || node.id === query.node) && (!projectNode || node.id === projectNode) && (!nodeIds||nodeIds.has(node.id)));
     // A single offline node must not delay a fifth, healthy machine behind
     // another complete 20-second read window on a cold Console load.
-    const results = await mapConcurrent(nodes, 8, (node) => this.load(node, path, local, ttl));
+    const results = await mapConcurrent(nodes, 8, (node) => this.load(node, path, local, ttl,fresh));
     return { values: results.flatMap((result) => result.data === null ? [] : [result.data]),
       sources: results.map((result) => result.source),
       // "complete" measures coverage of all node snapshots. A source being
@@ -114,42 +135,83 @@ export class WorkbenchFeed {
         && !result.source.error), observedAt: Date.now() };
   }
 
-  async metadata() {
-    const group = await this.collect("/workbench/metadata", () => readLocalMetadata(this.config), {}, 1000);
+  async metadata(fresh=false) {
+    const group = await this.collect("/workbench/metadata", () => readWorkbenchMetadata(this.config,this.runtime), {}, 1000,undefined,fresh);
     return { projects: group.values.flatMap((value) => value.projects), roots: group.values.flatMap((value) => value.roots),
       sources: group.sources, complete: group.complete, observedAt: group.observedAt };
+  }
+
+  async nodeSettings(nodeId:string) {
+    const node=this.nodes().find(node=>node.id===nodeId);
+    if(!node)throw new WorkbenchError('节点不存在',404,'node_not_found','none');
+    const result=await this.load(node,'/workbench/metadata',()=>readWorkbenchMetadata(this.config,this.runtime),1000,true);
+    if(!result.data||!result.source.online||result.source.error)throw new WorkbenchError(result.source.error??'节点设置尚未取得',503,'settings_unavailable','none');
+    return {settings:result.data.settings,roots:result.data.roots,source:result.source};
+  }
+
+  private taskIndex(phases: Parameters<typeof aggregateTaskIndex>[0], titles: {map:Map<string,string>;tasks:Map<string,TaskLifecycle>}, sources:SourceState[]) {
+    const tasks=applyTaskTitles(aggregateTaskIndex(observeSourceStates(phases,sources)),titles.map);
+    const present=new Set(tasks.map(task=>task.taskId).filter(Boolean));
+    for(const task of titles.tasks.values()) if(!present.has(task.id)) {
+      const fallback=taskOnlyIndex(task);
+      const missing=(task.memberNodeIds??[]).some(node=>!sources.some(source=>source.nodeId===node&&source.online&&source.observedAt!==null&&!source.error));
+      tasks.push(missing?{...fallback,executionStatus:'unknown',actionableInterruption:true,reason:'部分任务成员尚未取得，后台执行状态待核对'}:fallback);
+    }
+    return tasks.map(task=>withTaskLifecycle(task,titles.tasks.get(task.taskId ?? '')));
   }
 
   async runs(query: Query) {
     const boundary = decodeBoundary(query.cursor), at = boundary?.at ?? Date.now();
     const limit = Math.min(100, Math.max(1, Number(query.limit ?? 25)));
-    const index = await this.collect("/workbench/task-index", () => readLocalTaskIndex(this.config), {}, 1000);
-    const titles = await this.sessionTitles();
-    const scoped = filterTaskIndex(applyTaskTitles(aggregateTaskIndex(observeSourceStates(index.values.flatMap((value) => value.items),index.sources)), titles.map)
-      .map(task=>withTaskLifecycle(task,titles.tasks.get(task.taskId ?? ''))), query, at);
-    const counts: Record<string, number> = {};
-    for (const task of scoped) {
-      const state = taskStage(task.executionStatus, task.acceptanceStatus);
-      counts[state] = (counts[state] ?? 0) + 1;
+    const {index,titles}=await this.scopedIndex(query);
+    const usage = query.usageDate || query.usageDays ? await this.usageContributors(query) : null;
+    const allTasks=this.taskIndex(index.values.flatMap(value=>value.items),titles,index.sources);
+    const contributes=(task:TaskIndex)=>!usage || task.phaseRefs.some(reference=>usage.runIds.has(reference));
+    const scoped = filterTaskIndex(allTasks,query,at).filter(contributes);
+    let counts:Record<string,number>={all:scoped.length};
+    for(const task of scoped){const state=taskStage(task.executionStatus,task.acceptanceStatus,task.phaseExecutionStatus);counts[state]=(counts[state]??0)+1;}
+    const navigation=filterTaskIndex(allTasks,{...query,stage:undefined,attention:undefined},at).filter(contributes);
+    counts.scopeAll=navigation.length;counts.scopeActive=0;counts.scopeWaiting=0;counts.scopeResults=0;counts.scopeAttention=0;
+    for(const task of navigation){
+      const state=taskStage(task.executionStatus,task.acceptanceStatus);
+      if(activeExecution(task.executionStatus))counts.scopeActive++;
+      if(['waiting','stalled','finalizing'].includes(state))counts.scopeWaiting++;
+      if(['done','accepted','rejected','review','failed','ended','cancelled','handed_off'].includes(state))counts.scopeResults++;
+      if(needsAttention(task))counts.scopeAttention++;
     }
-    counts.all = scoped.length;
-    const selected = scoped.filter((task) => !query.status || taskStage(task.executionStatus, task.acceptanceStatus) === query.status)
-      .sort((a, b) => compareTaskIndex(a, b, query, at));
-    const offset = boundary?.offset ?? 0;
-    const pageIndex = selected.slice(offset, offset + limit);
-    const summaries = await this.runSummaries(pageIndex.flatMap((task) => task.phaseRefs));
-    const detailed = new Map(applyRunTitles(aggregateTasks(summaries.values), titles.map).map((run) => [taskKey(run), run]));
-    const items = pageIndex.map(task=>this.resolvedRun(task,detailed.get(task.key)));
-    return { items,
-      total: selected.length, counts, offset, limit,
-      nextCursor: items.length && offset + items.length < selected.length ? pageCursor(items.at(-1)!, query, at, offset + items.length, "next") : null,
-      previousCursor: items.length && offset > 0 ? pageCursor(items[0], query, at, Math.max(0, offset - limit), "previous") : null,
-      sources: mergeSources(mergeSources(index.sources, summaries.sources), titles.sources),
-      complete: index.complete && summaries.complete && titles.complete, observedAt: Date.now() };
+    const selected=scoped.filter(task=>!query.status||taskStage(task.executionStatus,task.acceptanceStatus,task.phaseExecutionStatus)===query.status)
+      .sort((a,b)=>compareTaskIndex(a,b,query,at));
+    const signature=JSON.stringify(Object.entries(query).filter(([name])=>!['cursor','limit','fresh'].includes(name)).sort(([a],[b])=>a.localeCompare(b)));
+    let snapshotId=(boundary as typeof boundary & {snapshot?:string})?.snapshot;
+    let snapshot=snapshotId?this.pages.get(snapshotId):undefined;
+    if(snapshotId && (!snapshot || snapshot.expiresAt<Date.now() || snapshot.query!==signature))
+      throw new WorkbenchError('任务分页已过期，请返回第一页刷新',409,'cursor_expired','none');
+    if(!snapshot){
+      snapshotId=randomUUID();snapshot={keys:selected.map(task=>task.key),counts,at,query:signature,expiresAt:Date.now()+15*60_000};
+      this.pages.set(snapshotId,snapshot);
+      for(const [id,value] of this.pages)if(value.expiresAt<Date.now())this.pages.delete(id);
+      while(this.pages.size>32)this.pages.delete(this.pages.keys().next().value!);
+    }
+    counts=snapshot.counts;
+    const offset=boundary?.offset??0;
+    const byKey=new Map(allTasks.map(task=>[task.key,task]));
+    const keys=snapshot.keys.slice(offset,offset+limit);
+    const pageIndex=keys.flatMap(key=>byKey.has(key)?[byKey.get(key)!]:[]);
+    const summaries=await this.runSummaries(pageIndex.flatMap(task=>task.phaseRefs),query.fresh==='1');
+    const detailed=new Map(applyRunTitles(aggregateTasks(observeSourceStates(summaries.values,summaries.sources)),titles.map).map(run=>[taskKey(run),run]));
+    const items=pageIndex.map(task=>this.resolvedRun(task,detailed.get(task.key)));
+    const cursor=(run:Run,next:number,direction:'next'|'previous')=>Buffer.from(JSON.stringify({
+      ...JSON.parse(Buffer.from(pageCursor(run,query,at,next,direction),'base64url').toString('utf8')),snapshot:snapshotId,
+    })).toString('base64url');
+    return {items,total:snapshot.keys.length,counts,offset,limit,snapshotAt:snapshot.at,
+      nextCursor:items.length&&offset+keys.length<snapshot.keys.length?cursor(items.at(-1)!,offset+keys.length,'next'):null,
+      previousCursor:items.length&&offset>0?cursor(items[0],Math.max(0,offset-limit),'previous'):null,
+      sources:mergeSources(mergeSources(mergeSources(index.sources,summaries.sources),titles.sources),usage?.sources??[]),
+      complete:index.complete&&summaries.complete&&titles.complete&&(!usage||usage.complete),observedAt:Date.now()};
   }
 
-  private async sessionTitles() {
-    const group = await this.collect("/workbench/session-titles", () => readLocalSessionTitles(this.config), {}, 1000);
+  private async sessionTitles(nodeIds?:ReadonlySet<string>,fresh=false) {
+    const group = await this.collect("/workbench/session-titles", () => readLocalSessionTitles(this.config), {}, 1000,nodeIds,fresh);
     const tasks = new Map<string,TaskLifecycle>();
     const authority = new Set<string>();
     for (const source of group.values) for (const task of source.tasks ?? []) {
@@ -159,32 +221,79 @@ export class WorkbenchFeed {
       if (source.authoritative) authority.add(task.id);
     }
     return { map: resolveSessionTitles(group.values.flatMap((value) => value.items)),
-      tasks,observedAt:group.observedAt,
+      tasks,items:group.values.flatMap(value=>value.items),observedAt:group.observedAt,
       sources: group.sources, complete: group.complete };
+  }
+
+  private async scopedIndex(query:Query) {
+    const scoped=Boolean(query.node||query.project);
+    const fresh=query.fresh==='1';
+    const [initial,titles]=await Promise.all([
+      this.collect('/workbench/task-index',()=>readLocalTaskIndex(this.config),scoped?query:{},1000,undefined,fresh),this.sessionTitles(undefined,fresh),
+    ]);
+    if(!scoped)return {index:initial,titles};
+    const required=new Set(initial.sources.map(source=>source.nodeId));
+    const taskIds=new Set(initial.values.flatMap(value=>value.items).map(phase=>phase.taskId).filter(Boolean));
+    for(const task of titles.tasks.values()){
+      const matches=taskIds.has(task.id)||(task.workspaces??[]).some(workspace=>(!query.node||workspace.nodeId===query.node)&&(!query.project||workspace.projectId===query.project));
+      if(!matches)continue;
+      for(const node of task.memberNodeIds??[])required.add(node);
+      if(task.nodeId)required.add(task.nodeId);
+    }
+    const additional=new Set([...required].filter(node=>!initial.sources.some(source=>source.nodeId===node)));
+    const extra=await this.collect('/workbench/task-index',()=>readLocalTaskIndex(this.config),{},1000,additional,fresh);
+    const sources=titles.sources.filter(source=>required.has(source.nodeId));
+    return {index:{...initial,values:[...initial.values,...extra.values],sources:[...initial.sources,...extra.sources],complete:initial.complete&&extra.complete},
+      titles:{...titles,sources,complete:sources.every(source=>source.online&&source.observedAt!==null&&!source.error&&['ready','refreshing'].includes(source.state))}};
   }
 
   private resolvedRun(task:TaskIndex,detail?:Run):Run {
     const run=detail ?? fallbackTask(task);
+    const canComplete=task.requestState==='active' && !activeExecution(task.executionStatus)
+      && task.executionStatus!=='unknown' && !(task.executionStatus==='interrupted_recoverable'&&task.actionableInterruption);
     return {...run,title:task.title,executionStatus:task.executionStatus,acceptanceStatus:task.acceptanceStatus,sourceTaskId:task.sourceTaskId??null,
+      requestState:task.requestState,resultStatus:task.resultStatus,phaseExecutionStatus:task.phaseExecutionStatus,finalization:task.finalization,actionableInterruption:task.actionableInterruption,
+      revision:run.revision+(task.taskRevision??0),taskRevision:task.taskRevision,reason:task.reason??run.reason,
       finishedAt:task.finishedAt,lastActivityAt:task.lastActivityAt,
-      actions:{...run.actions,complete:task.executionStatus==='waiting' && run.actions.complete,
-        review:task.executionStatus==='completed' && task.acceptanceStatus==='pending'}};
+      actions:{...run.actions,complete:canComplete,review:task.acceptanceStatus==='pending'&&run.actions.review}};
   }
 
-  async projectConversations(data:ReturnType<LocalActions['sessions']>) {
+  async projectConversations(data:ReturnType<LocalActions['sessions']>,fresh=false) {
     if (!Array.isArray(data.conversations)) throw new WorkbenchError('该节点尚未提供对话会话数据，请更新节点服务',503,'node_capability_unavailable');
-    const lifecycle=await this.sessionTitles();
+    const lifecycle=await this.sessionTitles(undefined,fresh);
     return {...data,complete:lifecycle.complete,sources:lifecycle.sources,observedAt:lifecycle.observedAt,
       conversations:data.conversations.map(conversation=>{
       const tasks=conversation.tasks.map(task=>{
-        const state=withTaskLifecycle(task,lifecycle.tasks.get(task.taskId ?? ''));
-        return {...state,status:taskStage(state.executionStatus,state.acceptanceStatus)};
+        const state=withTaskLifecycle({...task,phaseExecutionStatus:task.executionStatus},lifecycle.tasks.get(task.taskId ?? ''));
+        return {...state,status:taskStage(state.executionStatus,state.acceptanceStatus,state.phaseExecutionStatus)};
       });
       return {...conversation,tasks,activeCount:tasks.filter(task=>activeExecution(task.executionStatus)).length};
     })};
   }
 
-  private async runSummaries(references: string[]) {
+  async conversations(query:Query) {
+    const {index,titles}=await this.scopedIndex(query);
+    const tasks=filterTaskIndex(this.taskIndex(index.values.flatMap(value=>value.items),titles,index.sources),{...query,q:undefined,days:query.days??'0'},Date.now());
+    const search=(query.q??'').trim().toLocaleLowerCase();
+    const sessions=new Map(titles.items.map(row=>[row.id,row]));
+    const groups=new Map<string,TaskIndex[]>();
+    for(const task of tasks)if(task.sessionId){const values=groups.get(task.sessionId)??[];values.push(task);groups.set(task.sessionId,values);}
+    const items=[...groups].flatMap(([sessionId,values])=>{
+      const title=titles.map.get(sessionId)??sessionId;
+      if(search&&![title,sessionId,...values.flatMap(task=>[task.title,task.taskId??''])].some(value=>value.toLocaleLowerCase().includes(search)))return [];
+      const session=sessions.get(sessionId);
+      const current=values.sort((a,b)=>b.startedAt-a.startedAt);
+      return [{id:sessionId,title,projectId:current[0]?.projectIds[0]??'',nodeId:current[0]?.nodeIds[0]??'',
+        createdAt:Math.min(...current.map(task=>task.startedAt)),updatedAt:session?.lastActivityAt??Math.max(...current.map(task=>task.lastActivityAt)),
+        taskCount:current.length,activeCount:current.filter(task=>activeExecution(task.executionStatus)).length,
+        tasks:current.map(task=>{const run=this.resolvedRun(task);return {id:run.id,taskId:task.taskId,title:task.title,status:taskStage(task.executionStatus,task.acceptanceStatus,task.phaseExecutionStatus),
+          root:run.root,workspaces:run.workspaces,executionStatus:task.executionStatus,acceptanceStatus:task.acceptanceStatus,
+          lastActivityAt:task.lastActivityAt,startedAt:task.startedAt,finishedAt:task.finishedAt,hasRun:task.phaseRefs.length>0};})}];
+    }).sort((a,b)=>b.updatedAt-a.updatedAt||a.id.localeCompare(b.id));
+    return {items,total:items.length,sources:mergeSources(index.sources,titles.sources),complete:index.complete&&titles.complete};
+  }
+
+  private async runSummaries(references: string[],fresh=false) {
     const byNode = new Map<string, string[]>();
     for (const reference of references) {
       const parsed = parseWorkspaceHandle(reference);
@@ -199,10 +308,10 @@ export class WorkbenchFeed {
       const chunks = chunk(ids, 100);
       const resources = await mapConcurrent(chunks, 2, (batch) => {
         const path = "/workbench/run-summaries?ids=" + encodeURIComponent(batch.join(","));
-        return this.load(node, path, () => readLocalRunSummaries(this.config, batch), 5000);
+        return this.load(node, path, () => readLocalRunSummaries(this.config, batch), 5000,fresh);
       });
       return { data: { items: resources.flatMap((resource) => resource.data?.items ?? []) },
-        source: resources.find((resource) => resource.source.error)?.source ?? resources.at(-1)?.source
+        source: resources.reduce<SourceState[]>((values,resource)=>mergeSources(values,[resource.source]),[])[0]
           ?? { nodeId: node.id, name: node.nickname, online: node.online, state: "ready" as const, observedAt: Date.now(), stale: false, error: null },
         complete: resources.every((resource) => resource.data !== null) };
     });
@@ -213,88 +322,122 @@ export class WorkbenchFeed {
     };
   }
 
-  async sessionRuns(sessionId: string): Promise<{ runs: Run[]; complete: boolean; sources: SourceState[] }> {
-    const index = await this.collect("/workbench/task-index", () => readLocalTaskIndex(this.config), {}, 1000);
-    const references = index.values.flatMap((value) => value.items)
-      .filter((phase) => phase.sessionId === sessionId)
-      .map((phase) => phase.id);
-    const summaries = await this.runSummaries(references);
-    const titles = await this.sessionTitles();
-    return { runs: applyRunTitles(summaries.values.filter((run) => run.sessionId === sessionId), titles.map)
-      .map(run=>withTaskLifecycle(run,titles.tasks.get(run.taskId ?? ''))),
-      complete: index.complete && summaries.complete && titles.complete,
-      sources: mergeSources(mergeSources(index.sources, summaries.sources), titles.sources) };
+  async sessionRuns(sessionId:string,fresh=false) {
+    return this.relatedRuns({sessionId},fresh);
   }
 
-  async taskRuns(taskId: string): Promise<{ runs: Run[]; complete: boolean; sources: SourceState[] }> {
-    const index = await this.collect("/workbench/task-index", () => readLocalTaskIndex(this.config), {}, 1000);
-    const references = index.values.flatMap((value) => value.items)
-      .filter((phase) => phase.taskId === taskId)
-      .map((phase) => phase.id);
-    const summaries = await this.runSummaries(references);
-    const titles = await this.sessionTitles();
-    return { runs: applyRunTitles(summaries.values.filter((run) => run.taskId === taskId), titles.map)
-      .map(run=>withTaskLifecycle(run,titles.tasks.get(run.taskId ?? ''))),
-      complete: index.complete && summaries.complete && titles.complete,
-      sources: mergeSources(mergeSources(index.sources, summaries.sources), titles.sources) };
+  async taskRuns(taskId:string,fresh=false) {
+    return this.relatedRuns({taskId},fresh);
   }
 
-  async overview(zone: string) {
+  private async relatedRuns(identity:{taskId?:string;sessionId?:string},fresh=false) {
+    const known=identity.taskId?[...this.cache.entries()].filter(([key])=>key.endsWith(':/workbench/session-titles'))
+      .flatMap(([,cached])=>{const value=cached.data as ReturnType<typeof readLocalSessionTitles>|null;
+        return (value?.tasks??[]).filter(task=>task.id===identity.taskId).map(task=>({task,authoritative:value!.authoritative}));})
+      .sort((a,b)=>Number(b.authoritative)-Number(a.authoritative)||b.task.revision-a.task.revision)[0]?.task:undefined;
+    const titles=await this.sessionTitles(known?.nodeId?new Set([known.nodeId]):undefined,fresh);
+    const lifecycle=identity.taskId?titles.tasks.get(identity.taskId):undefined;
+    const members=lifecycle?new Set([...(lifecycle.memberNodeIds??[]),...(lifecycle.nodeId?[lifecycle.nodeId]:[])]):undefined;
+    const index=await this.collect('/workbench/task-index',()=>readLocalTaskIndex(this.config),{},1000,members?.size?members:undefined,fresh);
+    const matches=(phase:{taskId:string|null;sessionId:string|null})=>identity.taskId?phase.taskId===identity.taskId:phase.sessionId===identity.sessionId;
+    const phases=index.values.flatMap(value=>value.items).filter(matches);
+    const required=new Set([...phases.map(phase=>phase.nodeId),...(lifecycle?.memberNodeIds??[]),...(lifecycle?.nodeId?[lifecycle.nodeId]:[])]);
+    const summaries=await this.runSummaries(phases.map(phase=>phase.id),fresh);
+    const sources=mergeSources(mergeSources(index.sources,summaries.sources),titles.sources).filter(source=>required.has(source.nodeId));
+    const authoritative=Boolean(lifecycle&&lifecycle.nodeId&&sources.some(source=>source.nodeId===lifecycle.nodeId));
+    const complete=(authoritative?required.size>0&&[...required].every(node=>sources.some(source=>source.nodeId===node&&source.online&&source.observedAt!==null
+      &&['ready','refreshing'].includes(source.state)&&!source.error))
+      :index.complete&&titles.complete)&&summaries.complete;
+    const runs=applyRunTitles(observeSourceStates(summaries.values.filter(matches),sources),titles.map).map(run=>withTaskLifecycle(run,titles.tasks.get(run.taskId??'')));
+    const task=lifecycle?this.resolvedRun(withTaskLifecycle(phases.length?aggregateTaskIndex(observeSourceStates(phases,sources))[0]!:taskOnlyIndex(lifecycle),lifecycle),runs.length?aggregateTasks(runs)[0]:undefined)
+      :runs.length?aggregateTasks(runs)[0]:undefined;
+    return {runs,task,lifecycle,complete,sources,missingNodes:[...required].filter(node=>!sources.some(source=>source.nodeId===node&&source.online&&!source.error&&source.observedAt!==null))};
+  }
+
+  taskFromPhases(phases:Run[],lifecycle?:TaskLifecycle) {
+    const detail=phases.length?aggregateTasks(phases)[0]:undefined;
+    if(!lifecycle)return detail;
+    const index=phases.length?aggregateTaskIndex(phases.map(run=>({...run,tokens:run.usage.total,changed:Boolean(run.diff),
+      currentPhase:run.currentPhase!==false,actionableInterruption:run.actionableInterruption===true})))[0]!:taskOnlyIndex(lifecycle);
+    return this.resolvedRun(withTaskLifecycle({...index,title:lifecycle.title},lifecycle),detail);
+  }
+
+  async overview(zone: string,fresh=false) {
     const at = Date.now();
     const [group,index,titles] = await Promise.all([
-      this.collect("/workbench/overview?tz=" + encodeURIComponent(zone), () => readLocalOverview(this.config, zone)),
-      this.collect("/workbench/task-index", () => readLocalTaskIndex(this.config), {}, 1000),
-      this.sessionTitles(),
+      this.collect("/workbench/overview-usage?tz=" + encodeURIComponent(zone), () => readLocalOverviewUsage(this.config, zone),{},5000,undefined,fresh),
+      this.collect("/workbench/task-index", () => readLocalTaskIndex(this.config), {}, 1000,undefined,fresh),
+      this.sessionTitles(undefined,fresh),
     ]);
-    const tasks = applyTaskTitles(aggregateTaskIndex(observeSourceStates(index.values.flatMap((value) => value.items),index.sources)), titles.map)
-      .map(task=>withTaskLifecycle(task,titles.tasks.get(task.taskId ?? '')));
+    const tasks = this.taskIndex(index.values.flatMap(value=>value.items),titles,index.sources);
     const activeIndex = tasks.filter(task=>activeExecution(task.executionStatus)).sort((a,b)=>b.lastActivityAt-a.lastActivityAt);
     const visibleActive=[...activeIndex.filter(task=>task.executionStatus!=='queued').slice(0,12),
       ...activeIndex.filter(task=>task.executionStatus==='queued').slice(0,3)];
     const waitingIndex = tasks.filter(task=>['waiting','stalled','finalizing'].includes(task.executionStatus)).sort((a,b)=>b.lastActivityAt-a.lastActivityAt);
     const recentIndex = tasks.filter((task) => !["running", "queued", "stopping", "waiting", "stalled", "finalizing"].includes(task.executionStatus))
       .sort((a, b) => (b.finishedAt ?? b.lastActivityAt) - (a.finishedAt ?? a.lastActivityAt)).slice(0, 6);
-    const attentionIndex = tasks.filter((task) => task.executionStatus === "unknown"
-      || task.executionStatus === "interrupted_recoverable" && task.actionableInterruption
-      || task.executionStatus === "failed" && task.lastActivityAt >= at - 86_400_000)
+    const attentionIndex = tasks.filter(needsAttention)
       .sort((a, b) => b.lastActivityAt - a.lastActivityAt);
     const visibleIndex = [...visibleActive, ...waitingIndex.slice(0,6), ...recentIndex, ...attentionIndex.slice(0, 6)];
-    const summaries = await this.runSummaries([...new Set(visibleIndex.flatMap((task) => task.phaseRefs))]);
-    const detailed = new Map(applyRunTitles(aggregateTasks(summaries.values), titles.map).map((run) => [taskKey(run), run]));
+    const summaries = await this.runSummaries([...new Set(visibleIndex.flatMap((task) => task.phaseRefs))],fresh);
+    const detailed = new Map(applyRunTitles(aggregateTasks(observeSourceStates(summaries.values,summaries.sources)), titles.map).map((run) => [taskKey(run), run]));
     const resolve = (task: TaskIndex) => this.resolvedRun(task,detailed.get(task.key));
     const active = visibleActive.map(resolve);
     const recent = recentIndex.map(resolve);
     const today = dayAt(at, zone);
     const complete = group.complete && index.complete && summaries.complete && titles.complete;
-    return { active,activeCount:complete ? activeIndex.length : null,
-      waiting:waitingIndex.slice(0,6).map(resolve),waitingCount:complete ? waitingIndex.length : null,
+    const taskCoverage=index.complete&&titles.complete;
+    const taskSources=mergeSources(index.sources,titles.sources);
+    const nodeCounts=Object.fromEntries(taskSources.map(source=>{
+      // 节点卡片统计本节点阶段；同一 Task 在其它节点运行不能增加本节点运行数。
+      const own=aggregateTaskIndex(observeSourceStates(index.values.flatMap(value=>value.items).filter(phase=>phase.nodeId===source.nodeId),[source]));
+      const known=source.online&&source.observedAt!==null&&!source.error;
+      return [source.nodeId,{running:known?own.filter(task=>['running','stopping'].includes(task.executionStatus)).length:null,
+        queued:known?own.filter(task=>task.executionStatus==='queued').length:null,
+        waiting:known?own.filter(task=>['waiting','stalled','finalizing'].includes(task.executionStatus)).length:null,complete:known}];
+    }));
+    return { active,activeCount:taskCoverage ? activeIndex.length : null,nodeCounts,
+      knownCounts:{active:activeIndex.length,waiting:waitingIndex.length,attention:attentionIndex.length},
+      coverage:{tasks:taskCoverage,usage:group.complete,details:summaries.complete},
+      waiting:waitingIndex.slice(0,6).map(resolve),waitingCount:taskCoverage ? waitingIndex.length : null,
       recent,
       attention: attentionIndex.slice(0, 6).map((task) => {
         const run = resolve(task);
         return { id: run.id, kind: run.executionStatus, title: run.title, detail: run.reason ?? "查看保存的执行记录", nodeId: run.nodeId };
       }),
-      attentionCount: complete ? attentionIndex.length : null,
-      runningCount: complete ? activeIndex.filter((task) => task.executionStatus === "running" || task.executionStatus === "stopping").length : null,
-      queuedCount: complete ? activeIndex.filter((task) => task.executionStatus === "queued").length : null,
-      reviewCount: complete ? tasks.filter((task) => taskStage(task.executionStatus, task.acceptanceStatus) === "review").length : null,
-      completedToday: complete ? tasks.filter((task) => task.executionStatus === "completed" && task.finishedAt !== null && dayAt(task.finishedAt, zone) === today).length : null,
-      failedToday: complete ? tasks.filter((task) => task.executionStatus === "failed" && dayAt(task.finishedAt ?? task.lastActivityAt, zone) === today).length : null,
+      attentionCount: taskCoverage ? attentionIndex.length : null,
+      runningCount: taskCoverage ? activeIndex.filter((task) => task.executionStatus === "running" || task.executionStatus === "stopping").length : null,
+      queuedCount: taskCoverage ? activeIndex.filter((task) => task.executionStatus === "queued").length : null,
+      reviewCount: taskCoverage ? tasks.filter((task) => taskStage(task.executionStatus, task.acceptanceStatus,task.phaseExecutionStatus) === "review").length : null,
+      completedToday: taskCoverage ? tasks.filter((task) => task.executionStatus === "completed" && task.finishedAt !== null && dayAt(task.finishedAt, zone) === today).length : null,
+      failedToday: taskCoverage ? tasks.filter((task) => task.executionStatus === "failed" && dayAt(task.finishedAt ?? task.lastActivityAt, zone) === today).length : null,
       todayUsage: mergeTotals(group.values.map((value) => value.todayUsage)),
       projects: group.values.flatMap((value) => value.projects).sort((a, b) => (b.usage ?? 0) - (a.usage ?? 0)).slice(0, 4),
       sources: mergeSources(mergeSources(mergeSources(group.sources, index.sources), summaries.sources), titles.sources), complete, observedAt: Date.now() };
   }
 
   async usage(query: Query) {
-    const search = new URLSearchParams(Object.entries(query).filter((value): value is [string, string] => value[1] !== undefined));
-    const group = await this.collect("/workbench/usage?" + search, () => readLocalUsage(this.config, query), query, 30000);
+    const search = new URLSearchParams(Object.entries(query).filter((value): value is [string, string] => value[1] !== undefined&&value[0]!=='fresh'));
+    const group = await this.collect("/workbench/usage?" + search, () => readLocalUsage(this.config, query), query, 30000,undefined,query.fresh==='1');
     const dates = [...new Set(group.values.flatMap((value) => value.daily.map((row) => row.day)))].sort();
     return { ...mergeTotals(group.values), daily: dates.map((day) => ({ day, ...mergeTotals(group.values.flatMap((value) => value.daily.filter((row) => row.day === day))) })),
       projects: group.values.flatMap((value) => value.projects).sort((a, b) => (b.total ?? 0) - (a.total ?? 0)),
-      top: group.values.flatMap((value) => value.top).sort((a, b) => (b.usage.total ?? 0) - (a.usage.total ?? 0)).slice(0, 8),
+      top: aggregateTasks(group.values.flatMap(value=>value.top)).sort((a,b)=>(b.usage.total??0)-(a.usage.total??0)).slice(0,8),
+      basis:'execution_finished_at' as const,unit:'execution' as const,
+      pendingUsage:mergeTotals(group.values.map(value=>value.pendingUsage)),undatedUsage:mergeTotals(group.values.map(value=>value.undatedUsage)),
       sources: group.sources, complete: group.complete, observedAt: group.observedAt };
   }
 
-  async fleet() {
+  private async usageContributors(query:Query) {
+    const input:Query={...query,days:query.usageDays??'30',date:query.usageDate};
+    for(const name of ['cursor','limit','status','stage','execution','attention','changed','usageDate','usageDays','fresh'])delete input[name];
+    const search=new URLSearchParams(Object.entries(input).filter((value):value is [string,string]=>value[1]!==undefined));
+    const group=await this.collect('/workbench/usage?'+search,()=>readLocalUsage(this.config,input),input,30000,undefined,query.fresh==='1');
+    return {runIds:new Set(group.values.flatMap(value=>value.runIds)),sources:group.sources,complete:group.complete};
+  }
+
+  async fleet(fresh=false) {
+    if(fresh)await this.metadata(true);
     const status = this.runtime?.status();
     const nodes: NodeView[] = this.runtime?.nodes() ?? [{ id: this.localId, nickname: "本机", capabilities: capabilities({worker:true}), priority: 0,
       online: true, roots: [], platform: process.platform, tools: [], providers: [],
@@ -311,6 +454,7 @@ export class WorkbenchFeed {
         gpus: health.gpus.map((gpu) => ({ name: gpu.name, util: gpu.utilization, used: gpu.memoryUsedMiB / 1024, total: gpu.memoryTotalMiB / 1024, temp: gpu.temperature ?? null })),
         gpuSampled: health.gpuSampled ?? null,
         latency: node.latencyMs ?? null, version: node.version ?? null, priority: settings?.priority ?? node.priority, revision: settings?.revision ?? null,
+        settingsState:{savedRevision:settings?.savedRevision??settings?.revision??null,appliedRevision:settings?.appliedRevision??null,pending:settings?.pending??null,error:settings?.error??null},
         egress: { enabled: egress.enabled, healthy: egress.healthy, ip: null, region: null, latency: egress.latencyMs ?? null,
           config: settings?.egress.config ?? null, port: settings?.egress.port ?? null, probe: settings?.egress.probe ?? null,
           recovery: settings?.egress.recovery ?? null, inherit: settings?.egress.inherit ?? false }, lastSeen: node.lastSeen ?? node.updatedAt };
@@ -327,15 +471,18 @@ export class WorkbenchFeed {
 }
 
 
-function mergeSources(primary: SourceState[], secondary: SourceState[]): SourceState[] {
-  const secondaryByNode = new Map(secondary.map((source) => [source.nodeId, source]));
-  return primary.map((source) => {
-    const detail = secondaryByNode.get(source.nodeId);
-    if (!detail) return source;
-    if (detail.error || detail.state === "offline") return detail;
-    return { ...source, observedAt: Math.max(source.observedAt ?? 0, detail.observedAt ?? 0),
-      stale: source.stale || detail.stale, state: source.stale ? source.state : detail.state, error: source.error ?? detail.error };
-  });
+export function mergeSources(primary:SourceState[],secondary:SourceState[]):SourceState[] {
+  const result=new Map(primary.map(source=>[source.nodeId,source]));
+  const rank:Record<SourceReadState,number>={ready:0,refreshing:1,loading:2,error:3,offline:4};
+  for(const source of secondary){
+    const previous=result.get(source.nodeId);
+    if(!previous){result.set(source.nodeId,source);continue;}
+    const state=rank[previous.state]>=rank[source.state]?previous.state:source.state;
+    result.set(source.nodeId,{...previous,online:previous.online&&source.online,state,
+      observedAt:previous.observedAt===null||source.observedAt===null?null:Math.min(previous.observedAt,source.observedAt),
+      stale:previous.stale||source.stale,error:previous.error??source.error});
+  }
+  return [...result.values()];
 }
 
 function chunk<T>(values: readonly T[], size: number): T[][] {

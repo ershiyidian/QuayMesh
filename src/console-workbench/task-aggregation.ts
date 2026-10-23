@@ -3,9 +3,12 @@ import { dayAt, type Query } from "./query.js";
 import type { TaskPhaseIndex } from "./local-queries.js";
 import type { SessionTitleIndex } from "./local-queries.js";
 import type { Run, Usage } from "./types.js";
+import { needsAttention, relevantExecution, taskStage, withTaskLifecycle, executionTimeEnd, type TaskLifecycle } from '../console-task-state.js';
+import { taskView } from '../task-view.js';
 export { taskStage } from '../console-task-state.js';
 
 export const TASK_REFERENCE_PREFIX = "qmtask:";
+export const SESSION_REFERENCE_PREFIX = "qmsession:";
 
 export interface TaskIndex {
   key: string;
@@ -19,6 +22,7 @@ export interface TaskIndex {
   projectNames: string[];
   roots: string[];
   executionStatus: string;
+  phaseExecutionStatus?: string;
   acceptanceStatus: string;
   startedAt: number;
   finishedAt: number | null;
@@ -27,6 +31,14 @@ export interface TaskIndex {
   changed: boolean;
   actionableInterruption: boolean;
   currentPhaseRefs: string[];
+  requestState?: string;
+  taskRevision?: number;
+  resultStatus?: string | null;
+  finalization?: TaskLifecycle['finalization'];
+  workspaces?: NonNullable<TaskLifecycle['workspaces']>;
+  reason?: string | null;
+  observedAt?: number | null;
+  stale?: boolean;
 }
 
 export function taskReference(taskId: string): string {
@@ -37,6 +49,30 @@ export function parseTaskReference(value: string): string | null {
   return value.startsWith(TASK_REFERENCE_PREFIX) && value.length > TASK_REFERENCE_PREFIX.length
     ? value.slice(TASK_REFERENCE_PREFIX.length)
     : null;
+}
+
+export function sessionReference(sessionId: string): string {
+  return SESSION_REFERENCE_PREFIX + sessionId;
+}
+
+export function parseSessionReference(value: string): string | null {
+  return value.startsWith(SESSION_REFERENCE_PREFIX) && value.length > SESSION_REFERENCE_PREFIX.length
+    ? value.slice(SESSION_REFERENCE_PREFIX.length) : null;
+}
+
+export function taskOnlyIndex(task: TaskLifecycle, at = Date.now()): TaskIndex {
+  const workspaces = task.workspaces ?? [];
+  return withTaskLifecycle({
+    key: `task:${task.id}`, sessionId:task.sessionId, taskId:task.id, title:task.title,
+    phaseRefs:[], currentPhaseRefs:[], nodeIds:task.memberNodeIds?.length ? task.memberNodeIds : [task.nodeId ?? 'local'],
+    projectIds:[...new Set(workspaces.map(value=>value.projectId).filter(Boolean))],
+    projectNames:[...new Set(workspaces.map(value=>value.name))], roots:[...new Set(workspaces.map(value=>value.root))], workspaces,
+    executionStatus:taskView({requestState:task.state,result:task.resultStatus,execution:'waiting',
+      finalizing:Boolean(task.finalization),lastProgressAt:task.lastActivityAt,now:at}).status,
+    acceptanceStatus:'not_required', startedAt:task.createdAt ?? task.lastActivityAt, finishedAt:task.finishedAt,
+    lastActivityAt:task.lastActivityAt, tokens:0, changed:false, actionableInterruption:false,
+    reason:task.state==='active' ? '任务已创建，尚未登记后台执行；请求仍然开放' : null,
+  },task);
 }
 
 export function aggregateTasks(runs: Run[]): Run[] {
@@ -62,7 +98,7 @@ export function aggregateTaskIndex(phases: TaskPhaseIndex[]): TaskIndex[] {
     const sessionId = values.find((value) => value.sessionId)?.sessionId ?? null;
     const taskId = values.find((value) => value.taskId)?.taskId ?? null;
     const current = values.filter((value) => value.currentPhase);
-    const stateValues = current.length ? values.filter(value => value.currentPhase || ["running","queued","stopping"].includes(value.executionStatus)) : values;
+    const stateValues = current.length ? values.filter(relevantExecution) : values;
     const tokenValues = values.map((value) => value.tokens).filter((value): value is number => value !== null);
     return {
       key,
@@ -77,12 +113,17 @@ export function aggregateTaskIndex(phases: TaskPhaseIndex[]): TaskIndex[] {
       executionStatus: aggregateExecution(stateValues.map((value) => value.executionStatus)),
       acceptanceStatus: aggregateAcceptance(stateValues.map((value) => value.acceptanceStatus)),
       startedAt: Math.min(...values.map((value) => value.startedAt)),
-      finishedAt: values.every((value) => value.finishedAt !== null) ? Math.max(...values.map((value) => value.finishedAt!)) : null,
+      finishedAt: stateValues.every((value) => value.finishedAt !== null) ? Math.max(...stateValues.map((value) => value.finishedAt!)) : null,
       lastActivityAt: Math.max(...values.map((value) => value.lastActivityAt)),
+      observedAt: stateValues.every(value => value.observedAt != null) ? Math.min(...stateValues.map(value => value.observedAt!)) : null,
+      stale: stateValues.some(value => value.stale),
       tokens: tokenValues.length ? tokenValues.reduce((sum, value) => sum + value, 0) : null,
       changed: values.some((value) => value.changed),
       actionableInterruption: stateValues.some((value) => value.actionableInterruption),
       currentPhaseRefs: stateValues.map((value) => value.id),
+      requestState:stateValues.find(value=>value.requestState)?.requestState,
+      resultStatus:stateValues.find(value=>value.resultStatus)?.resultStatus ?? null,
+      finalization:stateValues.find(value=>value.finalization)?.finalization ?? null,
     };
   });
 }
@@ -122,19 +163,22 @@ export function filterTaskIndex(tasks: TaskIndex[], query: Query, at: number): T
     && (!query.root || task.roots.includes(query.root))
     && (!query.changed || task.changed)
     && (!query.execution || task.executionStatus === query.execution)
-    && (!query.attention || task.executionStatus === "failed" || task.executionStatus === "unknown"
-      || task.executionStatus === "interrupted_recoverable" && task.actionableInterruption)
+    && (!query.stage || query.stage.split(',').includes(taskStage(task.executionStatus,task.acceptanceStatus)))
+    && (!query.attention || needsAttention(task))
     && (!query.date || dayAt(task.startedAt, zone) === query.date)
     && (!query.finishedDay || task.finishedAt !== null && dayAt(task.finishedAt, zone) === query.finishedDay)
     && (!search || [task.title, task.taskId ?? "", task.sessionId ?? "", ...task.phaseRefs, ...task.projectNames, ...task.nodeIds, ...task.roots]
       .some((value) => value.toLocaleLowerCase().includes(search)))
     && (!days || task.startedAt >= at - days * 86_400_000 || ["running", "queued", "stopping", "waiting"].includes(task.executionStatus)
-      || Boolean(query.attention && task.executionStatus === "interrupted_recoverable" && task.actionableInterruption)));
+      || needsAttention(task)));
 }
 
 export function compareTaskIndex(left: TaskIndex, right: TaskIndex, query: Query, at: number): number {
-  const value = (task: TaskIndex) => query.sort === "tokens" ? task.tokens ?? -1
-    : query.sort === "duration" ? (task.finishedAt ?? at) - task.startedAt : task.startedAt;
+  const value = (task: TaskIndex) => {
+    const end = executionTimeEnd(task, at);
+    return query.sort === "tokens" ? task.tokens ?? -1
+      : query.sort === "duration" ? end === null ? -1 : Math.max(0, end - task.startedAt) : task.startedAt;
+  };
   const delta = value(left) - value(right);
   return (query.sort === "oldest" ? delta : -delta) || left.key.localeCompare(right.key);
 }
@@ -144,43 +188,53 @@ export function taskKey(run: Run): string {
 }
 
 export function fallbackTask(task: TaskIndex): Run {
-  const reference = task.phaseRefs[0]!;
+  const reference = task.phaseRefs[0] ?? taskReference(task.taskId ?? task.sessionId ?? task.key);
   const parsed = parseWorkspaceHandle(reference);
   const project = task.projectIds[0] ?? "";
   const projectParsed = parseWorkspaceHandle(project);
   return {
-    id: task.taskId ? taskReference(task.taskId) : task.sessionId ? taskReference(task.sessionId) : reference,
+    id: task.taskId ? taskReference(task.taskId) : task.sessionId ? sessionReference(task.sessionId) : reference,
     localId: task.taskId ?? task.sessionId ?? parsed?.local ?? reference,
     title: task.title,
     nodeId: task.nodeIds[0] ?? parsed?.node ?? "unknown",
     projectId: project,
     projectLocalId: projectParsed?.local ?? project,
-    projectName: task.projectNames.length === 1 ? task.projectNames[0]! : `${task.projectNames.length} 个工作区`,
+    projectName: task.projectNames.length === 1 ? task.projectNames[0]! : task.projectNames.length ? `${task.projectNames.length} 个工作区` : '尚未关联工作区',
     root: task.roots[0] ?? "",
     executionStatus: task.executionStatus,
+    phaseExecutionStatus:task.phaseExecutionStatus,
     acceptanceStatus: task.acceptanceStatus,
     startedAt: task.startedAt,
     finishedAt: task.finishedAt,
     lastActivityAt: task.lastActivityAt,
+    observedAt: task.observedAt,
+    stale: task.stale,
     revision: 0,
     workspaceRevision: 0,
     sessionId: task.sessionId,
     taskId: task.taskId,
+    requestState:task.requestState,
+    taskRevision:task.taskRevision,
+    resultStatus:task.resultStatus,
+    finalization:task.finalization,
+    actionableInterruption:task.actionableInterruption,
     memberId: null,
-    usage: { total: task.tokens, input: null, cached: null, output: null, reasoning: null, quality: task.tokens === null ? "unavailable" : "partial" },
+    usage: task.phaseRefs.length ? { total: task.tokens, input: null, cached: null, output: null, reasoning: null, quality: task.tokens === null ? "unavailable" : "partial" }
+      : {total:0,input:0,cached:0,output:0,reasoning:0,quality:'not_used'},
     diff: null,
     origin: "session_index",
     branch: null,
     baseSha: null,
     command: null,
     agent: null,
-    reason: task.actionableInterruption ? "执行记录需要核对" : null,
-    actions: { interrupt: false, resume: false, review: false, revert: false, complete: false, patch: task.currentPhaseRefs.length === 1 },
-    warnings: ["部分节点详情暂未取得"],
+    reason: task.reason ?? (task.actionableInterruption ? "执行记录需要核对" : null),
+    actions: { interrupt: false, resume: false, review: false, revert: false, complete: !task.phaseRefs.length && task.requestState==='active', patch: task.currentPhaseRefs.length === 1 },
+    warnings: task.phaseRefs.length ? ["部分节点详情暂未取得"] : [],
     phaseRefs: task.phaseRefs,
     currentPhaseRefs: task.currentPhaseRefs,
     nodeIds: task.nodeIds,
     workspaceCount: task.projectIds.length,
+    workspaces:task.workspaces,
     currentPhase: true,
   };
 }
@@ -194,7 +248,7 @@ function mergeTask(group: Run[]): Run {
   const workspaces = [...new Map(group.flatMap(run => run.workspaces ?? [{nodeId:run.nodeId,projectId:run.projectId,
     memberId:run.memberId,name:run.projectName,root:run.root}]).map(value=>[JSON.stringify([value.nodeId,value.root]),value])).values()];
   const currentRuns = group.filter((run) => run.currentPhase !== false);
-  const stateRuns = currentRuns.length ? group.filter(run => run.currentPhase !== false || ["running","queued","stopping"].includes(run.executionStatus)) : group;
+  const stateRuns = currentRuns.length ? group.filter(relevantExecution) : group;
   const nodeStates=Object.fromEntries([...new Set(stateRuns.map(run=>run.nodeId))].map(nodeId=>[
     nodeId,aggregateExecution(stateRuns.filter(run=>run.nodeId===nodeId).map(run=>run.executionStatus)),
   ]));
@@ -204,21 +258,25 @@ function mergeTask(group: Run[]): Run {
   const usage = mergeUsage(group.map((run) => run.usage));
   const executions = stateRuns.map((run) => run.executionStatus);
   const taskCanComplete = stateRuns.some((run) => run.actions.complete)
-    && executions.every((state) => state === "waiting" || state === "idle" || state === "completed");
+    && stateRuns.every(run => run.actions.complete || ['completed','ended','handed_off'].includes(run.executionStatus));
   const taskCanReview = stateRuns.some((run) => run.actions.review)
     && executions.every((state) => state === "completed");
   return {
     ...current,
     workspaces,
-    id: current.taskId ? taskReference(current.taskId) : current.sessionId ? taskReference(current.sessionId) : current.id,
+    id: current.taskId ? taskReference(current.taskId) : current.sessionId ? sessionReference(current.sessionId) : current.id,
     localId: current.taskId ?? current.sessionId ?? current.localId,
     title: chooseTaskTitle(group),
     projectName: projects.length === 1 ? projects[0]! : `${memberIds.size || projects.length} 个工作区`,
     executionStatus,
     acceptanceStatus,
+    actionableInterruption:stateRuns.some(run=>run.actionableInterruption),
+    finalization:stateRuns.find(run=>run.finalization)?.finalization ?? null,
     startedAt: Math.min(...group.map((run) => run.startedAt)),
     finishedAt: stateRuns.every((run) => run.finishedAt !== null) ? Math.max(...stateRuns.map((run) => run.finishedAt!)) : null,
     lastActivityAt: Math.max(...group.map((run) => run.lastActivityAt)),
+    observedAt: stateRuns.every(run => run.observedAt != null) ? Math.min(...stateRuns.map(run => run.observedAt!)) : null,
+    stale: stateRuns.some(run => run.stale),
     revision: group.reduce((sum, run) => sum + run.revision, 0),
     workspaceRevision: group.reduce((sum, run) => sum + run.workspaceRevision, 0),
     usage,
@@ -265,7 +323,7 @@ function isTaskTitle(title: string): boolean {
 }
 
 function aggregateExecution(states: string[]): string {
-  for (const state of ["running", "queued", "stopping", "unknown", "failed", "interrupted_recoverable", "finalizing", "waiting", "stalled", "cancelled", "completed", "ended"]) {
+  for (const state of ["running", "stopping", "queued", "unknown", "finalizing", "failed", "interrupted_recoverable", "stalled", "waiting", "cancelled", "completed", "handed_off", "ended"]) {
     if (states.includes(state)) return state;
   }
   return states[0] ?? "unknown";
