@@ -1,6 +1,7 @@
 allowBuilds:
   '@google/genai': false
-  better-sqlite3: true
+  # 13.x 随包提供 N-API 二进制；自动 node-gyp 会覆盖其无安装脚本的约定。
+  better-sqlite3: false
   esbuild: true
   koffi: true
   node-pty: true
