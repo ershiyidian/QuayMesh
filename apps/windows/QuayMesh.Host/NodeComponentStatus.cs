@@ -23,6 +23,7 @@ public sealed class NodeComponentStatus
         try
         {
             using var doc=JsonDocument.Parse(File.ReadAllText(path));
+            var fileAge=DateTime.UtcNow-File.GetLastWriteTimeUtc(path);
             foreach(var component in doc.RootElement.GetProperty("components").EnumerateArray())
             {
                 if(component.GetProperty("id").GetString()!=name) continue;
@@ -33,9 +34,16 @@ public sealed class NodeComponentStatus
                 {
                     "ready"=>ServiceState.Healthy,
                     "starting" or "waiting"=>ServiceState.Starting,
-                    "backoff"=>ServiceState.Unhealthy,
-                    _=>ServiceState.Stopped
+                    "backoff" or "degraded"=>ServiceState.Unhealthy,
+                    "stopped"=>ServiceState.Stopped,
+                    _=>ServiceState.UnknownIdentity
                 };
+                if (fileAge>TimeSpan.FromSeconds(15)) state=ServiceState.UnknownIdentity;
+                if(component.TryGetProperty("observedAt",out var observed)
+                    && observed.ValueKind==JsonValueKind.Number
+                    && observed.TryGetInt64(out var observedMs)
+                    && DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()-observedMs>15000)
+                    state=ServiceState.UnknownIdentity;
                 return (state,pid);
             }
             return (ServiceState.Stopped,null);

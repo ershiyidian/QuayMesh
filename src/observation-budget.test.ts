@@ -1,0 +1,47 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { createConnection, createServer, type Socket, type AddressInfo } from "node:net";
+import { once } from "node:events";
+import { ObservationGate, observeWithSignal } from "./observation-budget.js";
+
+test("取消观察保留实际IO占用，排队取消释放队列且过载有界", async t => {
+  const sockets: Socket[] = [];
+  const server = createServer(socket => { sockets.push(socket); });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(async () => { for (const socket of sockets) socket.destroy(); await new Promise<void>(resolve => server.close(() => resolve())); });
+  const port = (server.address() as AddressInfo).port;
+  let started = 0;
+  const io = async () => {
+    started++;
+    const socket = createConnection({ port, host: "127.0.0.1" });
+    const chunks: Buffer[] = [];
+    socket.on("data", data => chunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data)));
+    await once(socket, "end");
+    socket.destroy();
+    return Buffer.concat(chunks).toString();
+  };
+  const gate = new ObservationGate(1, 1), first = new AbortController(), queued = new AbortController();
+  const connected = once(server, "connection");
+  const activeWork = gate.run(io, first.signal);
+  const observed = observeWithSignal(activeWork, first.signal);
+  const rejectedObservation = assert.rejects(observed, /observer stopped/);
+  await connected;
+  first.abort(new Error("observer stopped"));
+  await rejectedObservation;
+  const pending = gate.run(io, queued.signal);
+  const rejectedQueue = assert.rejects(pending, /queued observer stopped/);
+  await assert.rejects(gate.run(io), /OBSERVATION_BUSY/);
+  assert.equal(started, 1, "取消HTTP等待后，未结束的IO仍占用原槽位");
+  queued.abort(new Error("queued observer stopped"));
+  await rejectedQueue;
+  const nextConnected = once(server, "connection");
+  const next = gate.run(io);
+  assert.equal(started, 1);
+  sockets[0]!.end("first result");
+  assert.equal(await activeWork, "first result");
+  await nextConnected;
+  assert.equal(started, 2);
+  sockets[1]!.end("second result");
+  assert.equal(await next, "second result");
+});

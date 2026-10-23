@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import { pidAlive } from "./process-liveness.js";
+import { processOwner, processOwnerAlive } from "./process-identity.js";
 import { canonicalExecutionRoot, overlaps } from "./execution-coordinator.js";
 import { canonicalWorkspaceRoot } from "./roots.js";
 import type { AgentUsageObservation, TokenCounts } from "./agent-usage.js";
@@ -54,6 +55,7 @@ const active = (status: string) => ["starting", "queued", "running"].includes(st
 export const WORK_RUN_LEASE_MS = 15 * 60 * 1000;
 export const EXECUTION_OBSERVATION_MS = 30_000;
 const leaseExpiry = (at = Date.now()) => new Date(at + WORK_RUN_LEASE_MS).toISOString();
+type ExecutionOwner = {generation: string; owner_token: string; owner_pid: number; process_start: string | null};
 
 export class WorkFinishBlockedError extends Error {
   readonly nextAction = "Observe this run's children until terminal, then retry finish. For unresolved claims/waiters, ask their owner to reconcile and release them; never steal a lock.";
@@ -95,6 +97,40 @@ export class WorkLedger {
   constructor(readonly stateDir: string) { this.database = openDatabase(stateDir); }
   close(): void { this.database.close(); }
   get db() { return this.database.sqlite; }
+
+  private recordOwner(domain: "execution" | "operation", objectId: string, generation: string): void {
+    this.db.prepare(`INSERT INTO execution_owners(domain,id,generation,owner_token,owner_pid,process_start,created_at)
+      VALUES(?,?,?,?,?,?,?) ON CONFLICT(domain,id) DO UPDATE SET generation=excluded.generation,
+      owner_token=excluded.owner_token,owner_pid=excluded.owner_pid,process_start=excluded.process_start,created_at=excluded.created_at`)
+      .run(domain, objectId, generation, processOwner.token, processOwner.pid, processOwner.start, now());
+  }
+
+  private owner(domain: "execution" | "operation", objectId: string): ExecutionOwner | undefined {
+    return this.db.prepare("SELECT generation,owner_token,owner_pid,process_start FROM execution_owners WHERE domain=? AND id=?")
+      .get(domain, objectId) as ExecutionOwner | undefined;
+  }
+
+  private liveOwner(domain: "execution" | "operation", objectId: string, agentId?: string): boolean {
+    const owner = this.owner(domain, objectId);
+    if (owner) return processOwnerAlive(owner);
+    // 旧版本没有启动身份，真实存活的执行 claim 保留为兼容依据。
+    const claims = domain === "execution"
+      ? this.db.prepare("SELECT owner_pid FROM execution_claims WHERE agent_id=? UNION ALL SELECT owner_pid FROM execution_waiters WHERE agent_id=? AND expires_at_ms>?").all(agentId, agentId, Date.now())
+      : this.db.prepare("SELECT owner_pid FROM execution_claims WHERE operation_id=? UNION ALL SELECT owner_pid FROM qm_runtime_work WHERE operation_id=?").all(objectId, objectId);
+    return (claims as Array<{owner_pid:number}>).some(claim => pidAlive(claim.owner_pid));
+  }
+
+  private clearResolvedRun(runId: string): void {
+    const unresolved = this.db.prepare(`SELECT 1 FROM console_executions WHERE run_id=? AND status IN ('unknown','reconciliation_required')
+      UNION ALL SELECT 1 FROM console_operations WHERE run_id=? AND status IN ('unknown','reconciliation_required') LIMIT 1`).get(runId, runId);
+    if (unresolved) return;
+    // 子操作已经结束也不能盖过另一个未证实退出的 claim；等该 claim 的证据核对完成。
+    if (this.db.prepare(`SELECT 1 FROM execution_claim_reconciliations r JOIN execution_claims c ON c.id=r.claim_id
+      WHERE r.run_id=? OR EXISTS (SELECT 1 FROM json_each(r.evidence,'$.runIds') WHERE value=?) LIMIT 1`).get(runId,runId)) return;
+    this.db.prepare(`UPDATE console_work_runs SET status='running',finished_at=NULL,revision=revision+1
+      WHERE id=? AND status='reconciliation_required'`).run(runId);
+    this.reconcileRun(runId);
+  }
 
   project(root: string, name?: string): ProjectRow {
     if (name !== undefined && (!name.trim() || name.length > 200)) throw new Error("Project name must contain 1–200 characters.");
@@ -322,7 +358,7 @@ export class WorkLedger {
         const resumed = this.db.prepare(`UPDATE console_operations SET run_id=?,request_key=?,status=?,evidence=?,finished_at=NULL,observed_at=?
           WHERE id=? AND request_key=? AND kind=? AND label=? AND status IN ('starting','queued','running','failed')`)
           .run(input.runId,input.requestKey,input.status,JSON.stringify(evidence),now(),input.id,input.retryOfInvocationId,input.kind.slice(0,64),input.label.slice(0,200));
-        if (resumed.changes) {this.touch(input.runId); return input.id;}
+        if (resumed.changes) {this.recordOwner("operation",input.id,input.requestKey);this.touch(input.runId); return input.id;}
         if (this.db.prepare("SELECT 1 FROM console_operations WHERE id=?").get(input.id)) throw new Error("OPERATION_RETRY_SUPERSEDED");
       }
       const previous = this.db.prepare("select * from console_operations where run_id=? and request_key=?")
@@ -338,17 +374,23 @@ export class WorkLedger {
         .run(operationId, input.runId, input.requestKey.slice(0, 160), input.kind.slice(0, 64), input.label.slice(0, 200),
           input.status, JSON.stringify(evidence), now(), active(input.status) ? null : now());
       this.db.prepare("update console_operations set observed_at=? where id=?").run(now(),operationId);
+      if (active(input.status)) this.recordOwner("operation",operationId,input.requestKey);
       this.touch(input.runId); return operationId;
     }).immediate();
   }
   endOperation(operationId: string, status: "completed" | "failed" | "cancelled" | "reconciliation_required", evidence: Evidence[] = [], requestKey?: string): void {
     const op = this.db.prepare("select run_id,status from console_operations where id=?").get(operationId) as { run_id: string; status: string } | undefined;
-    if (!op || !active(op.status)) return;
+    if (!op) return;
+    const owner = this.owner("operation", operationId);
+    const recovering = op.status === "reconciliation_required" && owner?.owner_token === processOwner.token
+      && (requestKey === undefined || owner.generation === requestKey);
+    if (!active(op.status) && !recovering) return;
     const updated = this.db.prepare(`update console_operations set status=?, evidence=?, finished_at=? where id=?
-      and status in ('starting','queued','running') and (? is null or request_key=?)`)
-      .run(status, JSON.stringify(validateEvidence(evidence)), now(), operationId, requestKey ?? null, requestKey ?? null);
+      and status in ('starting','queued','running','reconciliation_required') and (? is null or request_key=?)`)
+      .run(status, JSON.stringify(validateEvidence(evidence)), status === "reconciliation_required" ? null : now(), operationId, requestKey ?? null, requestKey ?? null);
     if (!updated.changes) return;
     if (status === "reconciliation_required") this.markRunReconciliationRequired(op.run_id);
+    else this.clearResolvedRun(op.run_id);
     this.touch(op.run_id);
   }
 
@@ -365,6 +407,7 @@ export class WorkLedger {
     this.db.prepare(`insert into console_executions(id,run_id,agent_id,provider,status,requested_model,requested_effort,created_at)
       values(?,?,?,?,?,?,?,?)`).run(executionId, run.id, input.agentId, input.provider, "queued", input.model ?? null, input.effort ?? null, now());
     this.db.prepare("update console_executions set observed_at=? where id=?").run(now(),executionId);
+    this.recordOwner("execution",executionId,executionId);
     this.touch(run.id); return executionId;
     }).immediate();
   }
@@ -404,9 +447,27 @@ export class WorkLedger {
   reconcileInterruptedExecutions(): number {
     return this.db.transaction(() => {
       const rows = this.db.prepare("select * from console_executions where status in ('starting','queued','running')").all() as ExecutionRow[];
+      let changed = 0;
       for (const row of rows) {
-        this.db.prepare("update console_executions set status='reconciliation_required',finished_at=? where id=?").run(now(), row.id);
-        this.db.prepare("update console_work_runs set status='reconciliation_required',revision=revision+1 where id=?").run(row.run_id);
+        if (this.liveOwner("execution", row.id, row.agent_id)) continue;
+        this.db.prepare("update console_executions set status='reconciliation_required',finished_at=NULL where id=?").run(row.id);
+        this.markRunReconciliationRequired(row.run_id);
+        changed++;
+      }
+      return changed;
+    }).immediate();
+  }
+
+  reconcileCompletedExecutions(): number {
+    return this.db.transaction(() => {
+      const rows = this.db.prepare(`SELECT e.id,e.run_id FROM console_executions e JOIN execution_responses r ON r.execution_id=e.id
+        WHERE e.status='reconciliation_required' AND e.provider_finished=1`).all() as Array<{id:string;run_id:string}>;
+      for (const row of rows) {
+        // response 只在同一 execution 的成功路径保存；取消和失败的真实终态不会进入此集合。
+        this.db.prepare("UPDATE console_executions SET status='completed',finished_at=? WHERE id=?")
+          .run(now(), row.id);
+        this.clearResolvedRun(row.run_id);
+        this.touch(row.run_id);
       }
       return rows.length;
     }).immediate();
@@ -415,8 +476,9 @@ export class WorkLedger {
   reconcileOrphanedOperations(): number {
     return this.db.transaction(() => {
       const rows = this.db.prepare("select id, run_id, evidence from console_operations where status in ('starting','queued','running')").all() as { id: string; run_id: string; evidence: string }[];
-      const at = now();
+      let changed = 0;
       for (const row of rows) {
+        if (this.liveOwner("operation", row.id)) continue;
         let list: Evidence[] = [];
         try {
           const parsed = JSON.parse(row.evidence) as unknown;
@@ -424,55 +486,69 @@ export class WorkLedger {
         } catch { list = []; }
         list.push({ label: "In-flight operation lost its owner process", outcome: "not_run",
           reference: JSON.stringify({ version: 1, boundary: "process_restart", operationId: row.id, retry: "reconcile_before_replay" }) });
-        this.db.prepare("update console_operations set status='reconciliation_required', finished_at=?, evidence=? where id=?").run(at, JSON.stringify(list), row.id);
+        this.db.prepare("update console_operations set status='reconciliation_required', finished_at=NULL, evidence=? where id=?").run(JSON.stringify(list), row.id);
         this.db.prepare("update console_work_runs set status='reconciliation_required', revision=revision+1 where id=? and status='running'").run(row.run_id);
+        changed++;
       }
-      return rows.length;
+      return changed;
     }).immediate();
   }
 
-  /**
-   * Release only claims whose owner pid is gone. Terminal agent claims are deleted after an evidence row.
-   * Command/process claims, and agent claims that still look active, first mark the run reconciliation_required.
-   * Never `DELETE FROM execution_claims`.
-   */
+  // owner 死亡后仍可能有子进程写入；只凭同一操作的终态收据释放占用。
   reconcileDeadExecutionClaims(isAlive: (pid: number) => boolean = pidAlive): { released: number; reconciled: number } {
     return this.db.transaction(() => {
-      const claims = this.db.prepare("select id, owner_pid, kind, checkout_root, agent_id from execution_claims").all() as { id: string; owner_pid: number; kind: string; checkout_root: string; agent_id: string | null }[];
+      const claims = this.db.prepare("select id, owner_pid, kind, checkout_root, agent_id,operation_id,task_id,acquired_at from execution_claims").all() as Array<{
+        id:string;owner_pid:number;kind:string;checkout_root:string;agent_id:string|null;operation_id:string|null;task_id:string|null;acquired_at:string;
+      }>;
       let released = 0;
       let reconciled = 0;
       for (const claim of claims) {
         if (isAlive(claim.owner_pid)) continue;
         const latest = claim.agent_id
-          ? this.db.prepare("select id, run_id, status from console_executions where agent_id=? order by rowid desc limit 1").get(claim.agent_id) as { id: string; run_id: string; status: string } | undefined
+          ? this.db.prepare("select id, run_id, status,finished_at from console_executions where agent_id=? order by rowid desc limit 1").get(claim.agent_id) as { id: string; run_id: string; status: string;finished_at:string|null } | undefined
           : undefined;
         const agent = claim.agent_id
           ? this.db.prepare("select status from local_agent_sessions where id=?").get(claim.agent_id) as { status: string } | undefined
           : undefined;
         const executionHot = Boolean(latest && ["starting", "queued", "running"].includes(latest.status));
-        const terminalAgent = claim.kind === "agent" && Boolean(agent) && ["error", "stopped", "idle"].includes(agent!.status) && !executionHot;
+        const terminalAgent = claim.kind === "agent" && Boolean(agent) && ["error", "stopped", "idle"].includes(agent!.status)
+          && Boolean(latest?.finished_at && latest.finished_at >= claim.acquired_at && ["completed","failed","cancelled"].includes(latest.status));
+        const operation = claim.operation_id
+          ? this.db.prepare("SELECT run_id,status,finished_at FROM console_operations WHERE id=?").get(claim.operation_id) as {run_id:string;status:string;finished_at:string|null}|undefined
+          : undefined;
+        const terminalOperation = Boolean(operation?.finished_at && operation.finished_at >= claim.acquired_at
+          && ["completed","failed","cancelled"].includes(operation.status));
+        const terminal = claim.kind === "agent" ? terminalAgent : terminalOperation;
         const runIds = new Set<string>();
         if (latest?.run_id) runIds.add(latest.run_id);
-        if (!terminalAgent) {
+        if (operation?.run_id) runIds.add(operation.run_id);
+        if (!terminal && claim.task_id) {
+          for (const row of this.db.prepare("SELECT run_id FROM qm_run_links WHERE task_id=?").all(claim.task_id) as Array<{run_id:string}>) runIds.add(row.run_id);
+        }
+        if (!terminal && runIds.size === 0) {
           const rootRuns = this.db.prepare(`select r.id from console_work_runs r join console_projects p on p.id=r.project_id
             where r.status='running' and p.root=?`).all(claim.checkout_root) as { id: string }[];
           for (const row of rootRuns) runIds.add(row.id);
         }
-        const reason = terminalAgent ? "dead_owner_terminal_agent" : claim.kind === "agent" ? "dead_owner_unproven_agent" : "dead_owner_command";
+        const reason = terminalAgent ? "dead_owner_terminal_agent" : terminal && terminalOperation ? "dead_owner_terminal_operation"
+          : claim.kind === "agent" ? "dead_owner_unproven_agent" : "dead_owner_command";
+        if (!this.db.prepare("SELECT 1 FROM execution_claim_reconciliations WHERE claim_id=? AND reason=?").get(claim.id,reason))
         this.db.prepare(`insert into execution_claim_reconciliations(id, claim_id, kind, owner_pid, agent_id, checkout_root, run_id, reason, evidence, created_at)
           values(?,?,?,?,?,?,?,?,?,?)`).run(id("claimrec"), claim.id, claim.kind, claim.owner_pid, claim.agent_id, claim.checkout_root,
             [...runIds][0] ?? null, reason, JSON.stringify({ version: 1, retry: "reconcile_before_replay", runIds: [...runIds], executionId: latest?.id ?? null, executionStatus: latest?.status ?? null, agentStatus: agent?.status ?? null }), now());
-        if (!terminalAgent) {
+        if (!terminal) {
           for (const runId of runIds) {
             const changed = this.db.prepare("update console_work_runs set status='reconciliation_required', revision=revision+1 where id=? and status in ('running','interrupted')").run(runId);
             if (changed.changes > 0) reconciled++;
           }
           if (latest && executionHot) {
-            this.db.prepare("update console_executions set status='reconciliation_required', finished_at=? where id=? and status in ('starting','queued','running')").run(now(), latest.id);
+            this.db.prepare("update console_executions set status='reconciliation_required', finished_at=NULL where id=? and status in ('starting','queued','running')").run(latest.id);
           }
+          continue;
         }
         this.db.prepare("delete from execution_claims where id=?").run(claim.id);
         released++;
+        for (const runId of runIds) this.clearResolvedRun(runId);
       }
       const waiters = this.db.prepare("select id, owner_pid, kind, checkout_root, agent_id from execution_waiters").all() as { id: string; owner_pid: number; kind: string; checkout_root: string; agent_id: string | null }[];
       for (const waiter of waiters) {
@@ -611,12 +687,18 @@ export class WorkLedger {
   }
   endExecution(executionId: string, status: string): void {
     const row = this.execution(executionId);
-    if (!active(row.status)) return;
-    const updated = this.db.prepare("update console_executions set status=?,finished_at=? where id=? and status in ('starting','queued','running')").run(status, now(), executionId);
+    const owner = this.owner("execution", executionId);
+    const recovering = row.status === "reconciliation_required" && (owner?.owner_token === processOwner.token
+      || !owner && status === "completed" && row.provider_finished === 1
+        && Boolean(this.db.prepare("SELECT 1 FROM execution_responses WHERE execution_id=?").get(executionId)));
+    if (!active(row.status) && !recovering) return;
+    const updated = this.db.prepare("update console_executions set status=?,finished_at=? where id=? and status in ('starting','queued','running','reconciliation_required')").run(status, status === "reconciliation_required" ? null : now(), executionId);
     if (!updated.changes) return;
     if (row.provider === "codex" && status === "completed" && !row.requested && !row.delta) {
       this.db.prepare("update console_executions set usage_quality='unavailable',boundary_reason='missing_lifecycle_events' where id=?").run(executionId);
     }
+    if (status === "reconciliation_required") this.markRunReconciliationRequired(row.run_id);
+    else this.clearResolvedRun(row.run_id);
     this.touch(row.run_id);
   }
 

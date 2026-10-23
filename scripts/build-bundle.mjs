@@ -4,12 +4,16 @@ import { dirname,resolve,join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { platformName } from "../node/compile.mjs";
 import { parse, stringify } from "yaml";
+import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
 
 const root=fileURLToPath(new URL("..",import.meta.url));
 const pkg=JSON.parse(await readFile(join(root,"package.json"),"utf8"));
 const label=platformName();
 if (!["linux-x64","linux-arm64","windows-x64"].includes(label)) throw new Error(`不支持的发行平台：${label}`);
 const components=JSON.parse(await readFile(join(root,"components.lock.json"),"utf8"));
+const packageRequire=createRequire(join(root,"package.json"));
+const sqlitePackage=packageRequire("better-sqlite3/package.json");
 if (process.versions.node !== components.node) throw new Error(`发行构建需要 Node.js ${components.node}`);
 const exe=name=>name+(process.platform==="win32"?".exe":"");
 function run(command,args,cwd=root){
@@ -67,7 +71,8 @@ if(process.platform==="win32")await cp(join(root,"scripts","windows-easytier-cut
 await mkdir(join(output,"runtime"),{recursive:true});
 await cp(process.execPath,join(output,"runtime",exe("node")));
 const release={version:pkg.version,platform:label,createdAt:new Date().toISOString(),
-  node:process.versions.node,sourceCommit:identity.sourceCommit,uncommittedSource:identity.uncommittedSource,components};
+  node:process.versions.node,nodeAbi:process.versions.modules,dependencies:{"better-sqlite3":sqlitePackage.version},
+  sourceCommit:identity.sourceCommit,uncommittedSource:identity.uncommittedSource,components};
 await writeFile(join(output,"release.json"),JSON.stringify(release,null,2)+"\n");
 const installPackage=JSON.parse(await readFile(join(output,"package.json"),"utf8"));
 delete installPackage.scripts.postinstall;
@@ -78,8 +83,25 @@ const workspace=parse(await readFile(workspaceFile,"utf8"));
 workspace.nodeLinker="hoisted";
 await writeFile(workspaceFile,stringify(workspace),"utf8");
 await runPnpm(["install","--prod","--frozen-lockfile"],output);
+// 只记录发行目录实际装载的二进制，避免源码安装与 hoisted 发行布局混淆。
+const bundleRequire=createRequire(join(output,"package.json"));
+const BundleDatabase=bundleRequire("better-sqlite3");
+const probe=new BundleDatabase(":memory:");probe.prepare("SELECT 1").get();probe.close();
+const nativePaths=new Set();
+const visited=new Set();
+function loadedNative(module){
+  if(!module||visited.has(module.id))return;
+  visited.add(module.id);
+  if(module.filename?.endsWith(".node"))nativePaths.add(module.filename);
+  for(const child of module.children??[])loadedNative(child);
+}
+loadedNative(bundleRequire.cache[bundleRequire.resolve("better-sqlite3")]);
+if(nativePaths.size!==1)throw new Error("无法唯一确认发行实际加载的 SQLite 原生模块");
+const hash=async path=>createHash("sha256").update(await readFile(path)).digest("hex");
+const runtime={nodeSha256:await hash(join(output,"runtime",exe("node"))),packageLockSha256:await hash(join(output,"pnpm-lock.yaml"))};
+const nativeDependencies={"better-sqlite3":{version:bundleRequire("better-sqlite3/package.json").version,sha256:await hash([...nativePaths][0])}};
 const payloadEntries=(await readdir(output)).filter(name=>name!=="release.json"&&name!==".git").sort();
-await writeFile(join(output,"release.json"),JSON.stringify({...release,payloadEntries},null,2)+"\n");
+await writeFile(join(output,"release.json"),JSON.stringify({...release,runtime,nativeDependencies,payloadEntries},null,2)+"\n");
 await run(join(output,"runtime",exe("node")),[join(output,"node","verify-installed.mjs")],output);
 await run(process.execPath,[join(root,"scripts","archive-directory.mjs"),output]);
 console.log(`发行目录：${output}`);

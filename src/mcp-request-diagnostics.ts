@@ -10,10 +10,12 @@ const actions = new Set(["list","capture","search","status","recovery","start","
 const errorCodes = new Set(["WORK_STATE", "INVALID_TASK", "AGENT_CONFLICT", "EXECUTION_CONFLICT", "STALE_CONTEXT", "ACCESS_DENIED", "WORKSPACE_NOT_FOUND", "WORKSPACE_RESTORE_REQUIRED", "WORKSPACE_MISMATCH", "WORKSPACE_SESSION_MISMATCH", "SESSION_SCOPE_MISMATCH", "TASK_NOT_ACTIVE", "AGENT_NOT_FOUND",
   "NODE_ADMISSION_PAUSED", "TASK_SESSION_MISMATCH", "TASK_NOT_FOUND", "INVALID_ARGUMENT", "OPERATION_KEY_INVALID", "REQUEST_ID_REUSED",
   "OPERATION_RETRY_SCOPE_MISMATCH", "OPERATION_RETRY_NOT_ALLOWED", "OPERATION_RETRY_SUPERSEDED", "OPERATION_ID_MISMATCH",
-  "REQUEST_TIMEOUT", "RPC_INTERRUPTED", "NODE_UNAVAILABLE", "PROCESS_RECONCILIATION_REQUIRED", "TOOL_EXECUTION_ERROR", "ZOD_ERROR",
+  "REQUEST_TIMEOUT", "RPC_INTERRUPTED", "NODE_UNAVAILABLE", "PEER_BUSY", "PROCESS_RECONCILIATION_REQUIRED", "TOOL_EXECUTION_ERROR", "ZOD_ERROR",
   "ENOENT", "EACCES", "EPERM", "EINVAL", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ECONNABORTED", "EPIPE", "ENOTFOUND"]);
 const effects = new Set(["not_started", "started", "partial", "completed", "unknown"]);
 const retryHints = new Set(["fix_input", "retry_same_key", "query_original", "do_not_retry", "retry_later"]);
+// 只检查服务自己定义的完整恢复尾注；错误正文、任意标记和私有 details 不进入日志。
+const recoverySuffix = /\n\[QuayMesh recovery: error_code=([A-Z][A-Z0-9_]{0,63}); effect=(?:not_started|started|partial|completed|unknown); retry_hint=(?:fix_input|retry_same_key|query_original|do_not_retry|retry_later)(?:; operation_id=[A-Za-z0-9][A-Za-z0-9_.:%~-]{0,255})?\]$/u;
 const object = (value: unknown): Record<string, any> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : {};
 const known = (value: unknown, allowed: Set<string>) => typeof value === "string" && allowed.has(value) ? value : "other";
 const identity = (value: unknown, prefix: string) => typeof value === "string"
@@ -118,6 +120,12 @@ export function traceMcpRequest(req: Request, res: Response, requestId: string, 
           // Report only presence of receipt layers; values/errors may be private.
           for (const block of content) {
             if (block?.type !== "text" || typeof block.text !== "string") continue;
+            const recoveryCode = recoverySuffix.exec(block.text)?.[1];
+            if (recoveryCode) {
+              result.recoveryTextErrorCode = known(recoveryCode, errorCodes);
+              if (typeof structured.error_code === "string") result.errorCodeConsistent = result.errorCodeConsistent !== false
+                && recoveryCode === structured.error_code;
+            }
             try {
               const value = object(JSON.parse(block.text));
               result.operationId = identity(value.operation_id ?? value.operationId, "op") ?? result.operationId;

@@ -151,10 +151,18 @@ export const executionObservationSchema = z.object({
   staleOperationIds: z.array(z.string().min(1).max(256)).max(4096),
 }).strict();
 
+export const snapshotLiveStateSchema = z.object({
+  observedAt: time,
+  hostStatus: hostStateEnum,
+  executionStatus: executionStateEnum,
+}).strict();
+
 export const snapshotSchema = z
   .object({
     sourceTaskId: id.nullable().optional(),
     executionObservation: executionObservationSchema.optional(),
+    live: snapshotLiveStateSchema.optional(),
+    finalization: z.object({state: z.enum(["pending", "failed"]), requestedAt: time, error: nullableText}).strict().nullable().optional(),
     sessionId: id,
     taskId: id.nullable().optional(),
     taskState:z.enum(["active","closed"]).optional(),

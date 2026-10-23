@@ -13,11 +13,12 @@ export function checkCutoverIdle(stateDir) {
   try {
     const count = sql => Number(db.prepare(sql).get().count);
     const claims = count("SELECT count(*) AS count FROM execution_claims");
-    const activeWork = count("SELECT count(*) AS count FROM qm_runtime_work WHERE blocking=1");
-    const commands = count("SELECT count(*) AS count FROM console_operations WHERE status IN ('running','starting')");
-    const agents = count("SELECT count(*) AS count FROM console_executions WHERE status IN ('running','starting')");
-    return { idle: claims + activeWork + commands + agents === 0,
-      claims, activeWork, commands, agents };
+    const activeWork = count("SELECT count(*) AS count FROM qm_runtime_work WHERE blocking=1 OR kind='egress'");
+    const waiting = count("SELECT count(*) AS count FROM execution_waiters WHERE expires_at_ms>strftime('%s','now')*1000");
+    const commands = count("SELECT count(*) AS count FROM console_operations WHERE status IN ('running','starting','queued','unknown','reconciliation_required')");
+    const agents = count("SELECT count(*) AS count FROM console_executions WHERE status IN ('running','starting','queued','unknown','reconciliation_required')");
+    return { idle: claims + waiting + activeWork + commands + agents === 0,
+      claims, waiting, activeWork, commands, agents };
   } finally { db.close(); }
 }
 

@@ -22,7 +22,8 @@ import { errorEnvelope } from "../session/outcome.js";
 
 export function createFederation(config: ServerConfig, workspaces: WorkspaceRegistry, providers: () => unknown[],
   consoleOperation: (method: string, path: string, body?: unknown) => Promise<ConsoleReply>,
-  sessionRuntime?: SessionRuntime, execution?: ExecutionCoordinator): FederationRuntime | undefined {
+  sessionRuntime?: SessionRuntime, execution?: ExecutionCoordinator,
+  diagnostics?: (event:string,fields:Record<string,unknown>,level?:"info"|"warn"|"error")=>void): FederationRuntime | undefined {
   const federation = config.federation;
   if (!federation?.enabled) return undefined;
   const token = (process.env[federation.tokenEnv] ?? (federation.tokenFile ? readFileSync(resolve(expandHomePath(federation.tokenFile)), "utf8") : "")).trim();
@@ -60,7 +61,7 @@ export function createFederation(config: ServerConfig, workspaces: WorkspaceRegi
   const settings = (): Promise<JsonRecord> => nodeSettings();
   const runtime: FederationRuntime = new FederationRuntime(federation, token, {
     stateDir: config.stateDir, httpPort: config.port, ingressPort: federation.ingressPort ?? 7677, publicBaseUrl: config.publicBaseUrl, providers, execution,
-    console: consoleOperation, settings,
+    console: consoleOperation, settings, diagnostics,
     prepareOpen: async (input) => {
       const { root_id, subdirectory, ...rest } = input;
       if (input.workspace_id !== undefined) {

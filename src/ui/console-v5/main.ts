@@ -7,7 +7,7 @@ import { dialog, formObject } from "./dialogs.js";
 import { consoleError, validateSession, WriteIntent, type ConsoleError, type ConsoleSession } from "./client.js";
 import { icon } from './icons.js';
 import { setDisplayTimeZone, timeZone, tm, fullTime, day, smartTime, ago, duration, fmt, compact, bytes, csvCell, timestamp } from './format.js';
-import { esc, clamp, stages, stage, status, btn, ib, badge, acceptanceBadge, meter, smallTime, spark, usageText, diffStat, resultExplanation, changeCaptureBlockReason, changeCaptureNotice, dedupeCaptureWarnings, elapsed as renderElapsed, transferPercent, percent, QUALITY } from './presentation.js';
+import { esc, clamp, stages, stage, status, btn, ib, badge, lifecycleBadges, meter, smallTime, spark, usageText, diffStat, resultExplanation, changeCaptureBlockReason, changeCaptureNotice, dedupeCaptureWarnings, executionObservationForRun, elapsed as renderElapsed, transferPercent, percent, QUALITY } from './presentation.js';
 import type { Run, RunDetail, RunPage, Overview, Fleet, Machine, NodeSettingsSnapshot, ChangeFile, Command, FileDiff, PatchPage, Project, Root, ListResponse, Sessions, Thread, SourceState, UsageReport, ActivityPage, EventRow, TransferRow, AuditRow, RevertPreview, RevertReceipt, ArchivePreview, ReviewReceipt, ActionReceipt, ControlReceipt, Preferences, Route, CacheEntry } from './contracts.js';
 import Prism from "prismjs";
 import "prismjs/components/prism-typescript.js";
@@ -135,9 +135,9 @@ function runObservation(run: Run) {
     const entry = matching[0], sources = (entry?.data as { sources?: SourceState[] } | undefined)?.sources?.filter(source => (run.nodeIds || [run.nodeId]).includes(source.nodeId)) || [];
     const observed = sources.map(source => source.observedAt).filter((at): at is number => at !== null);
     const observedAt = run.observedAt !== undefined ? run.observedAt : (observed.length ? Math.min(...observed) : entry?.time || null);
-    return { stale: Boolean(run.stale || entry?.error) || sources.some(source => Boolean(sourceWarning(source))) || Boolean(observedAt && Date.now()-observedAt > 30_000 && ['running','stopping','queued'].includes(run.executionStatus)), observedAt };
+    return { stale: Boolean(run.stale || entry?.error) || sources.some(source => Boolean(sourceWarning(source))) || Boolean(observedAt && Date.now()-observedAt > 30_000 && ['running','stopping','queued'].includes(run.executionStatus)), observedAt, sources };
 }
-function elapsed(run: Run): string { return renderElapsed(run,runObservation(run)); }
+function elapsed(run: Run): string { const observation=runObservation(run);return renderElapsed(run,executionObservationForRun(run,observation.sources,observation)); }
 function routePaths() {
     const list = ['fleet/status'];
     if (['overview', 'machines'].includes(route.view)) list.push(overviewPath());
@@ -416,15 +416,7 @@ function taskScopeTabs(page?: RunPage) {
         ['attention','需要处理',count('scopeAttention')],['open','暂无后台执行',count('scopeWaiting')],['ended','结束与结果',count('scopeResults')]], current, 'task-scope');
 }
 function runBadges(run: Run): string {
-    const state = stage(run), observation = runObservation(run), result = [status(state)];
-    if (observation.stale) result.push(`<span class="badge warn" title="${esc('最后确认：'+fullTime(observation.observedAt))}">上次确认</span>`);
-    if (run.phaseExecutionStatus === 'completed' && run.executionStatus !== 'completed') result.push(badge('执行阶段已结束'));
-    const acceptance = acceptanceBadge(run);
-    if (acceptance) result.push(acceptance);
-    if (run.resultStatus === 'handed_off' && state !== 'handed_off') result.push(badge('请求已交接'));
-    else if(run.requestState==='closed'&&['running','stopping','queued','unknown'].includes(run.executionStatus))
-        result.push(badge('请求已结束'+(run.resultStatus?' · '+({completed:'已记录完成',failed:'已记录失败',cancelled:'已记录取消'} as Record<string,string>)[run.resultStatus]:'')));
-    return result.join(' ');
+    return lifecycleBadges(run,runObservation(run));
 }
 
 function phaseCards(detail: RunDetail): string {
@@ -442,7 +434,7 @@ function tasksPage() {
     const bulk = selectedRuns.size ? `<div class="bulkbar"><span>${selectedRuns.size} 项已选</span>${blocked.length ? `<span class="amber">${blocked.length} 项文件证据待确认</span>` : ''}<span class="spacer"></span>${btn('验收' + (eligible.length ? ' ' + eligible.length : ''), 'bulk-accept', !eligible.length || !canWrite() ? 'disabled' : '', 'small')}${btn('驳回', 'bulk-reject', !eligible.length || !canWrite() ? 'disabled' : '', 'small')}${ib('copy', 'bulk-copy', '复制所选任务引用')}${ib('close', 'clear-selection', '取消选择')}</div>` : '';
     const stateControls = sel ? `<select class="select queue-state" data-param="status" aria-label="任务状态">${states.map(([v, t, n]) => opt(v, t + (n == null ? '' : ' · ' + n), route.p.status || '')).join('')}</select>` : taskScopeTabs(d) + `<select class="select" data-param="status" aria-label="具体任务状态">${states.map(([v,t,n]) => opt(v,t + (n == null ? '' : ' · ' + n),route.p.status || '')).join('')}</select>`;
     const filters = `<div class="task-filters">${stateControls}<div class="toolbar list-search">${searchField(route.p.q, '搜索任务…')}${sel ? ib('filter', 'toggle-filters', '筛选任务', `aria-expanded="${route.p.filters === '1'}"`, route.p.filters === '1' ? 'active' : '') : ''}</div><div class="toolbar extended-filters ${sel && route.p.filters !== '1' ? 'hidden' : ''}">${scopes()}${rangeSelect(route.p.days ?? '0')}<select class="select" aria-label="任务排序" data-param="sort">${[['newest', '最新开始'], ['oldest', '最早开始'], ['tokens', '用量最高'], ['duration', '耗时最长']].map(([v, t]) => opt(v, t, route.p.sort || 'newest')).join('')}</select></div>${route.p.finishedDay ? `<div class="filter-chip">完成于 ${esc(route.p.finishedDay)} ${ib('close', 'clear-finished', '清除完成日期')}</div>` : ''}${route.p.attention ? `<div class="filter-chip">执行异常 ${ib('close', 'clear-attention', '清除异常筛选')}</div>` : ''}${route.p.usageDate || route.p.usageDays ? `<div class="filter-chip">用量发生范围：${esc(route.p.usageDate || ('近 ' + route.p.usageDays + ' 天'))}${ib('close','clear-usage-range','清除用量发生范围')}</div>` : ''}${route.p.date ? `<div class="filter-chip">${esc(route.p.date)} ${ib('close', 'clear-date', '清除日期筛选')}</div>` : ''}</div>`;
-    let list = !d ? resourceState(path) : !d.items.length ? `<div class="panel">${empty(d.complete ? '没有匹配任务' : '已读取来源中没有匹配任务', d.complete ? '' : '部分节点尚未确认，完整结果仍待核对。', btn('清除筛选', 'reset-filters'))}</div>` : sortLayout === 'timeline' && !sel ? timelineView(d) : `<div class="panel task-list-panel"><div class="table-wrap"><table class="data-table run-table"><colgroup><col style="width:34px"><col><col style="width:105px"><col style="width:58px"><col style="width:105px"><col style="width:86px"><col style="width:90px"><col style="width:94px"><col style="width:32px"></colgroup><thead><tr><th><label class="check-label"><input type="checkbox" data-select-all="runs" aria-label="选择本页全部任务" ${d.items.every(r => selectedRuns.has(r.id)) ? 'checked' : ''}></label></th><th>任务 / 项目</th><th>状态</th><th>节点</th><th>改动</th><th class="align-right">耗时</th><th class="align-right">Token</th><th class="align-right">开始</th><th></th></tr></thead><tbody>${d.items.map(taskRow).join('')}</tbody></table></div>${pagination(d)}</div>`;
+    let list = !d ? resourceState(path) : !d.items.length ? `<div class="panel">${empty(d.complete ? '没有匹配任务' : '已读取来源中没有匹配任务', d.complete ? '' : '部分节点尚未确认，完整结果仍待核对。', btn('清除筛选', 'reset-filters'))}</div>` : sortLayout === 'timeline' && !sel ? timelineView(d) : `<div class="panel task-list-panel"><div class="table-wrap"><table class="data-table run-table"><colgroup><col style="width:34px"><col><col style="width:140px"><col style="width:58px"><col style="width:105px"><col style="width:86px"><col style="width:90px"><col style="width:94px"><col style="width:32px"></colgroup><thead><tr><th><label class="check-label"><input type="checkbox" data-select-all="runs" aria-label="选择本页全部任务" ${d.items.every(r => selectedRuns.has(r.id)) ? 'checked' : ''}></label></th><th>任务 / 项目</th><th>状态</th><th>节点</th><th>改动</th><th class="align-right">耗时</th><th class="align-right">Token</th><th class="align-right">开始</th><th></th></tr></thead><tbody>${d.items.map(taskRow).join('')}</tbody></table></div>${pagination(d)}</div>`;
     const actions = sel ? ib('download', 'export-runs', '导出本页') : segmented([['list', icon('tasks', 14)], ['timeline', icon('activity', 14)]], sortLayout, 'layout') + btn(icon('download', 14) + '导出本页', 'export-runs', d?.items.length ? '' : 'disabled');
     return `<div class="split ${sel ? 'has-detail' : 'no-detail'} ${review ? 'review-mode' : ''} ${route.p.focus === '1' ? 'detail-focus' : ''}"><section class="list-pane" aria-label="任务列表"><div class="page">${pageHead(review ? '改动审查' : '任务', review ? '选择待验收结果，或切换查看所有文件改动。' : '', actions)}${review ? segmented([['review','待验收'],['all','全部改动']],route.p.reviewMode || 'review','review-mode') : ''}${filters}${bulk}${staleNotice(path)}${list}</div></section>${sel ? '<button class="inspector-mask" data-action="close-inspector" aria-label="关闭详情"></button>' + inspector() : ''}</div>`;
 }

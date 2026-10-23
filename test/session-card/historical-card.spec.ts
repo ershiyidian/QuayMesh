@@ -1,6 +1,6 @@
 import {expect,test} from '@playwright/test';
 
-for (const version of [1,3,4,5,6]) {
+for (const version of [1,3,4,5,6,7]) {
   test(`v${version} 历史地址通过真实 MCP 冷加载并读取同一任务`, async ({page}) => {
     const uri=`ui://quaymesh/task-card/v${version}.html`;
     await page.route('**/api/bootstrap',async route=>{

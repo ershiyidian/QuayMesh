@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { Resources } from '../../src/ui/console-v5/resources.js';
 import { ApiError, WriteIntent, validateSession, createApi } from '../../src/ui/console-v5/client.js';
 import { mergeFields } from '../../src/ui/console-v5/settings-form.js';
-import { elapsed, esc, percent, resultExplanation, changeCaptureBlockReason, changeCaptureNotice, dedupeCaptureWarnings, acceptanceBadge, status, transferPercent } from '../../src/ui/console-v5/presentation.js';
+import { elapsed, esc, percent, resultExplanation, changeCaptureBlockReason, changeCaptureNotice, dedupeCaptureWarnings, acceptanceBadge, lifecycleBadges, executionObservationForRun, status, transferPercent } from '../../src/ui/console-v5/presentation.js';
 import { fullTime, setDisplayTimeZone, day, timestamp } from '../../src/ui/console-v5/format.js';
 import { taskStages, taskStage } from '../../src/console-task-state.js';
 import { resourceHealth } from '../../src/ui/console-v5/source-state.js';
@@ -120,6 +120,35 @@ test('概要回退与状态说明相同时只显示一次，真实交付总结�
   assert.ok(delivered.includes(`<p class="notice ">${reason}</p>`));
   assert.match(resultExplanation('交付完成',null,'done'),/execution-summary/);
   assert.equal(resultExplanation('','核对执行结果','unknown'),'<p class="notice warn">核对执行结果</p>');
+});
+
+test('全局和项目共用主状态：已保存交付在前，后台与验收独立且不覆写结果',()=>{
+  const completed={requestState:'closed',resultStatus:'completed',executionStatus:'unknown',acceptanceStatus:'not_required'} as Run;
+  const unknown=lifecycleBadges(completed,{stale:true,observedAt:1000});
+  assert.ok(unknown.indexOf('已完成')<unknown.indexOf('后台执行结果待核对'));
+  assert.match(unknown,/上次确认/);
+  const active=lifecycleBadges({...completed,executionStatus:'running'});
+  assert.ok(active.indexOf('已完成')<active.indexOf('后台仍在执行'));
+  const archived=lifecycleBadges({...completed,resultStatus:null});
+  assert.match(archived,/已结束 · 交付未确认/);assert.doesNotMatch(archived,/已完成/);
+  assert.match(lifecycleBadges({...completed,executionStatus:'completed',acceptanceStatus:'pending'}),/已完成.*待验收/);
+  assert.match(lifecycleBadges({...completed,requestState:'active',resultStatus:null,executionStatus:'finalizing',
+    finalization:{status:'failed',requestedAt:1000,error:'capture failed'}}),/交付确认失败/);
+  const executing=lifecycleBadges({...completed,requestState:'active',resultStatus:null,executionStatus:'running',
+    finalization:{status:'failed',requestedAt:1000,error:'capture failed'}});
+  assert.ok(executing.indexOf('执行中')<executing.indexOf('交付确认失败'));
+});
+
+test('混合节点任务的时钟使用仍在执行节点的观察，另一离线节点不污染计时',()=>{
+  const now=Date.now(),run={nodeId:'a',nodeIds:['a','b'],nodeStates:{a:'unknown',b:'running'},executionStatus:'running',
+    observedAt:now-60_000,stale:true,startedAt:now-120_000,finishedAt:null,lastActivityAt:now-60_000} as Run;
+  const sources=[{nodeId:'a',online:false,error:'offline',observedAt:now-60_000},{nodeId:'b',online:true,error:null,observedAt:now}];
+  const fallback={stale:true,observedAt:run.observedAt!};
+  const observation=executionObservationForRun(run,sources,fallback,now);
+  assert.deepEqual(observation,{stale:false,observedAt:now});
+  assert.match(elapsed(run,observation),/data-elapsed/);
+  const expired=executionObservationForRun(run,sources,fallback,now+31_000);
+  assert.equal(expired,fallback);assert.doesNotMatch(elapsed(run,expired),/data-elapsed/);
 });
 
 test('文件证据采集状态限定于当前详情，历史检查点和旧节点字段缺失不会误报失败', () => {

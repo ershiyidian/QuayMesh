@@ -5,10 +5,12 @@ import { realpath } from "node:fs/promises";
 import { relative, isAbsolute, sep } from "node:path";
 import * as z from "zod/v4";
 import type { ToolRegistrationContext } from "./types.js";
-import { jsonReply, replyBytes, REPLY_BYTES, textPage } from "../bounded-reply.js";
+import { jsonReply, replyBytes, REPLY_BYTES } from "../bounded-reply.js";
 import { currentInvocation } from "../session/invocations.js";
 import type { InvocationContext } from "../session/types.js";
 import { currentOperationEvents } from "../session/activity.js";
+import { savedOperationStatus } from "../session/operation-status.js";
+import { observationBudget, observeWithSignal } from "../observation-budget.js";
 
 const id = z.string().min(1).max(256);
 const fileSelectionSchema = z.object({
@@ -56,7 +58,7 @@ export function registerWorkspaceContextTool({ server, config, workspaces, proce
     description: "Batch file ranges or literal searches. Continue with result_ref and cursor. status/recovery inspect saved work.",
     inputSchema: workspaceContextInputSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, async (rawInput) => {
+  }, async (rawInput, extra) => {
     const input = workspaceContextInputSchema.parse(rawInput);
     const historical = input.action === "recovery" || (input.action === "status" && !input.environment);
     const observation = currentInvocation();
@@ -64,7 +66,7 @@ export function registerWorkspaceContextTool({ server, config, workspaces, proce
     const member = historical && observation && sessionRuntime
       ? sessionRuntime.store.getMember(observation.session_id, observation.member_id) : null;
     if (member && member.workspace_id !== input.workspace_id) throw new Error("WORKSPACE_SESSION_MISMATCH");
-    const liveWorkspace = member ? undefined : await workspaces.getWorkspace(input.workspace_id);
+    const liveWorkspace = member ? undefined : await workspaces.getWorkspace(input.workspace_id,{touch:false});
     const workspace = liveWorkspace ?? { id: member!.workspace_id, root: member!.root };
     if (input.action === "status") {
       if (!sessionRuntime) throw new Error("SESSION_RUNTIME_REQUIRED");
@@ -90,7 +92,9 @@ export function registerWorkspaceContextTool({ server, config, workspaces, proce
     }
     if (!liveWorkspace) throw new Error("WORKSPACE_OBSERVATION_MODE_REQUIRED");
     const invocation = currentInvocation();
+    const budget=observationBudget("workspace_context",input,extra as {signal?:AbortSignal;_meta?:unknown});
     const capture = () => processSessions.readWorkspace(workspace.root, async () => {
+      budget.signal.throwIfAborted();
       const receipt = {
         hostAcknowledgment: "unknown" as const,
         ...(invocation?.operation_id ? { operation_id: invocation.operation_id } : {}),
@@ -102,20 +106,23 @@ export function registerWorkspaceContextTool({ server, config, workspaces, proce
         const resolved = await realpath(path);
         const rest = relative(base, resolved);
         if (isAbsolute(rest) || rest === ".." || rest.startsWith(`..${sep}`)) throw new Error("Directory is outside this workspace.");
-        const entries = await listDirectories(resolved,input.depth??1);
         const offset = input.offset ?? 0;
+        const entries = await listDirectories(resolved,input.depth??1,offset+101,budget.signal);
         const page = entries.slice(offset,offset+100);
-        const value = { ...receipt, providerInvoked: false, entries: page, total: entries.length,
+        const complete=entries.length<offset+101;
+        const value = { ...receipt, providerInvoked: false, entries: page, total:complete?entries.length:null,enumeration_complete:complete,
           nextOffset: offset + page.length < entries.length ? offset + page.length : null };
         while (replyBytes(value) > REPLY_BYTES && page.length > 1) {
           page.pop(); value.nextOffset = offset + page.length;
         }
         return value;
       }
-      return contextPage({server,workspaces,processSessions,sessionRuntime,config},liveWorkspace,{...input,action:input.action as "capture"|"search"});
+      return contextPage({server,workspaces,processSessions,sessionRuntime,config},liveWorkspace,{...input,action:input.action as "capture"|"search"},budget.signal);
     });
-    const result=await capture();
-    return jsonReply(result, "partial" in result && result.partial ? "部分选区失败，错误与成功内容均已保留。" : undefined);
+    try {
+      const result=await observeWithSignal(capture(),budget.signal);
+      return jsonReply(result, "partial" in result && result.partial ? "部分选区失败，错误与成功内容均已保留。" : undefined);
+    } finally {budget.dispose();}
   });
 }
 
@@ -150,47 +157,12 @@ async function statusReply(
     throw new Error("WORKSPACE_SESSION_MISMATCH");
   }
   if (operationId) {
-    const saved = runtime.store.findInvocationByOperation(invocation.owner_id, operationId);
-    if (saved && saved.member_id !== member.id) throw new Error("WORKSPACE_SESSION_MISMATCH");
-    if (saved) {
-      const event = runtime.store.findOperationEvent(operationId);
-      const agent = runtime.store.agentForOperation(operationId, session.id, member.id)?.agentId;
-      const processHandle = processSessions.findOperation(operationId)?.session_id;
-      const envelope = saved.result_json ? JSON.parse(saved.result_json) : null;
-      const result = envelope?.kind === "result" ? envelope.value : null;
-      const pending = ["accepted", "queued", "running"].includes(saved.state);
-      const resultJson = result ? JSON.stringify(result) : null;
-      const page = resultJson && (offset > 0 || Buffer.byteLength(resultJson) > 4096)
-        ? textPage(resultJson, offset, 4096) : null;
-      return {
-        session_id: session.id, workspace_id: workspace.id, operation_id: operationId,
-        execution_state: session.execution_state, review_state: session.review_state, host_state: session.host_state,
-        tool_name: saved.tool_name, operation_state: saved.state, effect: saved.effect,
-        operations: [{ operation_id: operationId, kind: String(event?.payload.kind ?? saved.tool_name),
-          label: String(event?.payload.label ?? saved.tool_name), state: saved.state, effect: saved.effect,
-          created_at: saved.created_at, finished_at: saved.finished_at,
-          outcome: saved.state === "succeeded" ? "completed" : saved.state,
-          ...(agent ? { agent_id: agent } : {}),
-          ...(processHandle ? { process_handle: processHandle } : {}),
-          ...(envelope && !result ? {error: {code: envelope.errorCode ?? "OPERATION_ERROR",
-            message: envelope.message ?? envelope.error ?? "Operation failed.",
-            next_action: "Inspect the recorded result before retrying."}} : {}),
-          ...(saved.result_ref ? { result_ref: saved.result_ref } : {}) }],
-        unknown_effects: saved.effect === "unknown" ? [operationId] : [],
-        result_ready: result !== null, result_ref: saved.result_ref,
-        ...(["exec_command","bash"].includes(saved.tool_name)
-          ? page ? {initial_receipt_page:{...page,encoding:"json",next_offset:page.nextOffset}} : result ? {initial_receipt:result} : {}
-          : page ? {result_page:{...page,encoding:"json",next_offset:page.nextOffset}} : result ? {result} : {}),
-        ...(envelope && !result ? { error: envelope } : {}),
-        created_at: saved.created_at, finished_at: saved.finished_at,
-        poll_after_ms: pending ? 2000 : null,
-        next_action: saved.tool_name === "exec_command" && result
-          ? { tool: "read_output", arguments: { workspace_id: workspace.id, operation_id: operationId, cursor: 0 } }
-          : pending ? { tool: "workspace_context", arguments: { workspace_id: workspace.id, action: "status", operation_id: operationId } } : null,
-      };
-    }
+    const saved=savedOperationStatus(runtime.store,invocation,workspace.id,operationId,{offset,
+      agentId:runtime.store.agentForOperation(operationId,session.id,member.id)?.agentId,
+      processHandle:processSessions.findOperation(operationId)?.session_id});
+    if (saved) return saved;
   }
-  const events = runtime.store.eventsForSession(session.id);
+  const events = operationId ? runtime.store.eventsForOperation(operationId,session.id,member.id) : runtime.store.eventsForSession(session.id);
   const byOperation = new Map<string, StatusOperationRow>();
   for (const event of currentOperationEvents(events)) {
     if (event.member_id !== member.id) continue;
@@ -233,7 +205,9 @@ async function statusReply(
     review_state: session.review_state,
     host_state: session.host_state,
     operations,
-    unknown_effects: operations.filter((row) => row.effect === "unknown" || row.state === "unknown").map((row) => row.operation_id),
+    ...(operationId ? {operation_id:operationId,lookup:operations.length?"found":"not_found",
+      ...(!operations.length?{operation_state:"unknown",effect:"unknown",result_ready:false}: {})} : {}),
+    unknown_effects: operationId&&!operations.length ? [operationId] : operations.filter((row) => row.effect === "unknown" || row.state === "unknown").map((row) => row.operation_id),
     note: "This read does not change execution state. Use read, write_stdin, wait_agent or Console for detailed evidence.",
   };
 }

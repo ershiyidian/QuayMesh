@@ -123,6 +123,22 @@ From the new package:
 
 The first command creates a versioned installation and returns `manifestFile`. The second switches the service when its current work allows it. The installation record retains the previous version for recovery.
 
+Activation pauses admission and waits for accepted commands, agent turns, transfers, and open egress tunnels to close. A tunnel remains active until its client closes it; an idle period does not authorize terminating a model connection. If drain times out, the current service remains running.
+
+The prepared release is verified with its own Node runtime and installed SQLite dependency, including 500 native close/garbage-collection cycles. Activation takes a consistent SQLite backup, records `installation-transition.json`, and requires the same Core process to remain ready for 60 seconds before resuming work. A manager restart preserves this pause. `status` shows an unfinished transition so it can be recovered deliberately.
+
+Rollback is automatic only while the database schema remains compatible. If a failed upgrade has changed the schema, the installer preserves the new database, backup, and transition record instead of starting an incompatible previous binary. Check the recorded backup and every process using the state directory before restoring data. Existing command pipes, PTYs, and model streams remain owned by their original processes; upgrade waits for them to finish.
+
+When initiating a Windows upgrade from a QuayMesh command, prepare the release first, then start the independent activation task:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\node\windows-activate.ps1 -PreparedManifest C:\path\returned\prepared.json
+```
+
+The command returns a `resultPath`. Windows Task Scheduler owns the activation process, so closing the old Host's process group does not kill the installer. The task verifies the prepared identity and native runtime, checks the execution ledger, and delegates admission, drain, backup, and stable readiness to the installer. Its result and transcript remain under `stateDir/activations/`. A blocked preflight preserves pending and unknown records for investigation. A committed release remains running if a later status check fails. Use an elevated session to register the task for a TUN node.
+
+New release manifests contain SHA-256 hashes of Node, the dependency lock file, and the SQLite addon actually loaded during verification. Activation compares them with the running Core's process-bound identity for the full readiness window. `active-release.json` retains the original activation time when the same release restarts and records the current process's `startedAt` separately.
+
 ## Inspect a node
 
 ```bash
@@ -132,5 +148,9 @@ The first command creates a versioned installation and returns `manifestFile`. T
 ```
 
 `status` reports the running release, component states, cluster connection, and configuration revision. Component logs are stored under `stateDir/logs/`.
+
+Component status includes the last exit code/signal separately from readiness probe errors. A component with repeated rapid exits remains degraded until it has passed readiness continuously for 60 seconds; it is excluded from gateway selection during that interval. New gateway configurations default to a 60-second recovery delay. Existing explicitly configured delays are preserved.
+
+During mixed-version operation, an older manager with at least three recorded Core restarts must show a ready Core, fresh observations, and a stable process/peer connection for at least five minutes before it can serve new gateway connections. Historical restart counts stop excluding it after that window. Existing model streams continue on their original gateway.
 
 Continue with [configuration](CONFIGURATION.md) and [tasks](TASKS.md).

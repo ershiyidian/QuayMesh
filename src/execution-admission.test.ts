@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { ExecutionCoordinator } from "./execution-coordinator.js";
 import { WorkLedger } from "./work-ledger.js";
 
-test("仅排队的工作记录不阻挡维护，实际开始的工作继续阻挡", async t => {
+test("已经受理的排队工作与实际执行都阻挡维护重启", async t => {
   const root = await mkdtemp(join(tmpdir(),"quaymesh-admission-queued-"));
   const coordinator = new ExecutionCoordinator(join(root,"state"));
   const ledger = new WorkLedger(join(root,"state"));
@@ -16,13 +16,14 @@ test("仅排队的工作记录不阻挡维护，实际开始的工作继续阻�
   const queued = ledger.operation({runId:run.id,requestKey:"queued",kind:"command",label:"等待资源",status:"queued"});
   coordinator.pause("维护检查");
   assert.equal(coordinator.admissionStatus().queuedOperations,1);
-  assert.equal(coordinator.admissionStatus().idle,true);
+  assert.equal(coordinator.admissionStatus().idle,false);
   coordinator.resume();
   const active = ledger.operation({runId:run.id,requestKey:"running",kind:"command",label:"执行准备",status:"starting"});
   assert.equal(coordinator.admissionStatus().idle,false);
   ledger.endOperation(active,"completed");
-  assert.equal(coordinator.admissionStatus().idle,true);
+  assert.equal(coordinator.admissionStatus().idle,false);
   ledger.endOperation(queued,"completed");
+  assert.equal(coordinator.admissionStatus().idle,true);
 });
 
 test("共享数据库的接收控制同时限制工具、传输和出口，已接受工作可以完成",async t=>{
@@ -46,6 +47,17 @@ test("共享数据库的接收控制同时限制工具、传输和出口，已�
   const transfer=b.beginWork({kind:"transfer"});
   assert.equal(a.admissionStatus().work.find(value=>value.kind==="transfer")?.count,1);
   transfer.release();assert.equal(a.admissionStatus().idle,true);
+});
+
+test("维护期间允许的收尾 lease 仍保护工作免于重启",async t=>{
+  const root=await mkdtemp(join(tmpdir(),"qm-finalizing-admission-")),coordinator=new ExecutionCoordinator(root);
+  t.after(()=>{coordinator.close();return rm(root,{recursive:true,force:true});});
+  coordinator.pause("正在更新");
+  const finalizer=coordinator.beginWork({kind:"tool",allowWhilePaused:true,blocking:true});
+  assert.equal(coordinator.admissionState().accepting,false);
+  assert.equal(coordinator.admissionStatus().activeWork,1);
+  assert.equal(coordinator.admissionStatus().idle,false);
+  finalizer.release();assert.equal(coordinator.admissionStatus().idle,true);
 });
 test("重启只清除服务退出暂停，维护暂停保持", async t => {
   const root = await mkdtemp(join(tmpdir(), "quaymesh-admission-restart-"));
@@ -77,16 +89,17 @@ test("重启只清除服务退出暂停，维护暂停保持", async t => {
 
 
 
-test("长期出口连接不冒充任务，维护仍等待真实工作并拒绝新出口",async t=>{
+test("维护等待已经建立的出口释放，并拒绝新出口",async t=>{
   const root=await mkdtemp(join(tmpdir(),"quaymesh-egress-admission-"));
   const coordinator=new ExecutionCoordinator(join(root,"state"));
   t.after(()=>{coordinator.close();return rm(root,{recursive:true,force:true});});
   const channel=coordinator.beginWork({kind:"egress",blocking:false});
-  assert.equal(coordinator.admissionStatus().idle,true);
+  assert.equal(coordinator.admissionStatus().idle,false);
+  assert.equal(coordinator.admissionStatus().work.find(value=>value.kind==="egress")?.count,1);
   const job=coordinator.beginWork({kind:"tool"});
   coordinator.pause("release cutover");
   assert.equal(coordinator.admissionStatus().idle,false);
   assert.throws(()=>coordinator.beginWork({kind:"egress",blocking:false}),/release cutover/);
-  job.release();assert.equal(coordinator.admissionStatus().idle,true);
-  channel.release();coordinator.resume();
+  job.release();assert.equal(coordinator.admissionStatus().idle,false);
+  channel.release();assert.equal(coordinator.admissionStatus().idle,true);coordinator.resume();
 });

@@ -27,6 +27,7 @@ import { readRunCheckpoint, saveRunCheckpoint, type RunCheckpoint } from "./run-
 import type { SessionChangeCollector } from "./changes.js";
 import type { SessionProjector } from "./projection.js";
 import type { TaskFinalStatus } from "./task-data.js";
+import type { ExecutionCoordinator } from "../execution-coordinator.js";
 
 export interface TaskOwnerReceipt {
   taskId: string;
@@ -65,6 +66,13 @@ export interface OperationProgressResult {
   result_ref?: string | null;
 }
 
+interface FinalizationFlight<T> {
+  status: TaskFinalStatus;
+  summary: string;
+  ready: Promise<void>;
+  work: Promise<T>;
+}
+
 export class SessionService {
   private stopped = false;
   private retryingFinalizations: Promise<void> | undefined;
@@ -74,31 +82,39 @@ export class SessionService {
     if(this.stopped)return Promise.resolve();
     if(this.retryingFinalizations)return this.retryingFinalizations;
     const work=(async()=>{
-      // 按持久顺序轮转，前面的长任务或坏归档不能饿死后续已完成任务。
+      // flight 跨轮次保留；观察期限到达既不释放归档占用，也不重新发起同一任务。
+      const active=()=>this.finalizing.size+this.finalizingLocal.size;
+      if(active()>=4)return;
       const batch=this.store.taskData.pendingFinalizations(4,this.finalizationCursor);
-      this.finalizationCursor=batch.at(-1);
+      const observed:Promise<unknown>[]=[];
       for(const intent of batch) {
-        if(this.stopped)break;
+        if(this.stopped||active()>=4)break;
+        this.finalizationCursor=intent;
         const task=this.store.getTask(intent.task_id);
         if(this.finalizing.has(task.id)||this.finalizingLocal.has(task.id))continue;
         if(intent.status!=="handed_off"&&(this.localBackground(task.id).length||this.store.taskData.activeWork(task.id)))continue;
         const owner=this.store.getSession(task.session_id).owner_id;
-        try {
-          if(task.source_kind==="federation_mirror")await this.finishOwnedTask(owner,task.id,intent.status,intent.summary);
-          else await this.finishTask(owner,task.id,intent.status,intent.summary);
-        } catch(error) {
+        const flight=task.source_kind==="federation_mirror"
+          ? this.finishOwnedTask(owner,task.id,intent.status,intent.summary)
+          : this.finishTask(owner,task.id,intent.status,intent.summary);
+        observed.push(flight.catch(error=>{
           // finishTask 已保存精确失败信息，下一轮仅接续原意图，不重执行操作。
           console.error("QuayMesh 任务收尾仍待处理",task.id,error instanceof Error?error.message:String(error));
-        }
+        }));
       }
+      if(!observed.length)return;
+      let timer:NodeJS.Timeout|undefined;
+      try {
+        await Promise.race([Promise.allSettled(observed),new Promise<void>(resolve=>{timer=setTimeout(resolve,2000);})]);
+      } finally {if(timer)clearTimeout(timer);}
     })().finally(()=>{this.retryingFinalizations=undefined;});
     this.retryingFinalizations=work;
     return work;
   }
   private readonly listeners: (() => void)[] = [];
   private readonly pendingRecovery = new Set<Promise<void>>();
-  private readonly finalizing = new Map<string, Promise<TaskRecord>>();
-  private readonly finalizingLocal = new Map<string, Promise<TaskOwnerReceipt>>();
+  private readonly finalizing = new Map<string, FinalizationFlight<TaskRecord>>();
+  private readonly finalizingLocal = new Map<string, FinalizationFlight<TaskOwnerReceipt>>();
   private readonly pendingRuns = new Map<string, Promise<string>>();
   private remoteFinalizer?: (task: TaskRecord, status: TaskFinalStatus, summary: string) => Promise<TaskOwnerReceipt[]>;
   private remoteArchiver?: (task:TaskRecord)=>Promise<TaskOwnerReceipt[]>;
@@ -112,6 +128,7 @@ export class SessionService {
     private readonly projections?: SessionProjector,
     private readonly recovery?: RecoveryService,
     private readonly nodeId = "local",
+    private readonly execution?: ExecutionCoordinator,
   ) {}
 
   start(
@@ -158,15 +175,47 @@ export class SessionService {
 
   async finishTask(ownerId: string, taskId: string, status: "completed"|"failed"|"cancelled"|"handed_off", summary: string, expectedTaskRevision?: number): Promise<TaskRecord> {
     this.store.requireSession(ownerId,this.store.getTask(taskId).session_id);
-    const pending=this.finalizing.get(taskId);
+    return this.runFinalization(this.finalizing,taskId,status,summary,
+      ready=>this.completeTask(ownerId,taskId,status,summary,expectedTaskRevision,ready));
+  }
+
+  private runFinalization<T>(flights:Map<string,FinalizationFlight<T>>,taskId:string,status:TaskFinalStatus,summary:string,
+    finish:(ready:()=>void)=>Promise<T>):Promise<T> {
+    const pending=flights.get(taskId);
     if(pending){
-      const intent=this.store.taskData.finalization(taskId);
-      if(intent && (intent.status!==status || intent.summary!==summary))throw new Error('TASK_FINALIZATION_CONFLICT');
-      return pending;
+      // 写锁期间 intent 可能尚未落盘，内存中的同一 flight 也要拒绝冲突请求。
+      if(pending.status!==status || pending.summary!==summary)throw new Error('TASK_FINALIZATION_CONFLICT');
+      return pending.work;
     }
-    const work=this.completeTask(ownerId,taskId,status,summary,expectedTaskRevision).finally(()=>this.finalizing.delete(taskId));
-    this.finalizing.set(taskId,work);
+    let markReady!:()=>void;
+    const ready=new Promise<void>(resolve=>{markReady=resolve;});
+    const run=()=>finish(markReady);
+    // 归档独立持有维护占用；工具先返回受理后仍由 service 收尾，不能计入自身 task 的 activeWork。
+    const work=Promise.resolve().then(()=>this.execution
+      ? this.execution.withWork({kind:"tool",allowWhilePaused:true,blocking:true},run) : run())
+      .finally(()=>flights.delete(taskId));
+    flights.set(taskId,{status,summary,ready,work});
     return work;
+  }
+
+  async finishTaskWithinBudget(ownerId: string, taskId: string, status: TaskFinalStatus, summary: string, waitMs=2000): Promise<
+    { task: TaskRecord; accepted: false } | { task: TaskRecord; accepted: true; pollAfterMs: number }
+  > {
+    const work=this.finishTask(ownerId,taskId,status,summary);
+    const ready=this.finalizing.get(taskId)?.ready;
+    // 持久 finalization 会记录后台错误，避免受理响应后的失败成为未处理拒绝。
+    void work.catch(()=>{});
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const result=await Promise.race([work.then(task=>({task,accepted:false as const})),
+        new Promise<null>(resolve=>{timer=setTimeout(()=>resolve(null),waitMs);})]);
+      if(result)return result;
+      // 预算先于持久 intent 到达时，只等可恢复身份落盘，不把等待退化成整次归档。
+      if(ready)await Promise.race([ready,work]);
+      const task=this.store.getTask(taskId),intent=this.store.taskData.finalization(taskId);
+      if(!intent || intent.status!==status || intent.summary!==summary || intent.error) return {task:await work,accepted:false};
+      return task.state==='closed' ? {task,accepted:false} : {task,accepted:true,pollAfterMs:2000};
+    } finally {if(timer)clearTimeout(timer);}
   }
 
   setRemoteFinalizer(finalizer: (task: TaskRecord, status: TaskFinalStatus, summary: string) => Promise<TaskOwnerReceipt[]>): void {
@@ -187,14 +236,16 @@ export class SessionService {
     }
   }
 
-  private async completeTask(ownerId: string, taskId: string, status: TaskFinalStatus, summary: string, expectedTaskRevision?: number): Promise<TaskRecord> {
+  private async completeTask(ownerId: string, taskId: string, status: TaskFinalStatus, summary: string, expectedTaskRevision?: number, ready?:()=>void): Promise<TaskRecord> {
     const task=this.store.getTask(taskId);
     this.store.requireSession(ownerId,task.session_id);
     if(task.state==="closed"&&task.result_status) {
       if(task.result_status!==status)throw new Error('TASK_ALREADY_FINISHED_WITH_DIFFERENT_RESULT');
+      if(task.summary!==summary)throw new Error('TASK_FINALIZATION_ALREADY_CONFIRMED');
       return task;
     }
-    this.store.taskData.requestFinalization(taskId,status,summary,expectedTaskRevision);
+    await this.store.writeAsync(()=>this.store.taskData.requestFinalization(taskId,status,summary,expectedTaskRevision));
+    ready?.();
     try {
       this.assertTaskIdle(taskId,status);
       const remote=this.store.taskMemberIds(taskId).map(id=>this.store.getMember(task.session_id,id)).filter(member=>member.node_id!==this.nodeId);
@@ -205,61 +256,57 @@ export class SessionService {
         const frozen=receipt?.snapshots.find(value=>value.memberId===member.id);
         if(!receipt||!frozen)throw new Error(`TASK_OWNER_RECEIPT_MISSING: ${member.node_id}:${member.id}`);
         if(status!=="handed_off"&&(receipt.activeWork||receipt.backgroundRuns.length))throw new Error(`TASK_HAS_ACTIVE_EXECUTIONS: ${member.node_id}`);
-        this.store.putTaskSnapshot(taskId,member.id,frozen.revision,frozen.snapshot,frozen.files);
+        await this.store.writeAsync(()=>this.store.putTaskSnapshot(taskId,member.id,frozen.revision,frozen.snapshot,frozen.files));
       }
       this.assertTaskIdle(taskId,status);
       await this.captureTask(task,true);
-      this.finishLocalRuns(taskId,status,summary);
-      return this.store.completeTaskFinalization(taskId,status,summary);
+      await this.finishLocalRuns(taskId,status,summary);
+      return await this.store.writeAsync(()=>this.store.completeTaskFinalization(taskId,status,summary));
     } catch(error) {
-      this.store.taskData.finishFinalization(taskId,error instanceof Error?error.message:String(error));
+      await this.store.writeAsync(()=>this.store.taskData.finishFinalization(taskId,error instanceof Error?error.message:String(error)));
       throw error;
     }
   }
 
-  private finishLocalRuns(taskId: string, status: TaskFinalStatus, summary: string): void {
+  private async finishLocalRuns(taskId: string, status: TaskFinalStatus, summary: string): Promise<void> {
     if (status === "handed_off") {
-      this.ledger?.archiveTaskRuns(taskId);
+      if(this.ledger)await runSqliteWrite(this.ledger.db,()=>this.ledger!.archiveTaskRuns(taskId));
       return;
     }
     if(this.ledger) {
       for(const id of this.store.runIdsForTask(taskId)) {
-        if(this.ledger.run(id).status==="running")
-          this.ledger.finish(id,{status,acceptance:"not_applicable",summary,evidence:[]});
+        await runSqliteWrite(this.ledger.db,()=>{
+          if(this.ledger!.run(id).status==="running")
+            this.ledger!.finish(id,{status,acceptance:"not_applicable",summary,evidence:[]});
+        });
       }
     }
   }
 
   async finishOwnedTask(ownerId: string, taskId: string, status: TaskFinalStatus, summary: string): Promise<TaskOwnerReceipt> {
     this.store.requireSession(ownerId,this.store.getTask(taskId).session_id);
-    const pending=this.finalizingLocal.get(taskId);
-    if(pending){
-      const intent=this.store.taskData.finalization(taskId);
-      if(intent && (intent.status!==status || intent.summary!==summary))throw new Error('TASK_FINALIZATION_CONFLICT');
-      return pending;
-    }
-    const work=(async()=>{
+    return this.runFinalization(this.finalizingLocal,taskId,status,summary,async ready=>{
       const task=this.store.getTask(taskId);
       this.store.requireSession(ownerId,task.session_id);
       if(task.state==='closed' && task.result_status && task.result_status!==status)throw new Error('TASK_ALREADY_FINISHED_WITH_DIFFERENT_RESULT');
+      if(task.state==='closed' && task.result_status && task.summary!==summary)throw new Error('TASK_FINALIZATION_ALREADY_CONFIRMED');
       if(!(task.state==="closed"&&task.result_status)) {
-        this.store.taskData.requestFinalization(taskId,status,summary);
+        await this.store.writeAsync(()=>this.store.taskData.requestFinalization(taskId,status,summary));
+        ready();
         try {
           this.assertTaskIdle(taskId,status);
           await this.captureTask(task,false);
           this.assertTaskIdle(taskId,status);
-          this.finishLocalRuns(taskId,status,summary);
-          this.store.completeTaskFinalization(taskId,status,summary);
+          await this.finishLocalRuns(taskId,status,summary);
+          await this.store.writeAsync(()=>this.store.completeTaskFinalization(taskId,status,summary));
         } catch(error) {
-          this.store.taskData.finishFinalization(taskId,error instanceof Error?error.message:String(error));
+          await this.store.writeAsync(()=>this.store.taskData.finishFinalization(taskId,error instanceof Error?error.message:String(error)));
           throw error;
         }
       }
       return {taskId,nodeId:this.nodeId,backgroundRuns:this.localBackground(taskId),activeWork:this.store.taskData.activeWork(taskId),
         snapshots:this.store.taskSnapshots(taskId).filter(value=>this.store.getMember(task.session_id,value.memberId).node_id===this.nodeId)};
-    })().finally(()=>this.finalizingLocal.delete(taskId));
-    this.finalizingLocal.set(taskId,work);
-    return work;
+    });
   }
 
   private async freezeTask(task: TaskRecord): Promise<void> {
@@ -312,7 +359,7 @@ export class SessionService {
           ? stored
           : await this.projections.materialize(task.session_id, member.id, task.id);
         const files = this.store.fileSummaries(task.session_id, member.id, task.id);
-        this.store.putTaskSnapshot(task.id, member.id, snapshot.rev, snapshot, files);
+        await this.store.writeAsync(()=>this.store.putTaskSnapshot(task.id, member.id, snapshot.rev, snapshot, files));
         if (member.node_id === this.nodeId) {
           const paths = [...new Set([
             ...snapshot.instructions.map((item) => item.path),
@@ -324,19 +371,19 @@ export class SessionService {
               if (error.code === "ENOENT") return null;
               throw error;
             });
-            if (content !== null) this.store.putTaskContext(task.id, member.id, path, content);
+            if (content !== null) await this.store.writeAsync(()=>this.store.putTaskContext(task.id, member.id, path, content));
           }
         }
         if (this.ledger) {
           for (const runId of this.store.runIdsForMember(task.session_id, member.id, task.id)) {
             if (!readRunCheckpoint(this.ledger.db, runId)) {
-              saveRunCheckpoint(this.ledger.db, runId, { revision: snapshot.rev, snapshot, files });
+              await runSqliteWrite(this.ledger.db,()=>saveRunCheckpoint(this.ledger!.db, runId, { revision: snapshot.rev, snapshot, files }));
             }
           }
         }
       }
     }
-    this.store.setTaskChangeSummary(task.id,changeErrors.length?"incomplete":"complete",changeErrors.length?changeErrors.join(" | "):null);
+    await this.store.writeAsync(()=>this.store.setTaskChangeSummary(task.id,changeErrors.length?"incomplete":"complete",changeErrors.length?changeErrors.join(" | "):null));
   }
 
   async open(
@@ -844,7 +891,7 @@ export class SessionService {
   async close(): Promise<void> {
     this.stopped = true;
     await this.retryingFinalizations;
-    await Promise.allSettled([...this.finalizing.values(),...this.finalizingLocal.values()]);
+    await Promise.allSettled([...this.finalizing.values(),...this.finalizingLocal.values()].map(flight=>flight.work));
     for (const dispose of this.listeners) {
       try {
         dispose();

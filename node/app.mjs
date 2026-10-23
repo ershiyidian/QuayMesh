@@ -26,6 +26,7 @@ export class QuayMeshNode {
     this.stopped = false; this.configRevision = configuration.revision;
     this.discovery = { ready:false, lastSuccessAt:null, lastError:null };
     this.pendingConfiguration = null; this.errors = new SourceErrors();
+    this.componentObservations=new Map();
     this.settingsQueue = Promise.resolve(); this.settingsApply = null; this.pendingSettingsRevision = null;
     this.corePort = configuration.node.corePort; this.maintenance = false;
     this.maintenanceReleasePending = false;
@@ -137,11 +138,16 @@ export class QuayMeshNode {
     this.generation = await this.prepare(this.config,this.configRevision);
     this.token = this.generation.token;
     const {node,cluster} = this.config;
+    this.installationTransition=await readOptionalJson(join(node.stateDir,"installation-transition.json"));
+    if(this.installationTransition)this.maintenance=true;
     this.supervisor = new ComponentSupervisor({logDir:join(node.stateDir,"logs"),intervalMs:this.intervalMs});
     this.supervisor.define(this.generation.plans);
     this.supervisor.on("fault",error => this.errors.fail("supervisor",error));
     this.supervisor.on("change",components => {
       for (const value of components) {
+        const observation=JSON.stringify([value.pid,value.state,value.observedAt,value.lastExitAt,value.error]);
+        if(this.componentObservations.get(value.id)===observation)continue;
+        this.componentObservations.set(value.id,observation);
         if (value.error) this.errors.fail(`component:${value.id}`,value.error,{pid:value.pid});
         else if (value.state === "ready") this.errors.recover(`component:${value.id}`);
       }
@@ -151,6 +157,7 @@ export class QuayMeshNode {
     try {
       if (node.capabilities.coordinator) this.registry = await new RegistryServer({cluster,token:this.token,stateDir:join(node.stateDir,"coordinator")}).start();
       this.relay = await this.createRelay(this.config);
+      if(this.installationTransition)this.relay?.setAccepting(false);
       await this.startAdmin();
       await this.supervisor.start();
       await this.supervisor.waitReady(new Set(["core"]),this.readinessMs);
@@ -283,12 +290,17 @@ export class QuayMeshNode {
       configuration:{applied:this.configRevision,desired:this.pendingConfiguration?.revision || this.configRevision,
         state:this.applying ? "applying" : this.pendingConfiguration?.failed ? "rejected" : this.pendingConfiguration ? "pending" : "applied"},
       maintenance:this.maintenance,components:this.supervisor?.snapshot() || [],discovery:this.discovery,
+      installationTransition:this.installationTransition??null,
+      activeCoreRelease:this.activeCoreRelease??null,
       membership:this.membership?.state || {connected:false,lastSuccessAt:null,error:null},
       error:errors.current.at(-1)?.message || null, errors, observedAt:Date.now()};
   }
   async persistStatus() {
     if (this.statusWriting || this.stopped) return;
-    this.statusWriting = writeJson(this.statusFile,this.status());
+    this.statusWriting = (async()=>{
+      this.activeCoreRelease=await readOptionalJson(join(this.config.node.stateDir,"core","active-release.json"));
+      await writeJson(this.statusFile,this.status());
+    })();
     try { await this.statusWriting; this.errors.recover("status"); }
     finally { this.statusWriting = null; }
   }
@@ -305,6 +317,7 @@ export class QuayMeshNode {
   async reconcileMaintenance() {
     if (this.stopped || this.maintenanceRecovery || this.applying || this.application || this.settingsApply) return;
     if (this.maintenance && !this.maintenanceReleasePending) return;
+    if(await readOptionalJson(join(this.config.node.stateDir,"installation-transition.json")))return;
     const job = (async () => {
       if (this.maintenanceReleasePending) {
         await this.endMaintenance();
@@ -346,6 +359,8 @@ export class QuayMeshNode {
     }
   }
   async endMaintenance() {
+    if(await readOptionalJson(join(this.config.node.stateDir,"installation-transition.json")))
+      throw Object.assign(new Error("发行切换仍在验证或等待恢复，准入保持暂停。"),{status:409});
     // Admin resume, timer recovery and rollback may converge here. One
     // Core resume transaction owns the latch; callers share its outcome.
     if (this.maintenanceRelease) return this.maintenanceRelease;
@@ -354,6 +369,7 @@ export class QuayMeshNode {
       try {
         await resumeAdmissionWithRetry(() => this.admission("resume"));
         this.maintenance = false;
+        this.installationTransition=null;
         this.maintenanceReleasePending = false;
         this.relay?.setAccepting(true);
         this.errors.recover("admission");

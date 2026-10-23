@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { isUtf8 } from "node:buffer";
 import { readFileSync, realpathSync, statSync } from "node:fs";
+import { readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 export interface ContextFileRef { path: string; sha256: string }
@@ -33,6 +34,23 @@ export function readContextFile(root: string, path: string): { path: string; byt
   if (bytes.includes(0)) throw new Error("Binary context inputs are not accepted.");
   if (!isUtf8(bytes)) throw new Error("Context input must be valid UTF-8; invalid bytes cannot be paged losslessly.");
   return { path: local.split(sep).join("/"), bytes, sha256: createHash("sha256").update(bytes).digest("hex") };
+}
+
+export async function readContextFileAsync(root: string, path: string, signal?: AbortSignal): Promise<{ path: string; bytes: Buffer; sha256: string }> {
+  signal?.throwIfAborted();
+  if (!path || /[\x00-\x1f]/.test(path) || isAbsolute(path) || /^[A-Za-z]:/.test(path)) throw new Error("Context paths must be workspace-relative.");
+  const base = await realpath(root), real = await realpath(resolve(base,path));
+  const local = relative(base,real);
+  if (isAbsolute(local) || local === ".." || local.startsWith(`..${sep}`)) throw new Error("Context file is outside the workspace.");
+  const before = await stat(real);
+  if (!before.isFile() || before.size > 512 * 1024) throw new Error("Context input must be a regular file no larger than 512 KiB.");
+  const bytes = await readFile(real,{signal});
+  const after = await stat(real);
+  signal?.throwIfAborted();
+  if (bytes.length > 512 * 1024 || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ino !== after.ino) throw new Error("Context input changed while reading; recapture it.");
+  if (bytes.includes(0)) throw new Error("Binary context inputs are not accepted.");
+  if (!isUtf8(bytes)) throw new Error("Context input must be valid UTF-8; invalid bytes cannot be paged losslessly.");
+  return {path:local.split(sep).join("/"),bytes,sha256:createHash("sha256").update(bytes).digest("hex")};
 }
 
 export function verifyHostContext(root: string, context?: HostPreparedContext): void {

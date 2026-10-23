@@ -1,9 +1,11 @@
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, createReadStream } from "node:fs";
+import { readFile, writeFile, rename, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import type { Duplex, Readable } from "node:stream";
-import { PeerTransport, PeerLink, NodeUnavailableError, PeerApplicationError, bridge } from "./transport.js";
+import { PeerTransport, PeerLink, NodeUnavailableError, PeerApplicationError, RpcRequestTimeoutError, bridge, type PeerProgressNotification } from "./transport.js";
 import { catalog, chooseGateway, parseWorkspaceHandle, routedResult, selectRoot } from "./routing.js";
 import { EgressListener, connectProxy, dialTcp, probeProxy } from "./egress.js";
 import { capabilities } from "./capabilities.js";
@@ -25,7 +27,7 @@ import { jsonReply } from "../bounded-reply.js";
 import { currentInvocation } from "../session/invocations.js";
 import { errorCode, toolErrorResult } from "../session/outcome.js";
 import { WorkspaceAccessError } from "../workspaces.js";
-import { dispatchPeerRequest, isTransientPeerFailure } from "./read-retry.js";
+import { dispatchPeerRequest, isTransientPeerFailure, isIdempotentPeerRequest } from "./read-retry.js";
 import { dispatchConsoleRequest } from "./console-request.js";
 
 export interface ArtifactWriteLifecycle {
@@ -40,6 +42,7 @@ export interface FederationHooks {
   ingressPort: number;
   publicBaseUrl: string;
   execution?: ExecutionCoordinator;
+  diagnostics?(event: string, fields: Record<string, unknown>, level?: "info" | "warn" | "error"): void;
   providers(): unknown[];
   prepareOpen(input: JsonRecord): Promise<JsonRecord>;
   checkWorkspace(id: string, options?: { touch?: boolean }): Promise<void>;
@@ -66,7 +69,8 @@ export class FederationRuntime extends EventEmitter {
   private readonly activeTransfers = new Map<string, TransferView>();
   private readonly aborts = new Map<string, AbortController>();
   private readonly known = new Map<string, NodeManifest>();
-  private readonly events: { time: string; kind: string; nodeId: string; message: string }[] = [];
+  private readonly events: { time: string; kind: string; nodeId: string; message: string; details?: Record<string, unknown> }[] = [];
+  private readonly egressStreams = new Set<Duplex>();
   private manifest: NodeManifest;
   private activeCalls = 0;
   private heartbeat?: NodeJS.Timeout;
@@ -78,6 +82,10 @@ export class FederationRuntime extends EventEmitter {
   private egress?: EgressListener;
   private ingress?: EgressListener;
   private readonly cacheFile: string;
+  private pendingCache?: NodeManifest[];
+  private cacheWriting?: Promise<void>;
+  private readonly releaseRecording: Promise<void>;
+  private runtimeIdentity?: NodeManifest["runtime"];
   private readonly modelTools = new Set<string>();
   private sessionFeed?: SessionFeed;
   private stopped = false;
@@ -100,11 +108,18 @@ export class FederationRuntime extends EventEmitter {
     }
     this.proxyUrl = config.egress.proxyUrl;
     this.manifest = this.makeManifest();
-    recordActiveRelease(hooks.stateDir, config.nodeId, this.manifest.version);
-    this.transport = new PeerTransport(config, token, (method, params, peer) => this.receive(method, params, peer),
+    this.releaseRecording = runtimeIdentity().then(async identity => {
+      this.runtimeIdentity=identity;
+      await recordActiveRelease(hooks.stateDir, config.nodeId, this.manifest.version, identity);
+    });
+    void this.releaseRecording.catch(() => {});
+    this.transport = new PeerTransport(config, token, (method, params, peer, context) => this.receive(method, params, peer, context?.signal, context?.notify),
       (service, metadata, stream) => this.receiveStream(service, metadata, stream));
     this.transport.on("online", (link: PeerLink) => { void this.peerOnline(link).catch((error) => this.event("connection", link.peerId, String(error))); });
-    this.transport.on("offline", (id: string) => { this.event("offline", id, "节点连接断开"); this.emit("change"); });
+    this.transport.on("offline", (id: string, details: Record<string, unknown>) => { this.event("offline", id, "节点连接断开", details); this.emit("change"); });
+    this.transport.on("peerError", (id: string, error: Error) => this.event("connection_error", id, error.message, {
+      code: (error as NodeJS.ErrnoException).code, ...this.transport.links.get(id)?.diagnostics() }));
+    this.transport.on("rpcTimeout", (id: string, details: Record<string, unknown>) => this.event("rpc_timeout", id, "节点调用等待超时", details));
     this.transport.on("fault", (error) => this.event("error", config.nodeId, String(error)));
 
   }
@@ -138,8 +153,10 @@ export class FederationRuntime extends EventEmitter {
 
   private makeManifest(): NodeManifest {
     return { id: this.config.nodeId, nickname: this.config.nickname, capabilities: this.config.capabilities, priority: this.config.priority,
-      ...this.componentStatus(), roots: this.config.roots, platform: process.platform, version: runtimeVersion(), tools: [...this.modelTools].sort(), providers: this.hooks.providers(),
-      egress: this.manifest?.egress ?? { enabled: this.config.capabilities.egress, healthy: this.config.capabilities.egress ? false : !this.config.egress.enabled },
+      ...this.componentStatus(), roots: this.config.roots, platform: process.platform, version: runtimeVersion(), runtime: this.runtimeIdentity,
+      tools: [...this.modelTools].sort(), providers: this.hooks.providers(),
+      egress: { ...(this.manifest?.egress ?? { enabled: this.config.capabilities.egress, healthy: this.config.capabilities.egress ? false : !this.config.egress.enabled }),
+        draining: !this.execution.admissionState().accepting, activeConnections: this.egressStreams.size },
       health: this.manifest?.health ?? { cpuCount: 0, load: [], memoryFree: 0, memoryTotal: 0, uptime: 0, gpus: [], activeCalls: 0 }, updatedAt: Date.now() };
   }
   start(): Promise<void> {
@@ -150,6 +167,7 @@ export class FederationRuntime extends EventEmitter {
     return this.ready;
   }
   private async startServices(): Promise<void> {
+    await this.releaseRecording;
     await this.transport.start();
     for (const transfer of this.transferStore.active()) {
       try {
@@ -171,7 +189,8 @@ export class FederationRuntime extends EventEmitter {
     const port = this.config.egress.listenPort;
     if (this.egress && (!this.config.egress.enabled || this.egress.address !== port)) { await this.egress.close(); this.egress = undefined; }
     if (this.config.egress.enabled) {
-      if (!this.egress) { this.egress = new EgressListener(port, () => this.openGatewayStream("egress")); await this.egress.start(); }
+      if (!this.egress) { this.egress = new EgressListener(port, () => this.openGatewayStream("egress"), error =>
+        this.event("egress_error", this.selected ?? this.localId, "出口连接建立失败", { code: error.code, phase: error.phase ?? "gateway_select" })); await this.egress.start(); }
       if (this.config.capabilities.egress) {
         void this.probe();
         this.probeTimer = setInterval(() => void this.probe(), this.config.egress.probeIntervalMs); this.probeTimer.unref();
@@ -229,10 +248,14 @@ export class FederationRuntime extends EventEmitter {
     return { enabled: true, localNodeId: this.localId, capabilities: this.config.capabilities, gatewayId: gateway?.id ?? null,
       publicMcpUrl: `${this.hooks.publicBaseUrl.replace(/\/$/, "")}/mcp`, ingressPort: this.hooks.ingressPort,
       proxyUrl: this.config.egress.enabled ? `http://127.0.0.1:${this.config.egress.listenPort}` : null,
-      nodes: this.nodes(), events: this.events.slice(-40).reverse(), transfers: this.transferStore.list(), startupError: this.startupError };
+      nodes: this.nodes(), events: this.events.slice(-40).reverse(), transfers: this.transferStore.list(), startupError: this.startupError,
+      links: [...this.transport.links.values()].map(link => ({ nodeId: link.peerId, ...link.diagnostics() })),
+      activeEgressConnections: this.egressStreams.size };
   }
-  private event(kind: string, nodeId: string, message: string): void {
-    this.events.push({ time: new Date().toISOString(), kind, nodeId, message });
+  private event(kind: string, nodeId: string, message: string, details?: Record<string, unknown>): void {
+    this.events.push({ time: new Date().toISOString(), kind, nodeId, message, details });
+    this.hooks.diagnostics?.(`federation_${kind}`, { nodeId, message, ...details },
+      kind.includes("error") || kind === "offline" ? "warn" : "info");
     if (this.events.length > 100) this.events.shift(); this.emit("change");
   }
   private async peerOnline(link: PeerLink): Promise<void> {
@@ -261,13 +284,14 @@ export class FederationRuntime extends EventEmitter {
   private remember(manifest: NodeManifest, peerId: string): void {
     if (manifest.id !== peerId) throw new Error("节点身份与目录清单不匹配");
     this.known.set(peerId, manifest);
-    this.persist(this.cacheFile, [...this.known.values()]);
+    this.persistCache([...this.known.values()]);
   }
   private publishManifest(): void {
     this.manifest = this.makeManifest(); this.manifest.egress.enabled = this.config.capabilities.egress;
     for (const link of this.transport.links.values()) link.notify("manifest", this.manifest);
     this.emit("change");
   }
+  refreshAdmission(): void { this.publishManifest(); }
   private async sample(): Promise<void> {
     if (this.sampling || this.stopped) return; this.sampling = true;
     try {
@@ -287,13 +311,16 @@ export class FederationRuntime extends EventEmitter {
         checkedAt: Date.now(), latencyMs: Math.round(performance.now() - started) };
     } catch (error) {
       this.manifest.egress = { enabled: true, healthy: false, checkedAt: Date.now(), error: error instanceof Error ? error.message : String(error) };
+      this.event("egress_probe_error", this.localId, "出口探测失败", { phase: (error as { phase?: string } | undefined)?.phase ?? "probe",
+        code: (error as NodeJS.ErrnoException | undefined)?.code });
     } finally { this.probing = false; this.publishManifest(); }
   }
-  private async receive(method: string, params: any, peer: string): Promise<unknown> {
+  private async receive(method: string, params: any, peer: string, signal?: AbortSignal,
+    notify?: (notification: PeerProgressNotification) => void | Promise<void>): Promise<unknown> {
     switch (method) {
       case "hello": this.remember(params.manifest, peer); return { manifest: this.makeManifest() };
       case "manifest": this.remember(params, peer); this.notePeerSuccess(peer); this.emit("change"); return null;
-      case "tool": return this.invokeLocal(params.name, params.input, params.extra ?? {});
+      case "tool": return this.invokeLocal(params.name, params.input, { ...(params.extra ?? {}), signal, sendNotification: notify });
       case "session.feed": {
         if (!this.sessionFeed) throw new Error("SESSION_FEED_UNAVAILABLE");
         return this.sessionFeed.handleRequest(params, peer);
@@ -346,20 +373,34 @@ export class FederationRuntime extends EventEmitter {
     const message = error instanceof Error ? error.message : String(error);
     this.peerHealth.set(node, { lastSuccessAt: previous.lastSuccessAt, lastError: message.slice(0, 300), consecutiveFailures: previous.consecutiveFailures + 1 });
   }
-  private linkAdapter<T>(node: string, method: string, params: unknown) {
+  private linkAdapter<T>(node: string, method: string, params: unknown,
+    onProgress?: (notification: PeerProgressNotification) => void | Promise<void>, signal?: AbortSignal) {
     const link = this.transport.links.get(node);
     if (!link) return undefined;
-    return { get connected() { return link.connected; }, call: (timeout: number) => link.call<T>(method, params, timeout), close: () => link.close() };
+    return { get connected() { return link.connected; }, call: (timeout: number) => {
+      let request = params;
+      if (method === "tool" && isIdempotentPeerRequest(method, params)) {
+        const input = params as { extra?: JsonRecord };
+        const extra = input.extra ?? {};
+        const meta = extra._meta as JsonRecord | undefined;
+        const declared = Number(meta?.[TOOL_DEADLINE_META]);
+        // 每次只读尝试共享调用者期限，同时不得在该次 RPC 超时后继续堆积远端观察。
+        request = { ...input, extra: { ...extra, _meta: { ...meta,
+          [TOOL_DEADLINE_META]: Math.min(Number.isFinite(declared) ? declared : Infinity, Date.now() + timeout) } } };
+      }
+      return link.call<T>(method, request, timeout, onProgress, signal);
+    }, close: () => link.close() };
   }
-  async request<T = unknown>(node: string, method: string, params: unknown, timeoutMs?: number): Promise<T> {
-    if (node === this.localId) return this.receive(method, params, this.localId) as Promise<T>;
+  async request<T = unknown>(node: string, method: string, params: unknown, timeoutMs?: number,
+    onProgress?: (notification: PeerProgressNotification) => void | Promise<void>, signal?: AbortSignal): Promise<T> {
+    if (node === this.localId) return this.receive(method, params, this.localId, signal, onProgress) as Promise<T>;
     try {
       const result = await dispatchPeerRequest<T>({
-        node, method, params, timeoutMs, rpcTimeoutMs: this.config.rpcTimeoutMs,
-        getLink: () => this.linkAdapter<T>(node, method, params),
+        node, method, params, timeoutMs, rpcTimeoutMs: this.config.rpcTimeoutMs, signal,
+        getLink: () => this.linkAdapter<T>(node, method, params, onProgress, signal),
         waitForLink: async (waitMs) => {
           const link = await this.transport.waitForLink(node, waitMs);
-          return link ? this.linkAdapter<T>(node, method, params) : undefined;
+          return link ? this.linkAdapter<T>(node, method, params, onProgress, signal) : undefined;
         },
       });
       this.notePeerSuccess(node);
@@ -381,11 +422,63 @@ export class FederationRuntime extends EventEmitter {
   private async invokeAcceptedTool(name: string, input: JsonRecord, extra: JsonRecord): Promise<unknown> {
     const deadlineAt=toolDeadline(name,input,extra._meta);
     remainingToolTime(deadlineAt);
+    // Workspace registration may be replay-safe but still commits durable
+    // membership/baseline state. Only observation work follows client aborts.
+    const cancellable = name !== "open_workspace" && name !== "attach_workspace"
+      && isIdempotentPeerRequest("tool", { name, input });
+    if (!cancellable) {
+      const { signal: _transportSignal, ...durableExtra } = extra;
+      return this.invokeToolBody(name, input, durableExtra, deadlineAt);
+    }
+    const controller = new AbortController();
+    const inherited = extra.signal instanceof AbortSignal ? extra.signal : undefined;
+    const abort = () => controller.abort(inherited?.reason ?? new RpcRequestTimeoutError(this.localId, String(extra.requestId ?? "read"), "读取已取消"));
+    if (inherited?.aborted) abort(); else inherited?.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(() => controller.abort(new RpcRequestTimeoutError(this.localId, String(extra.requestId ?? "read"), "读取期限已到")), remainingToolTime(deadlineAt));
+    timer.unref();
+    let onAbort: (() => void) | undefined;
+    try {
+      controller.signal.throwIfAborted();
+      const work = this.invokeToolBody(name, input, { ...extra, signal: controller.signal }, deadlineAt);
+      const expired = new Promise<never>((_resolve, reject) => {
+        onAbort = () => reject(controller.signal.reason);
+        controller.signal.addEventListener("abort", onAbort, { once: true });
+        if (controller.signal.aborted) onAbort();
+      });
+      return await Promise.race([work, expired]);
+    } finally {
+      clearTimeout(timer);
+      inherited?.removeEventListener("abort", abort);
+      if (onAbort) controller.signal.removeEventListener("abort", onAbort);
+    }
+  }
+  private async invokeToolBody(name: string, input: JsonRecord, extra: JsonRecord, deadlineAt: number): Promise<unknown> {
     if (!this.config.capabilities.worker && (typeof input.workspace_id === "string" || name === "open_workspace" || name === "attach_workspace")) {
       throw new Error(`节点 ${this.localId} 未启用执行能力`);
     }
     const handler = this.handlers.get(name); if (!handler) throw new Error(`节点 ${this.config.nickname} 没有启用 ${name}`);
+    const progressToken = (extra._meta as JsonRecord | undefined)?.progressToken;
+    const canNotify = (typeof progressToken === "string" || typeof progressToken === "number") && typeof extra.sendNotification === "function";
+    const sendNotification = extra.sendNotification as ((notification: PeerProgressNotification) => void | Promise<void>) | undefined;
+    let progress = 0;
+    const notify = async (notification: unknown): Promise<void> => {
+      if (!canNotify || !notification || typeof notification !== "object") return;
+      const value = notification as { method?: unknown; params?: { message?: unknown } };
+      if (value.method !== "notifications/progress") return;
+      try { await sendNotification?.({ method: "notifications/progress", params: {
+        progressToken: progressToken as string | number, progress: progress++,
+        ...(typeof value.params?.message === "string" ? { message: value.params.message.slice(0, 512) } : {}),
+      } }); } catch { /* Host notification delivery does not change the tool's committed outcome. */ }
+    };
+    const phase = (stage: string, message: string) => {
+      const trusted = extra.trustedInvocation as TrustedInvocationEnvelope | undefined;
+      this.hooks.diagnostics?.("tool_phase", { nodeId: this.localId, tool: name, stage,
+        requestId: extra.requestId, operationId: trusted?.operation_id, taskId: trusted?.task_id });
+      void notify({ method: "notifications/progress", params: { message } });
+    };
+    phase("received", "节点已接收调用，正在准备身份与工作区");
     const prepared = await this.sessionFeed?.prepareLocalTool(name, input, extra.trustedInvocation as TrustedInvocationEnvelope | undefined);
+    if (extra.signal instanceof AbortSignal) extra.signal.throwIfAborted();
     if (prepared) extra = {...extra, trustedInvocation: prepared};
     const opensWorkspace = name === "open_workspace" || name === "attach_workspace";
     const args = opensWorkspace ? await this.hooks.prepareOpen(input) : input;
@@ -404,9 +497,12 @@ export class FederationRuntime extends EventEmitter {
     this.activeCalls++;
     try {
       remainingToolTime(deadlineAt);
+      if (extra.signal instanceof AbortSignal) extra.signal.throwIfAborted();
       const controller = new AbortController();
+      phase("executing", "身份与工作区已就绪，正在执行工具");
       const result = await handler(args, { signal: controller.signal, ...extra,
-        sendNotification: async () => {}, sendRequest: async () => { throw new Error("该工具需要交互式宿主请求"); } });
+        sendNotification: notify, sendRequest: async () => { throw new Error("该工具需要交互式宿主请求"); } });
+      phase("result_ready", "工具已返回结果，正在交付回执");
       return routedResult(result, this.localId, { textReferences: opensWorkspace, jsonText: false });
     } finally { this.activeCalls--; }
   }
@@ -444,16 +540,29 @@ export class FederationRuntime extends EventEmitter {
       ? {...trusted, invocation_id: attempt.invocation_id, operation_id: attempt.operation_id}
       : trusted;
     const identity = safeForwardedContext(extra);
+    const requestedProgress = (extra._meta as JsonRecord | undefined)?.progressToken;
+    const progressToken = typeof requestedProgress === "string" && requestedProgress.length <= 1024
+      || typeof requestedProgress === "number" && Number.isFinite(requestedProgress) ? requestedProgress : undefined;
     const deadlineAt=toolDeadline(name,args,extra._meta);
     const context = { _meta: { ...(identity.conversation_id ? { "openai/session": identity.conversation_id } : {}),
-        [TOOL_DEADLINE_META]:deadlineAt },
+        [TOOL_DEADLINE_META]:deadlineAt, ...(progressToken !== undefined ? { progressToken } : {}) },
       requestId: identity.request_id,
       sessionId: identity.transport_session_id,
       ...(trustedInvocation ? { trustedInvocation } : {}),
       ...(identity.owner_id ? { authInfo: { clientId: identity.client_id, extra: {
         owner_id: identity.owner_id, transport_instance_id: identity.transport_instance_id,
       } } } : {}) };
-    const result = await this.request(node, "tool", { name, input: args, extra: context }, remainingToolTime(deadlineAt));
+    let progress = 0;
+    const onProgress = progressToken !== undefined && typeof extra.sendNotification === "function"
+      ? (notification: PeerProgressNotification) => (extra.sendNotification as (notification: PeerProgressNotification) => Promise<void>)({
+        method: "notifications/progress", params: { progressToken, progress: progress++,
+          ...(notification.params.message ? { message: notification.params.message } : {}) },
+      }) : undefined;
+    const signal = extra.signal instanceof AbortSignal ? extra.signal : undefined;
+    const query=()=>this.request(node, "tool", { name, input: args, extra: context }, remainingToolTime(deadlineAt), onProgress, signal);
+    const result = name==="workspace_context" && this.sessionFeed
+      ? await this.sessionFeed.recoverOperationStatus(input,trustedInvocation,node,query)
+      : await query();
     if ((result as JsonRecord | null)?.isError !== true) {
       await this.sessionFeed?.afterRemoteResult(name, args, result, node, trustedInvocation);
     }
@@ -463,30 +572,37 @@ export class FederationRuntime extends EventEmitter {
     const node = service === "ingress"
       ? this.nodes().find(candidate => candidate.id === this.config.coordinatorId && candidate.online)
       : this.gateway();
-    if (!node) throw new Error(service === "ingress" ? "Coordinator 当前不可用" : "暂无可用出口");
+    if (!node) throw Object.assign(new Error(service === "ingress" ? "Coordinator 当前不可用" : "暂无可用出口"),
+      { code: service === "ingress" ? "COORDINATOR_UNAVAILABLE" : "EGRESS_UNAVAILABLE", phase: "gateway_select" });
     return this.openNodeStream(node.id, service);
   }
   async openNodeStream(node: string, service: string, metadata: unknown = {}): Promise<Duplex> {
     if (node === this.localId) {
       if (service === "ingress") return dialTcp("127.0.0.1", this.hooks.httpPort);
       if (service === "egress") {
-        if (!this.config.capabilities.egress || !this.manifest.egress.healthy) throw new Error("EGRESS_CAPABILITY_UNAVAILABLE");
-        const lease=this.execution.beginWork({kind:"egress",blocking:false});
-        try { return this.trackStream(await lease.run(()=>connectProxy(this.proxyUrl)),lease); }
+        if (!this.config.capabilities.egress || !this.manifest.egress.healthy)
+          throw Object.assign(new Error("EGRESS_CAPABILITY_UNAVAILABLE"), { code: "EGRESS_CAPABILITY_UNAVAILABLE", phase: "gateway_admission" });
+        const lease=this.execution.beginWork({kind:"egress"});
+        try { return this.trackStream(await lease.run(()=>connectProxy(this.proxyUrl)),lease,true); }
         catch(error) { lease.release(); throw error; }
       }
       throw new Error(`本地传输 ${service} 应调用本地文件接口`);
     }
     const link = this.transport.links.get(node); if (!link) throw new NodeUnavailableError(node);
     if(service!=="egress")return link.openStream(service, metadata);
-    const lease=this.execution.beginWork({kind:"egress",blocking:false});
-    try { return this.trackStream(await lease.run(()=>link.openStream(service,metadata)),lease); }
+    const lease=this.execution.beginWork({kind:"egress"});
+    try { return this.trackStream(await lease.run(()=>link.openStream(service,metadata)),lease,true); }
     catch(error) { lease.release(); throw error; }
   }
 
-  private trackStream(stream: Duplex, lease: RuntimeWorkLease): Duplex {
-    stream.once("close",()=>lease.release());
-    if(stream.destroyed)lease.release();
+  private trackStream(stream: Duplex, lease: RuntimeWorkLease, egress = false): Duplex {
+    if (egress) this.egressStreams.add(stream);
+    const release = () => {
+      this.egressStreams.delete(stream);
+      void lease.releaseAsync().catch(error => this.event("stream_release_error", this.localId, String(error)));
+    };
+    stream.once("close", release);
+    if(stream.destroyed) release();
     return stream;
   }
   private async receiveStream(service: string, metadata: JsonRecord, stream: Duplex): Promise<void> {
@@ -496,11 +612,17 @@ export class FederationRuntime extends EventEmitter {
       bridge(stream, await dialTcp("127.0.0.1", this.hooks.httpPort)); return;
     }
     if (service === "egress") {
-      if (!this.config.capabilities.egress || !this.manifest.egress.healthy) throw new Error("本机 mihomo 出口当前不可用");
-      const lease=this.execution.beginWork({kind:"egress",blocking:false});
-      this.trackStream(stream,lease);
+      if (!this.config.capabilities.egress || !this.manifest.egress.healthy)
+        throw Object.assign(new Error("本机 mihomo 出口当前不可用"), { code: "EGRESS_CAPABILITY_UNAVAILABLE", phase: "gateway_admission" });
+      const lease=this.execution.beginWork({kind:"egress"});
+      this.trackStream(stream,lease,true);
       try { bridge(stream,await lease.run(()=>connectProxy(this.proxyUrl))); }
-      catch(error) { lease.release(); throw error; }
+      catch(error) {
+        lease.release();
+        this.event("egress_connect_error", this.localId, "出口代理连接失败", {
+          code: (error as NodeJS.ErrnoException)?.code, phase: (error as { phase?: string })?.phase ?? "proxy_connect" });
+        throw error;
+      }
       return;
     }
     if (service === "artifact.read") {
@@ -611,17 +733,21 @@ export class FederationRuntime extends EventEmitter {
     void pending.catch(error=>this.event("transfer",this.localId,error instanceof Error?error.message:String(error)));
     return {...view};
   }
-  private persist(path: string, value: unknown): void {
-    const temporary = temporaryPath(path);
-    try {
-      writeFileSync(temporary, JSON.stringify(value), { mode: 0o600 });
-      renameSync(temporary, path);
-    } catch (error) {
-      try { rmSync(temporary, { force: true }); } catch (cleanupError) {
-        throw new AggregateError([error, cleanupError], "节点缓存写入失败，临时文件也未能删除");
+  private persistCache(value: NodeManifest[]): void {
+    // 一次写入加一份最新快照，慢磁盘不会累积整个心跳历史。
+    this.pendingCache=value;
+    if(this.cacheWriting)return;
+    this.cacheWriting=(async()=>{
+      while(this.pendingCache){
+        const snapshot=this.pendingCache;this.pendingCache=undefined;
+        const temporary=temporaryPath(this.cacheFile);
+        try{await writeFile(temporary,JSON.stringify(snapshot),{mode:0o600});await rename(temporary,this.cacheFile);}
+        finally{await rm(temporary,{force:true});}
       }
-      throw error;
-    }
+    })().catch(error=>this.event("cache_error",this.localId,String(error))).finally(()=>{
+      this.cacheWriting=undefined;
+      if(this.pendingCache)this.persistCache(this.pendingCache);
+    });
   }
   async close(): Promise<void> {
     if (this.stopped) return; this.stopped = true;
@@ -631,8 +757,10 @@ export class FederationRuntime extends EventEmitter {
     await this.sessionFeed?.close();
     await Promise.all([this.egress?.close(), this.ingress?.close()]);
     await this.transport.close();
+    while(this.cacheWriting)await this.cacheWriting;
+    await Promise.allSettled([this.releaseRecording]);
     this.transferStore.close();
-    if(this.ownsExecution)this.execution.close();
+    if(this.ownsExecution)await this.execution.close();
   }
 }
 
@@ -652,19 +780,57 @@ function runtimeVersion(): string | undefined {
   }
 }
 
-function recordActiveRelease(stateDir: string, nodeId: string, version: string | undefined): void {
+const moduleRequire=createRequire(import.meta.url);
+let identityPromise: Promise<NonNullable<NodeManifest["runtime"]>> | undefined;
+function runtimeIdentity(): Promise<NonNullable<NodeManifest["runtime"]>> {
+  return identityPromise??=(async()=>{
+    const packageFile=moduleRequire.resolve("better-sqlite3/package.json");
+    const installed=JSON.parse(await readFile(packageFile,"utf8")) as {version:string};
+    // Hash the addon this process loaded. The package may select a platform
+    // prebuild, a Debug build or a Release build; a guessed path can identify
+    // an unused binary, or prevent an otherwise healthy Core from starting.
+    const entry=moduleRequire.cache[moduleRequire.resolve("better-sqlite3")];
+    const pending=entry?[entry]:[];
+    const visited=new Set<NodeModule>();
+    const addons=new Set<string>();
+    while(pending.length){
+      const current=pending.pop()!;
+      if(visited.has(current))continue;
+      visited.add(current);
+      if(current.filename.endsWith(".node"))addons.add(current.filename);
+      pending.push(...current.children);
+    }
+    if(addons.size!==1)throw new Error("无法唯一识别本进程已加载的 SQLite 原生模块");
+    const [sqliteNativeSha256,nodeSha256,packageLockSha256]=await Promise.all([
+      hashFile([...addons][0]), hashFile(process.execPath), hashFile(moduleRequire.resolve("../../pnpm-lock.yaml")),
+    ]);
+    return {nodeVersion:process.versions.node,nodeAbi:process.versions.modules,sqlitePackageVersion:installed.version,
+      sqliteNativeSha256,nodeSha256,packageLockSha256};
+  })();
+}
+async function hashFile(path: string): Promise<string> {
+  const hash=createHash("sha256");
+  for await(const chunk of createReadStream(path))hash.update(chunk);
+  return hash.digest("hex");
+}
+async function recordActiveRelease(stateDir: string, nodeId: string, version: string | undefined, runtime: NodeManifest["runtime"]): Promise<void> {
   if (!version) return;
   const path = join(stateDir, "active-release.json");
   const temporary = temporaryPath(path);
+  let previous: { commit?: string; activatedAt?: string } | undefined;
+  try { previous = JSON.parse(await readFile(path, "utf8")); } catch (error) { if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error; }
+  const startedAt=new Date().toISOString();
   const value = {
     nodeId,
     commit: version,
-    activatedAt: new Date().toISOString(),
+    activatedAt: previous?.commit===version ? previous.activatedAt??startedAt : startedAt,
+    startedAt,
     entrypoint: process.argv[1] ?? null,
     pid: process.pid,
+    runtime,
   };
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temporary, path);
+  try{await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });await rename(temporary, path);}
+  finally{await rm(temporary,{force:true});}
 }
 
 function temporaryPath(path: string): string {

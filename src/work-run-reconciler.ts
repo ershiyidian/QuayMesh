@@ -37,6 +37,7 @@ export class WorkRunReconciler {
     this.ledger = ledger;
     ledger.reconcileTerminalOperations();
     ledger.reconcileInterruptedExecutions();
+    ledger.reconcileCompletedExecutions();
     ledger.reconcileOrphanedOperations();
     ledger.reconcileDeadExecutionClaims();
     ledger.reconcileStaleRuns();
@@ -47,6 +48,7 @@ export class WorkRunReconciler {
     const ledger = this.ledger ?? new WorkLedger(this.stateDir);
     this.ledger = ledger;
     ledger.reconcileTerminalOperations();
+    ledger.reconcileCompletedExecutions();
     ledger.reconcileDeadExecutionClaims();
     ledger.reconcileStaleRuns();
     ledger.reconcileArchivedTaskRuns();

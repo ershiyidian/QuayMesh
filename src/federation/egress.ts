@@ -8,7 +8,7 @@ export function dialTcp(host: string, port: number): Promise<Socket> {
   return new Promise((resolve, reject) => {
     const socket = connect({ host, port, allowHalfOpen: true });
     socket.setNoDelay(true);
-    const timer = setTimeout(() => socket.destroy(new Error(`连接 ${host}:${port} 超时`)), 8_000); timer.unref();
+    const timer = setTimeout(() => socket.destroy(Object.assign(new Error(`连接 ${host}:${port} 超时`), { code: "EGRESS_CONNECT_TIMEOUT", phase: "proxy_connect" })), 8_000); timer.unref();
     socket.once("connect", () => { clearTimeout(timer); resolve(socket); });
     socket.once("error", (error) => { clearTimeout(timer); reject(error); });
   });
@@ -18,7 +18,8 @@ export function dialTcp(host: string, port: number): Promise<Socket> {
 export class EgressListener {
   private server?: Server;
   private readonly sockets = new Set<Socket>();
-  constructor(private readonly port: number, private readonly target: () => Promise<Duplex>) {}
+  constructor(private readonly port: number, private readonly target: () => Promise<Duplex>,
+    private readonly onError?: (error: Error & { code?: string; phase?: string }) => void) {}
   async start(): Promise<void> {
     this.server = createServer({ pauseOnConnect: true, allowHalfOpen: true }, (socket) => {
       this.sockets.add(socket); socket.setNoDelay(true);
@@ -27,7 +28,12 @@ export class EgressListener {
       void this.target().then((target) => {
         if (socket.destroyed) { target.destroy(); return; }
         bridge(socket, target); socket.resume();
-      }).catch(() => socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"));
+      }).catch((failure: unknown) => {
+        const error = failure instanceof Error ? failure as Error & { code?: string; phase?: string } : new Error(String(failure));
+        this.onError?.(error);
+        const code = "code" in error && typeof error.code === "string" && /^[A-Z0-9_]{1,64}$/.test(error.code) ? error.code : "EGRESS_UNAVAILABLE";
+        socket.end(`HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nX-QuayMesh-Error: ${code}\r\nContent-Length: 0\r\n\r\n`);
+      });
     });
     await new Promise<void>((resolve, reject) => { this.server!.once("error", reject); this.server!.listen(this.port, "127.0.0.1", resolve); });
     this.server.on("error", () => {});
@@ -46,41 +52,48 @@ function proxyAddress(proxyUrl: string): URL {
 }
 export async function connectProxy(proxyUrl: string): Promise<Socket> {
   const url = proxyAddress(proxyUrl);
-  return dialTcp(url.hostname.replace(/^\[|\]$/g, ""), Number(url.port || 80));
+  try { return await dialTcp(url.hostname.replace(/^\[|\]$/g, ""), Number(url.port || 80)); }
+  catch (error) { throw Object.assign(error instanceof Error ? error : new Error(String(error)), { phase: "proxy_connect" }); }
 }
 /** A healthy listening port alone does not mean the provider's network is reachable. */
 export function probeProxy(proxyUrl: string, targetUrl: string, timeoutMs = 8_000): Promise<void> {
   const proxy = proxyAddress(proxyUrl); const target = new URL(targetUrl);
   if (!["http:", "https:"].includes(target.protocol)) return Promise.reject(new Error("出网探测地址使用 HTTP/HTTPS"));
   return new Promise((resolve, reject) => {
-    let finished = false; let tunnel: Duplex | undefined;
+    let finished = false; let tunnel: Duplex | undefined; let phase = "proxy_connect";
     const finish = (error?: Error) => {
       if (finished) return; finished = true; clearTimeout(timer); request.destroy(); tunnel?.destroy();
-      error ? reject(error) : resolve();
+      error ? reject(Object.assign(error, { phase })) : resolve();
     };
-    const timer = setTimeout(() => finish(new Error("mihomo 出网探测超时")), timeoutMs); timer.unref();
+    const timer = setTimeout(() => finish(Object.assign(new Error("mihomo 出网探测超时"), { code: "EGRESS_PROBE_TIMEOUT" })), timeoutMs); timer.unref();
     const authority = `${target.hostname}:${target.port || (target.protocol === "https:" ? 443 : 80)}`;
     const request = httpRequest({ hostname: proxy.hostname, port: proxy.port || 80, method: "CONNECT", path: authority,
       headers: { Host: authority }, agent: false });
+    request.once("socket", socket => socket.once("connect", () => { phase = "proxy_tunnel"; }));
     request.on("error", finish);
     request.on("connect", (response, socket, head) => {
+      phase = "proxy_tunnel";
       tunnel = socket;
-      if (response.statusCode !== 200) { finish(new Error(`mihomo CONNECT ${response.statusCode}`)); return; }
+      if (response.statusCode !== 200) { finish(Object.assign(new Error(`mihomo CONNECT ${response.statusCode}`), { code: "EGRESS_TUNNEL_REJECTED" })); return; }
       if (head.length) socket.unshift(head);
       const check = (stream: Duplex) => {
+        phase = "target_http";
         tunnel = stream;
         stream.once("error", finish);
+        const incomplete = () => finish(Object.assign(new Error("出网探测在目标响应头之前结束"), { code: "EGRESS_TARGET_CLOSED" }));
+        stream.once("end", incomplete); stream.once("close", incomplete);
         let header = "";
         stream.on("data", (chunk: Buffer) => {
           header += chunk.toString("latin1");
           const end = header.indexOf("\r\n");
           if (end < 0 && header.length < 8192) return;
           const status = Number(/^HTTP\/\d\.\d (\d{3})/.exec(header)?.[1]);
-          finish(status >= 200 && status < 400 ? undefined : new Error(`出网探测返回 HTTP ${status || "未知"}`));
+          finish(status >= 200 && status < 400 ? undefined : Object.assign(new Error(`出网探测返回 HTTP ${status || "未知"}`), { code: "EGRESS_TARGET_HTTP_ERROR" }));
         });
         stream.write(`GET ${target.pathname}${target.search} HTTP/1.1\r\nHost: ${target.host}\r\nConnection: close\r\n\r\n`);
       };
       if (target.protocol === "https:") {
+        phase = "target_tls";
         const secure = tlsConnect({ socket, servername: target.hostname, ALPNProtocols: ["http/1.1"] });
         secure.once("error", finish); secure.once("secureConnect", () => check(secure)); tunnel = secure;
       } else check(socket);

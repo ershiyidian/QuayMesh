@@ -10,11 +10,13 @@ const readerSchema = snapshotSchema.strip();
 
 export function snapshotFromSchema(value: unknown): Snapshot {
   const parsed = readerSchema.parse(value);
+  const {live, ...snapshot} = parsed;
   return {
-    ...parsed,
+    ...snapshot,
     execution_status: executionState(parsed.execution_status),
     review_status: reviewState(parsed.review_status),
     host_status: hostState(parsed.host_status),
+    ...(live ? {live: {...live, hostStatus: hostState(live.hostStatus), executionStatus: executionState(live.executionStatus)}} : {}),
   };
 }
 

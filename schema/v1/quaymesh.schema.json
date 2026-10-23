@@ -305,7 +305,7 @@
               "maximum": 300000
             },
             "recoveryDelayMs": {
-              "default": 30000,
+              "default": 60000,
               "type": "integer",
               "minimum": 0,
               "maximum": 300000

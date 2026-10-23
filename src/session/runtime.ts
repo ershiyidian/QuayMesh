@@ -113,13 +113,13 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
   );
   const recovery = new RecoveryService(store, config.stateDir);
   reverter = new SessionReverter(store, config.stateDir, execution, changes, agents);
-  const service = new SessionService(store, workspaces, ledger, agents, changes, projector, recovery, config.federation?.nodeId ?? "local");
+  const service = new SessionService(store, workspaces, ledger, agents, changes, projector, recovery, config.federation?.nodeId ?? "local", execution);
   const disposeProjectionUpdates = store.onChange((change) => {
     const member = store.getMember(change.sessionId, change.memberId);
     if (member.node_id === (config.federation?.nodeId ?? "local")) projector.schedule(change.sessionId, change.memberId, change.taskId);
   });
   changes.setCaptureListener((sessionId, memberId, taskId) => service.refreshMember(sessionId, memberId, taskId));
-  const recorder = new SessionToolRecorder(store, workspaces, service, changes, projector, execution);
+  const recorder = new SessionToolRecorder(store, workspaces, service, changes, projector, execution, config.federation?.nodeId ?? "local");
   const lastOutputActivity=new Map<string,number>();
   options.processSessions?.setOutputSink({
     async open(operationId, command) {

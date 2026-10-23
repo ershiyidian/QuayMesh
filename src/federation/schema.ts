@@ -28,7 +28,7 @@ export const federationConfigSchema = z.object({
     enabled: z.boolean().default(false), listenPort: port.default(17890),
     mihomoConfig: z.string().optional(), proxyUrl: z.string().url().default("http://127.0.0.1:7890"), controllerUrl: z.string().url().optional(),
     controllerSecretEnv: z.string().default("MIHOMO_SECRET"), probeUrl: z.string().url().default("https://www.gstatic.com/generate_204"),
-    probeIntervalMs: z.number().int().min(3000).max(300000).default(15000), recoveryDelayMs: z.number().int().min(0).max(300000).default(30000),
+    probeIntervalMs: z.number().int().min(3000).max(300000).default(15000), recoveryDelayMs: z.number().int().min(0).max(300000).default(60000),
     inheritProxy: z.boolean().default(true),
   }).strict().prefault({}),
 }).strict().prefault({}).superRefine((value, context) => {

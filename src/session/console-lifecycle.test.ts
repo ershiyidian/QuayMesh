@@ -12,7 +12,7 @@ import {WorkspaceRegistry} from '../workspaces.js';
 import {SessionService} from './service.js';
 import {SessionStore} from './store.js';
 import {SessionProjector} from './projection.js';
-import {ExecutionState, ReviewState} from './types.js';
+import {ExecutionState, HostState, ReviewState} from './types.js';
 import {runQuery} from '../console-workbench/run-query.js';
 import {WorkbenchFeed} from '../console-workbench/feed.js';
 import {readLocalIndex} from '../console-workbench/local.js';
@@ -412,4 +412,22 @@ test('SQL 待处理 OR 不会绕过项目过滤',async t=>{
   const execution=f.ledger.beginExecution({runId:run.id,agentId:f.agent.id,provider:'codex'});
   f.ledger.endExecution(execution,'cancelled');
   assert.equal(f.rows({attention:'1',project:'missing-project'}).length,0);
+});
+
+test('业务 revision 不变时，卡片轻量通道仍报告当前连接和执行状态',async t=>{
+  const f=await fixture(t),run=f.createRun('live-status');
+  const projector=new SessionProjector(f.store,f.stateDir,null,undefined,'local');
+  t.after(()=>projector.close());
+  const initial=await projector.readTask(f.task.id,-1);
+  assert.ok(initial.snapshot);assert.equal(initial.live?.hostStatus,HostState.connected);
+  const revision=f.store.getTask(f.task.id).revision;
+  f.ledger.db.prepare('update qm_session_members set online=0 where id=?').run(f.member.id);
+  const disconnected=await projector.readTask(f.task.id,revision);
+  assert.equal(disconnected.unchanged,true);assert.equal(disconnected.live?.hostStatus,HostState.disconnected);
+  f.ledger.db.prepare('update qm_session_members set online=1 where id=?').run(f.member.id);
+  f.ledger.finish(run.id,{status:'failed',acceptance:'not_applicable',summary:'真实执行失败',evidence:[]});
+  const recovered=await projector.readTask(f.task.id,revision);
+  assert.equal(recovered.unchanged,true);assert.equal(recovered.live?.hostStatus,HostState.connected);
+  assert.equal(recovered.live?.executionStatus,ExecutionState.failed);
+  assert.equal(f.store.getTask(f.task.id).revision,revision);
 });

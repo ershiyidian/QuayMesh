@@ -29,7 +29,7 @@ type Entry = {key:string; time:string; source:'operation'|'card'|'transport'|'no
 const cursorSchema = z.object({scope:z.string(),until:timestamp,after:z.string().max(512)}).strict();
 const lifecycle = new Set(['server_starting','server_exit','server_shutdown_started','server_shutdown_completed','server_shutdown_failed','server_uncaught_exception']);
 const logFields = ['requestId','method','tool','resourceUri','taskId','operationId','sessionId','httpStatus','rpcErrorCode',
-  'toolError','toolErrorCode','effect','retryHint','resultInspection','transportStatus','aborted','durationMs','authenticationMs','responseHeadersMs','firstResponseByteMs',
+  'toolError','toolErrorCode','recoveryTextErrorCode','errorCodeConsistent','effect','retryHint','resultInspection','transportStatus','aborted','durationMs','authenticationMs','responseHeadersMs','firstResponseByteMs',
   'responseBytes','pid','ppid','childPid','exitCode','signal','elapsedMs','errorCode','outcome'];
 const MAX_LOG_SCAN_BYTES = 32*1024*1024;
 const operationFields = ['operation_id','kind','status','state','effect','exit_code','signal','error_code','result_ref'];
@@ -70,9 +70,21 @@ export async function readDiagnostics(config:Pick<ServerConfig,'stateDir'|'feder
     if (!task) throw new Error('TASK_NOT_FOUND_OR_FORBIDDEN');
     const operationIds = new Set<string>();
     if (input.operation_id) {
-      const owned = db.prepare(`SELECT 1 FROM qm_events WHERE task_id=? AND (source_id=? OR json_extract(data_json,'$.operation_id')=?) LIMIT 1`).get(input.task_id,input.operation_id,input.operation_id);
+      const owned = db.prepare(`SELECT 1 FROM qm_events WHERE task_id=? AND session_id=? AND (source_id=? OR json_extract(data_json,'$.operation_id')=?)
+        UNION ALL SELECT 1 FROM qm_invocations i JOIN qm_session_members m ON m.id=i.member_id AND m.session_id=i.session_id
+        WHERE i.task_id=? AND i.session_id=? AND i.owner_id=? AND i.operation_id=? LIMIT 1`)
+        .get(input.task_id,task.session_id,input.operation_id,input.operation_id,input.task_id,task.session_id,ownerId,input.operation_id);
       if (!owned) throw new Error('OPERATION_NOT_IN_TASK');
       operationIds.add(input.operation_id);
+    }
+    for (const raw of db.prepare(`SELECT i.id,i.operation_id,i.tool_name,i.state,i.effect,i.created_at,i.finished_at,i.result_ref
+      FROM qm_invocations i JOIN qm_session_members m ON m.id=i.member_id AND m.session_id=i.session_id
+      WHERE i.task_id=? AND i.session_id=? AND i.owner_id=? AND (? IS NULL OR i.operation_id=?)`).iterate(
+        input.task_id,task.session_id,ownerId,input.operation_id??null,input.operation_id??null)) {
+      const receipt=raw as Row;
+      if (typeof receipt.operation_id === 'string') operationIds.add(receipt.operation_id);
+      if (!input.resource_uri) offer('operation',String(receipt.finished_at??receipt.created_at),`receipt:${receipt.id}`,{
+        event:'invocation_receipt',...select(receipt,['operation_id','tool_name','state','effect','created_at','finished_at','result_ref'])});
     }
     const events = db.prepare('SELECT sequence,event_type,source_id,data_json,created_at FROM qm_events WHERE task_id=? ORDER BY sequence').iterate(input.task_id);
     for (const raw of events) {

@@ -120,6 +120,7 @@ test("execution completion never auto-passes acceptance; active operations block
 test("interrupted execution is marked for reconciliation without deleting usage or replaying work", (t) => {
   const f = fixture(t); const run = f.begin("interrupted"); const execution = f.make(run.id, "t1");
   f.usage(execution, "t1", 1000);
+  f.ledger.db.prepare("UPDATE execution_owners SET owner_pid=? WHERE domain='execution' AND id=?").run(2_147_483_647,execution);
   assert.equal(f.ledger.reconcileInterruptedExecutions(), 1);
   assert.equal(f.ledger.run(run.id).status, "reconciliation_required");
   assert.equal(f.ledger.receipt(run.id).usageStatus, "partial");

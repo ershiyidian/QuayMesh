@@ -1,7 +1,8 @@
 import { icon } from './icons.js';
 import { fmt, compact, duration, fullTime, ago, smartTime, validTime } from './format.js';
-import type { Run, ChangeCapture } from './contracts.js';
+import type { Run, ChangeCapture, SourceState } from './contracts.js';
 import { taskStage, taskStages, executionTimeEnd } from '../../console-task-state.js';
+import { taskDelivery } from '../../task-view.js';
 
 export const esc = (v: unknown): string => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 
@@ -26,6 +27,25 @@ export function acceptanceBadge(run: Pick<Run, 'executionStatus' | 'phaseExecuti
   if (['accepted','passed'].includes(run.acceptanceStatus)) return badge('结果已验收','good');
   if (['rejected','failed'].includes(run.acceptanceStatus)) return badge('结果已驳回','warn');
   return '';
+}
+
+export function lifecycleBadges(run: Pick<Run, 'requestState'|'resultStatus'|'executionStatus'|'phaseExecutionStatus'|'acceptanceStatus'|'finalization'>,
+  observation?: {stale: boolean; observedAt: number | null}): string {
+  const delivery=taskDelivery(run.requestState,run.resultStatus),state=stage(run);
+  const primary=delivery ? `<span class="state ${delivery.status==='completed'?'done':esc(delivery.status)}">${icon(delivery.status==='completed'?'done':delivery.status==='ended'?'archive':delivery.status,14)}${esc(delivery.label)}</span>`
+    : run.finalization?.status==='failed'&&state==='finalizing' ? `<span class="state failed">${icon('failed',14)}交付确认失败</span>` : status(state);
+  const result=[primary];
+  if(!delivery&&run.finalization&&state!=='finalizing')result.push(badge(run.finalization.status==='failed'?'交付确认失败':'交付确认中','warn'));
+  if(delivery){
+    const background:Record<string,string>={running:'后台仍在执行',stopping:'后台正在停止',queued:'后台正在准备',unknown:'后台执行结果待核对',interrupted_recoverable:'后台执行已中断'};
+    if(background[run.executionStatus])result.push(badge(background[run.executionStatus],['unknown','interrupted_recoverable'].includes(run.executionStatus)?'warn':''));
+  }
+  if(observation?.stale)result.push(`<span class="badge warn" title="${esc('最后确认：'+fullTime(observation.observedAt))}">上次确认</span>`);
+  if(!delivery&&run.phaseExecutionStatus==='completed'&&run.executionStatus!=='completed')result.push(badge('执行阶段已结束'));
+  const acceptance=acceptanceBadge(run);
+  if(acceptance)result.push(acceptance);
+  else if(delivery&&['review','accepted','rejected'].includes(state))result.push(badge(stages[state],state==='accepted'?'good':'warn'));
+  return result.join(' ');
 }
 
 export const meter = (v: number | null | undefined, tone = '') => v == null || !Number.isFinite(v)
@@ -75,10 +95,21 @@ export function dedupeCaptureWarnings(warnings: readonly string[], captures?: re
   return warnings.filter(warning => !repeated.has(warning));
 }
 
+export function executionObservationForRun(run:Run,sources:readonly Pick<SourceState,'nodeId'|'online'|'observedAt'|'error'>[],
+  fallback:{stale:boolean;observedAt:number|null},now=Date.now()):{stale:boolean;observedAt:number|null}{
+  if(!['running','stopping','queued'].includes(run.executionStatus))return fallback;
+  const active=sources.filter(source=>{
+    const execution=run.nodeStates?.[source.nodeId]??((run.nodeIds?.length??1)===1&&source.nodeId===run.nodeId?run.executionStatus:null);
+    return execution&&['running','stopping','queued'].includes(execution)&&source.online&&!source.error
+      &&source.observedAt!==null&&now-source.observedAt<=30_000;
+  });
+  return active.length?{stale:false,observedAt:Math.min(...active.map(source=>source.observedAt!))}:fallback;
+}
+
 export function elapsed(r: Run, observation?: { stale: boolean; observedAt: number | null }) {
   const active = ['running', 'stopping'].includes(r.executionStatus);
   const at = observation ? observation.observedAt : r.observedAt ?? null;
-  const stale = observation?.stale || r.stale || at !== null && Date.now() - at > 30_000;
+  const stale = (observation ? observation.stale : r.stale) || at !== null && Date.now() - at > 30_000;
   const end = executionTimeEnd({...r,stale:Boolean(stale),observedAt:at});
   if (active && !stale && r.finishedAt === null) return `<span class="num elapsed" data-elapsed="${r.startedAt}" data-observed="${at ?? Date.now()}">${duration(end === null ? null : end-r.startedAt)}</span>`;
   if ((active || r.executionStatus === 'unknown') && stale)

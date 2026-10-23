@@ -17,7 +17,7 @@ import { WorkLedger as ProjectWorkLedger } from "./work-ledger.js";
 import { admittedTools } from "./tool-admission.js";
 import { localAgentProviderEnvironment } from "./local-agent-config.js";
 import type { ExecutionCoordinator, RuntimeWorkLease } from "./execution-coordinator.js";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { relative, resolve as resolveSessionPath } from "node:path";
@@ -428,12 +428,18 @@ function registerMcpSurface(
       status:z.enum(["completed","failed","cancelled","handed_off"]),
       summary:z.string().min(1).max(4000),
     },
-    outputSchema:{task_id:z.string(),state:z.literal("closed"),result_status:z.string()},
+    outputSchema:{task_id:z.string(),state:z.enum(["closed","finalizing"]),result_status:z.string().nullable(),
+      accepted:z.boolean().optional(),poll_after_ms:z.number().optional(),
+      next_action:z.object({tool:z.literal("finish_task"),arguments:z.object({task_id:z.string(),status:z.string(),summary:z.string()})}).optional()},
     annotations:{readOnlyHint:false,destructiveHint:true,idempotentHint:true,openWorldHint:false},
   },async({task_id,status,summary},extra)=>{
     if(!sessionRuntime)throw new Error("SESSION_RUNTIME_UNAVAILABLE");
     const owner=sessionRequestIdentity(extra).owner_id;
-    const task=await sessionRuntime.service.finishTask(owner,task_id,status,summary);
+    const finished=await sessionRuntime.service.finishTaskWithinBudget(owner,task_id,status,summary);
+    const task=finished.task;
+    if(finished.accepted)return {content:[{type:"text",text:"结束请求已保存，正在确认并归档各节点证据。卡片会在归档完成后更新。"}],
+      structuredContent:{task_id,state:"finalizing",result_status:null,accepted:true,poll_after_ms:finished.pollAfterMs,
+        next_action:{tool:"finish_task",arguments:{task_id,status,summary}}}};
     return {content:[{type:"text",text:summary+'\n'+task_id+'\n'+taskConsoleUrl(config,task_id)}],structuredContent:{task_id,state:task.state,result_status:task.result_status}};
   });
 
@@ -1108,7 +1114,13 @@ export function createServer(
       ? proxyEnvironment(config.federation.egress.listenPort, { NO_PROXY: process.env.NO_PROXY ?? process.env.no_proxy }, config.federation.peers.filter((peer) => peer.url).map((peer) => new URL(peer.url).hostname)) : {},
     diagnostics: (event, fields, level) => options.diagnostics
       ? options.diagnostics.record(event, fields, level) : logEvent(config.logging, level, event, fields) });
-  processSessions.executionCoordinator!.resumeAfterRestart();
+  const installationTransitionFile = process.env.QUAYMESH_INSTALL_TRANSITION_FILE;
+  const installationPending = () => Boolean(installationTransitionFile && existsSync(installationTransitionFile));
+  // A first install or an externally stopped old Core may have no persisted
+  // pause. Keep direct peer calls and egress frozen during release validation,
+  // before federation starts accepting connections.
+  if (installationPending()) processSessions.executionCoordinator!.pause("node-maintenance");
+  else processSessions.executionCoordinator!.resumeAfterRestart();
   const sessionLedger = new ProjectWorkLedger(config.stateDir);
   const localAgentStore = new LocalAgentStore(config.stateDir);
   const sessionRuntime = createSessionRuntime({
@@ -1132,7 +1144,8 @@ export function createServer(
   );
   let projectConsole: ReturnType<typeof createProjectConsoleRouter>;
   const federation = createFederation(config, workspaces, resolveLocalAgentProviders,
-    (method, path, body) => projectConsole.dispatch(method, path, body), sessionRuntime, processSessions.executionCoordinator);
+    (method, path, body) => projectConsole.dispatch(method, path, body), sessionRuntime, processSessions.executionCoordinator,
+    (event,fields,level)=>options.diagnostics ? options.diagnostics.record(event,fields,level) : logEvent(config.logging,level??"info",event,fields));
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
   const bearerAuth = requireBearerAuth({
     verifier: oauthProvider,
@@ -1243,8 +1256,12 @@ export function createServer(
     if (!token || req.headers.authorization !== `Bearer ${token}`) { res.status(401).json({ error: "unauthorized" }); return; }
     const action = req.body?.action;
     if (action !== "pause" && action !== "resume") { res.status(400).json({ error: "invalid_admission_action" }); return; }
+    if (action === "resume" && installationPending()) {
+      res.status(409).json({ error: "INSTALLATION_VALIDATION_PENDING", message: "发行切换仍在验证或等待恢复，准入保持暂停。" }); return;
+    }
     if (action === "pause") processSessions.executionCoordinator!.pause(typeof req.body.reason === "string" ? req.body.reason : undefined);
     else processSessions.executionCoordinator!.resume();
+    federation?.refreshAdmission();
     res.json({ ok: true, ...processSessions.executionCoordinator!.admissionStatus() });
   });
 
@@ -1468,6 +1485,7 @@ if (await isMainModule()) {
     shuttingDown = true;
     await shutdownHttpServer(httpServer, close, (event) => diagnostics.record(event));
     await runtime?.close();
+    await diagnostics.flush();
     process.exit(0);
   };
   runtimeShutdown = shutdown;

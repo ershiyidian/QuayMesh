@@ -127,11 +127,14 @@
       max-width: none
     }
 
-    .card[data-status=running] {
+    .card[data-status=running],
+    .card[data-status=finalizing],
+    .card[data-status=handed_off] {
       --tone: var(--color-text-info)
     }
 
-    .card[data-status=stalled] {
+    .card[data-status=stalled],
+    .card[data-status=unavailable] {
       --tone: var(--color-text-warning)
     }
 
@@ -147,7 +150,8 @@
       --tone: var(--color-text-tertiary)
     }
 
-    .card[data-status=idle] {
+    .card[data-status=idle],
+    .card[data-status=archived] {
       --tone: var(--color-text-tertiary)
     }
 
@@ -634,16 +638,47 @@
     }
 
     @media (max-width:520px) {
+      .hd {
+        grid-template-columns: 16px minmax(0, 1fr);
+        row-gap: 4px
+      }
+
+      .l2 {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 2px
+      }
+
+      .act {
+        white-space: normal;
+        overflow-wrap: anywhere
+      }
+
+      .hd-r {
+        grid-column: 2;
+        min-width: 0
+      }
+
+      .meta {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        gap: 0 8px;
+        min-width: 0;
+        margin-right: auto
+      }
+
+      .prog {
+        overflow-wrap: anywhere
+      }
+
       .ws {
         display: none
       }
 
-      .tab .lbl {
-        display: none
-      }
-
-      .stats .nf {
-        display: none
+      .tab {
+        gap: 4px;
+        padding: 0 8px
       }
     }
 

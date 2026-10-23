@@ -74,6 +74,7 @@ export interface PeerDispatchOptions<T> {
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
+  signal?: AbortSignal;
   getLink: () => ReadRetryLink<T> | undefined;
   waitForLink?: (waitMs: number) => Promise<ReadRetryLink<T> | undefined>;
 }
@@ -105,11 +106,13 @@ export async function executeBoundedRead<T>(options: PeerDispatchOptions<T>): Pr
   const maxAttempts = MAX_READ_RETRIES + 1;
   let lastError: unknown = new RpcRequestTimeoutError(options.node, "read-budget", "读取预算已耗尽");
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    options.signal?.throwIfAborted();
     if (deadline - now() <= 0) throw new RpcRequestTimeoutError(options.node, "read-budget", "读取预算已耗尽");
     let link = options.getLink();
     if (!link?.connected && options.waitForLink) {
       const waitMs = Math.min(deadline - now(), Math.max(1, backoffMs(attempt, () => 0)));
       if (waitMs > 0) link = await options.waitForLink(waitMs);
+      options.signal?.throwIfAborted();
     }
     if (!link?.connected) {
       lastError = new NodeUnavailableError(options.node);
@@ -161,7 +164,9 @@ function readAttemptTimeout(method: string, params: unknown): number {
 export function dispatchPeerRequest<T>(options: PeerDispatchOptions<T>): Promise<T> {
   if (!isIdempotentPeerRequest(options.method, options.params)) {
     const link = options.getLink();
-    if (!link?.connected) return Promise.reject(new NodeUnavailableError(options.node));
+    if (!link?.connected) return Promise.reject(Object.assign(new NodeUnavailableError(options.node), {
+      effect: "not_started", retryHint: "retry_later", details: { dispatch_state: "not_sent", owner_node_id: options.node },
+    }));
     return link.call(options.timeoutMs ?? options.rpcTimeoutMs);
   }
   return executeBoundedRead(options);

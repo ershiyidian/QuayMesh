@@ -26,7 +26,7 @@ async function fixture() {
   const directory=join(config.stateDir,'logs'), path=join(directory,'server-diagnostics.jsonl');
   const entry=(fields:Record<string,unknown>)=>({ts:new Date(now).toISOString(),method:'tools/call',tool:'workspace_context',
     ownerHash:diagnosticOwnerHash(owner),...fields});
-  return {root,config,database,store,owner,operationId,task,input,directory,path,entry,
+  return {root,config,database,store,owner,operationId,session,member,task,input,directory,path,entry,
     async close(){database.close();await rm(root,{recursive:true,force:true});}};
 }
 
@@ -77,6 +77,34 @@ test('已认证入口只按 owner 与数据库归属公开，缺少完成记录�
   await assert.rejects(readDiagnostics(f.config,'other-owner',f.input),/TASK_NOT_FOUND_OR_FORBIDDEN/);
   await assert.rejects(readDiagnostics(f.config,f.owner,{...f.input,operation_id:'op_123abc'}),/OPERATION_NOT_IN_TASK/);
   assert.deepEqual(f.database.sqlite.prepare('SELECT revision,state,last_activity_at FROM qm_tasks WHERE id=?').get(f.task.id),before);
+});
+
+test('仅入口回执存在时诊断仍可按原任务查询，并严格校验会话与成员归属',async t=>{
+  const f=await fixture();t.after(()=>f.close());
+  const operationId='op_aa1122';
+  f.store.reserveInvocation({id:'receipt-only',ownerId:f.owner,transportInstanceId:'entry',requestId:'1',
+    sessionId:f.session.id,memberId:f.member.id,taskId:f.task.id,toolName:'apply_patch',operationId,
+    argumentsJson:JSON.stringify({patch:'secret-patch-body'})});
+  f.store.updateInvocation({ownerId:f.owner,transportInstanceId:'entry',requestId:'1',state:'unknown' as any,effect:'unknown',
+    result:{kind:'error',errorCode:'RPC_INTERRUPTED',message:'secret-response-body'},finished:true});
+  assert.equal(f.store.findOperationEvent(operationId),null);
+  await mkdir(f.directory,{recursive:true});
+  await writeFile(f.path,JSON.stringify(f.entry({event:'mcp_exchange_finished',operationId,requestId:'receipt-trace',
+    httpStatus:200,resultInspection:'inspected',toolError:true,toolErrorCode:'INVALID_ARGUMENT',
+    recoveryTextErrorCode:'RPC_INTERRUPTED',errorCodeConsistent:false}))+'\n');
+  const result=await readDiagnostics(f.config,f.owner,{...f.input,operation_id:operationId});
+  const events=result.events as any[];
+  assert.equal(events.find(row=>row.data.event==='invocation_receipt')?.data.effect,'unknown');
+  const exchange=events.find(row=>row.data.event==='mcp_exchange_finished').data;
+  assert.equal(exchange.requestId,'receipt-trace');assert.equal(exchange.errorCodeConsistent,false);
+  assert.equal(exchange.recoveryTextErrorCode,'RPC_INTERRUPTED');
+  assert.ok(!JSON.stringify(result).includes('secret-'));
+  const otherSession=f.store.createSession(f.owner,'other-conversation','Other scope');
+  const otherMember=f.store.addMember(otherSession.id,'remote','ws_other',f.root,'checkout',null);
+  const otherTask=f.store.createTask(otherSession.id,'Other task');
+  await assert.rejects(readDiagnostics(f.config,f.owner,{...f.input,task_id:otherTask.id,operation_id:operationId}),/OPERATION_NOT_IN_TASK/);
+  f.database.sqlite.prepare('UPDATE qm_invocations SET member_id=? WHERE id=?').run(otherMember.id,'receipt-only');
+  await assert.rejects(readDiagnostics(f.config,f.owner,{...f.input,operation_id:operationId}),/OPERATION_NOT_IN_TASK/);
 });
 
 test('入口诊断保留真实 32 MiB 扫描预算、回复上限与不完整覆盖说明', async t=>{

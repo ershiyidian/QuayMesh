@@ -36,7 +36,7 @@ test("CD01/CD04：完成命令和完成Task在一小时后仍使用固定结束�
 });
 
 test("CD02/CD06：无后台的一小时静默显示明确提示，卡片查询时间不冒充模型活动",()=>{
-  const silent=snapshot({lastModelToolAt:NOW-3_600_000,lastActivityAt:NOW-3_600_000,serverNow:NOW+3_600_000,observedAt:NOW+3_600_000});
+  const silent=snapshot({lastModelToolAt:NOW-3_600_000,lastActivityAt:NOW-3_600_000,lastExecutionActivityAt:NOW-3_600_000,serverNow:NOW+3_600_000,observedAt:NOW+3_600_000});
   const view=cardPresentation(silent,NOW);
   assert.equal(view.status,"stalled");assert.equal(view.label,"长时间没有新的执行进展");
   assert.equal(view.modelActivityAgeMs,3_600_000);
@@ -56,7 +56,7 @@ test("CD05：交接固定本轮时长，后台时长继续；归档空结果不�
   const handed=snapshot({taskState:"closed",taskResult:"handed_off",deliveryEndedAt:NOW-90_000,endedAt:NOW-90_000,
     commands:[running],runningCommand:running,currentCommand:running});
   const handedView=cardPresentation(handed,NOW);
-  assert.equal(handedView.status,"running");assert.match(handedView.label,/已交接/);assert.equal(handedView.taskClockDynamic,false);assert.equal(handedView.commandClockDynamic,true);
+  assert.equal(handedView.status,"handed_off");assert.equal(handedView.backgroundStatus,"running");assert.match(handedView.label,/已交接/);assert.equal(handedView.taskClockDynamic,false);assert.equal(handedView.commandClockDynamic,true);
 
   const archived=snapshot({taskState:"closed",taskResult:null,closureReason:"superseded",archivedAt:NOW-10_000,endedAt:null,
     capabilities:{refresh:false,revert:false,continue:false,open_file:false}});
@@ -65,8 +65,8 @@ test("CD05：交接固定本轮时长，后台时长继续；归档空结果不�
 });
 
 test("CD07：静默阈值边界明确",()=>{
-  assert.equal(cardPresentation(snapshot({lastModelToolAt:NOW-DEFAULT_SILENCE_WARNING_MS+1}),NOW).status,"idle");
-  assert.equal(cardPresentation(snapshot({lastModelToolAt:NOW-DEFAULT_SILENCE_WARNING_MS}),NOW).status,"stalled");
+  assert.equal(cardPresentation(snapshot({lastModelToolAt:NOW-DEFAULT_SILENCE_WARNING_MS+1,lastActivityAt:null,lastExecutionActivityAt:null}),NOW).status,"idle");
+  assert.equal(cardPresentation(snapshot({lastModelToolAt:NOW-DEFAULT_SILENCE_WARNING_MS,lastActivityAt:null,lastExecutionActivityAt:null}),NOW).status,"stalled");
 });
 
 test("CD08：明确交付结果优先于临时节点离线/历史执行错误",()=>{
@@ -80,6 +80,6 @@ test("CD08：明确交付结果优先于临时节点离线/历史执行错误",(
   const cached=snapshot({taskState:"closed",taskResult:"completed",deliveryEndedAt:NOW-1000,commands:[stale],runningCommand:stale});
   assert.equal(isFinal(cached,NOW+60_000),false);
   const unknown={...cached,commands:[command('unknown')],runningCommand:null};
-  assert.equal(cardPresentation(unknown,NOW).status,'unavailable');assert.equal(isFinal(unknown,NOW),false);
+  assert.equal(cardPresentation(unknown,NOW).status,'success');assert.equal(cardPresentation(unknown,NOW).backgroundStatus,'unconfirmed');assert.equal(isFinal(unknown,NOW),false);
   assert.equal(isFinal({...cached,executionObservation:{observedAt:NOW,activeOperationIds:[],preparingOperationIds:[],staleOperationIds:[]}},NOW),true);
 });

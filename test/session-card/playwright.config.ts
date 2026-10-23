@@ -13,6 +13,7 @@ export default defineConfig({
   use: {
     baseURL: "http://127.0.0.1:4179",
     headless: true,
+    ...(process.env.QUAYMESH_BROWSER_EXECUTABLE ? {launchOptions:{executablePath:process.env.QUAYMESH_BROWSER_EXECUTABLE}} : {}),
     ...(process.env.QUAYMESH_BROWSER_CHANNEL ? {channel:process.env.QUAYMESH_BROWSER_CHANNEL} : {}),
     viewport: { width: 980, height: 900 },
     trace: "retain-on-failure",

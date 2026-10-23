@@ -5,6 +5,7 @@ import {join} from "node:path";
 import {setTimeout as delay} from "node:timers/promises";
 import {Client} from "@modelcontextprotocol/sdk/client/index.js";
 import {StreamableHTTPClientTransport} from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import {AjvJsonSchemaValidator} from "@modelcontextprotocol/server/validators/ajv";
 import {fixture,until} from "./tool-contract/fixture.js";
 import {SessionChangeCollector} from "../src/session/changes.js";
 import {SessionService} from "../src/session/service.js";
@@ -35,8 +36,9 @@ test("准备三十秒时立即交付受理回执，断连后同键不重写",{ti
     assert.notEqual(response.isError,true,JSON.stringify(response));
     const first=response.structuredContent as any;
     const output=definition.outputSchema!;
-    assert.deepEqual(Object.keys(first).filter(key=>!(key in (output.properties??{}))),[],
-      '初始受理回执必须遵守向宿主声明的结构化输出协议');
+    const validation=new AjvJsonSchemaValidator().getValidator(output)(first);
+    assert.equal(validation.valid,true,
+      `初始受理回执必须遵守向宿主声明的结构化输出协议：${validation.errorMessage??""}`);
     assert.ok(Date.now()-started<5000,"受理回执必须先于准备完成");
     assert.equal(first.accepted,true);assert.equal((response._meta as any)?.quaymesh?.phase,"preparing");
     assert.equal(first.effect,"not_started");assert.equal(first.result,"");assert.ok(preparing);

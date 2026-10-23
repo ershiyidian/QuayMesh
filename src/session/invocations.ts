@@ -40,6 +40,7 @@ export interface InvocationRequest {
 
 export interface InvocationOperation<T> {
   invoke(): Promise<T>;
+  onReserved?(): void;
   beforeEffect?(): Promise<void> | void;
   resultRef?(result: T): string | null;
   isError?(result: T): boolean;
@@ -144,7 +145,7 @@ export async function executeRecorded<T>(
           new Error("OPERATION_RETRY_SCOPE_MISMATCH: Retry requires the original active task and workspace member."),
           {code: "OPERATION_RETRY_SCOPE_MISMATCH", details: {operation_id: existing.operation_id, task_id: existing.task_id}});
       retryOf = existing.id;
-    } else return replayInvocation<T>(store, existing);
+    } else { operation.onReserved?.(); return replayInvocation<T>(store, existing); }
   }
 
   const reservation = await store.writeAsync(() => {
@@ -169,6 +170,7 @@ export async function executeRecorded<T>(
   if (reservation.alreadyReserved || reserved.id !== context.invocation_id) return executeRecorded(store, context, input, operation);
   const operationId = reserved.operation_id ?? operationIdFrom(context, requestId);
   context.operation_id = operationId;
+  operation.onReserved?.();
   await store.writeAsync(() => store.updateInvocation({
     ownerId: context.owner_id,
     transportInstanceId: context.transport_instance_id,

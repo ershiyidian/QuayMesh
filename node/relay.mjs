@@ -43,10 +43,11 @@ function readBody(req) {
 }
 
 export class McpRelay {
-  constructor({ origin, host = "127.0.0.1", port = 17676, socksUrl, onError = () => {}, onSuccess = () => {}, consoleRpc, consoleAssetDir }) {
+  constructor({ origin, host = "127.0.0.1", port = 17676, socksUrl, onError = () => {}, onSuccess = () => {}, consoleRpc, consoleAssetDir, mcpResponseTimeoutMs = 125000 }) {
     this.origin = new URL(origin);
     this.host = host; this.port = port; this.onError = onError;
     this.onSuccess = onSuccess; this.accepting = true; this.activeRequests = 0;
+    this.mcpResponseTimeoutMs = mcpResponseTimeoutMs;
     this.agent = createAgent(this.origin, { socksUrl });
     this.requests = new Set();
     this.consoleRpc = consoleRpc || null;
@@ -151,6 +152,8 @@ export class McpRelay {
   }
 
   forward(req, res, parsed) {
+    const startedAt=Date.now();
+    const boundedMcp=req.method==="POST"&&["/mcp","/mcp/"].includes(parsed.pathname);
     const target = new URL(`${parsed.pathname}${parsed.search}`, this.origin);
     const headers = forwardedHeaders(req.headers);
     headers.host = this.origin.host;
@@ -174,10 +177,31 @@ export class McpRelay {
       });
     });
     this.requests.add(upstream);
-    // 流式响应的等待时间由 MCP 协议控制，这里只限制连接和响应头等待。
+    // 最终结果期限不随 SSE 心跳延长，GET 订阅流仍按连接生命周期管理。
+    let responseTimer;
+    const deadline=(budget)=>{
+      clearTimeout(responseTimer);
+      responseTimer=setTimeout(()=>upstream.destroy(Object.assign(new Error("Coordinator 最终结果超时；请按原 operation 查询执行结果"),
+        {code:"MCP_RESPONSE_TIMEOUT",phase:"final_result"})),Math.max(1,budget-(Date.now()-startedAt)));
+      responseTimer.unref();
+    };
+    if(boundedMcp){
+      deadline(this.mcpResponseTimeoutMs);
+      // 附件导入已有独立的 15 分钟预算；只观察有限请求头段，不缓存大正文。
+      const chunks=[];let bytes=0;
+      req.on("data",chunk=>{bytes+=chunk.length;if(bytes<=65536)chunks.push(chunk);else chunks.length=0;});
+      req.once("end",()=>{
+        if(bytes>65536)return;
+        try{const body=JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          if(body.method==="tools/call"&&body.params?.name==="download_artifact")deadline(15*60*1000+5000);
+        }catch{}
+      });
+    }
+    res.once("finish",()=>clearTimeout(responseTimer));
+    res.once("close",()=>clearTimeout(responseTimer));
     const headerTimer = setTimeout(() => upstream.destroy(new Error("Coordinator 响应头超时")), ["/mcp", "/mcp/"].includes(parsed.pathname) ? 125000 : 30000);
     headerTimer.unref();
-    upstream.once("close", () => { clearTimeout(headerTimer); this.requests.delete(upstream); });
+    upstream.once("close", () => { clearTimeout(headerTimer); clearTimeout(responseTimer); this.requests.delete(upstream); });
     upstream.once("error", (error) => {
       clearTimeout(headerTimer);
       if (res.destroyed || req.aborted) return;

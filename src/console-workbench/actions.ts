@@ -137,12 +137,14 @@ export class LocalActions {
           }>;
         const tasks=actual.map(task=>({id:task.id,taskId:task.taskId,title:task.title,status:stage(task),root:task.root,workspaces:task.workspaces,
           executionStatus:task.executionStatus,acceptanceStatus:task.acceptanceStatus,lastActivityAt:task.lastActivityAt,
+          requestState:task.requestState,resultStatus:task.resultStatus,phaseExecutionStatus:task.phaseExecutionStatus,finalization:task.finalization,
           startedAt:task.startedAt,finishedAt:task.finishedAt,hasRun:true}));
         for(const task of taskRows)if(!tasks.some(value=>value.taskId===task.id)){
           const execution=taskView({requestState:task.state,result:task.result_status,execution:'waiting',lastProgressAt:Date.parse(task.last_activity_at),now:Date.now()}).status;
           tasks.push({id:taskReference(task.id),taskId:task.id,title:task.title,status:stage({executionStatus:execution,acceptanceStatus:'not_required'}),
             root:project.root,workspaces:[{nodeId:node,projectId:workspaceHandle(node,projectId),memberId:null,name:project.name,root:project.root}],
             executionStatus:execution,acceptanceStatus:'not_required',lastActivityAt:Date.parse(task.last_activity_at),startedAt:Date.parse(task.created_at),
+            requestState:task.state,resultStatus:task.result_status,phaseExecutionStatus:undefined,finalization:undefined,
             finishedAt:task.finished_at ? Date.parse(task.finished_at) : null,hasRun:false});
         }
         tasks.sort((a,b)=>b.startedAt-a.startedAt);

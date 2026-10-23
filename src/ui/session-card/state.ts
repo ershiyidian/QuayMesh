@@ -123,14 +123,18 @@ export function applySnapshot(
   if (previous && previous.sessionId !== next.sessionId) {
     throw new Error(`SESSION_CARD_IDENTITY_CHANGED: ${previous.sessionId} -> ${next.sessionId}`);
   }
-  if (previous?.taskId && next.taskId && previous.taskId !== next.taskId) {
+  if (previous?.taskId && previous.taskId !== next.taskId) {
     throw new Error(`SESSION_CARD_TASK_CHANGED: ${previous.taskId} -> ${next.taskId}`);
   }
   if (previous && previous.workspace?.id === next.workspace?.id && next.rev <= previous.rev) {
     const observation=next.rev===previous.rev && next.executionObservation &&
       next.executionObservation.observedAt >= (previous.executionObservation?.observedAt??0) ? next.executionObservation : previous.executionObservation;
-    const changed=!sameExecutionObservation(previous.executionObservation,observation);
-    if(observation)state.snapshot={...previous,executionObservation:observation};
+    const live=next.rev===previous.rev && next.live && next.live.observedAt >= (previous.live?.observedAt??0) ? next.live : previous.live;
+    const changed=!sameExecutionObservation(previous.executionObservation,observation)
+      || live?.hostStatus!==previous.live?.hostStatus || live?.executionStatus!==previous.live?.executionStatus;
+    state.snapshot={...previous,...(observation?{executionObservation:observation}:{}),
+      ...(live?{live,host_status:live.hostStatus,execution_status:live.executionStatus,serverNow:live.observedAt}:{})};
+    if(live)state.clockOffsetMs=live.observedAt-Date.now();
     return {
       snapshot: changed,
       files: false,
@@ -139,6 +143,20 @@ export function applySnapshot(
       instructions: false,
       status: false,
     };
+  }
+
+  // 任务交付属于持久事实；延迟快照只能补充执行与文件证据。
+  if(previous?.taskState==='closed') {
+    next={...next,taskState:'closed',taskResult:previous.taskResult??(next.taskState==='closed'?next.taskResult:null),
+      deliveryEndedAt:previous.deliveryEndedAt??next.deliveryEndedAt,
+      endedAt:previous.endedAt??next.endedAt,closureReason:previous.closureReason??next.closureReason,
+      archivedAt:previous.archivedAt??next.archivedAt,finalization:null};
+  }
+  if(previous&&previous.workspace?.id===next.workspace?.id){
+    if(previous.executionObservation&&(previous.executionObservation.observedAt>(next.executionObservation?.observedAt??-1)))
+      next={...next,executionObservation:previous.executionObservation};
+    if(previous.live&&previous.live.observedAt>(next.live?.observedAt??-1))
+      next={...next,live:previous.live,host_status:previous.live.hostStatus,execution_status:previous.live.executionStatus,serverNow:previous.live.observedAt};
   }
 
   const first = previous === null;

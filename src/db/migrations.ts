@@ -7,8 +7,9 @@ import { reliabilitySchema } from "./reliability-schema.js";
 import { taskLifecycleSchema } from "./task-lifecycle-schema.js";
 import { invocationAttemptSchema } from "./invocation-attempt-schema.js";
 import { consoleAuditSchema } from "./console-audit-schema.js";
+import { executionOwnerSchema } from "./execution-owner-schema.js";
 
-export const LATEST_DATABASE_VERSION = 7;
+export const LATEST_DATABASE_VERSION = 8;
 
 const legacyAgentColumns = {
   effort:"TEXT",task_name:"TEXT",error_code:"TEXT",error_retryable:"TEXT",
@@ -82,6 +83,11 @@ export function migrateDatabase(sqlite: Database.Database): void {
     if (version === 6) {
       sqlite.exec(consoleAuditSchema);
       record(7, "quaymesh-console-audit");
+      version = 7;
+    }
+    if (version === 7) {
+      sqlite.exec(executionOwnerSchema);
+      record(8, "quaymesh-execution-owner");
     }
     // 旧独立 Agent 存储可能沿用原版本号；保留 thinking 设置并原子补齐缺失结构。
     const legacy=sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='local_agent_sessions'").get();

@@ -18,6 +18,7 @@ test("同一配置模型支持云端和组合能力，云端禁用外网组件",
   assert.deepEqual(plans.map(plan=>plan.id),["mesh","core"]);
   assert.equal(plans[1].env.OPENAI_API_KEY,undefined);
   assert.equal(plans[1].env.HTTPS_PROXY,undefined);
+  assert.equal(plans[1].env.QUAYMESH_INSTALL_TRANSITION_FILE,join(root,"installation-transition.json"));
   const compiled=compileCore(cloud,c,{root,tokenFile:join(root,"token"),ownerToken:token(),membershipFile:join(root,"nodes"),statusFile:join(root,"status")});
   assert.equal(compiled.runtime.subagents.enabled,false);
   assert.equal(compiled.runtime.federation.egress.enabled,false);

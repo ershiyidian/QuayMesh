@@ -67,7 +67,7 @@ export function withTaskLifecycle<T extends {
   if (!task || task.id !== value.taskId) return value;
   const awaitingDelivery=task.state==='active' && !task.finalization && value.executionStatus==='completed';
   const status = taskView({requestState:task.state, result:task.resultStatus, execution:awaitingDelivery?'waiting':value.executionStatus,
-    finalizing:Boolean(task.finalization)}).status;
+    finalizing:Boolean(task.finalization),finalizationFailed:Boolean(task.finalization?.error)}).status;
   return {...value, executionStatus:status, sourceTaskId:task.sourceTaskId??null,
     phaseExecutionStatus:value.phaseExecutionStatus ?? value.executionStatus,
     requestState:task.state, resultStatus:task.resultStatus, taskRevision:task.revision, finalization:task.finalization??null,
@@ -106,7 +106,7 @@ export function executionTimeEnd(value: ExecutionTimeValue, now = Date.now()): n
   const stale = value.stale || valid(value.observedAt) && now - value.observedAt > 30_000;
   if (stale) return valid(value.observedAt) ? value.observedAt : valid(value.lastActivityAt) ? value.lastActivityAt : null;
   if (['running', 'stopping'].includes(value.executionStatus)) return now;
-  if (['unknown', 'stalled', 'interrupted', 'interrupted_recoverable', 'failed', 'cancelled', 'ended', 'handed_off', 'finalizing'].includes(value.executionStatus))
+  if (['waiting', 'idle', 'unknown', 'stalled', 'interrupted', 'interrupted_recoverable', 'failed', 'cancelled', 'ended', 'handed_off', 'finalizing'].includes(value.executionStatus))
     return valid(value.lastActivityAt) ? value.lastActivityAt : null;
   return null;
 }

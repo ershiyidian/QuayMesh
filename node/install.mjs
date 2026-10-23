@@ -166,21 +166,58 @@ async function runningStatus(port) {
   try { return await requestJson(`http://127.0.0.1:${port}/status`,{timeoutMs:2500}); }
   catch (error) { if (error.code === "ECONNREFUSED") return null; throw error; }
 }
-async function waitRunning(manifest,token,timeoutMs) {
+export async function waitRunning(manifest,token,timeoutMs,{stableMs=60000,resume=true}={}) {
   const deadline = Date.now()+timeoutMs;
+  const release=manifest.directory?await readOptionalJson(join(manifest.directory,"release.json")):undefined;
+  const fingerprints=Boolean(release?.runtime||release?.nativeDependencies);
+  let stableSince=0,identity,lastFailure;
   while (Date.now()<deadline) {
-    const state = await runningStatus(manifest.adminPort);
-    if (state?.nodeId===manifest.nodeId && state.release===manifest.sourceCommit &&
-      state.components?.some(value=>value.id==="core"&&value.state==="ready")) {
-      await requestJson(`http://127.0.0.1:${manifest.adminPort}/maintenance/resume`,{method:"POST",token,timeoutMs:10000});
-      return state;
+    const state = await runningStatus(manifest.adminPort).catch(error=>{
+      if(["ECONNRESET","ECONNREFUSED","ETIMEDOUT","ECONNABORTED"].includes(error.code))return null;
+      throw error;
+    });
+    const core=state?.components?.find(value=>value.id==="core");
+    let activeRelease,coreIdentityMatches=true;
+    if(fingerprints){
+      activeRelease=await readOptionalJson(join(manifest.stateDir,"core","active-release.json"));
+      const actual=activeRelease?.runtime;
+      const expected=release.nativeDependencies?.["better-sqlite3"];
+      coreIdentityMatches=activeRelease?.commit===manifest.sourceCommit&&activeRelease.pid===core?.pid&&
+        actual?.nodeVersion===release.node&&actual?.nodeAbi===release.nodeAbi&&
+        actual?.sqlitePackageVersion===expected?.version&&actual?.sqliteNativeSha256===expected?.sha256&&
+        actual?.nodeSha256===release.runtime?.nodeSha256&&actual?.packageLockSha256===release.runtime?.packageLockSha256&&
+        typeof actual?.sqliteNativeSha256==="string"&&/^[0-9a-f]{64}$/.test(actual.sqliteNativeSha256);
+      if(!coreIdentityMatches)lastFailure="Core 进程身份、Node 或 SQLite 实际指纹与发行清单不符";
     }
+    if (state?.nodeId===manifest.nodeId && state.release===manifest.sourceCommit &&
+      core?.state==="ready" && core.pid && !core.crashLoop && coreIdentityMatches) {
+      const nextIdentity=`${core.pid}:${core.startedAt??""}:${core.restarts??0}`;
+      if(identity!==nextIdentity){identity=nextIdentity;stableSince=Date.now();}
+      if(Date.now()-stableSince>=stableMs){
+        if(resume)await requestJson(`http://127.0.0.1:${manifest.adminPort}/maintenance/resume`,{method:"POST",token,timeoutMs:10000});
+        return {...state,...(activeRelease?{activeCoreRelease:activeRelease}:{})};
+      }
+    }else{identity=undefined;stableSince=0;}
     await sleep(500);
   }
-  throw new Error("新发行服务没有在规定时间内报告正确身份和就绪状态");
+  throw new Error(`新发行服务没有在规定时间内报告正确身份和就绪状态${lastFailure?`：${lastFailure}`:""}`);
 }
 
-export async function activateInstallation(manifestFile,{timeoutMs=60000}={}) {
+function databaseSnapshot(manifest,target) {
+  return new Promise((resolveSnapshot,reject)=>{
+    const child=spawn(manifest.nodeExecutable,[join(manifest.directory,"node","database-snapshot.mjs"),manifest.stateDir,...(target?[target]:[])],
+      {stdio:["ignore","pipe","inherit"],shell:false,windowsHide:true,env:restrictedEnvironment(process.env)});
+    let output="";
+    child.stdout.on("data",chunk=>{output+=chunk;if(output.length>65536)child.kill();});
+    child.once("error",reject);
+    child.once("close",code=>{
+      if(code!==0){reject(new Error(`数据库升级前检查失败，退出码 ${code}`));return;}
+      try{resolveSnapshot(JSON.parse(output));}catch(error){reject(error);}
+    });
+  });
+}
+
+export async function activateInstallation(manifestFile,{timeoutMs=180000}={}) {
   const manifest = JSON.parse(await readFile(resolve(manifestFile),"utf8"));
   if (manifest.version!==1) throw new Error("安装记录版本无效");
   await preserveLatestNodeSettings(manifest.stagedConfig,manifest.config,manifest.nodeId,manifest.settingsRevisionAtPrepare??1);
@@ -194,26 +231,47 @@ export async function activateInstallation(manifestFile,{timeoutMs=60000}={}) {
   if (previous && previous.nodeId!==manifest.nodeId) throw new Error("安装目录属于其他节点");
   const oldConfig = await readFile(manifest.config).catch(error => { if(error.code==="ENOENT")return null;throw error; });
   const oldUnit = manifest.unitFile ? await readFile(manifest.unitFile).catch(error => {if(error.code==="ENOENT")return null;throw error;}) : null;
-  let stopped = false, stopAttempted = false, maintenanceBegun = false;
+  let stopped = false, stopAttempted = false, maintenanceBegun = false, activationCommitted=false;
+  const transitionFile=join(manifest.stateDir,"installation-transition.json");
+  const priorTransition=await readOptionalJson(transitionFile);
+  if(priorTransition)throw new Error(`已有未收口的发行切换 ${priorTransition.sourceCommit}；请先核对安装记录与数据库备份。`);
+  let snapshot;
   try {
     if (running) {
       await requestJson(`http://127.0.0.1:${previous.adminPort}/maintenance/begin`,{method:"POST",token,timeoutMs:35000});
-      maintenanceBegun = true; stopAttempted = true;
+      maintenanceBegun = true;
+    }
+    snapshot=await databaseSnapshot(manifest,join(dirname(resolve(manifestFile)),"rollback-core.sqlite"));
+    await writeJson(transitionFile,{id:randomUUID(),sourceCommit:manifest.sourceCommit,previousCommit:previous?.sourceCommit??null,
+      startedAt:new Date().toISOString(),ownerPid:process.pid,database:snapshot,phase:"validating"});
+    if(running){
+      stopAttempted = true;
       await stopService(previous); stopped = true;
     }
     await atomicWrite(manifest.config,await readFile(manifest.stagedConfig));
     await registeredService(manifest,true);
-    const status = await waitRunning(manifest,token,timeoutMs);
+    const status = await waitRunning(manifest,token,timeoutMs,{resume:false});
     await writeJson(recordFile,{...manifest,activatedAt:new Date().toISOString(),pid:status.components.find(value=>value.id==="core")?.pid});
-    await writeJson(join(manifest.configDir,"previous-installation.json"),previous);
+    await writeJson(join(manifest.configDir,"previous-installation.json"),previous??null);
+    activationCommitted=true;
+    await rm(transitionFile,{force:true});
+    await requestJson(`http://127.0.0.1:${manifest.adminPort}/maintenance/resume`,{method:"POST",token,timeoutMs:10000});
     return {directory:manifest.directory,config:manifest.config,sourceCommit:manifest.sourceCommit,activated:true};
   } catch (error) {
+    if(activationCommitted)throw new Error("发行已经验证并提交，恢复准入尚待确认；保留当前服务，请查询管理端状态。",{cause:error});
     if (stopAttempted || stopped || !running) {
       try {
         const active = await runningStatus(manifest.adminPort);
         if (active?.nodeId === manifest.nodeId) await stopService(manifest);
+        const current=await databaseSnapshot(manifest);
+        if(snapshot && current.version!==snapshot.version){
+          await writeJson(transitionFile,{sourceCommit:manifest.sourceCommit,previousCommit:previous?.sourceCommit??null,
+            database:snapshot,currentDatabaseVersion:current.version,phase:"recovery_required",error:String(error)});
+          throw new Error(`数据库已从 ${snapshot.version} 升级到 ${current.version}，保留新版数据和备份 ${snapshot.backup}；旧版本无法自动启动，请完成升级恢复。`);
+        }
         if (oldConfig) await atomicWrite(manifest.config,oldConfig); else await rm(manifest.config,{force:true});
         if (oldUnit) await atomicWrite(manifest.unitFile,oldUnit,0o644);
+        await rm(transitionFile,{force:true});
         if (previous) { await registeredService(previous,true); await waitRunning(previous,token,timeoutMs); }
         else if (manifest.unitFile) {
           await rm(manifest.unitFile,{force:true});
@@ -221,6 +279,7 @@ export async function activateInstallation(manifestFile,{timeoutMs=60000}={}) {
         } else await run("powershell.exe",["-NoProfile","-ExecutionPolicy","Bypass","-File",join(manifest.directory,"node","windows-stop.ps1"),"-Unregister"]);
       } catch (recovery) { throw new AggregateError([error,recovery],"发行切换失败，恢复未完成"); }
     } else if (maintenanceBegun && running) {
+      await rm(transitionFile,{force:true});
       await requestJson(`http://127.0.0.1:${previous.adminPort}/maintenance/resume`,{method:"POST",token,timeoutMs:10000});
     }
     throw error;

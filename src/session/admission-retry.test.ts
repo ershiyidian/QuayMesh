@@ -25,6 +25,7 @@ import {migrateDatabase, LATEST_DATABASE_VERSION} from "../db/migrations.js";
 import {AgentOperationTracker} from "./agent-operations.js";
 import {RecoveryService} from "./recovery.js";
 import {latestActivity} from "./activity.js";
+import {holdSqliteWriteLock} from "../test-support/sqlite-lock.js";
 
 const exec = promisify(execFile);
 
@@ -40,7 +41,7 @@ async function fixture() {
   const store = new SessionStore(ledger.db), execution = new ExecutionCoordinator(stateDir);
   const changes = new SessionChangeCollector(store, stateDir), projector = new SessionProjector(store, stateDir);
   const service = new SessionService(store, workspaces, ledger, undefined, changes, projector);
-  const recorder = new SessionToolRecorder(store, workspaces, service, changes, projector);
+  const recorder = new SessionToolRecorder(store, workspaces, service, changes, projector, execution);
   const session = store.createSession("owner", "conversation", "Admission retries");
   const member = store.addMember(session.id, "local", "workspace", root, "checkout", null);
   const task = store.createTask(session.id, "Original task");
@@ -51,6 +52,66 @@ async function fixture() {
     async close() {await recorder.close(); await service.close(); await projector.close(); await changes.close();
       execution.close(); ledger.close(); workspaceStore.close(); await rm(directory, {recursive: true, force: true});}};
 }
+
+test("写锁超过受理等待预算后，一落盘就交付回执，后台工作继续受维护 lease 保护", {timeout:10000}, async t=>{
+  const f=await fixture();t.after(()=>f.close());
+  let releaseWork!:()=>void, entered!:()=>void;
+  const gate=new Promise<void>(resolve=>{releaseWork=resolve;});
+  const started=new Promise<void>(resolve=>{entered=resolve;});
+  t.after(()=>releaseWork());
+  const lock=await holdSqliteWriteLock(join(f.stateDir,"quaymesh.sqlite"),250);
+  t.after(()=>lock.release());
+  const input={operation_key:"lock-delayed-acceptance"};
+  const args={identity:{owner_id:"owner",conversation_id:"conversation",transport_instance_id:"delayed",
+    request_id:"initial",task_id:f.task.id},workspace_id:f.member.workspace_id,tool_name:"exec_command",
+    kind:"command" as const,label:"real file write",input,affectsFiles:false,replyWaitMs:20,
+    pendingResult:(context:{operation_id?:string})=>({accepted:true,operation_id:context.operation_id}),
+    operation:async(context:{operation_id?:string})=>{entered();await gate;await appendFile(join(f.root,"delayed.txt"),"once\n");
+      return {accepted:false,operation_id:context.operation_id};}};
+  const timeout=setTimeout(()=>releaseWork(),3000);
+  try {
+    const reply=await f.recorder.record(args);
+    assert.equal(reply.accepted,true,"the HTTP receipt must arrive before the unfinished action");
+    assert.ok(reply.operation_id);
+    assert.ok(f.store.findInvocationByOperation("owner",reply.operation_id!)?.id);
+    await started;
+    f.execution.pause("maintenance waits for accepted command");
+    assert.equal(f.execution.admissionStatus().activeWork,1);
+    assert.equal(f.execution.admissionStatus().idle,false);
+    releaseWork();await f.recorder.close();
+    assert.equal(f.execution.admissionStatus().activeWork,0);
+    assert.equal(f.store.findInvocationByOperation("owner",reply.operation_id!)?.state,"succeeded");
+    assert.equal(await readFile(join(f.root,"delayed.txt"),"utf8"),"once\n");
+    const replay=await f.recorder.record({...args,identity:{...args.identity,request_id:"replay"}});
+    assert.equal(replay.accepted,false);
+    assert.equal(await readFile(join(f.root,"delayed.txt"),"utf8"),"once\n");
+  } finally {clearTimeout(timeout);releaseWork();await lock.release();}
+});
+
+test("仅发送前已确认未执行的暂时离线或繁忙可用原 key 重试一次", async t=>{
+  const f=await fixture();t.after(()=>f.close());
+  for (const code of ["NODE_UNAVAILABLE","PEER_BUSY"]) {
+    const first=createInvocationContext(f.identity(`${code}-first`)),input={operation_key:code};
+    await assert.rejects(executeRecorded(f.store,first,input,{sideEffecting:true,forwarded:true,
+      invoke:async()=>{throw Object.assign(new Error("not dispatched"),{code,effect:"not_started",retryHint:"retry_later",
+        details:{dispatch_state:"not_sent"}});}}),error=>{
+      assert.equal((error as any).effect,"not_started");assert.equal((error as any).retryHint,"retry_later");return true;});
+    const retry=createInvocationContext(f.identity(`${code}-retry`));
+    const invoke=async()=>{await appendFile(join(f.root,code),"once\n");return {ok:true};};
+    const completed=await executeRecorded(f.store,retry,input,{invoke,sideEffecting:true,forwarded:true});
+    assert.equal(completed.replay,false);assert.equal(retry.operation_id,first.operation_id);
+    const replay=await executeRecorded(f.store,createInvocationContext(f.identity(`${code}-third`)),input,{invoke});
+    assert.equal(replay.replay,true);
+    assert.equal(await readFile(join(f.root,code),"utf8"),"once\n");
+  }
+  const first=createInvocationContext(f.identity("lost-first")),input={operation_key:"lost-after-dispatch"};
+  await assert.rejects(executeRecorded(f.store,first,input,{sideEffecting:true,forwarded:true,invoke:async()=>{
+    await appendFile(join(f.root,"lost.txt"),"once\n");throw Object.assign(new Error("reply lost"),{code:"NODE_UNAVAILABLE"});}}));
+  const replay=await executeRecorded(f.store,createInvocationContext(f.identity("lost-retry")),input,
+    {invoke:async()=>{await appendFile(join(f.root,"lost.txt"),"twice\n");}});
+  assert.equal(replay.replay,true);assert.equal(replay.effect,"unknown");
+  assert.equal(await readFile(join(f.root,"lost.txt"),"utf8"),"once\n");
+});
 
 test("preparation refusal keeps its error and task, retries once, and fences a late previous ticket", {timeout: 15000}, async t => {
   const f = await fixture(); t.after(() => f.close());
@@ -205,6 +266,9 @@ test("schema upgrade binds historical worker attempts using their run link and d
     DROP TABLE console_archive_steps;
     DROP TABLE console_audit;
     DROP TABLE console_audit_imports;
+    DROP TABLE execution_owners;
+    DROP INDEX qm_events_source_type;
+    DROP INDEX qm_events_operation_type;
     DELETE FROM qm_schema_migrations WHERE version>=6;`);
   assert.equal(f.ledger.db.prepare('SELECT max(version) FROM qm_schema_migrations').pluck().get(),5);
   assert.ok(!(f.ledger.db.pragma('table_info(qm_invocations)') as Array<{name:string}>).some(column=>column.name==='task_id'));

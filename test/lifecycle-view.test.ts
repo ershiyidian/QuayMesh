@@ -36,18 +36,18 @@ for(const result of ["completed","failed","cancelled"] as const){
     const active=snapshot({taskState:'closed',taskResult:result,commands:[command],runningCommand:command,
       executionObservation:{observedAt:now,activeOperationIds:['op'],preparingOperationIds:[],staleOperationIds:[]}});
     const activeView=cardPresentation(active,now);
-    assert.equal(activeView.status,'running');assert.match(activeView.label,/请求已结束/);
+    assert.equal(activeView.status,result==='completed'?'success':result);assert.equal(activeView.backgroundStatus,'running');assert.equal(activeView.backgroundLabel,'后台仍在执行');
     assert.equal(activeView.taskClockDynamic,false);assert.equal(activeView.commandClockDynamic,true);
     assert.equal(isFinal(active,now),false);
     const unknown={...active,executionObservation:{observedAt:now,activeOperationIds:[],preparingOperationIds:[],staleOperationIds:['op']}};
-    assert.equal(cardPresentation(unknown,now).status,'unavailable');assert.equal(isFinal(unknown,now),false);
+    assert.equal(cardPresentation(unknown,now).status,result==='completed'?'success':result);assert.equal(cardPresentation(unknown,now).backgroundStatus,'unconfirmed');assert.equal(isFinal(unknown,now),false);
     assert.equal(withTaskLifecycle({...run,executionStatus:'unknown'},task).executionStatus,'unknown');
   });
 }
 
 test("一小时无进展时停止执行计时，不伪造结束时间",()=>{
-  const view=cardPresentation(snapshot({lastModelToolAt:now-3_600_000}),now);
-  assert.equal(view.status,"stalled");assert.equal(view.taskClockDynamic,false);assert.equal(view.taskElapsedMs,null);
+  const view=cardPresentation(snapshot({lastModelToolAt:now-3_600_000,lastActivityAt:now-3_600_000}),now);
+  assert.equal(view.status,"stalled");assert.equal(view.taskClockDynamic,false);assert.equal(view.taskElapsedMs,0);
 });
 
 test("三十分钟无输出的真实活跃执行仍显示运行",()=>{
@@ -61,7 +61,8 @@ test("同一快照失去活性观察后显示待确认，不把时间当成进�
   const value=snapshot({commands:[command],runningCommand:command,executionObservation:{observedAt:now-31_000,
     activeOperationIds:["op"],preparingOperationIds:[],staleOperationIds:[]}});
   const view=cardPresentation(value,now);assert.equal(view.status,"unavailable");assert.equal(view.commandClockDynamic,false);
-  assert.equal(view.commandElapsedMs,null);assert.equal(view.taskClockDynamic,false);
+  assert.equal(view.commandElapsedMs,1_769_000);assert.equal(view.taskClockDynamic,false);
+  assert.equal(cardPresentation(value,now+60_000).commandElapsedMs,1_769_000);
 });
 
 test("明确中断不会因一分钟前的工具活动又显示等待下一步",()=>{
@@ -87,12 +88,23 @@ test("相同版本重复一百次不触发重绘，活性时间独立更新",()=
   assert.equal(applySnapshot(state,{...first,rev:6}).snapshot,false);
   assert.equal(state.snapshot?.executionObservation?.staleOperationIds[0],"op");
   assert.throws(()=>applySnapshot(state,{...first,taskId:"another"}),/TASK_CHANGED/);
+  assert.throws(()=>applySnapshot(state,{...first,taskId:null}),/TASK_CHANGED/);
 });
 
 test("来源过期不覆盖已知终态，同时不同在线节点不相互拖累",()=>{
   const rows=[{nodeId:"offline",executionStatus:"running"},{nodeId:"online",executionStatus:"running"},{nodeId:"offline",executionStatus:"completed"}];
   const out=observeSourceStates(rows,[{nodeId:"offline",online:false,observedAt:now},{nodeId:"online",online:true,observedAt:now}],now);
   assert.deepEqual(out.map(x=>x.executionStatus),["unknown","running","completed"]);
+});
+
+test('单个节点离线不遮蔽其他节点的新鲜执行，未知回执仍单独显示',()=>{
+  const value=snapshot({host_status:HostState.disconnected,commands:[command],runningCommand:command,
+    executionObservation:{observedAt:now,activeOperationIds:['op'],preparingOperationIds:[],staleOperationIds:['offline-op']}});
+  const active=cardPresentation(value,now);
+  assert.equal(active.status,'running');assert.equal(active.commandClockDynamic,true);
+  assert.equal(active.backgroundLabel,'后台仍在执行 · 另有命令结果待核对');
+  const expired=cardPresentation(value,now+31_000);
+  assert.equal(expired.status,'unavailable');assert.equal(expired.commandClockDynamic,false);
 });
 
 test("外部活性载荷拒绝非法集合和时间戳",()=>{
@@ -114,3 +126,76 @@ for(const execution of ["stalled","finalizing","unknown","interrupted_recoverabl
     assert.equal(result.executionStatus,execution);
   });
 }
+
+test('回答后缺少 finish_task：空闲立即停表，活动年龄持续增加且不推断完成',()=>{
+  const value=snapshot({lastModelToolAt:now-15_000,lastActivityAt:now-15_000});
+  const first=cardPresentation(value,now),later=cardPresentation(value,now+30_000);
+  assert.equal(first.status,'idle');assert.equal(later.status,'idle');
+  assert.equal(first.taskClockDynamic,false);assert.equal(first.taskElapsedMs,later.taskElapsedMs);
+  assert.equal(later.activityAgeMs-first.activityAgeMs,30_000);
+  assert.equal(value.taskState,'active');assert.equal(value.taskResult,null);
+});
+
+test('仅创建任务且没有业务事件也会给出静默提示，轮询时间不会延长计时',()=>{
+  const value=snapshot({startedAt:now-11*60_000,lastModelToolAt:null,lastActivityAt:null,lastExecutionActivityAt:null});
+  const view=cardPresentation(value,now);
+  assert.equal(view.status,'stalled');assert.equal(view.taskElapsedMs,0);assert.equal(view.taskClockDynamic,false);
+});
+
+test('已完成主状态与丢失命令回执独立，重复刷新不会让任务复活',()=>{
+  const value=snapshot({taskState:'closed',taskResult:'completed',deliveryEndedAt:now-10_000,endedAt:now-10_000,
+    commands:[{...command,status:'unknown'}],executionObservation:{observedAt:now,activeOperationIds:[],preparingOperationIds:[],staleOperationIds:['op']}});
+  const first=cardPresentation(value,now);
+  for(const elapsed of [30_000,60_000,30*60_000]){
+    const view=cardPresentation({...value,serverNow:now+elapsed,executionObservation:{...value.executionObservation!,observedAt:now+elapsed}},now+elapsed);
+    assert.equal(view.status,'success');assert.equal(view.backgroundStatus,'unconfirmed');
+    assert.equal(view.taskElapsedMs,first.taskElapsedMs);assert.equal(view.taskClockDynamic,false);
+  }
+});
+
+test('终态任务拒绝延迟高版本活动快照改写结果和结束时间，仍可补充回执',()=>{
+  const state=createCardState();
+  applySnapshot(state,snapshot({rev:8,taskState:'closed',taskResult:'completed',deliveryEndedAt:now-5000,endedAt:now-5000}));
+  applySnapshot(state,snapshot({rev:9,taskState:'active',taskResult:null,endedAt:null,
+    finalization:{state:'pending',requestedAt:now-10_000,error:null},
+    executionObservation:{observedAt:now+5000,activeOperationIds:[],preparingOperationIds:[],staleOperationIds:['missing-receipt']}}));
+  assert.equal(state.snapshot!.taskState,'closed');assert.equal(state.snapshot!.taskResult,'completed');
+  assert.equal(state.snapshot!.deliveryEndedAt,now-5000);
+  assert.equal(state.snapshot!.finalization,null);
+  assert.deepEqual(state.snapshot!.executionObservation!.staleOperationIds,['missing-receipt']);
+});
+
+test('未确认交付的归档也是终态，待核对后台和延迟快照不让它复活',()=>{
+  const state=createCardState();
+  applySnapshot(state,snapshot({rev:8,taskState:'closed',taskResult:null,closureReason:'superseded',archivedAt:now-5000}));
+  applySnapshot(state,snapshot({rev:9,taskState:'active',taskResult:null,finalization:{state:'pending',requestedAt:now-10_000,error:null},
+    executionObservation:{observedAt:now,activeOperationIds:[],preparingOperationIds:[],staleOperationIds:['missing-receipt']}}));
+  const view=cardPresentation(state.snapshot!,now);
+  assert.equal(state.snapshot!.taskState,'closed');assert.equal(state.snapshot!.taskResult,null);
+  assert.equal(view.status,'archived');assert.equal(view.label,'已归档 · 交付未确认');
+  assert.equal(view.backgroundStatus,'unconfirmed');assert.equal(view.taskClockDynamic,false);
+  assert.equal(view.taskElapsedMs,null);assert.equal(state.snapshot!.finalization,null);
+  assert.equal(isFinal(state.snapshot,now),false,'后台回执仍可继续核对');
+});
+
+test('同业务版本的实时状态可恢复连接，过时观测不能覆盖新的状态',()=>{
+  const state=createCardState();
+  const base=snapshot({host_status:HostState.disconnected,execution_status:ExecutionState.interrupted,
+    live:{observedAt:now,hostStatus:HostState.disconnected,executionStatus:ExecutionState.interrupted}});
+  applySnapshot(state,base);
+  assert.equal(applySnapshot(state,{...base,live:{observedAt:now+1000,hostStatus:HostState.connected,executionStatus:ExecutionState.idle}}).snapshot,true);
+  assert.equal(state.snapshot!.host_status,HostState.connected);assert.equal(state.snapshot!.execution_status,ExecutionState.idle);
+  applySnapshot(state,{...base,rev:base.rev+1});
+  assert.equal(state.snapshot!.host_status,HostState.connected);assert.equal(state.snapshot!.live!.observedAt,now+1000);
+});
+
+test('交付最终确认有独立结构化状态，不依赖提示文案',()=>{
+  const value=snapshot({notices:[],finalization:{state:'pending',requestedAt:now-5000,error:null}});
+  const view=cardPresentation(value,now);
+  assert.equal(view.status,'finalizing');assert.equal(view.taskClockDynamic,true);assert.equal(isFinal(value,now),false);
+  const failed=cardPresentation({...value,finalization:{state:'failed',requestedAt:now-5000,error:'receipt unavailable'}},now);
+  assert.equal(failed.label,'交付确认失败');assert.equal(failed.taskClockDynamic,false);
+  const executing=cardPresentation({...value,finalization:{state:'failed',requestedAt:now-5000,error:'receipt unavailable'},
+    executionObservation:{observedAt:now,activeOperationIds:['op'],preparingOperationIds:[],staleOperationIds:[]}},now);
+  assert.equal(executing.status,'running');assert.equal(executing.taskClockDynamic,true);
+});
