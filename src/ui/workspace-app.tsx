@@ -60,7 +60,7 @@ function bootPreview():void{
 
 async function boot(): Promise<void> {
   app = new App(
-    { name: "quaymesh-session-card", version: resourceVersion },
+    { name: "quaymesh-session-card", version: WORKSPACE_APP_VERSION },
     { availableDisplayModes: ["inline", "fullscreen"] },
     { autoResize: true },
   );
@@ -216,6 +216,9 @@ function bootstrapFromResult(result: unknown): Bootstrap | null {
   const initialSnapshot = rawSnapshot === undefined ? undefined : snapshotFromSchema(rawSnapshot);
   if (initialSnapshot && initialSnapshot.sessionId !== sessionId) {
     throw new Error("SESSION_CARD_BOOTSTRAP_IDENTITY_MISMATCH");
+  }
+  if (initialSnapshot?.taskId && taskId && initialSnapshot.taskId !== taskId) {
+    throw new Error("SESSION_CARD_BOOTSTRAP_TASK_MISMATCH");
   }
   return { sessionId, ...(taskId ? { taskId } : {}), memberId, workspaceId, snapshotRef, initialSnapshot };
 }

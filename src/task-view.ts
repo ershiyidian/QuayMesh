@@ -9,6 +9,7 @@ export interface TaskViewInput {
   unresolved?: boolean;
   stale?: boolean;
   finalizing?: boolean;
+  finalizationFailed?: boolean;
   lastOutcome?: string | null;
   lastProgressAt?: number | null;
   now?: number;
@@ -21,6 +22,12 @@ export interface TaskView {
   stale: boolean;
   clockRunning: boolean;
   resultStatus: string | null;
+}
+
+export function taskDelivery(requestState?: string | null, result?: string | null): {status: string; label: string} | null {
+  if (requestState !== 'closed') return null;
+  const labels: Record<string, string> = {completed:'已完成',failed:'未完成',cancelled:'已停止',handed_off:'已交接'};
+  return result && labels[result] ? {status:result,label:labels[result]} : {status:'ended',label:'已结束 · 交付未确认'};
 }
 
 // 交付状态与后台执行分别保留；界面、API 和 SQL 分类共同使用此读取模型。
@@ -46,7 +53,8 @@ export function taskView(input: TaskViewInput): TaskView {
   else if (input.lastProgressAt != null && input.now != null && input.now - input.lastProgressAt >= TASK_SILENCE_MS) status = 'stalled';
   else status = 'waiting';
   return {status, requestEnded: ended, resultStatus: input.result ?? null, backgroundActive: (active || queued) && !stale, stale,
-    clockRunning: !ended && !['stalled', 'unknown', 'interrupted_recoverable', 'completed', 'failed', 'cancelled', 'handed_off'].includes(status)};
+    clockRunning: !ended && !(status === 'finalizing' && input.finalizationFailed)
+      && ['running', 'queued', 'stopping', 'finalizing'].includes(status)};
 }
 
 export function runExecutionStatus(

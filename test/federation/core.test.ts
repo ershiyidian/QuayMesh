@@ -174,6 +174,25 @@ test("gateway recovery delay also covers network reconnection and unified proxy 
   assert.equal(chooseGateway([server, desktop])?.id, "desktop");
 });
 
+test("混合版本中的旧 crash loop 网关经过稳定窗口后才能重新承载新流", () => {
+  const now = 1_000_000;
+  const server = node("server", true, 300), desktop = node("desktop", true, 100);
+  server.components = [{ id: "core", state: "ready", restarts: 3340, startedAt: now - 1000, observedAt: now }];
+  server.onlineSince = now - 1000;
+  assert.equal(chooseGateway([server, desktop], now, 60_000, "server")?.id, "desktop");
+  server.components[0].observedAt = now + 300_000;
+  assert.equal(chooseGateway([server, desktop], now + 300_000, 60_000, "desktop")?.id, "server");
+  server.components[0].state = "degraded";
+  assert.equal(chooseGateway([server, desktop], now + 300_000, 60_000, "server")?.id, "desktop");
+  server.components[0].state = "ready";
+  server.components[0].startedAt = now + 300_000;
+  assert.equal(chooseGateway([server, desktop], now + 301_000, 60_000, "desktop")?.id, "desktop");
+  server.components[0].startedAt = now - 1000;
+  assert.equal(chooseGateway([server, desktop], now + 360_000, 60_000, "desktop")?.id, "desktop", "陈旧探针不提供稳定证据");
+  server.components[0].observedAt = now + 360_000;
+  assert.equal(chooseGateway([server, desktop], now + 360_000, 60_000, "desktop")?.id, "server", "历史重启次数不会永久禁选");
+});
+
 test("agent continuation hints and console links carry the node while literal file contents stay untouched", () => {
   const raw = JSON.stringify({ workspaceId: "ws_123", nextAction: { workspaceId: "ws_123" }, consolePath: "/console/?project=p&run=r", response: "literal ws_123" });
   const value = { content: [{ type: "text", text: raw }] };

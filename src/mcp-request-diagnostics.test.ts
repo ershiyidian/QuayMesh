@@ -15,13 +15,18 @@ test("real modern HTTP MCP diagnostics separate schema/tool errors from successf
   const rows: Record<string, any>[] = [];
   const handler = createMcpHandler(() => {
     const adapter = createModernMcpServerAdapter({ name: "fixture", version: "1" });
-    adapter.registrationTarget.registerTool("work_task", { inputSchema: { action: z.enum(["get", "snapshot", "finish", "structured", "retry_scope", "untrusted"]), workspaceId: z.string() } }, async ({ action }) => {
+    adapter.registrationTarget.registerTool("work_task", { inputSchema: { action: z.enum(["get", "snapshot", "finish", "structured", "mismatch", "retry_scope", "untrusted"]), workspaceId: z.string() } }, async ({ action }) => {
       if (action === "retry_scope") return toolErrorResult(Object.assign(new Error("secret-task-reference"), {
         code: "OPERATION_RETRY_SCOPE_MISMATCH", effect: "not_started",
       }));
       if (action === "structured") return toolErrorResult(Object.assign(new Error("secret-timeout-address"), {
         code: "REQUEST_TIMEOUT",
       }), { operationId: "op_abcdef", sideEffecting: true });
+      if (action === "mismatch") {
+        const result = toolErrorResult(Object.assign(new Error("secret-rewritten-timeout"), {code: "REQUEST_TIMEOUT"}),
+          {operationId: "op_abcdef", sideEffecting: true});
+        return {...result, structuredContent: {...result.structuredContent, error_code: "INVALID_ARGUMENT"}};
+      }
       if (action === "untrusted") return {
         isError: true, content: [{ type: "text" as const, text: "secret-error" }],
         structuredContent: { error_code: "secret-code", effect: "secret-effect", retry_hint: "secret-retry" },
@@ -65,6 +70,13 @@ test("real modern HTTP MCP diagnostics separate schema/tool errors from successf
   assert.equal(structured.row.retryHint, "query_original");
   assert.equal(structured.row.operationId, "op_abcdef");
   assert.equal(structured.row.outcome, "tool_error");
+  assert.equal(structured.row.recoveryTextErrorCode, "REQUEST_TIMEOUT");
+  assert.equal(structured.row.errorCodeConsistent, true);
+  const mismatch = await call("mismatch");
+  assert.equal(mismatch.row.requestId, "fixture");
+  assert.equal(mismatch.row.toolErrorCode, "INVALID_ARGUMENT");
+  assert.equal(mismatch.row.recoveryTextErrorCode, "REQUEST_TIMEOUT");
+  assert.equal(mismatch.row.errorCodeConsistent, false);
   const scope = await call("retry_scope");
   assert.equal(scope.row.toolErrorCode, "OPERATION_RETRY_SCOPE_MISMATCH");
   assert.equal(scope.row.effect, "not_started");

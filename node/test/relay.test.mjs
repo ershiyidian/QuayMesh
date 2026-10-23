@@ -92,3 +92,19 @@ test("上游半途断开 SSE 时下游立即失败，绝不记录成功", async 
   }
   assert.equal(relay.activeRequests, 0);
 });
+
+test("持续 SSE 心跳不会延长最终结果期限", async t => {
+  const http=await import("node:http");const {once}=await import("node:events");
+  const failures=[];let successes=0;
+  const origin=http.createServer((_req,res)=>{
+    res.writeHead(200,{"content-type":"text/event-stream"});res.write(": connected\n\n");
+    const timer=setInterval(()=>res.write(": alive\n\n"),10);res.once("close",()=>clearInterval(timer));
+  });
+  origin.listen(0,"127.0.0.1");await once(origin,"listening");
+  const relay=await new McpRelay({origin:`http://127.0.0.1:${origin.address().port}`,port:await freePort(),mcpResponseTimeoutMs:150,
+    onError:error=>failures.push(error),onSuccess:()=>successes++}).start();
+  t.after(async()=>{await relay.close();await new Promise(resolve=>origin.close(resolve));});
+  const response=await fetch(`http://127.0.0.1:${relay.port}/mcp`,{method:"POST",body:"{}"});
+  await assert.rejects(response.text(),/terminated|aborted|premature/i);
+  assert.equal(failures[0]?.code,"MCP_RESPONSE_TIMEOUT");assert.equal(successes,0);
+});

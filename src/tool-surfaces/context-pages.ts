@@ -1,6 +1,7 @@
-import { glob, readdir, stat } from "node:fs/promises";
+import { glob, opendir, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { isAbsolute, relative, sep } from "node:path";
-import { readContextFile } from "../workspace-context.js";
+import { readContextFileAsync } from "../workspace-context.js";
 import { replyBytes, REPLY_BYTES } from "../bounded-reply.js";
 import { mapConcurrent } from "../concurrency.js";
 import { currentInvocation } from "../session/invocations.js";
@@ -18,58 +19,107 @@ interface CapturedFile {
   selectionIndex:number;lines:Line[];error?:string;
 }
 interface Capture {
-  files:CapturedFile[];bytesRead:number;scope:Record<string,unknown>;enumeratedPaths?:string[];
+  files:CapturedFile[];bytesRead:number;scope:Record<string,unknown>;enumeratedPaths?:string[];enumerationToken?:string;
 }
 interface Position {selectionIndex:number;startLine:number;lineOffset:number;ref?:string}
 const EXCLUDED = ["**/.git/**","**/node_modules/**","**/Library/**","**/dist/**","**/build/**","**/.quaymesh/**"];
 const CAPTURE_BYTES = 4 * 1024 * 1024;
+type Enumeration = { iterator: AsyncIterator<string>; paths:string[]; complete:boolean; published:boolean; touched:number; pending?:Promise<void> };
+const enumerations = new Map<string,Enumeration>();
+const ENUMERATION_TTL_MS = 10 * 60_000;
 
-export async function listDirectories(root:string, depth:number) {
+function pruneEnumerations() {
+  const expired=[...enumerations].filter(([,value])=>Date.now()-value.touched>ENUMERATION_TTL_MS && !value.pending);
+  for(const [key,value] of expired){enumerations.delete(key);void value.iterator.return?.().catch(()=>{});}
+  if(enumerations.size>=32) {
+    const oldest=[...enumerations].filter(([,value])=>!value.pending).sort((a,b)=>a[1].touched-b[1].touched)[0];
+    if(oldest){enumerations.delete(oldest[0]);void oldest[1].iterator.return?.().catch(()=>{});}
+    else throw new Error("CONTEXT_ENUMERATION_BUSY: retry after another directory search completes");
+  }
+}
+
+export async function listDirectories(root:string, depth:number, maximum=100_001, signal?:AbortSignal) {
   const rows:Array<{name:string;kind:"directory"|"file"|"symlink"}>=[];
   async function visit(path:string,level:number) {
-    const entries=(await readdir(path,{withFileTypes:true})).sort((a,b)=>a.name.localeCompare(b.name));
-    for(const entry of entries) {
+    signal?.throwIfAborted();
+    const entries=await opendir(path);
+    for await(const entry of entries) {
+      signal?.throwIfAborted();
       const name=relative(root,`${path}/${entry.name}`).split(sep).join("/");
       rows.push({name,kind:entry.isSymbolicLink()?"symlink":entry.isDirectory()?"directory":"file"});
+      if(rows.length>=maximum)return;
       if(entry.isDirectory()&&level<depth&&![".git","node_modules","Library","dist","build",".quaymesh"].includes(entry.name)) {
         await visit(`${path}/${entry.name}`,level+1);
+        if(rows.length>=maximum)return;
       }
     }
   }
   await visit(root,1);return rows;
 }
 
-async function selections(context:ToolRegistrationContext,workspace:{id:string;root:string},input:ContextSelection,enumeratedPaths?:string[]):Promise<{files:FileSelection[];scope:Record<string,unknown>;enumeratedPaths?:string[]}> {
+async function selections(context:ToolRegistrationContext,workspace:{id:string;root:string},input:ContextSelection,enumeratedPaths?:string[],enumerationToken?:string,signal?:AbortSignal):Promise<{files:FileSelection[];scope:Record<string,unknown>;enumeratedPaths?:string[];enumerationToken?:string}> {
   if(input.files?.length)return {files:input.files,scope:{selection:"explicit",total_files:input.files.length},enumeratedPaths:undefined};
   if(input.action!=="search")throw new Error("CAPTURE_FILES_REQUIRED");
-  let paths=enumeratedPaths;
-  if(!paths) {
-    const directory=await context.workspaces.resolveWorkingDirectory(await context.workspaces.getWorkspace(workspace.id),input.directory??".");
-    paths=[];
-    for await(const path of glob(input.patterns??["**/*"],{cwd:directory,exclude:EXCLUDED})) {
-      if((await stat(`${directory}/${path}`)).isFile())paths.push(relative(workspace.root,`${directory}/${path}`).split(sep).join("/"));
-    }
-    paths.sort();
-  }
   const offset=input.file_offset??0,limit=input.max_files??100;
-  return {files:paths.slice(offset,offset+limit).map(path=>({path})),enumeratedPaths:paths,
+  let paths=enumeratedPaths,enumeration=enumerationToken ? enumerations.get(enumerationToken) : undefined;
+  if(enumerationToken && !enumeration)throw new Error("CONTEXT_ENUMERATION_EXPIRED: start a new search; captured result pages remain readable");
+  if(!paths&&!enumeration) {
+    pruneEnumerations();
+    const directory=await context.workspaces.resolveWorkingDirectory(await context.workspaces.getWorkspace(workspace.id,{touch:false}),input.directory??".");
+    const iterator=(async function*(){
+      for await(const path of glob(input.patterns??["**/*"],{cwd:directory,exclude:EXCLUDED})) {
+        if((await stat(`${directory}/${path}`)).isFile())yield relative(workspace.root,`${directory}/${path}`).split(sep).join("/");
+      }
+    })();
+    enumerationToken=`enum_${randomUUID()}`;
+    enumeration={iterator,paths:[],complete:false,published:false,touched:Date.now()};
+    enumerations.set(enumerationToken,enumeration);
+  }
+  if(enumeration) {
+    enumeration.touched=Date.now();
+    const current=enumeration;
+    // 同一结果的并发续页排成一条链，取消的观察不会打断其他续页。
+    const advance=(current.pending??Promise.resolve()).catch(()=>{}).then(async()=>{
+      signal?.throwIfAborted();
+      const target=Math.max(128,offset+limit+1);
+      while(!current.complete&&current.paths.length<target) {
+        signal?.throwIfAborted();
+        if(current.paths.length>=100_000)throw new Error("CONTEXT_ENUMERATION_LIMIT: narrow directory or patterns after 100000 files");
+        const next=await current.iterator.next();
+        if(next.done){current.complete=true;break;}
+        current.paths.push(next.value);
+      }
+      if(!current.published&&current.complete)current.paths.sort();
+      current.published=true;
+    });
+    current.pending=advance;
+    try {await advance;} finally {if(current.pending===advance)current.pending=undefined;}
+    paths=current.paths;
+  }
+  paths??=[];
+  const complete=!enumeration||enumeration.complete;
+  return {files:paths.slice(offset,offset+limit).map(path=>({path})),enumeratedPaths:complete?[...paths]:undefined,
+    enumerationToken:complete?undefined:enumerationToken,
     scope:{selection:"directory",directory:input.directory??".",patterns:input.patterns??["**/*"],excluded:EXCLUDED,
-      total_files:paths.length,file_offset:offset,next_file_offset:offset+limit<paths.length?offset+limit:null}};
+      total_files:complete?paths.length:null,enumerated_files:paths.length,enumeration_complete:complete,
+      ordering:enumeration?.published&&!complete?"stable_traversal":"snapshot",file_offset:offset,
+      next_file_offset:!complete||offset+limit<paths.length?offset+limit:null}};
 }
 
-async function capture(context:ToolRegistrationContext,workspace:{id:string;root:string},input:ContextSelection,enumeratedPaths?:string[]):Promise<Capture> {
-  const chosen=await selections(context,workspace,input,enumeratedPaths);
+async function capture(context:ToolRegistrationContext,workspace:{id:string;root:string},input:ContextSelection,enumeratedPaths?:string[],enumerationToken?:string,signal?:AbortSignal):Promise<Capture> {
+  const chosen=await selections(context,workspace,input,enumeratedPaths,enumerationToken,signal);
   const queries=input.action==="search"?input.queries??(input.query?[input.query]:[]):[];
   if(input.action==="search"&&!queries.length)throw new Error("SEARCH_QUERY_REQUIRED");
-  const reads=new Map<string,Promise<ReturnType<typeof readContextFile>>>();
+  const reads=new Map<string,ReturnType<typeof readContextFileAsync>>();
   let bytesRead=0;
   const load=(path:string)=>{
     let pending=reads.get(path);
     if(!pending) {
       pending=(async()=>{
-        const resolved=await context.workspaces.resolveReadPath(await context.workspaces.getWorkspace(workspace.id),path);
+        signal?.throwIfAborted();
+        const resolved=await context.workspaces.resolveReadPath(await context.workspaces.getWorkspace(workspace.id,{touch:false}),path);
         const root=resolved.skillRead?.skill.baseDir??workspace.root;
-        const file=readContextFile(root,relative(root,resolved.absolutePath));
+        const file=await readContextFileAsync(root,relative(root,resolved.absolutePath),signal);
         bytesRead+=file.bytes.length;
         if(bytesRead>CAPTURE_BYTES)throw new Error("CONTEXT_CAPTURE_LIMIT: select at most 4 MiB of source files");
         if(resolved.skillRead)file.path=resolved.absolutePath;
@@ -83,6 +133,7 @@ async function capture(context:ToolRegistrationContext,workspace:{id:string;root
     const first=selection.start_line??1,maxLines=selection.max_lines??(input.action==="search"?Number.MAX_SAFE_INTEGER:80);
     const empty:CapturedFile={path:selection.path,sha256:"",bytes:0,totalLines:0,startLine:first,maxLines,selectionIndex,lines:[]};
     try {
+      signal?.throwIfAborted();
       const file=await load(selection.path);
       const text=file.bytes.toString("utf8");
       const raw=text?text.split(/(?<=\n)/u):[];
@@ -102,14 +153,15 @@ async function capture(context:ToolRegistrationContext,workspace:{id:string;root
       return {...empty,path:file.path,sha256:file.sha256,bytes:file.bytes.length,totalLines:all.length,
         maxLines:Math.min(maxLines,Math.max(0,all.length-first+1)),lines};
     } catch(error) {
+      signal?.throwIfAborted();
       if(bytesRead>CAPTURE_BYTES)throw error;
       return {...empty,error:error instanceof Error?error.message:String(error)};
     }
   });
-  return {files,bytesRead,scope:{...chosen.scope,queries},enumeratedPaths:chosen.enumeratedPaths};
+  return {files,bytesRead,scope:{...chosen.scope,queries},enumeratedPaths:chosen.enumeratedPaths,enumerationToken:chosen.enumerationToken};
 }
 
-export async function contextPage(context:ToolRegistrationContext,workspace:{id:string;root:string},input:ContextSelection) {
+export async function contextPage(context:ToolRegistrationContext,workspace:{id:string;root:string},input:ContextSelection,signal?:AbortSignal) {
   const invocation=currentInvocation();
   if(!context.sessionRuntime||!invocation)throw new Error("SESSION_RUNTIME_REQUIRED");
   const store=context.sessionRuntime.store;
@@ -120,14 +172,16 @@ export async function contextPage(context:ToolRegistrationContext,workspace:{id:
     if(original.action!==input.action)throw new Error("CONTEXT_ACTION_MISMATCH");
     data=saved.result as Capture;
     if(input.file_offset!==undefined&&input.file_offset!==data.scope.file_offset) {
-      if(input.cursor||!data.enumeratedPaths)throw new Error("CONTEXT_ENUMERATION_INVALID");
+      if(input.cursor||(!data.enumeratedPaths&&!data.enumerationToken))throw new Error("CONTEXT_ENUMERATION_INVALID");
       input={...original,file_offset:input.file_offset,result_ref:undefined,cursor:undefined};
-      data=await capture(context,workspace,input,data.enumeratedPaths);
-      resultRef=store.saveContextResult(invocation.owner_id,invocation.session_id,invocation.member_id,invocation.task_id,input,data);
+      data=await capture(context,workspace,input,data.enumeratedPaths,data.enumerationToken,signal);
+      signal?.throwIfAborted();
+      resultRef=await store.writeAsync(()=>store.saveContextResult(invocation.owner_id,invocation.session_id,invocation.member_id,invocation.task_id,input,data),{signal});
     }
   } else {
-    data=await capture(context,workspace,input);
-    resultRef=store.saveContextResult(invocation.owner_id,invocation.session_id,invocation.member_id,invocation.task_id,input,data);
+    data=await capture(context,workspace,input,undefined,undefined,signal);
+    signal?.throwIfAborted();
+    resultRef=await store.writeAsync(()=>store.saveContextResult(invocation.owner_id,invocation.session_id,invocation.member_id,invocation.task_id,input,data),{signal});
   }
   let position:Position={selectionIndex:input.selection_index??0,startLine:1,lineOffset:input.line_offset??0};
   if(input.cursor) {

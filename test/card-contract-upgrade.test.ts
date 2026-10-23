@@ -10,8 +10,8 @@ import {createMcpSource} from '../src/ui/session-card/source.js';
 import type {App} from '@modelcontextprotocol/ext-apps';
 import {projectionForCard} from '../src/session/card-contract.js';
 
-// 旧卡片的实际严格协议：新增的两个字段会导致整份快照被拒收。
-const oldReader = snapshotSchema.omit({sourceTaskId: true, executionObservation: true}).strict();
+// 旧卡片的实际严格协议：新增字段会导致整份快照被拒收。
+const oldReader = snapshotSchema.omit({sourceTaskId: true, executionObservation: true, live: true, finalization: true}).strict();
 
 test('旧卡片在新服务的启动和后续读取中保持可用，新卡片保留完整活性', async t => {
   const f = await createRealTestServer({git: false});
@@ -27,7 +27,7 @@ test('旧卡片在新服务的启动和后续读取中保持可用，新卡片�
   const opened = await f.client.callTool({name: 'open_workspace', arguments: {path: f.project}, _meta: meta});
   assert.notEqual(opened.isError, true);
   assert.equal(oldReader.safeParse((opened._meta as any)?.quaymesh?.snapshot).success, true);
-  for (const version of ['task-card-v5', undefined, 'task-card-v4', WORKSPACE_APP_VERSION]) {
+  for (const version of ['task-card-v5', undefined, 'task-card-v4', 'task-card-v6', WORKSPACE_APP_VERSION]) {
     const result = await f.client.callTool({name: 'qm_session', arguments: {...identity, since_rev: -1,
       ...(version ? {resource_version: version} : {})}, _meta: meta});
     assert.notEqual(result.isError, true, JSON.stringify(result));
@@ -35,10 +35,29 @@ test('旧卡片在新服务的启动和后续读取中保持可用，新卡片�
     if (version === WORKSPACE_APP_VERSION) {
       assert.ok(data.snapshot.executionObservation);
       assert.ok('sourceTaskId' in data.snapshot);
+      assert.ok(data.live);
+    } else if (version === 'task-card-v6') {
+      assert.ok(data.snapshot.executionObservation);
+      assert.equal('live' in data.snapshot, false);
+      assert.equal('finalization' in data.snapshot, false);
+      assert.equal('live' in data, false);
     } else {
       assert.equal(oldReader.safeParse(data.snapshot).success, true, `旧读取器必须接受 ${version ?? '无版本'} 的完整快照`);
       assert.equal('observation' in data, false, '旧版输出协议也没有独立的 observation 字段');
     }
+  }
+  const app = {getHostCapabilities: () => ({serverTools:{}}),
+    callServerTool: (request: {name:string;arguments:Record<string,unknown>}) => f.client.callTool({...request,_meta:meta})} as unknown as App;
+  for (const historicalVersion of ['task-card-v1','task-card-v4','task-card-v6'] as const) {
+    const source=createMcpSource(app,session_id,task_id,undefined,historicalVersion);
+    try {
+      const snapshot=await source.snapshot(-1);
+      assert.ok(snapshot?.executionObservation, `${historicalVersion} 地址的新渲染器协商当前协议`);
+      assert.ok(snapshot.live);
+      const refreshed=await source.snapshot(snapshot.rev);
+      assert.ok(refreshed?.live, '同 revision 继续读取实时连接和执行状态');
+      assert.ok(refreshed.executionObservation!.observedAt>=snapshot.executionObservation.observedAt);
+    } finally {source.dispose();}
   }
 });
 
@@ -53,8 +72,8 @@ test('旧输出协议的未变化回执同样不携带新增观察字段', () =>
 });
 
 test('资源 URI、握手版本、旧资源入口保持一致', async t => {
-  assert.equal(WORKSPACE_APP_VERSION, 'task-card-v6');
-  assert.equal(WORKSPACE_APP_URI, 'ui://quaymesh/task-card/v6.html');
+  assert.equal(WORKSPACE_APP_VERSION, 'task-card-v7');
+  assert.equal(WORKSPACE_APP_URI, 'ui://quaymesh/task-card/v7.html');
   const f = await createRealTestServer({git: false});
   t.after(() => f.dispose());
   const listing = await f.client.listTools();

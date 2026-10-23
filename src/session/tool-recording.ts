@@ -11,7 +11,7 @@ import { parseWorkspaceHandle } from "../federation/routing.js";
 import { OperationState } from "./types.js";
 import { observesAcceptedWork } from "../tool-admission.js";
 import { classifyError, errorEnvelope, errorFromEnvelope, type InvocationEnvelope } from "./outcome.js";
-import type { ExecutionCoordinator } from "../execution-coordinator.js";
+import type { ExecutionCoordinator, RuntimeWorkLease } from "../execution-coordinator.js";
 
 export interface ModelToolIdentity {
   owner_id: string;
@@ -65,6 +65,7 @@ export class SessionToolRecorder {
     private readonly changes: SessionChangeCollector,
     private readonly projector: SessionProjector,
     private readonly execution?: ExecutionCoordinator,
+    private readonly nodeId = "local",
   ) {}
 
   async contextForWorkspace(
@@ -134,6 +135,7 @@ export class SessionToolRecorder {
     context: InvocationContext,
     input: Pick<RecordModelToolInput<T>, "pendingResult" | "replyWaitMs">,
     execution: Promise<T>,
+    reserved: Promise<void>,
   ): Promise<T> {
     this.ownedContexts.add(context);
     const work = execution.finally(() => {this.pendingRecords.delete(work);this.ownedContexts.delete(context);});
@@ -152,6 +154,8 @@ export class SessionToolRecorder {
         }),
       ]);
       if (outcome.kind === "result") return outcome.value;
+      // 写锁可能让初始受理计时器先到；一旦身份持久化立即返回回执，不再等待整个动作。
+      await Promise.race([reserved, work]);
       const saved = context.operation_id && this.store.findInvocationByOperation(context.owner_id,context.operation_id);
       if (!saved) return work;
       return input.pendingResult(context);
@@ -168,13 +172,10 @@ export class SessionToolRecorder {
       context.tool_name=input.tool_name;
       return observationContext.run(context, () => input.operation(context));
     }
-    await this.store.writeAsync(() => this.store.touchTaskMember(context.task_id!, context.member_id));
-    const run = () => this.recordWithContext(context, input);
-    // 提前返回受理回执时，实际工作继续保留执行占用与原操作身份。
-    const execution = input.pendingResult && this.execution
-      ? this.execution.withWork({ kind: "tool", taskId: context.task_id }, run)
-      : run();
-    return this.returnOrAccept(context, input, execution);
+    let notifyReserved!: () => void;
+    const reserved = new Promise<void>(resolve => {notifyReserved=resolve;});
+    const execution = this.recordWithContext(context, input, notifyReserved);
+    return this.returnOrAccept(context, input, execution, reserved);
   }
 
   async close(): Promise<void> {
@@ -186,17 +187,22 @@ export class SessionToolRecorder {
     const context = this.contextForKnownWorkspace(input.identity, input.workspace_id,false);
     if (!context) throw new Error(`REMOTE_SESSION_MEMBER_REQUIRED: ${input.workspace_id}`);
     if(observation){context.tool_name=input.tool_name;return observationContext.run(context,()=>input.operation(context));}
-    await this.store.writeAsync(() => this.store.touchTaskMember(context.task_id!, context.member_id));
     // 入口回执由协调端持久保存，远程操作仍使用相同的确定性 operation_id。
     // 等待时间达到上限即返回可查询的受理回执，后台 RPC 继续执行并归档结果。
-    return this.returnOrAccept(context, input, this.recordReceipt(context, input));
+    let notifyReserved!: () => void;
+    const reserved=new Promise<void>(resolve=>{notifyReserved=resolve;});
+    return this.returnOrAccept(context, input, this.recordReceipt(context, input, notifyReserved), reserved);
   }
 
-  private async recordReceipt<T>(context: InvocationContext, input: Omit<RecordModelToolInput<T>, "identity" | "workspace_id">): Promise<T> {
+  private async recordReceipt<T>(context: InvocationContext, input: Omit<RecordModelToolInput<T>, "identity" | "workspace_id">, onReserved?: () => void): Promise<T> {
     context.tool_name = input.tool_name;
+    let lease: RuntimeWorkLease | undefined;
+    let failed=false;
+    try {
     // 入口保存同一次请求的回执，文件、进程和工作记录由所属节点维护。
     const recorded = await executeRecorded<InvocationEnvelope<T>>(this.store, context, input.input, {
-      beforeEffect: () => {
+      onReserved,
+      beforeEffect: async () => {
         // 已有回执先由 executeRecorded 重放；只有新工作必须在转发和首次镜像前验证任务。
         if (observesAcceptedWork(input.tool_name, input.input as Record<string, unknown>)) return;
         const task = context.task_id ? this.store.getTask(context.task_id) : null;
@@ -205,16 +211,18 @@ export class SessionToolRecorder {
         const finalization = this.store.taskData.finalization(task.id);
         if (finalization && !finalization.error) throw Object.assign(new Error(`TASK_FINISHING: ${task.id}`),
           { code: "TASK_FINISHING", effect: "not_started" });
+        await this.store.writeAsync(() => this.store.touchTaskMember(task.id, context.member_id));
+        if (input.pendingResult && this.execution) lease=await this.execution.beginWorkAsync({kind:"tool",taskId:task.id,operationId:context.operation_id});
       },
       invoke: async () => {
-        try { return { kind: "result", value: await input.operation(context) }; }
+        try { return { kind: "result", value: await (lease ? lease.run(()=>input.operation(context)) : input.operation(context)) }; }
         catch (error) {
           const envelope = errorEnvelope(error,{sideEffecting:input.affectsFiles??false,forwarded:true,effectStarted:true});
           if (envelope.effect === "unknown" && context.operation_id) {
             const member = this.store.getMember(context.session_id, context.member_id);
             const workspaceId = parseWorkspaceHandle(member.workspace_id) ? member.workspace_id : `qm:${member.node_id}:${member.workspace_id}`;
             envelope.errorDetails = { ...(envelope.errorDetails && typeof envelope.errorDetails === "object" ? envelope.errorDetails : {}),
-              operation_id: context.operation_id, owner_node_id: member.node_id,
+              operation_id: context.operation_id, owner_node_id: member.node_id, receipt_node_id: this.nodeId,
               next_action: { tool: "workspace_context", arguments: { workspace_id: workspaceId, action: "status", operation_id: context.operation_id } } };
           }
           return envelope;
@@ -230,6 +238,8 @@ export class SessionToolRecorder {
     });
     if (!recorded.result) throw new Error(`INVOCATION_REPLAY_RESULT_PENDING: ${recorded.operation_id ?? "unknown"}`);
     return unwrapEnvelope(recorded.result);
+    } catch(error) {failed=true;throw error;}
+    finally {try {await lease?.releaseAsync();} catch(error) {if (!failed) throw error;}}
   }
 
   private contextForKnownWorkspace(
@@ -258,17 +268,24 @@ export class SessionToolRecorder {
   async recordWithContext<T>(
     context: InvocationContext,
     input: Omit<RecordModelToolInput<T>, "identity" | "workspace_id">,
+    onReserved?: () => void,
   ): Promise<T> {
     context.tool_name = input.tool_name;
     context.actor = "model";
     if (context.task_id && (this.store.getTask(context.task_id).state === "closed" || this.store.taskData.finalization(context.task_id)) &&
       observesAcceptedWork(input.tool_name, input.input as Record<string, unknown>)) {
-      return this.recordReceipt(context, input);
+      return this.recordReceipt(context, input, onReserved);
     }
     const isWrite = input.affectsFiles ?? (input.kind === "patch" || input.kind === "command" || input.kind === "copy");
     let ticket: Awaited<ReturnType<SessionService["beforeOperation"]>> | undefined;
+    let lease: RuntimeWorkLease | undefined;
+    let failed=false;
+    try {
     const operation: InvocationOperation<InvocationEnvelope<T>> = {
+      onReserved,
       beforeEffect: async () => {
+        if (input.pendingResult && this.execution) lease=await this.execution.beginWorkAsync({kind:"tool",taskId:context.task_id,operationId:context.operation_id});
+        const prepare=async()=>{
         ticket = await this.service.beforeOperation(context, input.kind, input.label);
         context.operation_id = ticket.operation_id;
         if (isWrite) {
@@ -279,10 +296,12 @@ export class SessionToolRecorder {
             await this.changes.ensureBaseline(member, [], member.root, context.task_id);
           }
         }
+        };
+        await (lease ? lease.run(prepare) : prepare());
       },
       invoke: async () => {
         try {
-          return { kind: "result", value: await input.operation(context) };
+          return { kind: "result", value: await (lease ? lease.run(()=>input.operation(context)) : input.operation(context)) };
         } catch (error) {
           return errorEnvelope(error,{sideEffecting:isWrite,effectStarted:true});
         }
@@ -340,6 +359,8 @@ export class SessionToolRecorder {
     });
     this.projector.schedule(context.session_id, context.member_id, context.task_id);
     return unwrapEnvelope(envelope);
+    } catch(error) {failed=true;throw error;}
+    finally {try {await lease?.releaseAsync();} catch(error) {if (!failed) throw error;}}
   }
 }
 

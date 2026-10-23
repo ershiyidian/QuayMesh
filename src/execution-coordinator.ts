@@ -178,7 +178,7 @@ export class ExecutionCoordinator {
         this.database.sqlite.prepare("DELETE FROM qm_runtime_work WHERE owner_pid=?").run(owner.owner_pid);
       this.database.sqlite.prepare(`INSERT INTO qm_runtime_work(id,owner_id,owner_pid,kind,operation_id,task_id,blocking,started_at)
         VALUES(?,?,?,?,?,?,?,?)`).run(id, this.ownerId, process.pid, input.kind, input.operationId ?? null,
-          input.taskId ?? null, input.allowWhilePaused || input.blocking === false ? 0 : 1, new Date().toISOString());
+          input.taskId ?? null, (input.kind === "egress" || (input.blocking ?? !input.allowWhilePaused)) ? 1 : 0, new Date().toISOString());
     }).immediate();
     const release = this.createReleaseHandle(id, "qm_runtime_work");
     return {
@@ -300,6 +300,12 @@ export class ExecutionCoordinator {
       resourceContains(scope,{kind:"file",path:canonicalResourcePath(path),access:"read"}));
   }
 
+  admissionState(): {accepting:boolean;reason:string|null;changedAt:string} {
+    const state=this.database.sqlite.prepare("SELECT accepting,reason,changed_at FROM qm_runtime_admission WHERE id=1")
+      .get() as {accepting:number;reason:string|null;changed_at:string};
+    return {accepting:state.accepting===1,reason:state.reason,changedAt:state.changed_at};
+  }
+
   admissionStatus() {
     return this.database.sqlite.transaction(() => {
       const state = this.database.sqlite.prepare("SELECT accepting,reason,changed_at FROM qm_runtime_admission WHERE id=1").get() as { accepting: number; reason: string | null; changed_at: string };
@@ -310,6 +316,8 @@ export class ExecutionCoordinator {
       const executions = count("SELECT COUNT(*) AS n FROM console_executions WHERE status IN ('running','starting')");
       const queuedOperations = count("SELECT COUNT(*) AS n FROM console_operations WHERE status='queued'");
       const queuedExecutions = count("SELECT COUNT(*) AS n FROM console_executions WHERE status='queued'");
+      const unresolvedOperations = count("SELECT COUNT(*) AS n FROM console_operations WHERE status IN ('unknown','reconciliation_required')");
+      const unresolvedExecutions = count("SELECT COUNT(*) AS n FROM console_executions WHERE status IN ('unknown','reconciliation_required')");
       const rows = this.database.sqlite.prepare(`SELECT kind,owner_pid,COUNT(*) AS count FROM qm_runtime_work
         WHERE blocking=1 GROUP BY kind,owner_pid ORDER BY kind,owner_pid`).all() as { kind: string; owner_pid: number; count: number }[];
       const owners = new Map<number, boolean>();
@@ -321,8 +329,8 @@ export class ExecutionCoordinator {
       const work = [...counts].map(([kind, count]) => ({ kind, count }));
       const activeWork = work.reduce((n, item) => n + item.count, 0);
       return { accepting: state.accepting === 1, reason: state.reason, changedAt: state.changed_at,
-        idle: claims + operations + executions + activeWork === 0,
-        claims, waiting, operations, executions, queuedOperations, queuedExecutions, activeWork, work };
+        idle: claims + waiting + operations + executions + queuedOperations + queuedExecutions + unresolvedOperations + unresolvedExecutions + activeWork === 0,
+        claims, waiting, operations, executions, queuedOperations, queuedExecutions, unresolvedOperations, unresolvedExecutions, activeWork, work };
     }).deferred();
   }
 

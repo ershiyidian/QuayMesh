@@ -103,6 +103,7 @@ export function componentPlans(node, cluster, env, { root, generatedDir, configD
   }
   plans.push({ id:"core", command:node.nodeRuntime || process.execPath, args:[join(root,"dist","cli.js"),"serve"], cwd:root,
     env:{...base, QUAYMESH_CONFIG_DIR:configDir, QUAYMESH_NODE_ADMIN_URL:`http://127.0.0.1:${node.adminPort}`, QUAYMESH_RELEASE_COMMIT:release,
+      QUAYMESH_INSTALL_TRANSITION_FILE:join(node.stateDir,"installation-transition.json"),
       QUAYMESH_EXTERNAL_ACCESS:String(node.network.externalAccess) },
     requires:managedMesh ? ["mesh"] : [] });
   if (node.capabilities.discovery) {

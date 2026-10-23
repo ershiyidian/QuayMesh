@@ -18,11 +18,12 @@ test("初始数据库创建全部工作区、任务和认证表", () => {
     migrateDatabase(db);
     assert.deepEqual(db.prepare("SELECT version,name FROM qm_schema_migrations").all(),
       [{version:1,name:"quaymesh-initial"},{version:2,name:"quaymesh-runtime-ownership"},{version:3,name:"quaymesh-durable-results"},{version:4,name:"quaymesh-task-lifecycle"},
-        {version:5,name:"quaymesh-execution-observation"},{version:6,name:"quaymesh-invocation-attempts"},{version:7,name:"quaymesh-console-audit"}]);
+        {version:5,name:"quaymesh-execution-observation"},{version:6,name:"quaymesh-invocation-attempts"},{version:7,name:"quaymesh-console-audit"},
+        {version:8,name:"quaymesh-execution-owner"}]);
     for (const name of ["workspace_sessions","oauth_clients","console_work_runs","execution_claims",
       "local_agent_sessions","qm_sessions","qm_tasks","qm_task_members","qm_task_snapshots","qm_task_context",
       "qm_runtime_work","qm_runtime_admission","qm_transfers","qm_task_change_baselines","qm_task_file_changes","qm_task_finalizations",
-      "console_audit","console_archive_steps"]) {
+      "console_audit","console_archive_steps","execution_owners"]) {
       assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(name));
     }
     assert.equal(db.pragma("foreign_keys",{simple:true}),1);
@@ -195,6 +196,9 @@ test("首次建表和旧版本升级失败均回滚全部迁移，再次升级�
       DROP TABLE console_archive_steps;
       DROP TABLE console_audit;
       DROP TABLE console_audit_imports;
+      DROP TABLE execution_owners;
+      DROP INDEX qm_events_source_type;
+      DROP INDEX qm_events_operation_type;
       DELETE FROM qm_schema_migrations WHERE version>=6;
       CREATE TRIGGER reject_upgrade BEFORE INSERT ON qm_schema_migrations WHEN NEW.version=6
         BEGIN SELECT RAISE(ABORT,'migration stopped'); END;`);
@@ -217,7 +221,10 @@ test("版本六调用保留历史结果，升级不把当前终态结果冒充�
       DROP TABLE console_archive_steps;
       DROP TABLE console_audit;
       DROP TABLE console_audit_imports;
-      DELETE FROM qm_schema_migrations WHERE version=7;`);
+      DROP TABLE execution_owners;
+      DROP INDEX qm_events_source_type;
+      DROP INDEX qm_events_operation_type;
+      DELETE FROM qm_schema_migrations WHERE version>=7;`);
     const at = "2026-10-20T01:00:00.000Z", result = JSON.stringify({ kind: "error", message: "later process failure" });
     db.prepare("INSERT INTO qm_sessions(id,owner_id,title,created_at,last_activity_at) VALUES(?,?,?,?,?)")
       .run("history-session", "owner", "Historical call", at, at);

@@ -70,3 +70,37 @@ test("BT12/16：一个结果范围过期不会遮蔽其他输出",{timeout:60000
   assert.equal(result.partial,true);assert.match(result.outputs[0].error,/OUTPUT_RANGE_EXPIRED/);
   assert.equal(result.outputs[1].result,"small-result\n");
 });
+
+test("输出JSON转义后仍遵守总预算，批量裁剪游标可完整重建",{timeout:60000},async t=>{
+  const f=await fixture(t), text='\u0000"\\\n\t中文😀'.repeat(3000);
+  const commands=[];
+  for(let index=0;index<2;index++)commands.push(await f.execute(`process.stdout.write(${JSON.stringify(text)});`,{yield_time_ms:2000,max_output_tokens:1}));
+  const cursors=[0,0], received=["",""];
+  let finished=false;
+  for(let attempt=0;attempt<40;attempt++) {
+    const response=await f.raw("read_output",{...f.scope,outputs:commands.map((command,index)=>({operation_id:command.operation_id,cursor:cursors[index]})),limit_bytes:32768});
+    assert.notEqual(response.isError,true,JSON.stringify(response));
+    assert.ok(Buffer.byteLength(JSON.stringify(response))<=REPLY_BYTES);
+    const pages=(response.structuredContent as any).outputs;
+    for(const [index,page] of pages.entries()) {
+      assert.equal(page.next_cursor,page.cursor+Buffer.byteLength(page.result));
+      received[index]+=page.result;cursors[index]=page.next_cursor;
+    }
+    if(pages.every((page:any)=>page.done)){finished=true;break;}
+  }
+  assert.equal(finished,true);assert.deepEqual(received,[text,text]);
+  assert.deepEqual(cursors,[Buffer.byteLength(text),Buffer.byteLength(text)]);
+});
+
+test("read_output的观察预算贯穿等待，超时后原命令继续并可续读",{timeout:60000},async t=>{
+  const f=await fixture(t), gate=join(f.root,"deadline-release");
+  const command=await f.execute(`import {existsSync} from 'node:fs';const timer=setInterval(()=>{if(existsSync(${JSON.stringify(gate)})){clearInterval(timer);console.log('still-owned');}},20);`,{yield_time_ms:0});
+  const started=performance.now();
+  const response=await f.client.callTool({name:"read_output",arguments:{...f.scope,operation_id:command.operation_id,wait_ms:10000},
+    _meta:{...f.meta,"quaymesh/deadline_at":Date.now()+350}});
+  assert.equal(response.isError,true);
+  assert.match(JSON.stringify(response),/TOOL_REQUEST_EXPIRED/);
+  assert.ok(performance.now()-started<3000);
+  await writeFile(gate,"release");
+  await until(async()=>{const page=await f.call("read_output",{...f.scope,operation_id:command.operation_id});return page.process_done&&page.result==="still-owned\n";});
+});

@@ -128,7 +128,7 @@ export function validateCluster(input) {
   }
   value.egress.probeUrl ??= "https://www.gstatic.com/generate_204";
   httpUrl(value.egress.probeUrl, "egress.probeUrl");
-  value.egress.recoveryDelayMs ??= 10000;
+  value.egress.recoveryDelayMs ??= 60000;
   check(Number.isInteger(value.egress.recoveryDelayMs) && value.egress.recoveryDelayMs >= 0 && value.egress.recoveryDelayMs <= 300000,
     "egress.recoveryDelayMs 超出范围");
   return value;

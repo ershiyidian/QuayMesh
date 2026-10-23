@@ -46,14 +46,19 @@ export interface NodeManifest {
   nickname: string;
   capabilities: NodeCapabilities;
   discovery?: { ready: boolean; lastSuccessAt?: number | null; lastError?: string | null };
-  components?: { id: string; state: string; pid?: number | null; restarts?: number; error?: string | null }[];
+  components?: { id: string; state: string; pid?: number | null; restarts?: number; error?: string | null;
+    startedAt?: number | null; stableSince?: number | null; crashLoop?: boolean; observedAt?: number | null;
+    lastExitCode?: number | null; lastExitSignal?: string | null; lastExitAt?: number | null }[];
   priority: number;
   roots: ExportedRoot[];
   platform: string;
   version?: string;
+  runtime?: { nodeVersion: string; nodeAbi: string; sqlitePackageVersion: string; sqliteNativeSha256: string;
+    nodeSha256: string; packageLockSha256: string };
   tools: string[];
   providers: unknown[];
-  egress: { enabled: boolean; healthy: boolean; healthySince?: number; error?: string; checkedAt?: number; latencyMs?: number };
+  egress: { enabled: boolean; healthy: boolean; healthySince?: number; error?: string; checkedAt?: number; latencyMs?: number;
+    draining?: boolean; activeConnections?: number };
   health: {
     cpuCount: number;
     cpu?: number | null;

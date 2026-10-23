@@ -3,6 +3,8 @@ import { jsonReply, REPLY_BYTES, replyBytes } from "../bounded-reply.js";
 import { currentInvocation } from "../session/invocations.js";
 import { cancelManagedCommand } from "../managed-command-control.js";
 import { mapConcurrent } from "../concurrency.js";
+import { observationBudget } from "../observation-budget.js";
+import { fitUtf8 } from "../session/output.js";
 import type { ToolRegistrationContext } from "./types.js";
 
 function outputWorkspace(context: ToolRegistrationContext, workspaceId: string) {
@@ -16,7 +18,8 @@ function outputWorkspace(context: ToolRegistrationContext, workspaceId: string) 
   return member;
 }
 
-export async function commandOutput(context:ToolRegistrationContext,workspaceId:string,operationId:string,cursor=0,limit=16384,preview=false) {
+export async function commandOutput(context:ToolRegistrationContext,workspaceId:string,operationId:string,cursor=0,limit=16384,preview=false,signal?:AbortSignal) {
+  signal?.throwIfAborted();
   const runtime=context.sessionRuntime,invocation=currentInvocation();
   if(!runtime||!invocation)throw new Error("SESSION_RUNTIME_REQUIRED");
   const workspace=outputWorkspace(context,workspaceId);
@@ -26,14 +29,21 @@ export async function commandOutput(context:ToolRegistrationContext,workspaceId:
     if (cursor !== 0) throw new Error("OUTPUT_RANGE_EXPIRED: command has not produced output");
     const pending = ["accepted", "queued", "running"].includes(saved.state);
     const envelope = saved.result_json ? JSON.parse(saved.result_json) : null;
-    return { result: pending ? "" : String(envelope?.message ?? envelope?.error ?? ""),
+    const message = pending ? "" : String(envelope?.message ?? envelope?.error ?? "");
+    let result = fitUtf8(message,limit);
+    const value = () => ({ result, effect: "not_started" as const, error_message_truncated: result.length < message.length,
       operation_id: operationId, task_id: command.task_id, operation_state: pending ? "preparing" : saved.state,
       cursor: 0, next_cursor: 0, total_bytes: 0, retained_from: 0, retained_until: null,
       done: !pending, process_done: !pending, has_more: false, truncated: false,
-      exit_code: null, signal: null, poll_after_ms: pending ? 2000 : null };
+      exit_code: null, signal: null, poll_after_ms: pending ? 2000 : null });
+    while(replyBytes(value())>REPLY_BYTES&&limit>4) {
+      limit=Math.max(4,Math.floor(limit/2));result=fitUtf8(result,limit);
+    }
+    if(replyBytes(value())>REPLY_BYTES)throw new Error("OUTPUT_METADATA_TOO_LARGE");
+    return value();
   }
   if(command.retained_until&&Date.parse(command.retained_until)<Date.now())throw new Error(`OUTPUT_EXPIRED: ${command.retained_until}`);
-  let page=await runtime.output.modelRead(command.session_id,operationId,cursor,limit);
+  const page=await runtime.output.modelRead(command.session_id,operationId,cursor,limit,signal);
   if(page.truncated&&!preview)throw new Error(`OUTPUT_RANGE_EXPIRED: operation_id=${operationId}; requested=${cursor}; retained_from=${page.retainedFrom}`);
   const attached=context.processSessions.findOperation(operationId);
   const state=!attached&&["running","queued","starting"].includes(command.status)?"reconciliation_required":command.status;
@@ -45,7 +55,9 @@ export async function commandOutput(context:ToolRegistrationContext,workspaceId:
     poll_after_ms:page.processDone||!attached?null:5000,
   });
   while(replyBytes(value())>REPLY_BYTES&&limit>4) {
-    limit=Math.max(4,Math.floor(limit/2));page=await runtime.output.modelRead(command.session_id,operationId,cursor,limit);
+    limit=Math.max(4,Math.floor(limit/2));
+    page.chunk=fitUtf8(page.chunk,limit);page.nextCursor=page.cursor+Buffer.byteLength(page.chunk);
+    page.done=page.processDone&&page.nextCursor>=page.totalBytes;
   }
   if(replyBytes(value())>REPLY_BYTES)throw new Error("OUTPUT_METADATA_TOO_LARGE");
   return value();
@@ -74,12 +86,13 @@ export function registerOperationTools(context:ToolRegistrationContext):void {
     const items=input.outputs??[{operation_id:input.operation_id!,cursor:input.cursor??0}];
     // 身份先验证；已授权结果的过期/范围错误按对应项返回。
     for(const item of items)runtime.store.requireCommand(invocation.owner_id,context.config.federation?.nodeId??"local",workspace.root,item.operation_id);
-    const signal=(extra as {signal?:AbortSignal}).signal;
+    const observation=observationBudget("read_output",input,extra as {signal?:AbortSignal;_meta?:unknown});
+    const signal=observation.signal;
     const watch=input.wait_ms?runtime.output.watch(items.map(item=>item.operation_id),input.wait_ms,signal):undefined;
     let budget=input.limit_bytes;
     const getPages=()=>mapConcurrent(items,4,async(item,index)=>{
-      try{return {index,...await commandOutput(context,input.workspace_id,item.operation_id,item.cursor,Math.max(4,Math.floor(budget/items.length))) };}
-      catch(error){return {index,operation_id:item.operation_id,cursor:item.cursor,error:error instanceof Error?error.message:String(error)};}
+      try{return {index,...await commandOutput(context,input.workspace_id,item.operation_id,item.cursor,Math.max(4,Math.floor(budget/items.length)),false,signal) };}
+      catch(error){signal.throwIfAborted();return {index,operation_id:item.operation_id,cursor:item.cursor,error:error instanceof Error?error.message:String(error)};}
     });
     try {
       let pages=await getPages();
@@ -92,10 +105,22 @@ export function registerOperationTools(context:ToolRegistrationContext):void {
       }
       const value=()=>({outputs:pages,partial:pages.some(page=>"error" in page),
         poll_after_ms:pages.some(page=>!("error" in page)&&page.poll_after_ms!==null)?5000:null});
-      while(replyBytes(value())>REPLY_BYTES&&budget>items.length*4) {budget=Math.max(items.length*4,Math.floor(budget/2));pages=await getPages();}
+      while(replyBytes(value())>REPLY_BYTES&&budget>items.length*4) {
+        budget=Math.max(items.length*4,Math.floor(budget/2));
+        // 只裁剪已读取的同一份快照，游标随实际返回字节推进。
+        pages=pages.map(page=>{
+          if("error" in page)return page;
+          const result=fitUtf8(page.result,Math.max(4,Math.floor(budget/items.length)));
+          // 准备失败的说明不是进程输出，裁剪说明不能伪造输出字节或续读游标。
+          if("error_message_truncated" in page)return {...page,result,
+            error_message_truncated:page.error_message_truncated===true||result.length<page.result.length};
+          const next_cursor=page.cursor+Buffer.byteLength(result);
+          return {...page,result,next_cursor,done:page.process_done&&next_cursor>=page.total_bytes,has_more:next_cursor<page.total_bytes};
+        });
+      }
       if(replyBytes(value())>REPLY_BYTES)throw new Error("OUTPUT_METADATA_TOO_LARGE");
       return jsonReply(value(),value().partial?"Some outputs failed; inspect each error.":"Outputs read.");
-    } finally {watch?.dispose();}
+    } finally {watch?.dispose();observation.dispose();}
   });
 
   server.registerTool("cancel_command",{

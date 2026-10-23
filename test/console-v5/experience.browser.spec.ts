@@ -7,6 +7,7 @@ import type {AddressInfo} from 'node:net';
 import {consoleExperienceFixture,liveCaptureFixture} from './experience-fixture.js';
 import {freePort} from '../session-card/server-fixture.js';
 import {canonicalWorkspaceRoot} from '../../src/roots.js';
+import {WorkLedger} from '../../src/work-ledger.js';
 // @ts-expect-error 节点管理器使用ESM脚本。
 import {McpRelay} from '../../node/relay.mjs';
 
@@ -62,6 +63,41 @@ test('总览只列实际执行，状态筛选、工作区和对话详情在浏�
   expect(errors).toEqual([]);
 });
 
+test('已完成任务的未知后台在全局、项目、会话中保持同一主结果',async({page})=>{
+  const isolated=await consoleExperienceFixture();
+  try{
+    const ledger=new WorkLedger(isolated.server.config.stateDir);
+    try{
+      const run=ledger.db.prepare('SELECT run_id FROM qm_run_links WHERE task_id=? LIMIT 1').get(isolated.completed.task_id) as {run_id:string};
+      ledger.operation({runId:run.run_id,requestKey:'delayed-exit-receipt',kind:'command',label:'退出回执待核对',status:'unknown'});
+    }finally{ledger.close();}
+    const pageData=await isolated.get('runs?days=0&fresh=1');
+    const completed=pageData.items.find((value:any)=>value.taskId===isolated.completed.task_id);
+    expect(completed).toMatchObject({requestState:'closed',resultStatus:'completed',executionStatus:'unknown'});
+    await login(page,isolated.server.baseUrl);
+    const assertRow=async()=>{
+      const row=page.locator('.run-table tbody tr',{hasText:'已经完成的改动'});
+      await expect(row.locator('.task-state .state').first()).toHaveText('已完成');
+      await expect(row.locator('.task-state')).toContainText('后台执行结果待核对');
+      expect(await row.locator('[data-elapsed]').count()).toBe(0);
+    };
+    await page.goto(isolated.server.baseUrl+'/console/#/tasks?days=0');
+    await assertRow();
+    await page.screenshot({path:screenshots+'/lifecycle-global.png',fullPage:true});
+    const projects=await isolated.get('projects');
+    const project=projects.items.find((value:any)=>canonicalWorkspaceRoot(value.path)===canonicalWorkspaceRoot(isolated.server.project));
+    await page.goto(isolated.server.baseUrl+'/console/#/tasks?days=0&project='+encodeURIComponent(project.id));
+    await assertRow();
+    await page.screenshot({path:screenshots+'/lifecycle-project.png',fullPage:true});
+    await page.goto(isolated.server.baseUrl+'/console/#/sessions?project='+encodeURIComponent(project.id));
+    await page.locator('.conversation details summary').click();
+    const task=page.locator('.conversation-task',{hasText:'已经完成的改动'});
+    await expect(task.locator('.state')).toHaveText('已完成');
+    await expect(task).toContainText('后台执行结果待核对');
+    await page.screenshot({path:screenshots+'/lifecycle-conversation.png',fullPage:true});
+  }finally{await isolated.server.dispose();}
+});
+
 test('读取等待可见，刷新失败保留旧记录且明确标为未更新',async({page})=>{
   await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
   let release!:()=>void;
@@ -92,6 +128,14 @@ test('读取等待可见，刷新失败保留旧记录且明确标为未更新',
   await expect(page.locator('[data-elapsed]')).toHaveAttribute('data-observed',String(running.observedAt));
   running.observedAt+=1000;await page.locator('#topbar [data-action=refresh]').click();
   await expect(page.locator('[data-elapsed]')).toHaveAttribute('data-observed',String(running.observedAt));
+  const activeAt=Date.now();
+  Object.assign(running,{nodeIds:[running.nodeId,'offline-other'],nodeStates:{[running.nodeId]:'running','offline-other':'unknown'},stale:true,observedAt:activeAt-60_000});
+  snapshot.sources=snapshot.sources.map((source:any)=>({...source,observedAt:activeAt}));
+  snapshot.sources.push({nodeId:'offline-other',name:'Offline peer',online:false,state:'offline',stale:true,observedAt:activeAt-60_000,error:'offline'});
+  await page.locator('#topbar [data-action=refresh]').click();
+  await expect(page.locator('[data-elapsed]')).toHaveAttribute('data-observed',String(activeAt));
+  await expect(page.locator('.overview-active .run-card')).toContainText('上次确认');
+  await page.screenshot({path:screenshots+'/mixed-source-clock.png',fullPage:true});
 });
 
 test('节点配置刷新合并独立修改，明确解决冲突后才提交新版本',async({page})=>{

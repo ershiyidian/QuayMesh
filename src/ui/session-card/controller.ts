@@ -76,7 +76,7 @@ export function createCardController(state:CardState,renderer:CardView,source:Se
         retryDelay=Math.min(Math.max(5000,retryDelay*2),30000);
         const supplied=(error as {retryAfterMs?:number})?.retryAfterMs;
         retryAt=Date.now()+(typeof supplied==="number"?Math.max(supplied,retryDelay):retryDelay);
-        void recordStage("error");
+        if(previousConnection!=="error")void recordStage("error");
       }
     } finally {request=null;if(!stopped&&state.connection!==previousConnection)view.renderFooter();}
   }

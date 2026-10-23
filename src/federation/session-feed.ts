@@ -12,6 +12,9 @@ import type { JsonRecord } from "./types.js";
 import { parseWorkspaceHandle } from "./routing.js";
 import type { SessionFeedRequest, SessionFeedUpdate, TrustedInvocationEnvelope } from "./session-types.js";
 import { isReadOnlyObservation } from "../tool-admission.js";
+import { jsonReply } from "../bounded-reply.js";
+import { errorCode } from "../session/outcome.js";
+import { savedOperationStatus, operationReceiptSummary } from "../session/operation-status.js";
 
 interface RemoteSubscription {
   nodeId: string;
@@ -81,6 +84,45 @@ export class SessionFeed {
   routeNodeFor(input: JsonRecord): string | undefined {
     const member = this.memberForInput(input);
     return member?.member.node_id;
+  }
+
+  async recoverOperationStatus(input: JsonRecord, identity: TrustedInvocationEnvelope | undefined,
+    ownerNodeId: string, queryOwner: () => Promise<unknown>): Promise<unknown> {
+    if (ownerNodeId===this.runtime.localId || input.action!=="status" || input.environment===true
+      || !identity?.session_id || !identity.member_id) return queryOwner();
+    const ids=typeof input.operation_id==="string" ? [input.operation_id]
+      : Array.isArray(input.operation_ids) ? input.operation_ids.filter((value):value is string=>typeof value==="string") : [];
+    if (!ids.length || ids.length>8) return queryOwner();
+    const member=this.store.getMember(identity.session_id,identity.member_id);
+    if (member.node_id!==ownerNodeId) throw new Error("WORKSPACE_SESSION_MISMATCH");
+    const workspaceId=parseWorkspaceHandle(member.workspace_id)?member.workspace_id:`qm:${ownerNodeId}:${member.workspace_id}`;
+    const context={owner_id:identity.owner_id,session_id:identity.session_id,member_id:identity.member_id};
+    const receipts=new Map(ids.map(id=>[id,savedOperationStatus(this.store,context,workspaceId,id,
+      {offset:typeof input.offset==="number"?input.offset:0})]));
+    let reply:unknown, failure:unknown;
+    try {reply=await queryOwner();} catch(error) {failure=error;}
+    if (![...receipts.values()].some(Boolean)) {
+      if (failure) throw failure;
+      return reply;
+    }
+    const envelope=reply&&typeof reply==="object"?reply as JsonRecord:{};
+    const body=envelope.structuredContent&&typeof envelope.structuredContent==="object"?envelope.structuredContent as JsonRecord:{};
+    const join=(operationId:string,owner:JsonRecord|undefined):JsonRecord=>{
+      const receipt=receipts.get(operationId);
+      const rows=Array.isArray(owner?.operations)?owner.operations as JsonRecord[]:[];
+      const found=owner?.lookup==="found" || rows.some(row=>row.operation_id===operationId);
+      const unreachable=Boolean(failure || envelope.isError===true || owner?.error && !found);
+      const lookup=unreachable?"unreachable":found?"found":"not_found";
+      const base=found ? owner! : receipt ?? {operation_id:operationId,operation_state:"unknown",effect:"unknown",operations:[],unknown_effects:[operationId],result_ready:false};
+      return {...base,receipt_node_id:this.runtime.localId,owner_node_id:ownerNodeId,owner_lookup:lookup,
+        ...(receipt?{entry_receipt:operationReceiptSummary(receipt)}:{}),
+        ...(!found?{poll_after_ms:2000,next_action:{tool:"workspace_context",arguments:{workspace_id:workspaceId,action:"status",operation_id:operationId}}}:{}),
+        ...(unreachable?{observation_error:{code:failure?errorCode(failure):String(body.error_code??"OWNER_STATUS_UNAVAILABLE")}}:{})};
+    };
+    if (typeof input.operation_id==="string") return jsonReply(join(input.operation_id,body));
+    const remoteRows=Array.isArray(body.results)?body.results as JsonRecord[]:[];
+    const results=ids.map(id=>join(id,remoteRows.find(row=>row.operation_id===id)));
+    return jsonReply({results,partial:results.some(row=>row.owner_lookup!=="found")});
   }
 
   trustedInvocation(name: string, input: JsonRecord, extra: JsonRecord): TrustedInvocationEnvelope | undefined {

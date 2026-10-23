@@ -46,7 +46,7 @@ export function retryableAdmission(row: {state: OperationState; effect: Invocati
           hint: saved.value.structuredContent?.retry_hint}
       : null;
   return error?.effect === "not_started" && error.hint === "retry_later"
-    && (error.code === "EXECUTION_CONFLICT" || error.code === "NODE_ADMISSION_PAUSED");
+    && (error.code === "EXECUTION_CONFLICT" || error.code === "NODE_ADMISSION_PAUSED" || error.code === "NODE_UNAVAILABLE" || error.code === "PEER_BUSY");
 }
 
 const NOT_STARTED = new Set([
@@ -86,7 +86,8 @@ export function classifyError(error: unknown, options: { sideEffecting: boolean;
   else effect="not_started";
   const state=effect==="unknown"?OperationState.unknown:OperationState.failed;
   const retryHint:RetryHint=effect==="unknown"?"query_original"
-    : effect==="not_started"&&(code==="EXECUTION_CONFLICT"||code==="NODE_ADMISSION_PAUSED")?"retry_later"
+    : effect==="not_started"&&(code==="EXECUTION_CONFLICT"||code==="NODE_ADMISSION_PAUSED"||code==="NODE_UNAVAILABLE"||code==="PEER_BUSY")?"retry_later"
+      : effect==="not_started"&&["fix_input","retry_same_key","do_not_retry","retry_later"].includes(String(value.retryHint))?value.retryHint as RetryHint
       : effect==="not_started"?"fix_input"
         : "do_not_retry";
   return {code,state,effect,retryHint,message,...(value.details!==undefined?{details:value.details}:{})};
@@ -127,6 +128,6 @@ export function classifyToolResultError(result: unknown, options:{sideEffecting:
   const code=typeof structured.error_code==="string"?structured.error_code:errorCode(new Error(text));
   const explicit=typeof structured.effect==="string"&&["not_started","started","partial","completed","unknown"].includes(structured.effect)
     ? structured.effect as InvocationEffect:undefined;
-  const source=Object.assign(new Error(text||code),{code,effect:explicit,details:structured.details});
+  const source=Object.assign(new Error(text||code),{code,effect:explicit,retryHint:structured.retry_hint,details:structured.details});
   return classifyError(source,{sideEffecting:options.sideEffecting,forwarded:options.forwarded,effectStarted:options.sideEffecting});
 }

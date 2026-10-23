@@ -1,4 +1,4 @@
-import { executionObservationSchema } from "../../session/schema.js";
+import { executionObservationSchema, snapshotLiveStateSchema } from "../../session/schema.js";
 import { WORKSPACE_APP_VERSION, type CardVersion } from '../../session/card-contract.js';
 import type { App } from "@modelcontextprotocol/ext-apps";
 import { snapshotFromSchema } from "./snapshot.js";
@@ -104,6 +104,7 @@ export function createMcpSource(
     if (signal?.aborted) abort();
     else signal?.addEventListener("abort", abort, { once: true });
     activeControllers.add(controller);
+    const timeout=setTimeout(()=>controller.abort(new Error('SESSION_CARD_REQUEST_TIMEOUT')),name==='qm_revert'?60_000:15_000);
     try {
       const result = await app.callServerTool(
         {
@@ -132,6 +133,7 @@ export function createMcpSource(
       }
       return result.structuredContent as T;
     } finally {
+      clearTimeout(timeout);
       signal?.removeEventListener("abort", abort);
       activeControllers.delete(controller);
     }
@@ -147,9 +149,10 @@ export function createMcpSource(
         servedInitial=true;
         if(sinceRev<0)return initialSnapshot;
       }
-      const result = await call<{ unchanged: boolean; rev?: number; snapshot?: unknown; observation?:Snapshot['executionObservation'] }>(
+      const result = await call<{ unchanged: boolean; rev?: number; snapshot?: unknown; observation?:Snapshot['executionObservation']; live?:Snapshot['live'] }>(
         "qm_session",
-        { since_rev: sinceRev, resource_version: resourceVersion,
+        // 历史资源地址可以装载新渲染器；协议能力由当前代码声明。
+        { since_rev: sinceRev, resource_version: WORKSPACE_APP_VERSION,
           ...(memberId ? { member_id: memberId } : {}), ...(cursor ? { cursor } : {}),
           ...(taskId && mountSnapshotPending ? { mount_id: mountId } : {}) },
         signal,
@@ -157,8 +160,11 @@ export function createMcpSource(
       mountSnapshotPending = false;
       if (requestedMemberId !== activeMemberId) return null;
       if(result.unchanged){
-        if(!currentSnapshot||!result.observation)return null;
-        currentSnapshot={...currentSnapshot,executionObservation:executionObservationSchema.parse(result.observation)};
+        if(!currentSnapshot||!result.observation&&!result.live)return null;
+        const live=result.live?snapshotLiveStateSchema.parse(result.live):undefined;
+        currentSnapshot=snapshotFromSchema({...currentSnapshot,
+          ...(result.observation?{executionObservation:executionObservationSchema.parse(result.observation)}:{}),
+          ...(live?{live,serverNow:live.observedAt,host_status:live.hostStatus,execution_status:live.executionStatus}:{})});
         return currentSnapshot;
       }
       currentSnapshot=snapshotFromSchema(result.snapshot);

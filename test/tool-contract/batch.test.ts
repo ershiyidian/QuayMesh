@@ -57,3 +57,20 @@ test("BT09/10/TC05：多查询行去重、目录枚举续读和具体对象schem
   const invalid=await f.raw("workspace_context",{...f.scope,action:"capture",query:"invalid",files:[{path:"src/a.ts"}]});
   assert.equal(invalid.isError,true);
 });
+
+test("大目录按页枚举，共用结果的并发续页不重复或遗漏文件",{timeout:60000},async t=>{
+  const paths=Array.from({length:310},(_,index)=>`source/file-${String(index).padStart(4,"0")}.txt`);
+  const f=await fixture(t,{git:false,files:Object.fromEntries(paths.map(path=>[path,"needle\n"]))});
+  const first=await f.call("workspace_context",{...f.scope,action:"search",directory:"source",patterns:["*.txt"],query:"needle",max_files:25});
+  assert.equal(first.scope.enumeration_complete,false);assert.equal(first.scope.total_files,null);
+  assert.ok(first.scope.enumerated_files<paths.length,"首页无需枚举完整目录");
+  const pages=await Promise.all(Array.from({length:12},(_,index)=>f.call("workspace_context",{
+    ...f.scope,action:"search",result_ref:first.result_ref,file_offset:(index+1)*25})));
+  const all=[first,...pages].flatMap(page=>page.entries.map((entry:any)=>entry.path));
+  assert.equal(new Set(all).size,paths.length);assert.deepEqual([...all].sort(),paths);
+  assert.equal(pages.at(-1)!.scope.enumeration_complete,true);
+  assert.equal(pages.at(-1)!.scope.next_file_offset,null);
+  const listing=await f.call("workspace_context",{...f.scope,action:"list",directory:"source"});
+  assert.equal(listing.total,null);assert.equal(listing.enumeration_complete,false);
+  assert.equal(listing.entries.length,100);
+});

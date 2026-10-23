@@ -223,6 +223,8 @@ export interface SnapshotCapabilities {
 
 export interface Snapshot {
   executionObservation?: import("../execution-observation.js").ExecutionObservation;
+  live?: SnapshotLiveState;
+  finalization?: {state: "pending" | "failed"; requestedAt: number; error: string | null} | null;
   sourceTaskId?: string | null;
   taskState?: "active" | "closed";
   taskResult?: TaskRecord["result_status"];
@@ -268,6 +270,12 @@ export interface Snapshot {
   cursors: SnapshotCursors | null;
   capabilities: SnapshotCapabilities;
   notices: string[];
+}
+
+export interface SnapshotLiveState {
+  observedAt: number;
+  hostStatus: HostState;
+  executionStatus: ExecutionState;
 }
 
 export interface RecoveryRowCommands {

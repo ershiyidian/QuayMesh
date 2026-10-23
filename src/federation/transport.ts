@@ -15,9 +15,15 @@ export class NodeUnavailableError extends Error {
   constructor(readonly nodeId: string, message = `节点 ${nodeId} 当前离线。该节点的工作区和运行仍归原节点所有。`) { super(message); }
 }
 export class PeerApplicationError extends Error {
-  constructor(readonly nodeId: string, message: string, readonly code?: string) {
+  readonly effect?: string;
+  readonly retryHint?: string;
+  readonly details?: Record<string, unknown>;
+  constructor(readonly nodeId: string, message: string, readonly code?: string, envelope?: PeerErrorEnvelope) {
     super(message);
     this.name = "PeerApplicationError";
+    this.effect = envelope?.effect;
+    this.retryHint = envelope?.retryHint;
+    this.details = envelope?.details;
   }
 }
 export class RpcInterruptedError extends Error {
@@ -34,12 +40,63 @@ export class RpcRequestTimeoutError extends RpcInterruptedError {
     this.message = `REQUEST_TIMEOUT: ${this.message}`;
   }
 }
-interface Frame { id?: string; method?: string; params?: unknown; result?: unknown; error?: { message: string; code?: string }; }
-interface Pending { resolve: (value: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }
+interface PeerErrorEnvelope { message: string; code?: string; effect?: string; retryHint?: string; details?: Record<string, unknown> }
+interface Frame { id?: string; method?: string; params?: unknown; result?: unknown; error?: PeerErrorEnvelope; }
+export interface PeerProgressNotification {
+  method: "notifications/progress";
+  params: { progressToken: string | number; progress: number; total?: number; message?: string };
+}
+interface Pending { resolve: (value: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout; startedAt: number;
+  onProgress?: (notification: PeerProgressNotification) => void | Promise<void> }
 type H2Stream = ServerHttp2Stream | ClientHttp2Stream;
-export type RpcHandler = (method: string, params: any, peerId: string) => unknown | Promise<unknown>;
+export type RpcHandler = (method: string, params: any, peerId: string,
+  context?: { signal: AbortSignal; requestId?: string; notify(notification: unknown): void }) => unknown | Promise<unknown>;
 export type StreamHandler = (service: string, metadata: any, stream: Duplex, peerId: string) => void | Promise<void>;
 const MAX_FRAME = 8 * 1024 * 1024;
+const MAX_STREAM_FRAME = 16 * 1024 * 1024;
+const CONTROL_FRAME_BYTES = 64 * 1024;
+const MAX_QUEUED_CONTROL_BYTES = 2 * 1024 * 1024;
+const MAX_PENDING_CALLS = 256;
+const MAX_LARGE_FRAMES = 8;
+const FRAME_SERVICE = "$frame.v1";
+const FEATURES = "frame-stream-v1";
+
+function progressNotification(value: unknown): PeerProgressNotification | undefined {
+  if (!value || typeof value !== "object") return;
+  const notification = value as Record<string, unknown>;
+  if (notification.method !== "notifications/progress" || !notification.params || typeof notification.params !== "object") return;
+  const params = notification.params as Record<string, unknown>;
+  const token = params.progressToken;
+  if (!(typeof token === "string" && token.length <= 1024 || typeof token === "number" && Number.isFinite(token))) return;
+  if (typeof params.progress !== "number" || !Number.isFinite(params.progress) || params.progress < 0) return;
+  return { method: "notifications/progress", params: { progressToken: token, progress: params.progress,
+    ...(typeof params.total === "number" && Number.isFinite(params.total) && params.total >= params.progress ? { total: params.total } : {}),
+    ...(typeof params.message === "string" ? { message: params.message.slice(0, 512) } : {}) } };
+}
+
+function peerError(error: unknown): PeerErrorEnvelope {
+  const value = error && typeof error === "object" ? error as Record<string, unknown> : {};
+  const envelope: PeerErrorEnvelope = {
+    message: (error instanceof Error ? error.message : String(error)).slice(0, 8192),
+    code: typeof value.code === "string" ? value.code.slice(0, 128) : "NODE_OPERATION_FAILED",
+  };
+  if (["not_started", "started", "completed", "partial", "unknown"].includes(String(value.effect))) envelope.effect = String(value.effect);
+  if (["retry_later", "query_original", "do_not_retry", "fix_input", "retry_same_key"].includes(String(value.retryHint))) envelope.retryHint = String(value.retryHint);
+  if (value.details && typeof value.details === "object") {
+    // 只传递恢复和资源身份；绝不把任意异常对象、凭据或循环引用放入跨节点帧。
+    const allowed = ["operation_id", "owner_node_id", "receipt_node_id", "task_id", "session_id", "member_id", "stage", "dispatch_state", "next_action", "leaseId", "conflicts", "resources", "scope", "claim_id"];
+    try {
+      const details = Object.fromEntries(Object.entries(value.details).filter(([key]) => allowed.includes(key)));
+      const encoded = JSON.stringify(details);
+      if (Buffer.byteLength(encoded) <= 16 * 1024) envelope.details = JSON.parse(encoded);
+    } catch {}
+  }
+  return envelope;
+}
+
+function unsentError(code: string, message: string): Error {
+  return Object.assign(new Error(message), { code, effect: "not_started", retryHint: "retry_later", details: { dispatch_state: "not_sent" } });
+}
 
 /** One bidirectional control stream and independent flow-controlled data streams per peer.
  * A desktop behind NAT can receive calls AND byte streams on its outbound connection. */
@@ -56,6 +113,9 @@ export class PeerLink extends EventEmitter {
   private closed = false;
   private pingOutstanding = false;
   private consecutivePingErrors = 0;
+  private queuedControlBytes = 0;
+  private outgoingLargeFrames = 0;
+  private readonly incoming = new Map<string, AbortController>();
   private readonly heartbeat: NodeJS.Timeout;
   constructor(
     readonly peerId: string,
@@ -63,6 +123,7 @@ export class PeerLink extends EventEmitter {
     readonly control: H2Stream,
     readonly client: ClientHttp2Session | undefined,
     private readonly owner: PeerTransport,
+    readonly frameStreams = false,
   ) {
     super();
     control.setEncoding("utf8");
@@ -112,6 +173,15 @@ export class PeerLink extends EventEmitter {
     this.heartbeat.unref();
   }
   get connected(): boolean { return !this.closed; }
+  diagnostics(): Record<string, unknown> {
+    const now = performance.now();
+    return { linkId: this.id, connectedAt: this.connectedAt, lastSeen: this.lastSeen,
+      direction: this.client ? "outgoing" : "incoming", pendingRpc: this.pending.size,
+      incomingRpc: this.incoming.size, queuedControlBytes: this.queuedControlBytes,
+      outgoingLargeFrames: this.outgoingLargeFrames, frameStreams: this.frameStreams,
+      oldestRpcMs: this.pending.size ? Math.round(Math.max(...[...this.pending.values()].map(value => now - value.startedAt))) : 0,
+      pingOutstandingMs: this.pingOutstanding ? Math.round(now - this.pingSentAt) : 0 };
+  }
   private receive(part: string): void {
     this.lastSeen = Date.now();
     this.lastSeenAt = performance.now();
@@ -129,53 +199,111 @@ export class PeerLink extends EventEmitter {
         this.close("frame_too_large");
         return;
       }
-      let frame: Frame;
-      try { frame = JSON.parse(line); } catch { this.close("invalid_json_frame"); return; }
-      if (!frame || typeof frame !== "object") { this.close("malformed_frame"); return; }
-      if (typeof frame.method === "string") {
-        void this.dispatch(frame);
-      } else if (typeof frame.id === "string") {
-        const pending = this.pending.get(frame.id);
-        if (!pending) continue;
-        clearTimeout(pending.timer); this.pending.delete(frame.id);
-        if (frame.error) pending.reject(new PeerApplicationError(this.peerId, frame.error.message, frame.error.code));
-        else pending.resolve(frame.result);
+      this.receiveFrame(line);
+    }
+  }
+  receiveFrame(text: string): void {
+    let frame: Frame;
+    try { frame = JSON.parse(text); } catch { this.close("invalid_json_frame"); return; }
+    if (!frame || typeof frame !== "object") { this.close("malformed_frame"); return; }
+    if (frame.method === "$cancel") {
+      const id = (frame.params as { id?: unknown } | undefined)?.id;
+      if (typeof id === "string") this.incoming.get(id)?.abort(new RpcRequestTimeoutError(this.peerId, id, "调用方已结束等待"));
+      return;
+    }
+    if (frame.method === "$progress") {
+      const params = frame.params as { id?: unknown; notification?: unknown } | undefined;
+      const progress = progressNotification(params?.notification);
+      const pending = typeof params?.id === "string" ? this.pending.get(params.id) : undefined;
+      if (progress && pending?.onProgress) {
+        try { void Promise.resolve(pending.onProgress(progress)).catch(() => {}); } catch {}
       }
+      return;
+    }
+    if (typeof frame.method === "string") void this.dispatch(frame);
+    else if (typeof frame.id === "string") {
+      const pending = this.pending.get(frame.id);
+      if (!pending) return;
+      clearTimeout(pending.timer); this.pending.delete(frame.id);
+      if (frame.error) pending.reject(new PeerApplicationError(this.peerId, frame.error.message, frame.error.code, peerError(frame.error)));
+      else pending.resolve(frame.result);
     }
   }
   private async dispatch(frame: Frame): Promise<void> {
+    const controller = new AbortController();
     try {
+      if (frame.id && frame.method !== "$openStream") {
+        if (this.incoming.size >= MAX_PENDING_CALLS) throw unsentError("PEER_BUSY", "节点请求队列已满，请稍后重试。");
+        this.incoming.set(frame.id, controller);
+      }
       const result = frame.method === "$openStream"
         ? await this.owner.openReverse(this, frame.params as { id: string; service: string; metadata: unknown })
-        : await this.owner.handler(frame.method!, frame.params, this.peerId);
-      if (frame.id && this.connected) await this.send({ id: frame.id, result: result ?? null });
+        : await this.owner.handler(frame.method!, frame.params, this.peerId, { signal: controller.signal, requestId: frame.id,
+          notify: value => {
+            const notification = progressNotification(value);
+            if (frame.id && this.frameStreams && notification && !controller.signal.aborted)
+              this.notify("$progress", { id: frame.id, notification });
+          } });
+      if (frame.id && this.connected && !controller.signal.aborted) {
+        try { await this.send({ id: frame.id, result: result ?? null }); }
+        catch (error) {
+          // 工作已经返回，正文交付失败须保留效果待核对，不能回报“未执行”。
+          throw Object.assign(error instanceof Error ? error : new Error(String(error)), { effect: "unknown", retryHint: "query_original" });
+        }
+      }
     } catch (error) {
-      if (frame.id && this.connected) await this.send({ id: frame.id, error: {
-        message: error instanceof Error ? error.message : String(error),
-        code: error && typeof error === "object" && "code" in error ? String(error.code) : "NODE_OPERATION_FAILED",
-      } }).catch(() => {});
-    }
+      if (frame.id && this.connected && !controller.signal.aborted) await this.send({ id: frame.id, error: peerError(error) }).catch(() => {});
+    } finally { if (frame.id) this.incoming.delete(frame.id); }
   }
   async send(frame: Frame): Promise<void> {
-    if (this.closed) throw new NodeUnavailableError(this.peerId);
+    if (this.closed) throw Object.assign(new NodeUnavailableError(this.peerId), { effect: "not_started", retryHint: "retry_later" });
     const text = JSON.stringify(frame) + "\n";
-    if (Buffer.byteLength(text) > MAX_FRAME) throw new Error("节点消息超过 8 MiB，请使用文件传输接口。");
-    await new Promise<void>((resolve, reject) => this.control.write(text, (error) => error ? reject(error) : resolve()));
+    const bytes = Buffer.byteLength(text);
+    if (this.frameStreams && bytes > CONTROL_FRAME_BYTES) {
+      if (bytes > MAX_STREAM_FRAME) throw unsentError("PEER_PAYLOAD_TOO_LARGE", "节点消息超过 16 MiB，请使用文件传输接口。");
+      if (this.outgoingLargeFrames >= MAX_LARGE_FRAMES) throw unsentError("PEER_BUSY", "节点大正文传输已满，请稍后重试。");
+      this.outgoingLargeFrames++;
+      try { await this.owner.sendFrameStream(this, text); }
+      finally { this.outgoingLargeFrames--; }
+      return;
+    }
+    if (bytes > MAX_FRAME) throw unsentError("PEER_PAYLOAD_TOO_LARGE", "目标节点仍使用 8 MiB 消息协议，请更新节点或使用文件传输接口。");
+    if (this.queuedControlBytes + bytes > Math.max(MAX_QUEUED_CONTROL_BYTES, bytes)) throw unsentError("PEER_BUSY", "节点控制消息队列已满，请稍后重试。");
+    this.queuedControlBytes += bytes;
+    try { await new Promise<void>((resolve, reject) => this.control.write(text, (error) => error ? reject(error) : resolve())); }
+    finally { this.queuedControlBytes -= bytes; }
   }
-  call<T = unknown>(method: string, params: unknown, timeoutMs = this.owner.config.rpcTimeoutMs): Promise<T> {
-    if (this.closed) return Promise.reject(new NodeUnavailableError(this.peerId));
+  call<T = unknown>(method: string, params: unknown, timeoutMs = this.owner.config.rpcTimeoutMs,
+    onProgress?: (notification: PeerProgressNotification) => void | Promise<void>, signal?: AbortSignal): Promise<T> {
+    if (this.closed) return Promise.reject(Object.assign(new NodeUnavailableError(this.peerId), { effect: "not_started", retryHint: "retry_later" }));
+    if (signal?.aborted) return Promise.reject(unsentError("REQUEST_CANCELLED", "调用在发送前已取消。"));
+    if (this.pending.size >= MAX_PENDING_CALLS) return Promise.reject(unsentError("PEER_BUSY", "节点调用数量已达上限，请稍后重试。"));
     const id = randomUUID();
     return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error, value?: T) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer); signal?.removeEventListener("abort", aborted); this.pending.delete(id);
+        error ? reject(error) : resolve(value as T);
+      };
+      const aborted = () => {
+        if (this.frameStreams) this.notify("$cancel", { id });
+        finish(Object.assign(new Error("调用方已取消等待；已受理的修改继续保留原操作身份。"), {
+          code: "REQUEST_CANCELLED", effect: "unknown", retryHint: "query_original",
+        }));
+      };
       const timer = setTimeout(() => {
-        this.pending.delete(id);
+        this.owner.emit("rpcTimeout", this.peerId, { method, requestId: id, timeoutMs, ...this.diagnostics() });
+        if (this.frameStreams) this.notify("$cancel", { id });
         // 单个慢请求只结束自己的等待者；共享连接继续承载心跳和其他请求。
-        reject(new RpcRequestTimeoutError(this.peerId, id));
+        finish(new RpcRequestTimeoutError(this.peerId, id));
       }, timeoutMs);
       timer.unref();
-      this.pending.set(id, { resolve, reject, timer });
-      void this.send({ id, method, params }).catch((error) => {
-        clearTimeout(timer); this.pending.delete(id); reject(error);
-      });
+      this.pending.set(id, { resolve: value => finish(undefined, value), reject: error => finish(error),
+        timer, startedAt: performance.now(), onProgress });
+      signal?.addEventListener("abort", aborted, { once: true });
+      void this.send({ id, method, params }).catch((error) => finish(error));
     });
   }
   notify(method: string, params: unknown): void { void this.send({ method, params }).catch(() => {}); }
@@ -184,13 +312,16 @@ export class PeerLink extends EventEmitter {
     if (this.closed) return;
     this.closed = true;
     this.closeReason = reason;
+    const diagnostics = this.diagnostics();
     clearInterval(this.heartbeat);
     for (const [id, p] of this.pending) {
       clearTimeout(p.timer); p.reject(new RpcInterruptedError(this.peerId, id, `连接中断 (${reason})`));
     }
     this.pending.clear();
+    for (const controller of this.incoming.values()) controller.abort(new Error(`连接中断 (${reason})`));
+    this.incoming.clear();
     this.control.destroy(); this.session.destroy();
-    this.emit("closed", { peerId: this.peerId, linkId: this.id, reason });
+    this.emit("closed", { peerId: this.peerId, reason, ...diagnostics });
   }
 }
 
@@ -201,6 +332,7 @@ export class PeerTransport extends EventEmitter {
   private readonly dialing = new Map<string, ClientHttp2Session>();
   private readonly opening = new Set<string>();
   private readonly streams = new Map<string, { link: PeerLink; resolve: (stream: Duplex) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
+  private readonly incomingFrameCounts = new Map<string, number>();
   private server?: Http2Server | Http2SecureServer;
   private stopped = true;
   private peerUrls = new Map<string, string>();
@@ -246,8 +378,8 @@ export class PeerTransport extends EventEmitter {
         stream.respond({ ":status": 409 }); stream.end(); return;
       }
       existing?.close("replaced_by_incoming_control");
-      stream.respond({ ":status": 200, "x-quaymesh-node": this.config.nodeId });
-      this.install(new PeerLink(peerId, stream.session!, stream, undefined, this));
+      stream.respond({ ":status": 200, "x-quaymesh-node": this.config.nodeId, "x-quaymesh-features": FEATURES });
+      this.install(new PeerLink(peerId, stream.session!, stream, undefined, this, String(headers["x-quaymesh-features"] ?? "").split(",").includes(FEATURES)));
       return;
     }
     if (headers[":path"] !== "/stream") { stream.respond({ ":status": 404 }); stream.end(); return; }
@@ -264,7 +396,7 @@ export class PeerTransport extends EventEmitter {
     const metadata = this.decodeMetadata(headers["x-quaymesh-metadata"]);
     if (typeof service !== "string") { stream.respond({ ":status": 400 }); stream.end(); return; }
     stream.respond({ ":status": 200 });
-    await this.onStream(service, metadata, stream, peerId);
+    await this.receiveStream(link, service, metadata, stream);
   }
   private decodeMetadata(header: unknown): unknown {
     return typeof header === "string" ? JSON.parse(Buffer.from(header, "base64url").toString()) : {};
@@ -280,7 +412,7 @@ export class PeerTransport extends EventEmitter {
         clearTimeout(pending.timer); pending.reject(new NodeUnavailableError(link.peerId)); this.streams.delete(id);
       }
       const reason = typeof info === "object" ? info?.reason : (typeof info === "string" ? info : link.closeReason);
-      this.emit("offline", link.peerId, { linkId: link.id, reason });
+      this.emit("offline", link.peerId, { ...link.diagnostics(), ...(typeof info === "object" ? info : {}), linkId: link.id, reason });
       const peer = this.config.peers.find((p) => p.id === link.peerId); if (peer) this.schedule(peer);
     });
     this.emit("online", link);
@@ -324,7 +456,7 @@ export class PeerTransport extends EventEmitter {
       if (!installed) this.schedule(peer, attempt);
     });
     session.once("connect", () => {
-      const stream = session.request({ ":method": "POST", ":path": "/control", authorization: `Bearer ${this.token}`, "x-quaymesh-node": this.config.nodeId }, { endStream: false });
+      const stream = session.request({ ":method": "POST", ":path": "/control", authorization: `Bearer ${this.token}`, "x-quaymesh-node": this.config.nodeId, "x-quaymesh-features": FEATURES }, { endStream: false });
       stream.on("error", () => session.destroy());
       stream.once("response", (headers) => {
         clearTimeout(timer);
@@ -333,7 +465,7 @@ export class PeerTransport extends EventEmitter {
         const existing = this.links.get(peer.id);
         if (existing?.connected && this.config.nodeId > peer.id) { session.destroy(); return; }
         existing?.close("replaced_by_outgoing_control"); installed = true;
-        this.install(new PeerLink(peer.id, session, stream, session, this));
+        this.install(new PeerLink(peer.id, session, stream, session, this, String(headers["x-quaymesh-features"] ?? "").split(",").includes(FEATURES)));
       });
     });
   }
@@ -364,20 +496,69 @@ export class PeerTransport extends EventEmitter {
         "x-quaymesh-node": this.config.nodeId,
         ...(reverse ? { "x-quaymesh-reverse": reverse } : { "x-quaymesh-service": service, "x-quaymesh-metadata": Buffer.from(JSON.stringify(metadata)).toString("base64url") }),
       }, { endStream: false });
-      const timer = setTimeout(() => { stream.close(constants.NGHTTP2_CANCEL); reject(new Error("传输流握手超时")); }, 10_000); timer.unref();
-      stream.on("error", reject);
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true; clearTimeout(timer);
+        if (error) { reject(error); stream.close(constants.NGHTTP2_CANCEL); }
+        else resolve(stream);
+      };
+      const timer = setTimeout(() => finish(new Error("传输流握手超时")), 10_000); timer.unref();
+      stream.on("error", error => finish(error));
+      stream.once("aborted", () => finish(new Error("传输流在响应头前被取消")));
       stream.once("response", (headers) => {
-        clearTimeout(timer);
-        if (headers[":status"] !== 200) { stream.close(); reject(new Error(`传输流被拒绝 (${headers[":status"]})`)); return; }
-        resolve(stream);
+        finish(headers[":status"] !== 200 ? new Error(`传输流被拒绝 (${headers[":status"]})`) : undefined);
       });
-      stream.once("close", () => clearTimeout(timer));
+      stream.once("close", () => finish(new Error(`传输流在响应头前关闭 (rstCode=${stream.rstCode})`)));
     });
   }
   async openReverse(link: PeerLink, params: { id: string; service: string; metadata: unknown }): Promise<void> {
     if (!link.client) throw new Error("反向传输需要主动连接");
     const stream = await this.requestStream(link, params.service, params.metadata, params.id);
-    void Promise.resolve(this.onStream(params.service, params.metadata, stream, link.peerId)).catch((error) => stream.destroy(error));
+    void this.receiveStream(link, params.service, params.metadata, stream).catch((error) => stream.destroy(error));
+  }
+  private async receiveStream(link: PeerLink, service: string, metadata: unknown, stream: Duplex): Promise<void> {
+    if (service !== FRAME_SERVICE) { await this.onStream(service, metadata, stream, link.peerId); return; }
+    if (!link.frameStreams) throw new Error("节点未协商正文流协议");
+    const active = this.incomingFrameCounts.get(link.id) ?? 0;
+    if (active >= MAX_LARGE_FRAMES) throw new Error("节点正文流接收数量已达上限");
+    this.incomingFrameCounts.set(link.id, active + 1);
+    const timer = setTimeout(() => stream.destroy(new Error("节点正文流接收超时")), Math.max(10_000, this.config.rpcTimeoutMs));
+    timer.unref();
+    try {
+      const chunks: Buffer[] = []; let bytes = 0;
+      for await (const chunk of stream) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        bytes += buffer.length;
+        if (bytes > MAX_STREAM_FRAME) throw new Error("节点正文流超过 16 MiB");
+        chunks.push(buffer);
+      }
+      link.receiveFrame(Buffer.concat(chunks, bytes).toString("utf8"));
+      stream.end();
+    } finally {
+      clearTimeout(timer);
+      const count = (this.incomingFrameCounts.get(link.id) ?? 1) - 1;
+      if (count) this.incomingFrameCounts.set(link.id, count); else this.incomingFrameCounts.delete(link.id);
+    }
+  }
+  async sendFrameStream(link: PeerLink, text: string): Promise<void> {
+    const stream = await this.openStream(link, FRAME_SERVICE, {});
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true; clearTimeout(timer);
+        stream.off("error", failed); stream.off("close", closed);
+        if (error) { stream.destroy(); reject(error); } else resolve();
+      };
+      const failed = (error: Error) => finish(error);
+      const closed = () => finish(new Error("节点正文流在发送完成前关闭"));
+      const timer = setTimeout(() => finish(new Error("节点正文流发送超时")), Math.max(10_000, this.config.rpcTimeoutMs));
+      timer.unref();
+      stream.once("error", failed); stream.once("close", closed);
+      // 数据流按 HTTP/2 帧调度，小控制消息无需排在整段 JSON 正文之后。
+      stream.end(text, () => finish());
+    });
   }
   waitForLink(peerId: string, timeoutMs: number): Promise<PeerLink | undefined> {
     const current = this.links.get(peerId);

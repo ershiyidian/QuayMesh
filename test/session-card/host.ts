@@ -9,6 +9,9 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { createServer as createViteServer, type ViteDevServer } from "vite";
 import { createRealTestServer, type RealTestServer } from "./server-fixture.js";
 import { WORKSPACE_APP_URI } from "../../src/tool-surfaces/types.js";
+import { SessionChangeCollector } from "../../src/session/changes.js";
+import { SessionStore } from "../../src/session/store.js";
+import { openDatabase } from "../../src/db/client.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(here, "../..");
@@ -43,6 +46,7 @@ interface HostState {
   browserState: BrowserState;
   disposed: boolean;
   servedTaskPages: number;
+  releaseFinalization?: () => void;
 }
 
 const state = await startLocalHost();
@@ -135,6 +139,7 @@ async function startLocalHost(): Promise<HostState> {
     const dispose = async () => {
       if (hostState.disposed) return;
       hostState.disposed = true;
+      hostState.releaseFinalization?.();
       hostState.http.closeAllConnections?.();
       await new Promise<void>((resolveClose) => hostState.http.close(() => resolveClose()));
       await hostState.vite.close();
@@ -223,6 +228,33 @@ async function handleRequest(hostState: HostState, request: IncomingMessage, res
         lastError: stringField(body.lastError) ?? null,
       };
       writeJson(response, 200, { ok: true });
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/finalization-control") {
+      const body=await readJsonBody(request),taskId=stringField(body.task_id);
+      if(!taskId)throw new Error('HOST_TASK_REQUIRED');
+      const database=openDatabase(hostState.fixture.config.stateDir);
+      try {
+        const store=new SessionStore(database.sqlite),task=store.getTask(taskId);
+        if(task.session_id!==hostState.sessionId)throw new Error('HOST_TASK_SCOPE_MISMATCH');
+        if(body.action==='hold'){
+          if(hostState.releaseFinalization)throw new Error('HOST_FINALIZATION_ALREADY_HELD');
+          // Delay the real collector at its I/O boundary; no result or task state is fabricated.
+          const capture=SessionChangeCollector.prototype.capture;
+          let release!:()=>void;
+          const held=new Promise<void>(resolve=>{release=resolve;});
+          SessionChangeCollector.prototype.capture=function(memberId,candidate,paths){
+            return candidate===taskId?held.then(()=>capture.call(this,memberId,candidate,paths)):capture.call(this,memberId,candidate,paths);
+          };
+          hostState.releaseFinalization=()=>{
+            SessionChangeCollector.prototype.capture=capture;
+            hostState.releaseFinalization=undefined;
+            release();
+          };
+        }else if(body.action==='release')hostState.releaseFinalization?.();
+        else if(body.action!=='status')throw new Error('HOST_FINALIZATION_ACTION_REQUIRED');
+        writeJson(response,200,{task:store.getTask(taskId),intent:store.taskData.finalization(taskId)});
+      }finally{database.close();}
       return;
     }
     if (request.method === "POST" && url.pathname === "/api/snapshot") {

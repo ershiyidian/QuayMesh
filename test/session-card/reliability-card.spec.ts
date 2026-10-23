@@ -33,7 +33,8 @@ test("设计师卡片默认折叠、活动摘要、任务计时、窄屏和终�
 
   await toggle.click();await expect(card.locator("#details")).toBeVisible();
   await card.locator("#t-commands").click();
-  const row=card.locator('[data-x^="c:"]',{hasText:"reliability-running"}).first();await expect(row).toBeVisible();await row.click();
+  const row=card.locator('[data-x^="c:"]',{hasText:"reliability-running"}).first();await expect(row).toBeVisible();
+  if(await row.getAttribute('aria-expanded')!=='true')await row.click();
   const commandGroup=row.locator("xpath=..");
   await expect(commandGroup.locator(".code")).toContainText("reliability-running",{timeout:20000});
   const calls=await(await page.request.get("/api/state")).json();expect(calls.callLog.some((line:string)=>line.includes("qm_command_outputs"))).toBe(true);

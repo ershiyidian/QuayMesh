@@ -35,6 +35,22 @@ public sealed class NodeComponentStatusTests
             }));
             Assert.AreEqual(ServiceState.Healthy,status.Mesh().State);
             Assert.AreEqual(12345,status.Mesh().Pid);
+
+            File.WriteAllText(Path.Combine(directory,"node-status.json"),JsonSerializer.Serialize(new
+            {
+                components=new[] {new { id="mesh",state="degraded",pid=(int?)12345,observedAt=(long?)null } }
+            }));
+            Assert.AreEqual(ServiceState.Unhealthy,status.Mesh().State);
+            Assert.AreEqual(12345,status.Mesh().Pid);
+            File.SetLastWriteTimeUtc(Path.Combine(directory,"node-status.json"),DateTime.UtcNow.AddMinutes(-1));
+            Assert.AreEqual(ServiceState.UnknownIdentity,status.Mesh().State);
+            Assert.AreEqual(12345,status.Mesh().Pid);
+
+            File.WriteAllText(Path.Combine(directory,"node-status.json"),JsonSerializer.Serialize(new
+            {
+                components=new[] {new { id="mesh",state="ready",pid=(int?)12345,observedAt=DateTimeOffset.UtcNow.AddMinutes(-1).ToUnixTimeMilliseconds() } }
+            }));
+            Assert.AreEqual(ServiceState.UnknownIdentity,status.Mesh().State);
         }
         finally
         {

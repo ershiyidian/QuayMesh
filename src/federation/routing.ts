@@ -83,7 +83,8 @@ export function routedResult(value: unknown, node: string, options: { textRefere
 }
 export function chooseGateway(nodes: NodeView[], now = Date.now(), recoveryDelayMs = 0, current?: string): NodeView | undefined {
   const candidates = nodes.filter((node) => node.online && node.priority > 0
-    && node.capabilities.egress && node.egress.enabled && node.egress.healthy)
+    && node.capabilities.egress && node.egress.enabled && node.egress.healthy && !node.egress.draining
+    && gatewayCoreStable(node, now, recoveryDelayMs))
     .sort((a, b) => b.priority - a.priority || a.id.localeCompare(b.id));
   const previous = candidates.find((node) => node.id === current);
   if (!previous) return candidates[0];
@@ -91,4 +92,21 @@ export function chooseGateway(nodes: NodeView[], now = Date.now(), recoveryDelay
   const availableSince = Math.max(first?.egress.healthySince ?? 0, first?.onlineSince ?? 0);
   if (first && first.id !== previous.id && availableSince && now - availableSince < recoveryDelayMs) return previous;
   return first;
+}
+
+function gatewayCoreStable(node: NodeView, now: number, recoveryDelayMs: number): boolean {
+  const core = node.components?.find(component => component.id === "core");
+  if (!core) return true;
+  if (core.crashLoop || core.state === "backoff") return false;
+  // Older managers report cumulative restarts without the new crashLoop and
+  // stableSince fields. A briefly ready process must not immediately regain
+  // gateway priority after thousands of native crashes. Historical restarts
+  // stop affecting eligibility after one continuously stable five-minute run.
+  if (core.crashLoop === undefined && (core.restarts ?? 0) >= 3) {
+    if (core.state !== "ready") return false;
+    const availableSince = Math.max(core.startedAt ?? 0, node.onlineSince ?? 0, node.egress.healthySince ?? 0);
+    if (!availableSince || now - availableSince < Math.max(300_000, recoveryDelayMs)) return false;
+    if (core.observedAt && now - core.observedAt > 45_000) return false;
+  }
+  return true;
 }

@@ -108,7 +108,7 @@ test("workspace_catalog answers from memory without dialing an offline peer", as
   await rm(root, { recursive: true, force: true });
 });
 
-test("dead execution claims are released only after evidence, and live claims stay", async () => {
+test("dead execution claims require terminal receipts; unproven children remain isolated", async () => {
   const root = await mkdtemp(join(tmpdir(), "quaymesh-claims-"));
   const ledger = new WorkLedger(root);
   try {
@@ -135,9 +135,11 @@ test("dead execution claims are released only after evidence, and live claims st
     ledger.db.prepare("update console_executions set run_id=? where id=?").run(hotRun.id, "exec-hot");
 
     const result = ledger.reconcileDeadExecutionClaims();
-    assert.equal(result.released, 3);
+    assert.equal(result.released, 1);
     assert.equal(ledger.db.prepare("select id from execution_claims where id='claim-live'").get() !== undefined, true);
     assert.equal(ledger.db.prepare("select id from execution_claims where id='claim-dead'").get(), undefined);
+    assert.ok(ledger.db.prepare("select id from execution_claims where id='claim-command'").get());
+    assert.ok(ledger.db.prepare("select id from execution_claims where id='claim-hot'").get());
     const evidence = ledger.db.prepare("select claim_id, reason from execution_claim_reconciliations order by claim_id").all() as { claim_id: string; reason: string }[];
     assert.deepEqual(evidence.map((row) => row.claim_id), ["claim-command", "claim-dead", "claim-hot"]);
     assert.equal(evidence.find((row) => row.claim_id === "claim-dead")?.reason, "dead_owner_terminal_agent");
@@ -145,6 +147,10 @@ test("dead execution claims are released only after evidence, and live claims st
     assert.equal(ledger.run(hotRun.id).status, "reconciliation_required");
     assert.equal(ledger.execution("exec-dead").status, "completed");
     assert.equal(ledger.execution("exec-hot").status, "reconciliation_required");
+    assert.equal(ledger.execution("exec-hot").finished_at,null);
+    const count=ledger.db.prepare("SELECT count(*) FROM execution_claim_reconciliations").pluck().get();
+    ledger.reconcileDeadExecutionClaims();
+    assert.equal(ledger.db.prepare("SELECT count(*) FROM execution_claim_reconciliations").pluck().get(),count);
   } finally {
     ledger.close();
     await rm(root, { recursive: true, force: true });

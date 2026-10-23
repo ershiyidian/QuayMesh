@@ -17,7 +17,8 @@ test("网络交接前准确拒绝进行中的命令、代理和执行资源", ()
   try {
     db.exec([
       "CREATE TABLE execution_claims (id TEXT);",
-      "CREATE TABLE qm_runtime_work (id TEXT, blocking INTEGER);",
+      "CREATE TABLE execution_waiters (id TEXT, expires_at_ms INTEGER);",
+      "CREATE TABLE qm_runtime_work (id TEXT, kind TEXT, blocking INTEGER);",
       "CREATE TABLE console_operations (id TEXT, status TEXT);",
       "CREATE TABLE console_executions (id TEXT, status TEXT);",
     ].join("\n"));
@@ -35,6 +36,23 @@ test("网络交接前准确拒绝进行中的命令、代理和执行资源", ()
     }
     db.prepare("INSERT INTO console_operations(status) VALUES ('completed')").run();
     db.prepare("INSERT INTO qm_runtime_work(blocking) VALUES (0)").run();
+    assert.equal(checkCutoverIdle(root).idle, true);
+    for (const table of ["console_operations", "console_executions"]) {
+      for (const status of ["starting", "queued", "unknown", "reconciliation_required"]) {
+        db.prepare(`INSERT INTO ${table}(status) VALUES (?)`).run(status);
+        assert.equal(checkCutoverIdle(root).idle, false, `${table}: ${status}`);
+        db.prepare(`DELETE FROM ${table} WHERE status=?`).run(status);
+      }
+    }
+    // Older releases persisted egress leases as non-blocking. A safe external
+    // cutover must still account for their live provider tunnels.
+    db.prepare("INSERT INTO qm_runtime_work(kind,blocking) VALUES ('egress',0)").run();
+    assert.equal(checkCutoverIdle(root).idle, false);
+    db.exec("DELETE FROM qm_runtime_work WHERE kind='egress'");
+    db.prepare("INSERT INTO execution_waiters(expires_at_ms) VALUES (?)").run(Date.now() + 60_000);
+    assert.equal(checkCutoverIdle(root).idle, false);
+    db.exec("DELETE FROM execution_waiters");
+    db.prepare("INSERT INTO execution_waiters(expires_at_ms) VALUES (?)").run(Date.now() - 60_000);
     assert.equal(checkCutoverIdle(root).idle, true);
   } finally {
     db.close();

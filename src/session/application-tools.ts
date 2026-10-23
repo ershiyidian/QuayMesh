@@ -1,4 +1,4 @@
-import { executionObservationSchema } from "./schema.js";
+import { executionObservationSchema, snapshotLiveStateSchema } from "./schema.js";
 import { projectionForCard } from './card-contract.js';
 import * as z from "zod/v4";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
@@ -584,12 +584,13 @@ function findTaskFile(
 
 function sessionOutputSchema() {
   return z.union([
-    z.object({ unchanged: z.literal(true), rev: z.number().int(), observation:executionObservationSchema.optional() }),
+    z.object({ unchanged: z.literal(true), rev: z.number().int(), observation:executionObservationSchema.optional(), live:snapshotLiveStateSchema.optional() }),
     z.object({
       unchanged: z.literal(false),
       rev: z.number().int(),
       snapshot: z.unknown(),
       observation:executionObservationSchema.optional(),
+      live:snapshotLiveStateSchema.optional(),
     }),
   ]);
 }

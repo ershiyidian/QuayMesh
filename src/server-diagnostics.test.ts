@@ -28,7 +28,7 @@ test("diagnostics capture completed and aborted requests without headers, bodies
     res.end("ok");
   });
   diagnostics.attach(server);
-  context.after(() => { diagnostics.dispose(); server.closeAllConnections(); server.close(); });
+  context.after(async () => { await diagnostics.dispose(); server.closeAllConnections(); server.close(); });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const port = (server.address() as AddressInfo).port;
@@ -53,7 +53,7 @@ test("diagnostics capture completed and aborted requests without headers, bodies
   assert(!readFileSync(fixtureData.path, "utf8").includes("fixture-secret"));
 });
 
-test("rotation bounds disk usage and error summaries omit raw messages", (context) => {
+test("rotation bounds disk usage and error summaries omit raw messages", async (context) => {
   const fixtureData = fixture(context);
   const diagnostics = new ServerDiagnostics({ stateDir: fixtureData.stateDir, logging });
   context.after(() => diagnostics.dispose());
@@ -64,6 +64,7 @@ test("rotation bounds disk usage and error summaries omit raw messages", (contex
   for (let rotation = 0; rotation < 2; rotation++) {
     writeFileSync(fixtureData.path, "x".repeat(8 * 1024 * 1024));
     diagnostics.record("rotation_test");
+    await diagnostics.flush();
     const date=new Date().toISOString().slice(0,10);
     assert(existsSync(`${fixtureData.path}.${date}.${rotation}`),"达到日志分段上限后按日期归档");
     assert(readFileSync(fixtureData.path).length < 4096);
@@ -80,15 +81,15 @@ test("unwritable diagnostics do not mask the original startup failure", (context
   assert.throws(() => diagnostics.start(() => { throw original; }), (error) => error === original);
 });
 
-test("silent configuration and disposal preserve logging and process-listener boundaries", (context) => {
+test("silent configuration and disposal preserve logging and process-listener boundaries", async (context) => {
   const fixtureData = fixture(context);
   const listeners = process.listenerCount("uncaughtExceptionMonitor");
   const diagnostics = new ServerDiagnostics({ stateDir: fixtureData.stateDir, logging: { ...logging, level: "silent" } });
   diagnostics.record("server_startup_failed", diagnosticError(new Error("fixture-secret")), "error");
   assert.equal(existsSync(fixtureData.path), false);
   assert.equal(process.listenerCount("uncaughtExceptionMonitor"), listeners + 1);
-  diagnostics.dispose();
-  diagnostics.dispose();
+  await diagnostics.dispose();
+  await diagnostics.dispose();
   assert.equal(process.listenerCount("uncaughtExceptionMonitor"), listeners);
 });
 

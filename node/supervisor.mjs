@@ -50,7 +50,8 @@ export function planIdentity(plan) {
 }
 function component(plan) {
   return { plan, state:"stopped", restarts:0, failures:0, nextStartAt:0, nextProbeAt:0,
-    child:null, startedAt:null, lastReadyAt:null, error:null, stopping:false, log:null };
+    child:null, startedAt:null, lastReadyAt:null, stableSince:null, probeError:null,
+    lastExitCode:null, lastExitSignal:null, lastExitAt:null, error:null, stopping:false, log:null };
 }
 function validatePlans(plans) {
   const definitions = new Map(plans.map(plan => [plan.id, plan]));
@@ -85,6 +86,9 @@ export class ComponentSupervisor extends EventEmitter {
       id:value.plan.id, state:value.state, processState:value.child ? "running" : "stopped",
       pid:value.child?.pid || null, restarts:value.restarts, startedAt:value.startedAt,
       lastReadyAt:value.lastReadyAt, observedAt:value.observedAt || null, error:value.error,
+      stableSince:value.stableSince, crashLoop:value.failures>=3,
+      probeError:value.probeError, lastExitCode:value.lastExitCode,
+      lastExitSignal:value.lastExitSignal, lastExitAt:value.lastExitAt,
     }));
   }
   async start() {
@@ -121,15 +125,21 @@ export class ComponentSupervisor extends EventEmitter {
     try {
       await value.plan.ready?.(child);
       if (value.child !== child) return;
-      value.state = "ready"; value.error = null; value.lastReadyAt = Date.now();
+      value.stableSince ??= Date.now();
+      if (Date.now()-value.stableSince>=60000) value.failures=0;
+      value.state = value.failures>=3 ? "degraded" : "ready";
+      value.probeError=null; value.lastReadyAt=Date.now();
+      value.error=value.failures>=3 ? "组件近期反复退出，等待连续稳定运行 60 秒" : null;
     } catch (error) {
       if (value.child !== child) return;
+      value.stableSince=null; value.probeError=error.message;
       value.state = value.lastReadyAt ? "degraded" : "starting"; value.error = error.message;
     } finally { value.observedAt = Date.now(); }
   }
   spawnComponent(value) {
     const { plan } = value;
     value.state = "starting"; value.error = null; value.startedAt = Date.now(); value.lastReadyAt = null;
+    value.stableSince=null; value.probeError=null;
     const log = new RollingLog(join(this.logDir, `${plan.id}.log`));
     value.log = log;
     log.on("error", error => { value.error = `日志写入失败：${error.message}`; this.emit("fault", error); });
@@ -141,12 +151,14 @@ export class ComponentSupervisor extends EventEmitter {
     child.once("error", error => { value.error = error.message; });
     value.closed = new Promise(resolve => child.once("close", (code, signal) => {
       value.child = null; value.spawned = false;
+      value.lastExitCode=code; value.lastExitSignal=signal; value.lastExitAt=Date.now(); value.stableSince=null;
       log.end();
       value.logClosed = finished(log).catch(error => { value.error = error.message; this.emit("fault", error); });
       if (value.stopping || this.stopped) value.state = "stopped";
       else {
         value.failures = Date.now() - value.startedAt >= 60000 ? 1 : value.failures + 1;
-        value.restarts++; value.error ||= `${plan.id} 已退出，code=${code} signal=${signal || "none"}`;
+        value.restarts++;
+        value.error = `${plan.id} 已退出，code=${code} signal=${signal || "none"}${value.error ? `；此前：${value.error}` : ""}`;
         value.state = "backoff";
         value.nextStartAt = Date.now() + Math.min(30000, 500 * 2 ** Math.min(value.failures - 1, 6));
       }

@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { ObservationGate, observeWithSignal } from "../observation-budget.js";
 
 const DEFAULT_MAXIMUM_BYTES = 4 * 1024 * 1024;
 const DEFAULT_SEGMENT_BYTES = 64 * 1024;
@@ -40,6 +41,8 @@ export class SessionOutputStore {
   private readonly writeErrors = new Map<string, Error>();
   private closed = false;
   private readonly changes = new EventEmitter().setMaxListeners(0);
+  private readonly readers = new ObservationGate(16, 64);
+  private queuedReads = 0;
 
   constructor(stateDir: string, private readonly maximumBytes = DEFAULT_MAXIMUM_BYTES) {
     if (!Number.isInteger(maximumBytes) || maximumBytes < 16) throw new Error("Session output retention must be an integer of at least 16 bytes.");
@@ -142,12 +145,18 @@ export class SessionOutputStore {
     });
   }
 
-  read(sessionId: string, commandId: string, cursor: number, requestedBytes: number, _scope: SessionOutputReaderScope): Promise<SessionOutputRead> {
+  read(sessionId: string, commandId: string, cursor: number, requestedBytes: number, _scope: SessionOutputReaderScope, signal?: AbortSignal): Promise<SessionOutputRead> {
     this.assertOpen();
+    signal?.throwIfAborted();
     if (!Number.isSafeInteger(cursor) || cursor < 0) throw new Error("OUTPUT_CURSOR_INVALID");
     if (!Number.isSafeInteger(requestedBytes) || requestedBytes < 0) throw new Error("OUTPUT_BYTES_INVALID");
-    return this.enqueue(commandId, async () => {
-      const metadata = await this.readMetadata(commandId);
+    if (this.queuedReads >= 128) throw Object.assign(new Error("OBSERVATION_BUSY: output reader queue is full; retry later"), {
+      code: "OBSERVATION_BUSY", effect: "not_started", retryHint: "retry_later",
+    });
+    this.queuedReads++;
+    const work = this.enqueue(commandId, () => this.readers.run<SessionOutputRead>(async () => {
+      signal?.throwIfAborted();
+      const metadata = await this.readMetadata(commandId, signal);
       const writeFailure=this.writeErrors.get(commandId);if(writeFailure)throw writeFailure;
       if (metadata.session_id !== sessionId) throw new Error("OUTPUT_SESSION_MISMATCH");
       if (metadata.expired || metadata.state === "expired") throw new Error(`OUTPUT_EXPIRED: ${metadata.retained_until}`);
@@ -155,7 +164,8 @@ export class SessionOutputStore {
       const retainedFrom = metadata.retained_from;
       const offset = Math.min(metadata.total_bytes, Math.max(cursor, retainedFrom));
       const wanted = Math.max(1, requestedBytes);
-      const raw = await this.readRange(metadata, offset, Math.min(wanted + 4, metadata.total_bytes - offset));
+      const raw = await this.readRange(metadata, offset, Math.min(wanted + 4, metadata.total_bytes - offset), signal);
+      signal?.throwIfAborted();
       const complete = raw.subarray(0, completeUtf8PrefixEnd(raw));
       const chunk = fitUtf8(complete.toString("utf8"), wanted);
       const nextCursor = offset + Buffer.byteLength(chunk, "utf8");
@@ -164,14 +174,15 @@ export class SessionOutputStore {
         retainedFrom, truncated: cursor < retainedFrom, totalBytes: metadata.total_bytes,
         processDone: metadata.done, exitCode: metadata.exit_code, signal: metadata.signal,
         outputState, errorCode: metadata.error_code ?? null };
-    });
+    }, signal)).finally(() => { this.queuedReads--; });
+    return observeWithSignal(work, signal);
   }
 
-  modelRead(sessionId: string, commandId: string, cursor: number, requestedBytes: number): Promise<SessionOutputRead> {
-    return this.read(sessionId, commandId, cursor, requestedBytes, "model");
+  modelRead(sessionId: string, commandId: string, cursor: number, requestedBytes: number, signal?: AbortSignal): Promise<SessionOutputRead> {
+    return this.read(sessionId, commandId, cursor, requestedBytes, "model", signal);
   }
-  uiRead(sessionId: string, commandId: string, cursor: number, requestedBytes: number): Promise<SessionOutputRead> {
-    return this.read(sessionId, commandId, cursor, requestedBytes, "ui");
+  uiRead(sessionId: string, commandId: string, cursor: number, requestedBytes: number, signal?: AbortSignal): Promise<SessionOutputRead> {
+    return this.read(sessionId, commandId, cursor, requestedBytes, "ui", signal);
   }
   async expire(commandId: string, retainedUntil: string): Promise<void> {
     this.assertOpen();
@@ -222,8 +233,8 @@ export class SessionOutputStore {
   private commandDirectory(commandId: string): string { return join(this.root, safeName(commandId)); }
   private metadataPath(commandId: string): string { return join(this.root, `${safeName(commandId)}.json`); }
 
-  private async readMetadata(commandId: string): Promise<SessionOutputMetadata> {
-    const text = await readFile(this.metadataPath(commandId), "utf8").catch((error: NodeJS.ErrnoException) => {
+  private async readMetadata(commandId: string, signal?: AbortSignal): Promise<SessionOutputMetadata> {
+    const text = await readFile(this.metadataPath(commandId), { encoding: "utf8", signal }).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") throw new Error(`OUTPUT_NOT_FOUND: ${commandId}`);
       throw error;
     });
@@ -242,18 +253,21 @@ export class SessionOutputStore {
     catch (error) { await unlink(temporary).catch(() => {}); throw error; }
   }
 
-  private async readRange(metadata: SessionOutputMetadata, offset: number, length: number): Promise<Buffer> {
+  private async readRange(metadata: SessionOutputMetadata, offset: number, length: number, signal?: AbortSignal): Promise<Buffer> {
+    signal?.throwIfAborted();
     if (length <= 0) return Buffer.alloc(0);
     const buffer = Buffer.alloc(length);
     let consumed = 0;
     if (metadata.version === 1) {
       const handle = await open(join(this.root, `${safeName(metadata.command_id)}.bin`), "r");
       try {
+        signal?.throwIfAborted();
         const result = await handle.read(buffer, 0, length, offset - metadata.retained_from);
         return buffer.subarray(0, result.bytesRead);
       } finally { await handle.close(); }
     }
     for (const segment of metadata.segments!) {
+      signal?.throwIfAborted();
       const end = segment.start + segment.bytes;
       if (end <= offset || segment.start >= offset + length) continue;
       const from = Math.max(segment.start, offset);
@@ -262,6 +276,7 @@ export class SessionOutputStore {
       try {
         let read = 0;
         while (read < count) {
+          signal?.throwIfAborted();
           const result = await handle.read(buffer, consumed + read, count - read, from - segment.start + read);
           if (result.bytesRead === 0) throw new Error("OUTPUT_SEGMENT_INCOMPLETE");
           read += result.bytesRead;
@@ -291,7 +306,7 @@ function completeUtf8PrefixEnd(bytes: Buffer): number {
   const needed = lead < 0x80 ? 1 : lead >= 0xc2 && lead <= 0xdf ? 2 : lead >= 0xe0 && lead <= 0xef ? 3 : lead >= 0xf0 && lead <= 0xf4 ? 4 : 1;
   return bytes.length - index < needed ? index : bytes.length;
 }
-function fitUtf8(text: string, maximumBytes: number): string {
+export function fitUtf8(text: string, maximumBytes: number): string {
   let size = 0, result = "";
   for (const point of text) {
     const bytes = Buffer.byteLength(point);

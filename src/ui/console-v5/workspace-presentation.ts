@@ -1,5 +1,5 @@
 import logo from '../../../app.ico';
-import { esc,status,smallTime } from './presentation.js';
+import { esc,lifecycleBadges,smallTime } from './presentation.js';
 import { icon } from './icons.js';
 import type { Run,Sessions } from './contracts.js';
 
@@ -13,5 +13,5 @@ export function workspaceSummary(run:Run):string {
 
 export function conversationCards(conversations:Sessions['conversations']):string {
   if(!conversations.length)return '<div class="empty"><h3>暂无会话</h3></div>';
-  return `<div class="conversation-list">${conversations.map(session=>`<article class="conversation" data-key="conversation-${esc(session.id)}"><header><div><h3>${esc(session.title)}</h3><div class="run-sub"><span>${session.taskCount} 个任务</span>${session.activeCount ? `<span class="accent">${session.activeCount} 项运行</span>`:''}<code title="${esc(session.id)}">${esc(session.id.slice(0,8))}</code></div></div>${smallTime(session.updatedAt)}</header><details><summary>查看任务 ${icon('down',14)}</summary><div>${session.tasks.map(task=>`<button class="conversation-task" type="button" data-action="open-run" data-id="${esc(task.id)}"><span>${esc(task.title)}${task.hasRun ? '' : '<small class="muted"> · 尚未启动执行</small>'}</span>${status(task.status)}${smallTime(task.finishedAt ?? task.startedAt)}</button>`).join('')}</div></details></article>`).join('')}</div>`;
+  return `<div class="conversation-list">${conversations.map(session=>`<article class="conversation" data-key="conversation-${esc(session.id)}"><header><div><h3>${esc(session.title)}</h3><div class="run-sub"><span>${session.taskCount} 个任务</span>${session.activeCount ? `<span class="accent">${session.activeCount} 项运行</span>`:''}<code title="${esc(session.id)}">${esc(session.id.slice(0,8))}</code></div></div>${smallTime(session.updatedAt)}</header><details><summary>查看任务 ${icon('down',14)}</summary><div>${session.tasks.map(task=>`<button class="conversation-task" type="button" data-action="open-run" data-id="${esc(task.id)}"><span>${esc(task.title)}${task.hasRun ? '' : '<small class="muted"> · 尚未启动执行</small>'}</span><span class="conversation-task-state">${lifecycleBadges(task)}</span>${smallTime(task.finishedAt ?? task.startedAt)}</button>`).join('')}</div></details></article>`).join('')}</div>`;
 }

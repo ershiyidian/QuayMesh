@@ -1777,13 +1777,26 @@ export class SessionStore {
     return row?(JSON.parse(row.data_json) as {metadata:Record<string,unknown>}).metadata:undefined;
   }
 
+  eventsForOperation(operationId:string,sessionId:string,memberId:string): SessionEvent[] {
+    const rows=this.db.prepare(`SELECT * FROM qm_events WHERE session_id=? AND member_id=?
+      AND event_type IN ('operation_started','operation_finished') AND source_id=?
+      UNION SELECT * FROM qm_events WHERE session_id=? AND member_id=?
+      AND event_type IN ('operation_started','operation_finished') AND json_extract(data_json,'$.operation_id')=? ORDER BY sequence`)
+      .all(sessionId,memberId,operationId,sessionId,memberId,operationId) as Array<Record<string,unknown>>;
+    return rows.map(row=>({sequence:Number(row.sequence),session_id:String(row.session_id),task_id:row.task_id?String(row.task_id):null,
+      member_id:String(row.member_id),type:row.event_type as SessionEvent["type"],source_id:String(row.source_id),
+      timestamp:String(row.created_at),payload:JSON.parse(String(row.data_json||"{}"))}));
+  }
+
   findOperationEvent(operationId: string): SessionEvent | null {
     const row = this.db
       .prepare(
         `SELECT sequence, session_id, task_id, member_id, event_type, source_id, data_json, created_at
-         FROM qm_events
-         WHERE event_type = 'operation_started'
-           AND (source_id = ? OR json_extract(data_json, '$.operation_id') = ?)
+         FROM (
+           SELECT * FROM qm_events WHERE event_type='operation_started' AND source_id=?
+           UNION ALL
+           SELECT * FROM qm_events WHERE event_type='operation_started' AND json_extract(data_json,'$.operation_id')=?
+         )
          ORDER BY sequence DESC LIMIT 1`,
       )
       .get(operationId, operationId) as Record<string, unknown> | undefined;

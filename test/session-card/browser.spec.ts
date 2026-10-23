@@ -47,13 +47,13 @@ test("real patch feeds compact Changes and lazy diff",async({page})=>{
 
 test("real commands feed compact Commands with durable output and failure",async({page})=>{
   const frame=await openCard(page),echoToken="browser-echo-"+Date.now();
-  await page.evaluate(token=>window.__quaymeshHost.runCommand("cmd /c echo "+token),echoToken);
+  await page.evaluate(command=>window.__quaymeshHost.runCommand(command),process.platform==="win32"?"cmd /c echo "+echoToken:"printf '%s\\n' "+echoToken);
   await frame.locator("#t-commands").click();
   const echoRow=frame.locator('[data-x^="c:"]',{hasText:echoToken}).first();
   await expect(echoRow).toBeVisible(POLL);await echoRow.click();
   await expect(frame.locator("#p-commands .code").first()).toContainText(echoToken,POLL);
   const failToken="browser-fail-"+Date.now();
-  await page.evaluate(token=>window.__quaymeshHost.runCommand(`cmd /c "echo ${token} 1>&2 & exit 7"`),failToken);
+  await page.evaluate(command=>window.__quaymeshHost.runCommand(command),process.platform==="win32"?`cmd /c "echo ${failToken} 1>&2 & exit 7"`:`printf '%s\\n' ${failToken} >&2; exit 7`);
   await expect(frame.locator('[data-x^="c:"]',{hasText:failToken}).first()).toBeVisible(POLL);
   await expect(frame.locator("#n-commands")).toHaveClass(/bad/);
   await page.screenshot({path:OUT+"/commands.png",fullPage:true});
@@ -86,13 +86,13 @@ test("disconnect error, reconnect and teardown keep the background operation",as
   await page.getByRole("button",{name:"Disconnect MCP"}).click();
   await expect.poll(async()=>(await(await page.request.get("/api/state")).json()).connected,POLL).toBe(false);
   await frame.locator("#toggle").click();await frame.locator("#toggle").click();
-  await expect(frame.locator("#act")).toContainText("界面读取失败",POLL);
+  await expect(frame.locator("#prog")).toContainText("状态更新暂不可用",POLL);
   await page.getByRole("button",{name:"Reconnect MCP"}).click();
   await expect.poll(async()=>(await(await page.request.get("/api/state")).json()).connected,POLL).toBe(true);
   await frame.locator("#toggle").click();await frame.locator("#toggle").click();
-  await expect(frame.locator("#act")).not.toContainText("界面读取失败",POLL);
+  await expect(frame.locator("#prog")).not.toContainText("状态更新暂不可用",POLL);
   const marker="teardown-"+Date.now()+".txt";
-  const started=await page.evaluate(name=>window.__quaymeshHost.runCommand(`cmd /c "ping -n 4 127.0.0.1 > nul & echo done > ${name}"`,1500),marker);
+  const started=await page.evaluate(command=>window.__quaymeshHost.runCommand(command,1500),process.platform==="win32"?`cmd /c "ping -n 4 127.0.0.1 > nul & echo done > ${marker}"`:`sleep 3; printf done > ${marker}`);
   expect(started.isError,JSON.stringify(started)).not.toBe(true);
   const operationId=String(started.structuredContent?.operation_id),boot=await(await page.request.get("/api/bootstrap")).json(),wid=workspaceId(boot);
   await page.getByRole("button",{name:"Teardown iframe"}).click();

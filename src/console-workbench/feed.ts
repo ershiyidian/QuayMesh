@@ -260,11 +260,17 @@ export class WorkbenchFeed {
 
   async projectConversations(data:ReturnType<LocalActions['sessions']>,fresh=false) {
     if (!Array.isArray(data.conversations)) throw new WorkbenchError('该节点尚未提供对话会话数据，请更新节点服务',503,'node_capability_unavailable');
-    const lifecycle=await this.sessionTitles(undefined,fresh);
-    return {...data,complete:lifecycle.complete,sources:lifecycle.sources,observedAt:lifecycle.observedAt,
+    const {index,titles}=await this.scopedIndex({project:data.conversations[0]?.projectId,fresh:fresh?'1':undefined});
+    const aggregate=new Map(this.taskIndex(index.values.flatMap(value=>value.items),titles,index.sources).map(task=>[task.taskId,task]));
+    return {...data,complete:index.complete&&titles.complete,sources:mergeSources(index.sources,titles.sources),observedAt:Date.now(),
       conversations:data.conversations.map(conversation=>{
       const tasks=conversation.tasks.map(task=>{
-        const state=withTaskLifecycle({...task,phaseExecutionStatus:task.executionStatus},lifecycle.tasks.get(task.taskId ?? ''));
+        // 项目决定会话归属；任务状态仍需包含它在其他工作区的执行。
+        const full=aggregate.get(task.taskId);
+        const state=full?{...task,executionStatus:full.executionStatus,acceptanceStatus:full.acceptanceStatus,
+          requestState:full.requestState,resultStatus:full.resultStatus,phaseExecutionStatus:full.phaseExecutionStatus,
+          finalization:full.finalization,finishedAt:full.finishedAt,lastActivityAt:full.lastActivityAt,workspaces:full.workspaces}
+          :withTaskLifecycle({...task,phaseExecutionStatus:task.executionStatus},titles.tasks.get(task.taskId ?? ''));
         return {...state,status:taskStage(state.executionStatus,state.acceptanceStatus,state.phaseExecutionStatus)};
       });
       return {...conversation,tasks,activeCount:tasks.filter(task=>activeExecution(task.executionStatus)).length};
@@ -288,6 +294,7 @@ export class WorkbenchFeed {
         taskCount:current.length,activeCount:current.filter(task=>activeExecution(task.executionStatus)).length,
         tasks:current.map(task=>{const run=this.resolvedRun(task);return {id:run.id,taskId:task.taskId,title:task.title,status:taskStage(task.executionStatus,task.acceptanceStatus,task.phaseExecutionStatus),
           root:run.root,workspaces:run.workspaces,executionStatus:task.executionStatus,acceptanceStatus:task.acceptanceStatus,
+          requestState:task.requestState,resultStatus:task.resultStatus,phaseExecutionStatus:task.phaseExecutionStatus,finalization:task.finalization,
           lastActivityAt:task.lastActivityAt,startedAt:task.startedAt,finishedAt:task.finishedAt,hasRun:task.phaseRefs.length>0};})}];
     }).sort((a,b)=>b.updatedAt-a.updatedAt||a.id.localeCompare(b.id));
     return {items,total:items.length,sources:mergeSources(index.sources,titles.sources),complete:index.complete&&titles.complete};
