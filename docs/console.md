@@ -26,6 +26,14 @@ A request, its background executions, and its review have separate states. Finis
 
 Use **Finish request** to record a delivery result. Review acceptance and rejection are separate actions. Finishing requires confirmation that all relevant task members have no active or unresolved execution. An unrelated offline node does not block the task's controls.
 
+### File evidence and capture state
+
+An empty file list can mean that change capture is still running or has failed. The **Changes** tab reports capture state for each affected workspace, including its node, full path, and any recorded error. Files already captured remain available to inspect. A pending or failed capture is shown as incomplete evidence instead of “no changes.”
+
+While the selected live scope has pending or failed capture, review acceptance and rejection, patch export, and file reversion are unavailable. Resolve a reported capture error or wait for the current capture, then refresh the file evidence. The server also checks capture state and evidence versions before allowing these operations. If evidence changes during a revert preview or paged patch export, refresh and start again so the operation uses one version you have inspected.
+
+The absence of a capture notice means that the current service has not observed pending or failed capture. It does not establish that every file change has been archived. Completed immutable checkpoints retain their own evidence: capture in a later task, even in the same workspace, does not block viewing or exporting an earlier checkpoint. Older nodes that do not report capture state are not labelled as failed solely because that field is missing.
+
 ### Controls and receipts
 
 Stop controls include managed commands and agents in all relevant phases. A batch preserves each target's outcome, including partial success and unavailable nodes. The original target plan and request identity are saved before dispatch. The operation receipts view can inspect the original request after a lost response without replaying successful targets.

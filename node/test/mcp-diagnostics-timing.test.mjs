@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import { traceMcpRequest } from "../../src/mcp-request-diagnostics.ts";
+import { freePort } from "./helpers.mjs";
 
 test("MCP 诊断记录真实响应头、首字节和最终流时长，不记录敏感数据", async t => {
   const rows = [];
@@ -16,7 +17,7 @@ test("MCP 诊断记录真实响应头、首字节和最终流时长，不记录�
     setTimeout(() => res.write(": ping\n\n"), 30);
     setTimeout(() => res.end('data: {"jsonrpc":"2.0","id":1,"result":{}}\n\n'), 75);
   });
-  server.listen(0, "127.0.0.1");
+  server.listen(await freePort(), "127.0.0.1");
   await once(server, "listening");
   t.after(() => new Promise(resolve => server.close(resolve)));
   const response = await fetch(`http://127.0.0.1:${server.address().port}/mcp`);

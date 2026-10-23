@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
 import { WorkLedger } from "../../src/work-ledger.js";
 import { SessionStore } from "../../src/session/store.js";
 import { readRunCheckpoint } from "../../src/session/run-checkpoints.js";
@@ -11,7 +10,7 @@ import { readLocalPage } from "../../src/console-workbench/local-queries.js";
 import { WorkbenchFeed } from "../../src/console-workbench/feed.js";
 import { workspaceHandle } from "../../src/federation/routing.js";
 import { canonicalWorkspaceRoot } from "../../src/roots.js";
-import { callOpen, createRealTestServer, structured } from "../session-card/server-fixture.js";
+import { callOpen, createRealTestServer, structured, waitForFixture, waitForRecordedTool } from "../session-card/server-fixture.js";
 
 type Detail = Awaited<ReturnType<typeof readRunDetail>>;
 
@@ -46,21 +45,21 @@ test("accepted work stays immutable after revert and continuation, and nested wo
   const memberId=store.getSession(sessionId).selected_member_id;
   assert.ok(memberId,"opened workspace must select its actual session member");
   assert.equal((openedResponse._meta as {quaymesh?:{member_id?:string}}|undefined)?.quaymesh?.member_id,memberId);
-  async function patch(text: string) {
+  const scope = { sessionId, workspaceId: String(opened.workspace_id), conversationId: "review-lifecycle" };
+  async function patch(text: string, paths: string[]) {
     const result = await fixture.client.callTool({ name: "apply_patch", arguments: { workspace_id: opened.workspace_id, patch: text }, _meta: meta });
-    assert.notEqual(result.isError, true, JSON.stringify(result));
+    await waitForRecordedTool(fixture, { ...scope, paths }, result);
   }
-  await patch("*** Begin Patch\n*** Add File: first.ts\n+export const value = 1;\n*** End Patch");
+  await patch("*** Begin Patch\n*** Add File: first.ts\n+export const value = 1;\n*** End Patch", ["first.ts"]);
   const linkedRuns=store.runIdsForMember(sessionId,memberId);
   assert.ok(linkedRuns.length>0,`apply_patch succeeded but run linkage is missing: session=${sessionId}, member=${memberId}`);
   const runId = linkedRuns[0]!;
   assert.ok(ledger.run(runId).id===runId,"linked run must exist in the authoritative WorkLedger");
   const reference = workspaceHandle(nodeId, runId);
   const detailPath = "runs/" + encodeURIComponent(reference);
-  let detail = await api<Detail>(detailPath);
-  for (let index = 0; index < 30 && !detail.files.length; index++) {
-    await delay(50); detail = await api<Detail>(detailPath);
-  }
+  let detail = await waitForFixture(fixture, { ...scope, paths: ["first.ts"] }, "captured first.ts ready for review",
+    () => api<Detail>(detailPath), value =>
+      value.files.some(file => file.path === "first.ts") && value.run.actions.complete);
   assert.equal(detail.files[0]?.path, "first.ts");
   assert.equal(detail.run.actions.complete, true);
 
@@ -97,7 +96,7 @@ test("accepted work stays immutable after revert and continuation, and nested wo
   });
 
   await t.test("new work resets review state without rewriting the preceding checkpoint", async () => {
-    await patch("*** Begin Patch\n*** Add File: second.ts\n+export const next = 2;\n*** End Patch");
+    await patch("*** Begin Patch\n*** Add File: second.ts\n+export const next = 2;\n*** End Patch", ["second.ts"]);
     const nextRun = store.runIdsForMember(sessionId, memberId)[0];
     assert.notEqual(nextRun, runId);
     assert.equal(ledger.run(nextRun).acceptance, "pending");
@@ -123,7 +122,8 @@ test("accepted work stays immutable after revert and continuation, and nested wo
     assert.equal(member.root, canonicalWorkspaceRoot(childRoot));
     const changed = await fixture.client.callTool({ name: "apply_patch", arguments: { workspace_id: child.workspace_id,
       patch: "*** Begin Patch\n*** Add File: inside.txt\n+inside child only\n*** End Patch" }, _meta: { "openai/session": "nested-scope" } });
-    assert.notEqual(changed.isError, true, JSON.stringify(changed));
+    await waitForRecordedTool(fixture, { sessionId: String(child.session_id), workspaceId: String(child.workspace_id),
+      conversationId: "nested-scope", paths: ["nested/inside.txt"] }, changed);
     assert.equal(await readFile(join(childRoot, "inside.txt"), "utf8"), "inside child only\n");
     await assert.rejects(stat(join(fixture.project, "inside.txt")), { code: "ENOENT" });
     const run = ledger.run(store.runIdsForMember(String(child.session_id), String(child.member_id))[0]);

@@ -50,6 +50,27 @@ interface AuthorizedSession {
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
 const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, openWorldHint: false } as const;
 
+const patchCursorSchema = z.object({
+  version: z.literal(1), sessionId: z.string(), memberId: z.string(), taskId: z.string().nullable(),
+  source: z.enum(["live", "frozen"]), revision: z.number().int().nonnegative(),
+  offset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+}).strict();
+type PatchIdentity = Omit<z.infer<typeof patchCursorSchema>, "version" | "offset">;
+
+function decodePatchCursor(cursor: string): z.infer<typeof patchCursorSchema> {
+  try {
+    if (!cursor.startsWith("qmpatch:") || cursor.length > 8192) throw new Error("Invalid patch cursor");
+    return patchCursorSchema.parse(JSON.parse(Buffer.from(cursor.slice(8), "base64url").toString("utf8")));
+  } catch {
+    throw new Error("PATCH_CURSOR_INVALID: 补丁分页引用无效，请从第一页重新导出");
+  }
+}
+
+function samePatchIdentity(left: PatchIdentity, right: PatchIdentity): boolean {
+  return left.sessionId === right.sessionId && left.memberId === right.memberId && left.taskId === right.taskId
+    && left.source === right.source && left.revision === right.revision;
+}
+
 export function registerSessionAppTools(
   server: Pick<McpServer, "registerTool">,
   dependencies: SessionAppToolDependencies,
@@ -335,12 +356,36 @@ export function registerSessionAppTools(
       bindTask(ownerId, input);
       const authorized = authorizedSession(ownerId, input.session_id);
       const member = memberForRequest(authorized, input.member_id);
+      const identity = (): PatchIdentity => {
+        const taskId = input.task_id ?? null;
+        const scope = { sessionId: authorized.session.id, memberId: member.id, taskId };
+        if (taskId && dependencies.store.getTask(taskId).state === "closed") {
+          const snapshot = dependencies.store.getTaskSnapshot(taskId, member.id);
+          if (!snapshot) throw new Error(`TASK_MEMBER_NOT_FOUND: ${member.id}`);
+          return { ...scope, source: "frozen", revision: snapshot.revision };
+        }
+        const capture = dependencies.changes.captureObservation(member.id, taskId ?? undefined);
+        if (capture.state === "pending") throw new Error("FILE_CAPTURE_PENDING: 文件改动正在采集，请完成后重新导出补丁");
+        if (capture.state === "failed") throw new Error(`FILE_CAPTURE_FAILED: 文件改动采集失败，无法导出完整补丁：${capture.error ?? "原因未知"}`);
+        return { ...scope, source: "live", revision: dependencies.store.memberRevision(member.id) };
+      };
+      const before = identity();
+      const cursor = input.cursor === undefined ? null : decodePatchCursor(input.cursor);
+      if (cursor && !samePatchIdentity(cursor, before)) {
+        throw new Error("PATCH_REVISION_CHANGED: 补丁所属任务或文件版本已更新，请从第一页重新导出");
+      }
+      const offset = cursor ? String(cursor.offset) : undefined;
       const result = input.task_id
-        ? await dependencies.changes.patchForTask(input.task_id, authorized.session.id, member.id, input.cursor)
-        : await dependencies.changes.patch(authorized.session.id, member.id, input.cursor);
+        ? await dependencies.changes.patchForTask(input.task_id, authorized.session.id, member.id, offset)
+        : await dependencies.changes.patch(authorized.session.id, member.id, offset);
+      if (!samePatchIdentity(before, identity())) {
+        throw new Error("PATCH_REVISION_CHANGED: 补丁所属任务或文件版本已更新，请从第一页重新导出");
+      }
       return jsonReply({
         patch: result.patch,
-        cursor: result.nextCursor,
+        cursor: result.nextCursor === null ? null : "qmpatch:" + Buffer.from(JSON.stringify({
+          version: 1, ...before, offset: Number(result.nextCursor),
+        })).toString("base64url"),
         done: result.nextCursor === null,
       });
     },

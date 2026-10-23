@@ -53,6 +53,26 @@ async function fixture(t: TestContext) {
   return {root,stateDir,config,ledger,store,service,session,member,task,agent,createRun,rows};
 }
 
+test('明确 legacy 事件不会归入后续 Task，省略 Task 与显式历史 Task 保持各自语义',async t=>{
+  const f=await fixture(t);
+  const later=f.store.createTask(f.session.id,'后续请求');
+  f.store.touchTaskMember(later.id,f.member.id);
+  const a=f.store.getTask(f.task.id).revision,b=f.store.getTask(later.id).revision;
+  const event={session_id:f.session.id,member_id:f.member.id,type:'file_changed' as const,
+    source_id:'legacy-change',timestamp:new Date().toISOString(),payload:{}};
+  f.store.appendEvent({...event,task_id:null});
+  assert.equal(f.store.eventsForSession(f.session.id).find(row=>row.source_id==='legacy-change')?.task_id,null);
+  assert.equal(f.store.getTask(f.task.id).revision,a);
+  assert.equal(f.store.getTask(later.id).revision,b,'legacy evidence cannot advance the current Task');
+  await f.store.appendEventAsync({...event,source_id:'current-change'});
+  assert.equal(f.store.eventsForTask(later.id).filter(row=>row.source_id==='current-change').length,1);
+  assert.equal(f.store.getTask(later.id).revision,b+1);
+  await f.store.appendEventAsync({...event,task_id:f.task.id,source_id:'historical-change'});
+  assert.equal(f.store.eventsForTask(f.task.id).filter(row=>row.source_id==='historical-change').length,1);
+  assert.equal(f.store.getTask(f.task.id).revision,a+1);
+  assert.equal(f.store.getTask(later.id).revision,b+1,'explicit historical evidence cannot advance the current Task');
+});
+
 test('执行端结束后协调端确认失败，SQL、摘要与生命周期均保留交付待确认',async t=>{
   const f=await fixture(t),run=f.createRun('finished-owner');
   f.ledger.finish(run.id,{status:'completed',acceptance:'not_applicable',summary:'worker finished',evidence:[]});

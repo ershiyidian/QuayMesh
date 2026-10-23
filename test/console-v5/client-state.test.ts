@@ -3,12 +3,12 @@ import assert from 'node:assert/strict';
 import { Resources } from '../../src/ui/console-v5/resources.js';
 import { ApiError, WriteIntent, validateSession, createApi } from '../../src/ui/console-v5/client.js';
 import { mergeFields } from '../../src/ui/console-v5/settings-form.js';
-import { elapsed, esc, percent, resultExplanation, status, transferPercent } from '../../src/ui/console-v5/presentation.js';
+import { elapsed, esc, percent, resultExplanation, changeCaptureBlockReason, changeCaptureNotice, dedupeCaptureWarnings, acceptanceBadge, status, transferPercent } from '../../src/ui/console-v5/presentation.js';
 import { fullTime, setDisplayTimeZone, day, timestamp } from '../../src/ui/console-v5/format.js';
 import { taskStages, taskStage } from '../../src/console-task-state.js';
 import { resourceHealth } from '../../src/ui/console-v5/source-state.js';
 import { CommandOutputs } from '../../src/ui/console-v5/command-output.js';
-import type { Run, ActionReceipt } from '../../src/ui/console-v5/contracts.js';
+import type { Run, ActionReceipt, ChangeCapture } from '../../src/ui/console-v5/contracts.js';
 import { EventNotifications, type NotificationMemory, type NotificationPage } from '../../src/ui/console-v5/notifications.js';
 import { filterTaskIndex, type TaskIndex } from '../../src/console-workbench/task-aggregation.js';
 import { receiptLabel, canQueryReceipt } from '../../src/ui/console-v5/receipt-presentation.js';
@@ -122,6 +122,44 @@ test('概要回退与状态说明相同时只显示一次，真实交付总结�
   assert.equal(resultExplanation('','核对执行结果','unknown'),'<p class="notice warn">核对执行结果</p>');
 });
 
+test('文件证据采集状态限定于当前详情，历史检查点和旧节点字段缺失不会误报失败', () => {
+  const idle:ChangeCapture={runId:'phase-a',nodeId:'node-a',projectName:'project-a',root:'/work/ProjectA',state:'idle',error:null};
+  assert.equal(changeCaptureBlockReason(undefined),null);
+  assert.equal(changeCaptureNotice(undefined),'');
+  assert.equal(changeCaptureBlockReason([]),null);
+  assert.equal(changeCaptureNotice([]),'');
+  assert.equal(changeCaptureBlockReason([idle]),null);
+  assert.equal(changeCaptureNotice([idle]),'','正常文件列表不显示常驻技术告示');
+  const pending={...idle,runId:'phase-b',state:'pending'} as ChangeCapture;
+  assert.match(changeCaptureBlockReason([pending])!,/仍在采集/);
+  assert.equal(changeCaptureBlockReason([]),null,'新阶段采集不能污染历史详情');
+});
+
+test('混合采集状态展示每个工作区和真实错误，不把缺失证据当作无改动', () => {
+  const pending:ChangeCapture={runId:'run-pending',nodeId:'node-a',projectName:'project-a',root:'/work/ProjectA',state:'pending',error:null};
+  const failed:ChangeCapture={runId:'run-failed',nodeId:'node-b',projectName:'<project-b>',root:'/work/<ProjectB>',state:'failed',error:'cannot read <evidence> & retry'};
+  const html=changeCaptureNotice([{...pending,root:'/work/IdleProject',state:'idle'},pending,failed]);
+  assert.match(changeCaptureBlockReason([pending,failed])!,/部分采集失败/);
+  assert.match(html,/data-capture-state="pending"/);assert.match(html,/data-capture-state="failed"/);
+  assert.ok(html.includes('/work/ProjectA'));assert.ok(html.includes(esc(failed.root)));assert.ok(html.includes(esc(failed.error)));
+  assert.doesNotMatch(html,/<project-b>|<evidence>|暂无文件改动|IdleProject|data-capture-state="idle"/);
+  assert.match(html,/已取得的文件仍可查看/);assert.match(html,/暂不能验收结果、导出补丁或还原文件/);
+});
+
+test('采集告示仅去除对应状态与完整错误文本，保留旧节点和其他警告', () => {
+  const pending:ChangeCapture={runId:'one',nodeId:'node',projectName:'project',root:'/work',state:'pending',error:null};
+  const failed:ChangeCapture={...pending,state:'failed',error:'EISDIR: capture-state.txt'};
+  const pendingText='文件改动正在整理，当前列表尚未确认完整。';
+  const failedText='文件改动整理失败，当前列表可能不完整：'+failed.error;
+  const other=['节点连接超时','来源覆盖不完整',pendingText+' 请另行检查。','文件改动整理失败，当前列表可能不完整：另一个错误'];
+  const warnings=[pendingText,failedText,...other];
+  assert.deepEqual(dedupeCaptureWarnings(warnings,[pending,failed]),other);
+  assert.deepEqual(dedupeCaptureWarnings(warnings,[pending]),[failedText,...other]);
+  assert.deepEqual(dedupeCaptureWarnings(warnings,[failed]),[pendingText,...other]);
+  for(const captures of [undefined,[],[{...pending,state:'idle' as const}]])assert.deepEqual(dedupeCaptureWarnings(warnings,captures),warnings);
+  assert.deepEqual(warnings,[pendingText,failedText,...other],'不能修改原始诊断记录');
+});
+
 test('命令输出取消后丢弃迟到分页，游标不推进时退出读取', async () => {
   const pending=deferred<any>();
   const reader=new CommandOutputs(async()=>pending.promise,()=>{});
@@ -176,6 +214,32 @@ test('开放请求的已完成阶段待验收仍属于总览等待组，验收�
   assert.equal(taskStage(task.executionStatus,task.acceptanceStatus,task.phaseExecutionStatus),'review');
   assert.deepEqual(filterTaskIndex([task],{stage:'waiting,stalled,finalizing',days:'0'},3),[task]);
   assert.deepEqual(filterTaskIndex([task],{stage:'done,accepted,rejected,review,failed,ended,cancelled,handed_off',days:'0'},3),[]);
+  assert.match(acceptanceBadge(task),/结果待验收/);
+});
+
+test('验收徽章依据真实阶段结果，不把默认pending或请求关闭当成交付完成', () => {
+  for (const executionStatus of ['running','stopping','queued','waiting','idle','unknown','ended','failed','cancelled','handed_off']) {
+    for (const requestState of ['active','closed']) {
+      const run={executionStatus,acceptanceStatus:'pending',requestState,resultStatus:'completed'};
+      assert.equal(acceptanceBadge(run),'',`${executionStatus} / ${requestState} 的默认 pending`);
+    }
+  }
+  for (const phaseExecutionStatus of ['waiting','idle','running','unknown','failed','cancelled']) {
+    assert.equal(acceptanceBadge({executionStatus:'waiting',phaseExecutionStatus,acceptanceStatus:'pending'}),'',phaseExecutionStatus);
+  }
+  for (const executionStatus of ['waiting','running','unknown']) {
+    assert.match(acceptanceBadge({executionStatus,phaseExecutionStatus:'completed',acceptanceStatus:'pending'}),/结果待验收/,executionStatus);
+  }
+  for (const [acceptanceStatus,label] of [['accepted','结果已验收'],['passed','结果已验收'],['rejected','结果已驳回'],['failed','结果已驳回']]) {
+    for (const executionStatus of ['running','waiting','unknown']) {
+      assert.ok(acceptanceBadge({executionStatus,phaseExecutionStatus:'unknown',acceptanceStatus}).includes(label),`${executionStatus} / ${acceptanceStatus}`);
+    }
+  }
+  for (const [acceptanceStatus,state] of [['pending','review'],['accepted','accepted'],['passed','accepted'],['rejected','rejected'],['failed','rejected']]) {
+    const run={executionStatus:'completed',acceptanceStatus};
+    assert.equal(taskStage(run.executionStatus,run.acceptanceStatus),state,'旧节点缺少阶段字段时使用执行状态');
+    assert.equal(acceptanceBadge(run),'','主状态已表达验收事实时不重复徽章');
+  }
 });
 
 test('写操作收到成功HTTP但非JSON或无效回执时仍按未知结果处理', async t => {

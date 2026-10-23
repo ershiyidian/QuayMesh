@@ -1,6 +1,6 @@
 import { icon } from './icons.js';
 import { fmt, compact, duration, fullTime, ago, smartTime, validTime } from './format.js';
-import type { Run } from './contracts.js';
+import type { Run, ChangeCapture } from './contracts.js';
 import { taskStage, taskStages, executionTimeEnd } from '../../console-task-state.js';
 
 export const esc = (v: unknown): string => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
@@ -18,6 +18,15 @@ export const btn = (text: string, action: string, extras = '', klass = '') => `<
 export const ib = (name: string, action: string, label: string, extras = '', klass = '') => `<button type="button" class="icon-btn ${klass}" data-action="${action}" title="${esc(label)}" aria-label="${esc(label)}" ${extras}>${icon(name)}</button>`;
 
 export const badge = (text: string | number, tone = '') => `<span class="badge ${tone}">${esc(text)}</span>`;
+
+export function acceptanceBadge(run: Pick<Run, 'executionStatus' | 'phaseExecutionStatus' | 'acceptanceStatus'>): string {
+  if (['review','accepted','rejected'].includes(stage(run))) return '';
+  if (run.acceptanceStatus === 'pending')
+    return (run.phaseExecutionStatus ?? run.executionStatus) === 'completed' ? badge('结果待验收','warn') : '';
+  if (['accepted','passed'].includes(run.acceptanceStatus)) return badge('结果已验收','good');
+  if (['rejected','failed'].includes(run.acceptanceStatus)) return badge('结果已驳回','warn');
+  return '';
+}
 
 export const meter = (v: number | null | undefined, tone = '') => v == null || !Number.isFinite(v)
   ? '<span class="progress indeterminate" role="meter" aria-label="数据尚未取得" aria-valuetext="未知"><i></i></span>'
@@ -39,6 +48,31 @@ export function resultExplanation(summary: string, reason: string | null, state:
   const distinctSummary = summary.trim() && summary.trim() !== reason?.trim();
   return (distinctSummary ? `<p class="execution-summary">${esc(summary)}</p>` : '')
     + (reason ? `<p class="notice ${['unknown','failed','interrupted','stalled','finalizing'].includes(state) ? 'warn' : ''}">${esc(reason)}</p>` : '');
+}
+
+export function changeCaptureBlockReason(captures?: readonly ChangeCapture[]): string | null {
+  const pending = captures?.some(capture => capture.state === 'pending');
+  const failed = captures?.some(capture => capture.state === 'failed');
+  if (pending && failed) return '部分文件改动仍在采集，部分采集失败，证据尚不完整。请核对错误，等待重新采集后刷新。';
+  if (failed) return '文件改动采集失败，证据尚不完整。请核对错误并重新采集后刷新。';
+  return pending ? '文件改动仍在采集，证据尚不完整。请等待采集结束后刷新。' : null;
+}
+
+export function changeCaptureNotice(captures?: readonly ChangeCapture[]): string {
+  const affected = captures?.filter(capture => capture.state === 'pending' || capture.state === 'failed') || [];
+  if (!affected.length) return '';
+  const blocked = changeCaptureBlockReason(affected);
+  const title = affected.some(capture => capture.state === 'failed') ? '文件改动采集失败' : '文件改动采集进行中';
+  return `<section class="notice warn change-capture-notice" role="status"><div><strong>${title}</strong><p>${blocked}</p>${affected.map(capture => `<div class="capture-scope" data-capture-state="${esc(capture.state)}"><b>${esc(capture.projectName)} · ${esc(capture.nodeId)} · ${capture.state === 'failed' ? '采集失败' : '采集中'}</b><div><code class="break">${esc(capture.root)}</code></div>${capture.error ? `<p class="small break">${esc(capture.error)}</p>` : ''}</div>`).join('')}<p>已取得的文件仍可查看。证据完整前，暂不能验收结果、导出补丁或还原文件。</p>${btn('刷新文件证据','refresh','','small')}</div></section>`;
+}
+
+export function dedupeCaptureWarnings(warnings: readonly string[], captures?: readonly ChangeCapture[]): string[] {
+  const repeated = new Set<string>();
+  for (const capture of captures || []) {
+    if (capture.state === 'pending') repeated.add('文件改动正在整理，当前列表尚未确认完整。');
+    if (capture.state === 'failed') repeated.add(`文件改动整理失败，当前列表可能不完整：${capture.error ?? '原因未知'}`);
+  }
+  return warnings.filter(warning => !repeated.has(warning));
 }
 
 export function elapsed(r: Run, observation?: { stale: boolean; observedAt: number | null }) {

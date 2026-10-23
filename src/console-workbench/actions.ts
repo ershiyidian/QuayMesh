@@ -10,6 +10,7 @@ import { LocalAgentStore } from "../local-agent-store.js";
 import { workspaceHandle } from "../federation/routing.js";
 import type { SessionRuntime } from "../session/runtime.js";
 import { ReviewState } from "../session/types.js";
+import { RevertPreconditionError } from "../session/revert.js";
 import { ProjectArchive } from "../project-archive.js";
 import { CodexThreadControl } from "../codex-thread-control.js";
 import { linkForRun, permitted, requireRun, readLocalIndex } from "./local.js";
@@ -24,7 +25,7 @@ import { taskView } from "../task-view.js";
 interface RevertPreview {
   id: string; runId: string; sessionId: string; memberId: string; owner: string;
   revision: number; files: string[]; expiresAt: number;
-  taskId?:string;
+  taskId?:string|null;
 }
 
 function archiveResponse(result: ReturnType<ProjectArchive["view"]>) {
@@ -46,12 +47,31 @@ export class LocalActions {
     this.audit = new ConsoleAudit(config.stateDir, config.federation?.nodeId ?? "local");
   }
 
+  private assertFileCaptureReady(memberId: string, taskId?: string) {
+    const capture = this.session?.changes?.captureObservation(memberId, taskId);
+    if (!capture || capture.state === "idle") return;
+    const failed = capture.state === "failed";
+    throw new WorkbenchError(failed
+      ? `文件改动采集失败，请处理后刷新并重新确认${capture.error ? `：${capture.error}` : ""}`
+      : "文件改动正在采集，请等待完成并刷新后重新确认", 409, failed ? "file_capture_failed" : "file_capture_pending", "none");
+  }
+
   async review(ref: { id: string; expectedRevision: number; completeExecution?: boolean }, verdict: "accept" | "reject", note: string, requestKey: string) {
     const ledger = new WorkLedger(this.config.stateDir);
     try {
       const original = requireRun(this.config, ledger, ref.id);
       if (original.revision !== ref.expectedRevision) throw new WorkbenchError("任务已更新，请刷新后再次确认", 409, "revision_conflict", "none");
       const link = linkForRun(ledger, ref.id);
+      const frozen = original.status === "completed" && readRunCheckpoint(ledger.db, original.id);
+      const live = this.session && link && !frozen ? { memberId: link.member_id, taskId: link.task_id ?? undefined,
+        revision: this.session.store.getMember(link.session_id, link.member_id).revision } : null;
+      const assertLiveEvidence = () => {
+        if (!live || !link || !this.session) return;
+        this.assertFileCaptureReady(live.memberId, live.taskId);
+        if (this.session.store.getMember(link.session_id, live.memberId).revision !== live.revision)
+          throw new WorkbenchError("文件或工作证据已更新，请刷新并重新核对后验收", 409, "revision_conflict", "none");
+      };
+      assertLiveEvidence();
       let checkpoint: RunCheckpoint | null = null;
       if (original.status === "running") {
         if (!ref.completeExecution || !this.session || link?.latest_run !== original.id) {
@@ -60,9 +80,12 @@ export class LocalActions {
         if (ledger.hasActiveChild(original.id)) throw new WorkbenchError("当前工作仍有执行中的操作或代理", 409, "work_active", "none");
         const unresolved = ledger.db.prepare("SELECT 1 FROM console_operations WHERE run_id=? AND status IN ('unknown','reconciliation_required') LIMIT 1").get(original.id);
         if (unresolved) throw new WorkbenchError("存在尚未确认的操作结果，请先核对", 409, "work_unresolved", "none");
-        checkpoint = await this.session.service.prepareRunCheckpoint(link.session_id, link.member_id,link.task_id ?? undefined);
+        try { checkpoint = await this.session.service.prepareRunCheckpoint(link.session_id, link.member_id,link.task_id ?? undefined); }
+        catch (error) { assertLiveEvidence(); throw error; }
+        assertLiveEvidence();
       }
       const commitReview = () => {
+        assertLiveEvidence();
         const run = requireRun(this.config, ledger, ref.id);
         if (run.revision !== ref.expectedRevision) throw new WorkbenchError("任务已更新，请刷新后再次确认", 409, "revision_conflict", "none");
         if (run.status === "running" && ref.completeExecution) {
@@ -190,20 +213,32 @@ export class LocalActions {
       if (run.revision !== expectedRevision) throw new WorkbenchError("任务已经更新", 409, "revision_conflict", "none");
       const link = linkForRun(ledger, id);
       if (!link) throw new WorkbenchError("此任务没有可自动撤销的会话写入证据", 409, "operation_rejected", "none");
+      this.assertFileCaptureReady(link.member_id, link.task_id ?? undefined);
+      const session = this.session;
+      const revision = session.store.getMember(link.session_id, link.member_id).revision;
       const checkpoint = readRunCheckpoint(ledger.db, id);
       if (!checkpoint && !link.task_id && link.latest_run !== id) throw new WorkbenchError("此历史任务没有保存可验证的文件版本，无法自动撤销", 409, "operation_rejected", "none");
-      if (checkpoint) {
-        const current = this.session.store.fileSummaries(link.session_id, link.member_id,link.task_id ?? undefined);
-        if (files.some((id) => {
-          const recorded = checkpoint.files.find((file) => file.id === id);
-          return !recorded || !current.some((file) => file.id === id && file.hash === recorded.hash);
-        })) throw new WorkbenchError("文件已不再是这段工作保存的版本，请重新查看改动", 409, "revision_conflict", "none");
-      }
-      const eligibility = await this.session.reverter.eligibility(link.owner_id, link.session_id, link.member_id, files,link.task_id ?? undefined);
+      const assertPreviewEvidence = () => {
+        this.assertFileCaptureReady(link.member_id, link.task_id ?? undefined);
+        if (session.store.getMember(link.session_id, link.member_id).revision !== revision)
+          throw new WorkbenchError("文件或工作证据已更新，请刷新并重新确认撤销", 409, "revision_conflict", "none");
+        if (checkpoint) {
+          const current = session.store.fileSummaries(link.session_id, link.member_id,link.task_id ?? undefined);
+          if (files.some((id) => {
+            const recorded = checkpoint.files.find((file) => file.id === id);
+            return !recorded || !current.some((file) => file.id === id && file.hash === recorded.hash);
+          })) throw new WorkbenchError("文件已不再是这段工作保存的版本，请重新查看改动", 409, "revision_conflict", "none");
+        }
+      };
+      assertPreviewEvidence();
+      const eligibility = await session.reverter.eligibility(link.owner_id, link.session_id, link.member_id, files,link.task_id);
+      assertPreviewEvidence();
+      if (eligibility.revision !== revision)
+        throw new WorkbenchError("文件或工作证据已更新，请刷新并重新确认撤销", 409, "revision_conflict", "none");
       if (!eligibility.allowed) throw new WorkbenchError(`当前无法撤销：${eligibility.reason}`, 409, "operation_rejected", "none");
       ledger.db.prepare("DELETE FROM console_revert_previews WHERE expires_at<=?").run(Date.now());
       const preview: RevertPreview = { id: randomUUID(), runId: id, sessionId: link.session_id, memberId: link.member_id,
-        owner: link.owner_id,taskId:link.task_id ?? undefined, revision: eligibility.revision, files, expiresAt: Date.now() + 300_000 };
+        owner: link.owner_id,taskId:link.task_id, revision, files, expiresAt: Date.now() + 300_000 };
       ledger.db.prepare("INSERT INTO console_revert_previews(id,data_json,expires_at) VALUES (?,?,?)")
         .run(preview.id, JSON.stringify(preview), preview.expiresAt);
       return { id: preview.id, hash: preview.id, files, expiresAt: preview.expiresAt, revision: preview.revision };
@@ -217,7 +252,17 @@ export class LocalActions {
       const preview = saved ? JSON.parse(saved.data_json) as RevertPreview : null;
       if (!preview || preview.id !== confirmation || preview.expiresAt <= Date.now()) throw new WorkbenchError("撤销预览已失效，请重新确认", 409, "preview_expired", "none");
       if (!this.session) throw new WorkbenchError("当前服务没有会话撤销能力", 409, "operation_rejected", "none");
-      const result = await this.session.reverter.revert(preview.owner, preview.sessionId, preview.memberId, preview.revision, true, preview.files,preview.taskId);
+      // 旧预览没有 taskId 字段时从原 Run 的持久归属恢复，不能落到会话当前 Task。
+      const originalLink = preview.taskId === undefined ? linkForRun(ledger, preview.runId) : null;
+      if (preview.taskId === undefined && (!originalLink || originalLink.session_id !== preview.sessionId || originalLink.member_id !== preview.memberId))
+        throw new WorkbenchError("原撤销预览的任务归属无法确认，请刷新并重新预览", 409, "preview_expired", "none");
+      const targetTaskId = preview.taskId === undefined ? originalLink!.task_id : preview.taskId;
+      let result;
+      try { result = await this.session.reverter.revert(preview.owner, preview.sessionId, preview.memberId, preview.revision, true, preview.files,targetTaskId); }
+      catch (error) {
+        if (error instanceof RevertPreconditionError) throw new WorkbenchError(error.message, 409, error.code, error.effect);
+        throw error;
+      }
       ledger.db.prepare("DELETE FROM console_revert_previews WHERE id=?").run(previewId);
       this.audit.record("run.revert", preview.runId, null, {previewId, files: result.changed_paths,revision:result.revision}, requestKey);
       return { status: "completed", files: result.changed_paths, revision: result.revision };

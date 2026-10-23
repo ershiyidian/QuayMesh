@@ -12,7 +12,7 @@ import { SourceErrors } from "../source-errors.mjs";
 import { componentPlans, compileCore } from "../compile.mjs";
 import { validateNode } from "../config.mjs";
 import { requestJson, requestText } from "../network.mjs";
-import { directory, token, cluster, nodeConfig, until } from "./helpers.mjs";
+import { directory, token, cluster, nodeConfig, until, freePort } from "./helpers.mjs";
 
 test("目录真实写入失败后返回错误，修复文件系统后下一次心跳重新保存", async t => {
   const root = await directory(t), key = token(), configuration = cluster();
@@ -103,10 +103,11 @@ test("Console规范URL、带版本静态缓存、HEAD和多个cookie保持真实
     res.setHeader("set-cookie",["one=1; Path=/","two=2; Path=/"]);
     res.end("ok");
   });
-  await new Promise(resolve=>source.listen(0,"127.0.0.1",resolve));
+  const sourcePort=await freePort();
+  await new Promise(resolve=>source.listen(sourcePort,"127.0.0.1",resolve));
   t.after(()=>new Promise(resolve=>source.close(resolve)));
   const origin = `http://127.0.0.1:${source.address().port}`;
-  const relay = await new McpRelay({origin,port:0,
+  const relay = await new McpRelay({origin,port:await freePort(),
     consoleAssetDir:root,consoleRpc:async request => {
       const response=await fetch(origin+request.path,{method:request.method,headers:request.headers,signal:request.signal});
       return {status:response.status,headers:{"set-cookie":response.headers.getSetCookie()},body:await response.text()};

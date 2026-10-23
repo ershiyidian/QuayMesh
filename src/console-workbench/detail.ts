@@ -6,10 +6,26 @@ import { WorkLedger } from "../work-ledger.js";
 import { runOperations, runTimeline } from "../console-run-data.js";
 import { LocalAgentStore } from "../local-agent-store.js";
 import type { SessionRuntime } from "../session/runtime.js";
+import type { CaptureObservation } from "../session/changes.js";
 import { linkForRun, readLocalIndex, requireRun } from "./local.js";
 import { WorkbenchError, type SourceState } from "./types.js";
 import { diffPage } from "./diff.js";
 import { readRunCheckpoint } from "../session/run-checkpoints.js";
+
+export interface ChangeCapture extends CaptureObservation {
+  runId: string;
+  nodeId: string;
+  projectName: string;
+  root: string;
+}
+
+function requireIdleCapture(runtime: SessionRuntime, memberId: string, taskId?: string): void {
+  const capture = runtime.changes.captureObservation(memberId, taskId);
+  if (capture.state === "pending") throw new WorkbenchError(
+    "文件改动仍在整理，请稍后刷新再导出补丁", 409, "change_capture_pending", "none");
+  if (capture.state === "failed") throw new WorkbenchError(
+    `文件改动整理失败，无法导出完整补丁：${capture.error ?? "原因未知"}`, 409, "change_capture_failed", "none");
+}
 
 function checkpointForRun(ledger:WorkLedger,id:string,runtime?:SessionRuntime) {
   const checkpoint=readRunCheckpoint(ledger.db,id);
@@ -62,6 +78,7 @@ export async function readRunDetail(config: ServerConfig, id: string, runtime?: 
     const snapshot = archived?.snapshot ?? (runtime && link
       ? await runtime.projector.materialize(link.session_id, link.member_id,link.task_id ?? undefined) : null);
     let files: FileRow[] = [];
+    const changeCaptures: ChangeCapture[] = [];
     const warnings = [...run.warnings];
     if (archived) {
       const currentFiles = runtime && currentMember && link ? runtime.store.fileSummaries(link.session_id, link.member_id,link.task_id ?? undefined) : [];
@@ -70,18 +87,28 @@ export async function readRunDetail(config: ServerConfig, id: string, runtime?: 
         revertible: currentFiles.some((current) => current.id === file.id && current.hash === file.hash && current.revertible && current.coverage === "session_owned") }));
       const candidates = files.filter((file) => file.revertible).map((file) => file.id);
       run.actions.revert = Boolean(runtime && currentMember && link && candidates.length
-        && (await runtime.reverter.eligibility(link.owner_id, link.session_id, link.member_id, candidates,link.task_id ?? undefined)).allowed);
+        && (await runtime.reverter.eligibility(link.owner_id, link.session_id, link.member_id, candidates,link.task_id)).allowed);
     } else if (runtime && currentMember && link && (link.task_id || link.latest_run === id)) {
+      // Read the observation and saved files without yielding between them. A
+      // capture finishing during eligibility checks must not turn an older empty
+      // list into an apparently settled one. Frozen checkpoints stay independent.
+      const capture = runtime.changes.captureObservation(link.member_id, link.task_id ?? undefined);
+      changeCaptures.push({ runId: run.id, nodeId: run.nodeId, projectName: run.projectName, root: run.root, ...capture });
+      if (capture.state === "pending") warnings.push("文件改动正在整理，当前列表尚未确认完整。");
+      if (capture.state === "failed") warnings.push(`文件改动整理失败，当前列表可能不完整：${capture.error ?? "原因未知"}`);
       files = runtime.store.fileSummaries(link.session_id, link.member_id,link.task_id ?? undefined).map((file) => ({
         id: file.id, path: file.path, kind: file.status, add: file.additions, del: file.removals,
         revision: file.hash, generated: file.large, binary: file.binary, revertible: file.revertible && file.coverage === "session_owned",
       }));
-      const eligibility = await runtime.reverter.eligibility(link.owner_id, link.session_id, link.member_id,undefined,link.task_id ?? undefined);
+      const eligibility = await runtime.reverter.eligibility(link.owner_id, link.session_id, link.member_id,undefined,link.task_id);
       run.actions.revert = eligibility.allowed;
     } else {
       try { files = await legacyFiles(config, operations); }
       catch (error) { warnings.push(`已保存的差异文件不可读：${error instanceof Error ? error.message : String(error)}`); }
       run.actions.revert = false;
+    }
+    if (changeCaptures.some(capture => capture.state !== "idle")) {
+      run.actions = { ...run.actions, review: false, complete: false, patch: false, revert: false };
     }
     const operationIds = new Set(operations.map((operation) => operation.id));
     const commands = snapshot ? snapshot.commands.filter((command) => operationIds.has(command.operation_id)).map((command) => ({
@@ -115,7 +142,7 @@ export async function readRunDetail(config: ServerConfig, id: string, runtime?: 
       })), files:files.map(file=>({...file,source:{runId:run.id,nodeId:run.nodeId,projectName:run.projectName,root:run.root}})), commands, agents: agentRows,
       timeline: runTimeline(row, operations, executions).map((event) => ({ time: Date.parse(event.time), text: [event.title, event.detail].filter(Boolean).join(" · "), tone: event.type === "error" ? "red" : "muted" })),
       instructions: snapshot?.instructions ?? [], skills: snapshot?.skills ?? [],
-      warnings, revision: row.revision,
+      warnings, changeCaptures, revision: row.revision,
     };
   } finally { agents.close(); ledger.close(); }
 }
@@ -172,9 +199,14 @@ export async function readRunPatch(config: ServerConfig, id: string, cursor?: st
       return { patch: page.text, complete: page.nextCursor === null, nextCursor: page.nextCursor, revision: archived.revision };
     }
     if (runtime && link && (link.task_id || link.latest_run === id)) {
+      requireIdleCapture(runtime, link.member_id, link.task_id ?? undefined);
+      const revision = runtime.store.memberRevision(link.member_id);
       const result = await runtime.changes.patch(link.session_id, link.member_id, cursor,link.task_id ?? undefined);
+      requireIdleCapture(runtime, link.member_id, link.task_id ?? undefined);
+      if (runtime.store.memberRevision(link.member_id) !== revision) throw new WorkbenchError(
+        "文件改动已更新，请刷新后重新导出补丁", 409, "revision_conflict", "none");
       return { patch: result.patch, complete: result.nextCursor === null, nextCursor: result.nextCursor,
-        revision: runtime.store.memberRevision(link.member_id) };
+        revision };
     }
     const files = await legacyFiles(config, runOperations(ledger, id));
     const patches = await Promise.all([...new Set(files.map((file) => file.operationId))].map((operation) => readFile(join(config.stateDir, "console-changes", `${operation}.patch`), "utf8")));

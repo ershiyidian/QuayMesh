@@ -644,7 +644,9 @@ export class SessionStore {
 
   private persistEvent(event: Omit<SessionEvent, "sequence">): { result: EventAppendResult; taskId?: string } {
     const appendTx = this.db.transaction(() => {
-      const currentTask = event.task_id ?? this.currentTask(event.session_id)?.id ?? null;
+      // Omission follows the current request; an explicit null preserves legacy
+      // session evidence and must never attach it to a later Task.
+      const currentTask = event.task_id === undefined ? this.currentTask(event.session_id)?.id ?? null : event.task_id;
       const existing = this.db
         .prepare(
           `SELECT sequence FROM qm_events

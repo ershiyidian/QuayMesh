@@ -1,17 +1,19 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createServer as createNetServer } from "node:net";
 import { promisify } from "node:util";
+import { setTimeout as delay } from "node:timers/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig, type ServerConfig } from "../../src/config.js";
 import { createServer, type CreateServerOptions } from "../../src/server.js";
 import { defaultQuayMeshConfig } from "../../src/config-schema.js";
 import { writeQuayMeshConfig } from "../../src/user-config.js";
+import { WorkLedger } from "../../src/work-ledger.js";
 
 const execFileAsync = promisify(execFile);
 const ownerToken = "test-owner-token-that-is-long-enough";
@@ -264,4 +266,115 @@ export async function openConversation(
 export function structured(result: Awaited<ReturnType<Client["callTool"]>>): Record<string, unknown> {
   assert.ok(result.structuredContent, "expected structuredContent");
   return result.structuredContent as Record<string, unknown>;
+}
+
+interface FixtureWorkScope {
+  sessionId: string;
+  paths?: string[];
+}
+
+// Tool acceptance, operation completion and asynchronous file capture are separate
+// boundaries. Observe the required evidence instead of assuming a fixed number of
+// short sleeps covers Git process startup on every runner.
+export async function waitForFixture<T>(
+  fixture: RealTestServer,
+  scope: FixtureWorkScope,
+  label: string,
+  read: () => Promise<T>,
+  ready: (value: T) => boolean,
+  timeoutMs = 15_000,
+): Promise<T> {
+  const started = performance.now();
+  let observation: T | undefined;
+  let failure: unknown;
+  let attempts = 0;
+  try {
+    for (;;) {
+      observation = await read();
+      attempts++;
+      if (ready(observation)) return observation;
+      const remaining = timeoutMs - (performance.now() - started);
+      if (remaining <= 0) break;
+      await delay(Math.min(100, remaining));
+    }
+  } catch (error) {
+    // An HTTP/tool error is a failure, not a transient condition to retry away.
+    failure = error;
+  }
+  const diagnostics = await fixtureWorkDiagnostics(fixture, scope).catch(error => ({ error: String(error) }));
+  throw new Error(`${label} ${failure ? "failed while waiting" : "did not converge"}: ${JSON.stringify({
+    elapsedMs: Math.round(performance.now() - started), timeoutMs, attempts, observation, diagnostics,
+  }, null, 2)}`, failure ? { cause: failure } : undefined);
+}
+
+export async function waitForRecordedTool(
+  fixture: RealTestServer,
+  scope: FixtureWorkScope & { workspaceId: string; conversationId: string },
+  result: Awaited<ReturnType<Client["callTool"]>>,
+): Promise<void> {
+  assert.notEqual(result.isError, true, JSON.stringify(result));
+  const receipt = structured(result);
+  if (receipt.accepted !== true && receipt.running !== true) return;
+  assert.equal(typeof receipt.operation_id, "string", JSON.stringify(result));
+  await waitForFixture(fixture, scope, `operation ${receipt.operation_id}`, async () => {
+    const status = await fixture.client.callTool({
+      name: "workspace_context",
+      arguments: { workspace_id: scope.workspaceId, action: "status", operation_id: receipt.operation_id },
+      _meta: { "openai/session": scope.conversationId },
+    });
+    assert.notEqual(status.isError, true, JSON.stringify(status));
+    return structured(status);
+  }, status => {
+    if (["accepted", "queued", "running"].includes(String(status.operation_state))) return false;
+    assert.equal(status.operation_state, "succeeded", JSON.stringify(status));
+    return true;
+  });
+}
+
+async function fixtureWorkDiagnostics(fixture: RealTestServer, scope: FixtureWorkScope): Promise<unknown> {
+  let database: unknown;
+  const ledger = new WorkLedger(fixture.config.stateDir);
+  try {
+    const rows = (sql: string) => ledger.db.prepare(sql).all(scope.sessionId);
+    database = {
+      session: rows("SELECT id,current_task_id,execution_state,review_state,revision FROM qm_sessions WHERE id=?"),
+      tasks: rows("SELECT id,state,revision,change_summary_state,change_summary_error,finished_at,result_status FROM qm_tasks WHERE session_id=?"),
+      members: rows("SELECT id,root,revision,snapshot_revision,dirty_revision,exported_revision,projection_error FROM qm_session_members WHERE session_id=?"),
+      links: rows("SELECT * FROM qm_run_links WHERE session_id=?"),
+      operations: rows(`SELECT o.* FROM console_operations o JOIN qm_run_links l ON l.run_id=o.run_id
+        WHERE l.session_id=? ORDER BY o.rowid`),
+      invocations: rows(`SELECT id,task_id,member_id,operation_id,tool_name,state,effect,result_json,created_at,finished_at,response_at
+        FROM qm_invocations WHERE session_id=? ORDER BY rowid`),
+      baselines: rows("SELECT * FROM qm_task_change_baselines WHERE session_id=?"),
+      files: rows("SELECT * FROM qm_task_file_changes WHERE session_id=?"),
+      events: rows("SELECT sequence,task_id,member_id,event_type,data_json,created_at FROM qm_events WHERE session_id=? ORDER BY sequence"),
+    };
+  } catch (error) {
+    database = { error: String(error) };
+  } finally {
+    ledger.close();
+  }
+  const git = async (args: string[]) => {
+    try {
+      return await execFileAsync("git", args, { cwd: fixture.project, windowsHide: true, timeout: 5000,
+        env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
+    } catch (error) {
+      const details = error as Error & { code?: unknown; stdout?: string; stderr?: string };
+      return { error: details.message, code: details.code, stdout: details.stdout, stderr: details.stderr };
+    }
+  };
+  const [version, config, status, files] = await Promise.all([
+    git(["--version"]),
+    git(["config", "--show-origin", "--get-regexp", "^core\\.(autocrlf|eol|safecrlf)$"]),
+    git(["status", "--porcelain=v1", "--untracked-files=all"]),
+    Promise.all((scope.paths ?? []).map(async path => {
+      try {
+        const content = await readFile(join(fixture.project, path));
+        return { path, bytes: content.length, sha256: createHash("sha256").update(content).digest("hex") };
+      } catch (error) { return { path, error: String(error) }; }
+    })),
+  ]);
+  // Capture's in-memory pending/error map is deliberately not exposed through a
+  // test-only server hook. dispose() flushes it and reports capture/flush errors.
+  return { database, filesystem: files, git: { version, config, status } };
 }

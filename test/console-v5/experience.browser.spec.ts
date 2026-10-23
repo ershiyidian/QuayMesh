@@ -1,10 +1,12 @@
 import {test,expect,chromium,type Page} from '@playwright/test';
-import {mkdtemp,rm,mkdir} from 'node:fs/promises';
+import {mkdtemp,rm,mkdir,writeFile,readFile,rename} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createServer,request as httpRequest,type Server} from 'node:http';
 import type {AddressInfo} from 'node:net';
-import {consoleExperienceFixture} from './experience-fixture.js';
+import {consoleExperienceFixture,liveCaptureFixture} from './experience-fixture.js';
+import {freePort} from '../session-card/server-fixture.js';
+import {canonicalWorkspaceRoot} from '../../src/roots.js';
 // @ts-expect-error 节点管理器使用ESM脚本。
 import {McpRelay} from '../../node/relay.mjs';
 
@@ -35,15 +37,16 @@ test('总览只列实际执行，状态筛选、工作区和对话详情在浏�
   await page.getByLabel('具体任务状态',{exact:true}).selectOption('waiting');
   await expect(page.locator('.run-table tbody tr')).toHaveCount(1);
   await expect(page.locator('.run-table')).toContainText('等待下一步的工作');
+  await expect(page.locator('.run-table')).not.toContainText('结果待验收');
   await page.getByLabel('具体任务状态',{exact:true}).selectOption('done');
   const scope=page.locator('.run-table .workspace-disclosure');
   await scope.locator('summary').click();
   await expect(scope.locator('.workspace-popover code')).toHaveCount(2);
   await expect(scope.locator('.workspace-popover code').last()).toBeInViewport({ratio:0.95});
-  await expect(scope).toContainText(f.server.secondRoot.toLowerCase());
+  await expect(scope).toContainText(canonicalWorkspaceRoot(f.server.secondRoot));
   await page.screenshot({path:screenshots+'/workspace-details.png',fullPage:true});
   const projects=await f.get('projects');
-  const project=projects.items.find((value:any)=>value.path.toLowerCase()===f.server.project.toLowerCase());
+  const project=projects.items.find((value:any)=>canonicalWorkspaceRoot(value.path)===canonicalWorkspaceRoot(f.server.project));
   await page.goto(f.server.baseUrl+'/console/#/sessions?project='+encodeURIComponent(project.id));
   await expect(page.locator('.conversation')).toHaveCount(1);
   await expect(page.locator('[data-action=session-tab][data-value=sessions] .count')).toHaveText('1');
@@ -171,11 +174,117 @@ test('任务详情保留交付总结、各工作区阶段入口和文件来源',
   const phase=await page.locator('.phase-card [data-action=open-run]').first().getAttribute('data-id');expect(phase).toMatch(/^qm:/);
   await page.locator('.phase-card [data-action=open-run]').first().click();await expect(page).toHaveURL(new RegExp('run='+encodeURIComponent(phase!)));
   await page.goto(f.server.baseUrl+'/console/#/tasks?days=0&run='+encodeURIComponent(reference)+'&tab=diff');
-  await expect.poll(async()=>((await page.locator('.file-source').first().textContent())||'').toLowerCase()).toContain(f.server.secondRoot.toLowerCase());
+  await expect.poll(async()=>{
+    const source=(await page.locator('.file-source').first().textContent())||'';
+    const root=source.split(' · ').slice(2).join(' · ');
+    return root?canonicalWorkspaceRoot(root):'';
+  }).toBe(canonicalWorkspaceRoot(f.server.secondRoot));
   await page.goto(f.server.baseUrl+'/console/#/tasks?days=0&run='+encodeURIComponent('qmtask:'+f.waiting.task_id));
   await expect(page.locator('[data-action=finish-task]')).toBeVisible();await expect(page.locator('#inspector')).not.toContainText('结束并验收');
+  await expect(page.locator('#inspector')).not.toContainText('结果待验收');
   await page.setViewportSize({width:390,height:844});await page.screenshot({path:screenshots+'/task-detail-narrow.png',fullPage:true});
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+});
+
+test('真实文件采集显示在途与失败证据，保留旧文件并隔离历史检查点',async({page})=>{
+  await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
+  const capture=await liveCaptureFixture(f),collector=capture.collector;
+  const original=collector.capture,descriptor=Object.getOwnPropertyDescriptor(collector,'capture');
+  const name='capture-state.txt',path=join(capture.member.root,name),backup=path+'.test-backup';
+  let release:(()=>void)|undefined,hasBackup=false;
+  const hold=()=>{
+    let entered!:()=>void;
+    const started=new Promise<void>(resolve=>{entered=resolve;});
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    collector.capture=async function(memberId,taskId,paths){
+      if(memberId===capture.member.id&&taskId===capture.taskId){entered();await gate;}
+      return original.call(this,memberId,taskId,paths);
+    };
+    collector.markDirty(capture.member.id,[name],capture.taskId);
+    return started;
+  };
+  const finish=async()=>{release?.();release=undefined;await collector.flushTask(capture.member.id,capture.taskId);collector.capture=original;};
+  const show=async(reference:string)=>page.goto(f.server.baseUrl+'/console/#/tasks?days=0&tab=diff&run='+encodeURIComponent(reference));
+  const noUnsafeActions=async()=>expect(page.locator('#inspector [data-action=patch]:enabled,#inspector [data-action=single-accept]:enabled,#inspector [data-action=single-reject]:enabled,#inspector [data-action=revert]:enabled')).toHaveCount(0);
+  try {
+    const evidence=await collector.prepareWrite(capture.member,[name],capture.member.root,capture.taskId);
+    await writeFile(path,'first captured content\n','utf8');
+    await collector.recordWrite(capture.member,evidence,capture.taskId);
+    await hold();
+    await login(page);await show(capture.reference);
+    await expect(page.locator('.change-capture-notice')).toContainText('文件改动采集进行中');
+    const pendingRoot=page.locator('.capture-scope[data-capture-state=pending] code');
+    await expect(pendingRoot).toBeVisible();
+    expect(canonicalWorkspaceRoot(await pendingRoot.innerText())).toBe(canonicalWorkspaceRoot(capture.member.root));
+    await expect(page.locator('.file-section')).toHaveCount(0);
+    await expect(page.locator('#inspector')).not.toContainText('暂无已记录的文件改动');
+    await expect(page.locator('#inspector')).not.toContainText('文件改动正在整理，当前列表尚未确认完整。');
+    await page.locator('[data-action=detail-tab][data-value=summary]').click();
+    await expect(page.locator('.change-capture-notice')).toHaveCount(1);
+    await expect(page.locator('#inspector')).not.toContainText('文件改动正在整理，当前列表尚未确认完整。');
+    await page.locator('[data-action=detail-tab][data-value=diff]').click();
+    await noUnsafeActions();await page.screenshot({path:screenshots+'/capture-pending.png',fullPage:true});
+    await finish();await page.locator('#topbar [data-action=refresh]').click();
+    await expect(page.locator('.file-section')).toHaveCount(1);
+    await expect(page.locator('.change-capture-notice')).toHaveCount(0);
+    await show(capture.phaseId);await expect(page.locator('#inspector [data-action=patch]')).toBeEnabled();
+
+    await hold();await page.locator('#topbar [data-action=refresh]').click();
+    await expect(page.locator('.change-capture-notice')).toContainText('文件改动采集进行中');
+    await expect(page.locator('.file-section')).toHaveCount(1);await noUnsafeActions();
+    const historical=await f.get('runs/'+encodeURIComponent('qmtask:'+f.completed.task_id)+'?fresh=1');
+    expect(historical.changeCaptures).toEqual([]);
+    const frozenPhase=historical.files.find((file:any)=>file.path==='finished.txt').source.runId;
+    await show(frozenPhase);
+    await expect(page.locator('.change-capture-notice')).toHaveCount(0);
+    await expect(page.locator('.file-path')).toContainText('finished.txt');
+    await expect(page.locator('#inspector [data-action=patch]')).toBeEnabled();
+    const downloadEvent=page.waitForEvent('download');
+    await page.locator('#inspector [data-action=patch]').click();
+    const download=await downloadEvent;
+    expect(await readFile((await download.path())!,'utf8')).toContain('真实完成的文件内容');
+    await page.locator('dialog footer [data-dialog-close]').click();
+    await finish();
+
+    await rename(path,backup);hasBackup=true;await mkdir(path);
+    collector.markDirty(capture.member.id,[name],capture.taskId);
+    await expect(collector.flushTask(capture.member.id,capture.taskId)).rejects.toThrow();
+    const failed=await f.get('runs/'+encodeURIComponent(capture.phaseId)+'?fresh=1');
+    expect(failed.changeCaptures[0].state).toBe('failed');expect(failed.changeCaptures[0].error).toBeTruthy();
+    await show(capture.phaseId);
+    // 此例关闭轮询；返回刚打开过的阶段会复用缓存，需通过页面主动刷新。
+    const [refreshed]=await Promise.all([
+      page.waitForResponse(response=>{
+        const url=new URL(response.url());
+        return url.pathname.endsWith('/runs/'+encodeURIComponent(capture.phaseId))&&url.searchParams.get('fresh')==='1';
+      }),
+      page.getByRole('button',{name:'刷新文件证据',exact:true}).click(),
+    ]);
+    expect(refreshed.status()).toBe(200);
+    expect((await refreshed.json()).changeCaptures[0].state).toBe('failed');
+    await expect(page.locator('.change-capture-notice')).toContainText('文件改动采集失败');
+    await expect(page.locator('.change-capture-notice')).toContainText(failed.changeCaptures[0].error);
+    await expect(page.locator('#inspector')).not.toContainText('文件改动整理失败，当前列表可能不完整：'+failed.changeCaptures[0].error);
+    await expect(page.locator('.file-section')).toHaveCount(1);await noUnsafeActions();
+    await page.setViewportSize({width:390,height:844});
+    await page.screenshot({path:screenshots+'/capture-failed-narrow.png',fullPage:true});
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+    await rm(path,{recursive:true,force:true});await rename(backup,path);hasBackup=false;
+    collector.markDirty(capture.member.id,[name],capture.taskId);await collector.flushTask(capture.member.id,capture.taskId);
+    await page.getByRole('button',{name:'刷新文件证据',exact:true}).click();
+    await expect(page.locator('.capture-scope[data-capture-state=failed]')).toHaveCount(0);
+    await expect(page.locator('.change-capture-notice')).toHaveCount(0);
+    await expect(page.locator('.file-section')).toHaveCount(1);await expect(page.locator('#inspector [data-action=patch]')).toBeEnabled();
+  } finally {
+    try {
+      release?.();collector.capture=original;
+      if(hasBackup){await rm(path,{recursive:true,force:true});await rename(backup,path);}
+      collector.markDirty(capture.member.id,[name],capture.taskId);
+      await collector.flushTask(capture.member.id,capture.taskId);
+    } finally {
+      if(descriptor)Object.defineProperty(collector,'capture',descriptor);else Reflect.deleteProperty(collector,'capture');
+    }
+  }
 });
 
 test('登录成功仍校验服务能力，不允许进入不兼容页面',async({page})=>{
@@ -211,7 +320,7 @@ test('后端连接中断时不要求重新输入口令，真实HTTP恢复后继�
   await new Promise<void>(resolve=>backend.listen(0,'127.0.0.1',resolve));
   const port=(backend.address() as AddressInfo).port;
   let base='';
-  const relay=await new McpRelay({origin:`http://127.0.0.1:${port}`,port:0,consoleAssetDir:join(process.cwd(),'dist','ui'),
+  const relay=await new McpRelay({origin:`http://127.0.0.1:${port}`,port:await freePort(),consoleAssetDir:join(process.cwd(),'dist','ui'),
     consoleRpc:(request:{method:string;path:string;headers:Record<string,string>;body?:string;signal:AbortSignal})=>
       new Promise((resolve,reject)=>{
         const upstream=httpRequest({host:'127.0.0.1',port,path:request.path,method:request.method,

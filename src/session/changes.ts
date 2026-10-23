@@ -30,9 +30,17 @@ interface OrdinaryBaseline {
   files: OrdinaryBaselineFile[];
 }
 
+export interface CaptureObservation {
+  /** idle means this process currently observes no capture work or failure. */
+  state: "idle" | "pending" | "failed";
+  error: string | null;
+}
+
 export class SessionChangeCollector {
   private readonly metadataWrites = new Map<string, Promise<void>>();
   private readonly pending = new Map<string, Promise<void>>();
+  private readonly captures = new Map<string, Set<Promise<void>>>();
+  private readonly captureTokens = new Map<string, symbol>();
   private readonly dirty = new Map<string, Set<string> | null>();
   private onCaptured?: (sessionId: string, memberId: string, taskId?: string) => Promise<void> | void;
   private closed = false;
@@ -66,23 +74,41 @@ export class SessionChangeCollector {
     return next;
   }
 
+  private metadataKeys(memberId: string, taskId?: string): string[] {
+    return [JSON.stringify([memberId, taskId ?? null, "baseline"]),
+      ownershipPath(this.stateDir, this.sessionIdFor(memberId), memberId, taskId)];
+  }
+
+  captureObservation(memberId: string, taskId?: string): CaptureObservation {
+    const key = JSON.stringify([memberId, taskId ?? null]);
+    const pending = this.pending.has(key) || Boolean(this.captures.get(key)?.size)
+      || this.metadataKeys(memberId, taskId).some(value => this.metadataWrites.has(value));
+    const error = this.captureErrors.get(key);
+    return { state: pending ? "pending" : error ? "failed" : "idle", error: error?.message ?? null };
+  }
+
+  private pendingWork(): Promise<void>[] {
+    return [...this.metadataWrites.values(), ...this.pending.values(), ...[...this.captures.values()].flatMap(values => [...values])];
+  }
+
   async flush(): Promise<void> {
-    while (this.metadataWrites.size) await Promise.all([...this.metadataWrites.values()]);
-    while (this.pending.size) await Promise.all([...this.pending.values()]);
+    for (;;) {
+      const work = this.pendingWork();
+      if (!work.length) break;
+      await Promise.all(work);
+    }
     if (this.captureErrors.size) throw new AggregateError([...this.captureErrors.values()], "文件改动捕获失败");
   }
 
   async flushTask(memberId: string, taskId?: string): Promise<void> {
     const key = JSON.stringify([memberId, taskId ?? null]);
-    const sessionId = this.sessionIdFor(memberId);
-    const metadataKeys = [JSON.stringify([memberId, taskId ?? null, "baseline"]),
-      ownershipPath(this.stateDir, sessionId, memberId, taskId)];
+    const metadataKeys = this.metadataKeys(memberId, taskId);
     for (;;) {
-      const writes = metadataKeys.flatMap(value => this.metadataWrites.get(value) ?? []);
-      if (!writes.length) break;
-      await Promise.all(writes);
+      const work = [...metadataKeys.flatMap(value => this.metadataWrites.get(value) ?? []),
+        ...(this.captures.get(key) ?? []), ...(this.pending.has(key) ? [this.pending.get(key)!] : [])];
+      if (!work.length) break;
+      await Promise.all(work);
     }
-    while (this.pending.has(key)) await this.pending.get(key);
     const error = this.captureErrors.get(key);
     if (error) throw error;
   }
@@ -172,16 +198,38 @@ export class SessionChangeCollector {
         this.dirty.delete(key);
         await this.capture(memberId, taskId, paths ? [...paths] : undefined);
       }
-      this.captureErrors.delete(key);
-    }).catch(error => {
-      this.captureErrors.set(key, error instanceof Error ? error : new Error(String(error)));
-      throw error;
     }).finally(() => { this.pending.delete(key); });
     this.pending.set(key, capture);
     void capture.catch(() => {});
   }
 
-  async capture(memberId: string, taskId?: string, changedPaths?: string[]): Promise<void> {
+  capture(memberId: string, taskId?: string, changedPaths?: string[]): Promise<void> {
+    const key = JSON.stringify([memberId, taskId ?? null]);
+    const active = this.captures.get(key) ?? new Set<Promise<void>>();
+    // An older publication can settle after a newer capture. Only the newest
+    // capture's result may replace the observation for this member and Task.
+    const token = Symbol();
+    this.captureTokens.set(key, token);
+    const work = this.captureNow(memberId, taskId, changedPaths).then(() => {
+      if (this.captureTokens.get(key) === token) this.captureErrors.delete(key);
+    }, error => {
+      if (this.captureTokens.get(key) === token) {
+        this.captureErrors.set(key, error instanceof Error ? error : new Error(String(error)));
+      }
+      throw error;
+    }).finally(() => {
+      active.delete(work);
+      if (!active.size) {
+        this.captures.delete(key);
+        this.captureTokens.delete(key);
+      }
+    });
+    active.add(work);
+    this.captures.set(key, active);
+    return work;
+  }
+
+  private async captureNow(memberId: string, taskId?: string, changedPaths?: string[]): Promise<void> {
     const { sessionId, member } = this.store.memberOwner(memberId);
     const baselines = this.store.changeBaselines(sessionId, memberId, taskId);
     if (baselines.length === 0) return;
@@ -270,12 +318,12 @@ export class SessionChangeCollector {
 
   async close(): Promise<void> {
     this.closed = true;
-    const errors:unknown[]=[];
-    for(const pending of [this.metadataWrites,this.pending]){
-      while(pending.size){
-        const results=await Promise.allSettled([...pending.values()]);
-        for(const result of results)if(result.status==="rejected")errors.push(result.reason);
-      }
+    const errors = new Set<unknown>();
+    for (;;) {
+      const work = this.pendingWork();
+      if (!work.length) break;
+      const results = await Promise.allSettled(work);
+      for (const result of results) if (result.status === "rejected") errors.add(result.reason);
     }
     // 差异归档失败属于交付附加信息；关闭时保存错误并释放资源，不能留下半关闭 Core。
     for(const [key,error] of this.captureErrors){

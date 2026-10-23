@@ -11,21 +11,21 @@
 | 门禁 | 实际结果 |
 | --- | --- |
 | `pnpm install --frozen-lockfile` | 通过，使用锁定依赖与随包原生二进制 |
-| `pnpm typecheck` | 通过，最终批次 20.00 秒 |
-| 数据库、控制台服务、收尾、升级、归档、传输、卡片核心回归 | **105/105 通过**，最终批次 30.59 秒 |
-| `pnpm test:console` | **48/48 通过**，最终批次 87.53 秒 |
-| `pnpm test:node` | **49/49 通过**，前一批次 9.23 秒；后续没有节点实现变更 |
-| `pnpm build` | 通过，最终批次 15.08 秒，包括控制台、会话卡片和 TypeScript 构建 |
-| `pnpm test:console:browser` | **8/8 通过**，最终批次 18.58 秒，真实 Chromium |
-| 扩展 Session / federation / reliability 回归 | 前一批次 167 项中的 **164 项通过**；3 项为成员身份夹具、导航契约和旧 schema 还原夹具问题，修正后全部包含在上面的 **105/105** 定向复跑中，无遗留失败 |
+| `pnpm typecheck` | 通过，012 批次 20.14 秒 |
+| 数据库、控制台服务、收尾、升级、归档、传输、卡片核心回归 | **128/128 通过**，012 批次 88.52 秒 |
+| `pnpm test:console` | **52/52 通过**，012 批次 91.95 秒 |
+| `pnpm test:node` | **50/50 通过**，010 批次 3.44 秒；后续没有节点实现或节点夹具变更 |
+| `pnpm build` | 通过，012 批次 15.66 秒，包括控制台、会话卡片和 TypeScript 构建 |
+| `pnpm test:console:browser` | **9/9 通过**，012 批次 22.66 秒，真实 Chromium |
+| 扩展 Session / federation / reliability 回归 | **172/172 通过**，012 批次 250.38 秒，包含最终源码和真实后台进程的 Task 交接隔离 |
 | SQLite 关闭/GC 回归 | 真实 `node --expose-gc` 子进程中 **500 次**交替内存可写、文件只读打开/查询/关闭，正常退出 |
-| 视觉复核 | 实看深色总览、浅色会话、加载态、窄屏传输与窄屏任务详情；修复重复概要后重新运行浏览器并复看截图 |
+| 视觉复核 | 实看深色总览、浅色会话、加载态、窄屏传输与任务详情；012 批次重新实看桌面采集中及窄屏真实采集失败，核对重复提示和错误待验收徽章均已消除 |
 | 补丁一致性 | `git diff --check` 通过；同步前逐文件比对已审核的内容哈希，未覆盖其它工作目录 |
 
 核心回归命令：
 
 ```text
-pnpm exec tsx --test --test-concurrency=1 src/db/*.test.ts src/console-workbench/*.test.ts src/session/console-lifecycle.test.ts src/session/admission-retry.test.ts src/project-archive.test.ts src/federation/transfer-store.test.ts test/lifecycle-view.test.ts test/reliability-system/card-timing.test.ts
+pnpm exec tsx --test --test-concurrency=1 src/db/*.test.ts src/console-workbench/*.test.ts src/session/console-lifecycle.test.ts src/session/admission-retry.test.ts src/session/revert.test.ts src/project-archive.test.ts src/federation/transfer-store.test.ts test/lifecycle-view.test.ts test/reliability-system/card-timing.test.ts
 ```
 
 扩展回归命令：
@@ -35,6 +35,20 @@ pnpm exec tsx --test --test-concurrency=1 src/session/*.test.ts src/work-ledger.
 ```
 
 上述组间存在重叠，不相加包装成“独立问题数”。GitHub CI 同步加入 Windows/Linux 核心回归和控制台回归，Linux 增加真实 Chromium 流程；此处记录的是提交前已经取得的 Windows 原生结果。
+
+## 远端干净环境补充
+
+首轮提交 `3bebb2a` 的主线 GitHub 检查在 Linux 和 Windows 上通过冻结安装、节点回归、类型检查、构建、105 项核心回归。Linux 的 48 项控制台回归也通过。继续检查发现并修正了验收代码自身的跨环境假设：
+
+- 浏览器用例将工作区路径无条件转小写，Linux 的混合大小写目录因此被错误判失败。三个相关断言现统一使用实际平台的 `canonicalWorkspaceRoot`，仍核验完整路径身份。
+- 两个 Windows 控制台用例把 `apply_patch` 的 `accepted/running` 首响应当成已经完成，随后只给异步 Git 改动采集 1.5–3 秒。验收现通过原 operation_id 等待真实终态，再等待 HTTP 详情中的指定文件及命令证据；不会重发写入或命令，也不会把缺文件断言删除。超时保留实际操作、任务、成员、文件基准及磁盘/Git 诊断。
+- 节点 HTTP 用例假定操作系统分配的临时端口一定可被 Fetch 访问。真实 Windows 环境分配了低位临时端口，触发 Fetch 的 `bad port` 拒绝。节点夹具现与现有 Session HTTP 夹具一致，排除 Fetch 禁用端口；所有使用 Fetch 的节点测试入口显式使用该分配器。
+- 同一提交的分支 CI 暴露 PowerShell/CIM 冷启动超过五秒的生产检查问题（见 E55）。对应用例原来仅在成功路径关闭 TCP listener，失败后挂住整组测试；现预先登记清理并设定用例时限。
+
+- 扩展 Task 生命周期用例假定 `exec_command` 首响应总带短期进程编号；真实慢准备只先返回 operation_id 时，测试向 write_stdin 传入了空身份。现以实际进程启动标记确认后台已经运行，交接后查询原持久 operation_id 到终态，仍验证 A/B Task 的事件、文件及基准隔离；不重复提交命令。
+- 新撤销故障注入用例的 Windows 目标路径比较改用生产相同的规范化规则，确保真正命中“文件替换后抛错”。浏览器手动刷新模式通过实际刷新按钮取得新状态，集成撤销用例等待结构化采集状态回到 idle，而非只看到上一轮的文件就执行。
+
+路径、操作等待与端口夹具的修正属于验收契约，不单独计作产品根因。007 批次的相关真实集成测试 **9/9**、浏览器 **8/8** 通过；端口检查及夹具修正后节点回归 **50/50** 通过。推送后的最终 CI 状态以对应提交的 GitHub Checks 为准。
 
 ## 验证入口
 
@@ -51,6 +65,7 @@ pnpm exec tsx --test --test-concurrency=1 src/session/*.test.ts src/work-ledger.
 | A | `src/project-archive.test.ts`；真实 SQLite/资源声明，受控 provider 验证器，未知副作用不重放 |
 | O | `src/console-workbench/activity-usage.test.ts`、`src/federation/transfer-store.test.ts`、审计/迁移测试；真实持久历史 |
 | Q | `src/console-workbench/query-scoping.test.ts`；300 行真实 SQLite、EXPLAIN、候选分类计数、SQL/内存/游标排序一致性 |
+| P | `src/console-workbench/change-capture.test.ts`、`src/console-workbench/review-actions.test.ts`、`src/session/revert.test.ts`；真实 Git/文件、SQLite 与 HTTP/MCP，采集状态、历史隔离、预览版本、恢复副作用 |
 
 ## 原 85 项逐项处理
 
@@ -230,6 +245,15 @@ pnpm exec tsx --test --test-concurrency=1 src/session/*.test.ts src/work-ledger.
 | E51 | better-sqlite3 13 随包带 N-API 二进制，但 pnpm 自动 build 触发 node-gyp 覆盖安装约定；禁用该包的额外构建，冻结锁文件安装使用随包二进制。 |
 | E52 | 新增首响应字段后，三个显式 invocation SELECT 未读取该列；补齐列读取，原始首响应可进入活动页。 |
 | E53 | 窄屏截图发现状态原因与回退概要逐字重复；相同回退仅显示一次，任何不同的真实交付总结及转义完整保留。 |
+| E54 | 文件改动仍在整理或采集失败时，详情可能呈现空列表；无 checkpoint 的验收、补丁导出和撤销也可能读取尚未稳定的证据。新增精确 Task/member 采集观测，包含后台队列、直接采集与元数据写入；详情及聚合页保留 pending/failed、已有文件与错误。相关操作拒绝未稳定的证据并提示刷新，异步读取前后检查状态及版本；冻结的历史 checkpoint 不继承下一阶段采集状态。idle 只表示当前进程未观察到采集或错误，不承诺历史证据完整。 |
+| E55 | Windows EasyTier 监听者验证每次启动 PowerShell/CIM，真实 CI 冷启动超过五秒即失败；改用原生 `netstat -ano`，匹配数字形式的本地 TCP 端口、监听端的空对端与 PID，不依赖系统语言的 LISTENING 文案，排除远端端口、已连接流、UDP 和无效 PID。真实 Windows 端口占用、错误 PID、释放后恢复，以及 IPv4/IPv6 和不同语言输出解析均有回归。 |
+| E56 | legacy Run 的无 Task 范围以 undefined 传递时，被 reverter 默认参数解释为当前 Task，历史 A 的文件和采集资格可能错误取自 B；事件写入也会把显式 null 归给当前 Task。显式 null 现保留 legacy 范围，省略参数仍兼容当前 Task；旧预览从原 Run 恢复归属，事件与 Task revision 不再污染下一请求。 |
+| E57 | 同一作用域的较早采集晚返回，可能清掉较新采集的错误，或用较早失败覆盖新成功。采集观察按最新启动的 scoped token 更新错误；后台队列不再另外无条件清写错误。真实文件采集及受控完成回调覆盖两种交错顺序。 |
+| E58 | 撤销预览在等待资格检查期间，后续 phase 可完成采集并回到 idle；原实现直接采用新 member revision，相当于替用户认可变化后的文件。现固定入口 revision，异步检查后必须保持相同，并重核原 checkpoint 文件 hash；旧意图明确拒绝，读取新 phase 后才能创建新预览。 |
+| E59 | Task 补丁导出根据缓存解析当前 phase；缓存仍指向已冻结 A 时，会漏掉刚开始采集的 B 并绕过 B 的检查。导出强制刷新相关阶段，历史 A 仍可独立导出；真实回归先暖 A 缓存再创建 B。 |
+| E60 | 卡片 `qm_patch` 没有采集状态及版本屏障，数字 offset 游标也允许把不同版本的页拼接。live 读取检查采集状态与前后 revision，游标绑定 session/member/Task、live/frozen 模式、证据版本及 offset；中途更新或关闭切换必须重新开始，冻结历史继续按原快照分页。 |
+| E61 | 撤销恢复可先替换文件、随后 chmod 等步骤失败；原事件因尚未登记 restored 而错误写成 not_started。现记录实际进入恢复的 attempted_paths：已确认部分完成为 partial，尝试后未获完成确认为 unknown，从未进入恢复才为 not_started；保留错误并禁止原请求盲重放。 |
+| E62 | 主状态与筛选已限制只有 completed 阶段需要验收，但 runBadges 的附加徽章仍把默认 pending 显示为“结果待验收”；仅执行读取的开放请求及没有交付结果的历史请求会误报。附加徽章现按阶段执行事实限制 pending，保留已有明确验收结论；真实浏览器和状态组合回归覆盖开放请求、执行中、未知及已结束阶段。 |
 
 ## Git 整合依据
 
@@ -250,6 +274,6 @@ pnpm exec tsx --test --test-concurrency=1 src/session/*.test.ts src/work-ledger.
 5. **跨工作区还原仍按阶段。** 已有可达入口、来源和版本保护；没有声称多个根目录的原子回滚。
 6. **观测与通知能力有真实边界。** 缺首响应的历史不伪造；未测速度不显示；用量按执行轮次完成日确认；通知依赖浏览器前台读取。
 7. **界面模块并非全部重写。** 状态/时间/回执/通知/配置合并已共享或拆出，主界面文件仍较大；技术对象导航仍存在。
-8. **本轮观察到连接作用域切换，但未归因为本地代码缺陷。** 原会话出现 scope mismatch 后按当前授权会话重新附加；没有越过作用域限制，也不把它计作已经修复的产品 bug。
+8. **本轮观察到连接作用域切换，以及桌面节点读取超时和短暂离线，原因尚未独立查明。** scope mismatch 后按当前授权会话重新附加；连接恢复后继续查询原 operation_id 并读取持久结果。这些观察不计作已经修复的源码缺陷。
 
 界面逐项实现的补充索引见 [Console UI 修复映射](console-ui-audit-closure.md)。英文和简体中文用户指南已同步说明新的状态、回执、刷新、配置及用量语义。

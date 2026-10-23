@@ -7,7 +7,7 @@ import { dialog, formObject } from "./dialogs.js";
 import { consoleError, validateSession, WriteIntent, type ConsoleError, type ConsoleSession } from "./client.js";
 import { icon } from './icons.js';
 import { setDisplayTimeZone, timeZone, tm, fullTime, day, smartTime, ago, duration, fmt, compact, bytes, csvCell, timestamp } from './format.js';
-import { esc, clamp, stages, stage, status, btn, ib, badge, meter, smallTime, spark, usageText, diffStat, resultExplanation, elapsed as renderElapsed, transferPercent, percent, QUALITY } from './presentation.js';
+import { esc, clamp, stages, stage, status, btn, ib, badge, acceptanceBadge, meter, smallTime, spark, usageText, diffStat, resultExplanation, changeCaptureBlockReason, changeCaptureNotice, dedupeCaptureWarnings, elapsed as renderElapsed, transferPercent, percent, QUALITY } from './presentation.js';
 import type { Run, RunDetail, RunPage, Overview, Fleet, Machine, NodeSettingsSnapshot, ChangeFile, Command, FileDiff, PatchPage, Project, Root, ListResponse, Sessions, Thread, SourceState, UsageReport, ActivityPage, EventRow, TransferRow, AuditRow, RevertPreview, RevertReceipt, ArchivePreview, ReviewReceipt, ActionReceipt, ControlReceipt, Preferences, Route, CacheEntry } from './contracts.js';
 import Prism from "prismjs";
 import "prismjs/components/prism-typescript.js";
@@ -174,8 +174,8 @@ function freshness(path: string) {
     if (path.includes('/files/'))
         return Infinity;
     if (/^runs\/[^/?]+$/.test(path)) {
-        const r = data<RunDetail>(path)?.run;
-        if (r && !['running', 'queued', 'stopping', 'waiting'].includes(r.executionStatus))
+        const detail = data<RunDetail>(path), r = detail?.run;
+        if (r && !changeCaptureBlockReason(detail?.changeCaptures) && !['running', 'queued', 'stopping', 'waiting'].includes(r.executionStatus))
             return Math.max(30000, (pref.poll || 8) * 1000);
     }
     return Math.max(1000, (pref.poll || 8) * 1000);
@@ -260,10 +260,10 @@ function schedulePoll() {
 function resourceState(path: string) { const e = CACHE.get(path); if (e?.data)
     return ''; if (e?.error)
     return `<div class="panel">${empty('读取失败', e.error.message, btn('重试', 'retry', `data-path="${esc(path)}"`))}</div>`; return `<div class="panel loading" aria-busy="true" aria-label="正在读取数据"><p><span class="spinner"></span> 正在读取${esc(resourceName(path))}…</p><div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div><p class="small muted">${e?.startedAt ? "开始于 " + esc(fullTime(e.startedAt)) : "等待数据返回"}</p></div>`; }
-function staleNotice(path: string) {
+function staleNotice(path: string, captures?: RunDetail['changeCaptures']) {
   const entry = CACHE.get(path);
   const sources = (entry?.data as { sources?: SourceState[] } | null)?.sources?.filter(source => sourceWarning(source)) || [];
-  const warnings = (entry?.data as { warnings?: string[] } | null)?.warnings || [];
+  const warnings = dedupeCaptureWarnings((entry?.data as { warnings?: string[] } | null)?.warnings || [], captures);
   const messages = [entry?.error?.message, ...sources.map(source => (source.name || source.nodeId) + '：' + sourceWarning(source) + (source.observedAt ? ' · 最后确认 ' + fullTime(source.observedAt) : '')), ...warnings].filter(Boolean);
   if (!messages.length) return '';
   return '<div class="notice warn visually-spaced">' + icon('alert') + '<div>' + messages.map(esc).join('<br>') + '</div>' + btn('重试', 'retry', 'data-path="' + esc(path) + '"', 'small') + '</div>';
@@ -419,8 +419,8 @@ function runBadges(run: Run): string {
     const state = stage(run), observation = runObservation(run), result = [status(state)];
     if (observation.stale) result.push(`<span class="badge warn" title="${esc('最后确认：'+fullTime(observation.observedAt))}">上次确认</span>`);
     if (run.phaseExecutionStatus === 'completed' && run.executionStatus !== 'completed') result.push(badge('执行阶段已结束'));
-    if (['pending','accepted','passed','rejected','failed'].includes(run.acceptanceStatus) && !['review','accepted','rejected'].includes(state))
-        result.push(badge(run.acceptanceStatus === 'pending' ? '结果待验收' : ['accepted','passed'].includes(run.acceptanceStatus) ? '结果已验收' : '结果已驳回', ['accepted','passed'].includes(run.acceptanceStatus) ? 'good' : 'warn'));
+    const acceptance = acceptanceBadge(run);
+    if (acceptance) result.push(acceptance);
     if (run.resultStatus === 'handed_off' && state !== 'handed_off') result.push(badge('请求已交接'));
     else if(run.requestState==='closed'&&['running','stopping','queued','unknown'].includes(run.executionStatus))
         result.push(badge('请求已结束'+(run.resultStatus?' · '+({completed:'已记录完成',failed:'已记录失败',cancelled:'已记录取消'} as Record<string,string>)[run.resultStatus]:'')));
@@ -437,9 +437,9 @@ function phaseCards(detail: RunDetail): string {
 
 function tasksPage() {
     const path = runPath(), d = data<RunPage>(path), review = route.view === 'changes', sel = route.p.run, counts = d?.counts || {};
-    const chosen = (d?.items || []).filter(r => selectedRuns.has(r.id)), eligible = chosen.filter(r => r.actions.review);
+    const chosen = (d?.items || []).filter(r => selectedRuns.has(r.id)), blocked = chosen.filter(r => changeCaptureBlockReason(data<RunDetail>('runs/' + enc(r.id))?.changeCaptures)), eligible = chosen.filter(r => r.actions.review && !blocked.includes(r));
     const states: Array<[string,string,number?]> = [['', '全部', counts.all], ...taskStages.map(([key,label]):[string,string,number?]=>[key,label,counts[key]])];
-    const bulk = selectedRuns.size ? `<div class="bulkbar"><span>${selectedRuns.size} 项已选</span><span class="spacer"></span>${btn('验收' + (eligible.length ? ' ' + eligible.length : ''), 'bulk-accept', !eligible.length || !canWrite() ? 'disabled' : '', 'small')}${btn('驳回', 'bulk-reject', !eligible.length || !canWrite() ? 'disabled' : '', 'small')}${ib('copy', 'bulk-copy', '复制所选任务引用')}${ib('close', 'clear-selection', '取消选择')}</div>` : '';
+    const bulk = selectedRuns.size ? `<div class="bulkbar"><span>${selectedRuns.size} 项已选</span>${blocked.length ? `<span class="amber">${blocked.length} 项文件证据待确认</span>` : ''}<span class="spacer"></span>${btn('验收' + (eligible.length ? ' ' + eligible.length : ''), 'bulk-accept', !eligible.length || !canWrite() ? 'disabled' : '', 'small')}${btn('驳回', 'bulk-reject', !eligible.length || !canWrite() ? 'disabled' : '', 'small')}${ib('copy', 'bulk-copy', '复制所选任务引用')}${ib('close', 'clear-selection', '取消选择')}</div>` : '';
     const stateControls = sel ? `<select class="select queue-state" data-param="status" aria-label="任务状态">${states.map(([v, t, n]) => opt(v, t + (n == null ? '' : ' · ' + n), route.p.status || '')).join('')}</select>` : taskScopeTabs(d) + `<select class="select" data-param="status" aria-label="具体任务状态">${states.map(([v,t,n]) => opt(v,t + (n == null ? '' : ' · ' + n),route.p.status || '')).join('')}</select>`;
     const filters = `<div class="task-filters">${stateControls}<div class="toolbar list-search">${searchField(route.p.q, '搜索任务…')}${sel ? ib('filter', 'toggle-filters', '筛选任务', `aria-expanded="${route.p.filters === '1'}"`, route.p.filters === '1' ? 'active' : '') : ''}</div><div class="toolbar extended-filters ${sel && route.p.filters !== '1' ? 'hidden' : ''}">${scopes()}${rangeSelect(route.p.days ?? '0')}<select class="select" aria-label="任务排序" data-param="sort">${[['newest', '最新开始'], ['oldest', '最早开始'], ['tokens', '用量最高'], ['duration', '耗时最长']].map(([v, t]) => opt(v, t, route.p.sort || 'newest')).join('')}</select></div>${route.p.finishedDay ? `<div class="filter-chip">完成于 ${esc(route.p.finishedDay)} ${ib('close', 'clear-finished', '清除完成日期')}</div>` : ''}${route.p.attention ? `<div class="filter-chip">执行异常 ${ib('close', 'clear-attention', '清除异常筛选')}</div>` : ''}${route.p.usageDate || route.p.usageDays ? `<div class="filter-chip">用量发生范围：${esc(route.p.usageDate || ('近 ' + route.p.usageDays + ' 天'))}${ib('close','clear-usage-range','清除用量发生范围')}</div>` : ''}${route.p.date ? `<div class="filter-chip">${esc(route.p.date)} ${ib('close', 'clear-date', '清除日期筛选')}</div>` : ''}</div>`;
     let list = !d ? resourceState(path) : !d.items.length ? `<div class="panel">${empty(d.complete ? '没有匹配任务' : '已读取来源中没有匹配任务', d.complete ? '' : '部分节点尚未确认，完整结果仍待核对。', btn('清除筛选', 'reset-filters'))}</div>` : sortLayout === 'timeline' && !sel ? timelineView(d) : `<div class="panel task-list-panel"><div class="table-wrap"><table class="data-table run-table"><colgroup><col style="width:34px"><col><col style="width:105px"><col style="width:58px"><col style="width:105px"><col style="width:86px"><col style="width:90px"><col style="width:94px"><col style="width:32px"></colgroup><thead><tr><th><label class="check-label"><input type="checkbox" data-select-all="runs" aria-label="选择本页全部任务" ${d.items.every(r => selectedRuns.has(r.id)) ? 'checked' : ''}></label></th><th>任务 / 项目</th><th>状态</th><th>节点</th><th>改动</th><th class="align-right">耗时</th><th class="align-right">Token</th><th class="align-right">开始</th><th></th></tr></thead><tbody>${d.items.map(taskRow).join('')}</tbody></table></div>${pagination(d)}</div>`;
@@ -476,6 +476,8 @@ function inspector() {
     if (!d)
         return `<aside class="inspector" id="inspector" aria-label="执行详情"><header class="session-card-head"><span class="spacer"></span>${ib('close', 'close-inspector', '关闭详情', 'id="inspector-close"')}</header><div class="inspector-body">${resourceState(path)}</div></aside>`;
     const r = d.run;
+    const captureBlocked = changeCaptureBlockReason(d.changeCaptures), captureAttrs = captureBlocked ? `disabled title="${esc(captureBlocked)}"` : '';
+    const shownCaptures = captureBlocked ? d.changeCaptures : undefined, runWarnings = dedupeCaptureWarnings(r.warnings || [], shownCaptures);
     const state = stage(r), running = d.commands.find(c => commandStatus(c, r) === 'running'), latest = d.commands.filter(c => !c.supersededBy).at(-1), failed = !['completed','ended','cancelled','handed_off'].includes(r.executionStatus) && latest && commandStatus(latest, r) === 'failed' ? latest : undefined, live = running || failed;
     const head = `<header class="session-card-head"><span class="session-symbol">${icon('changes', 17)}<i class="session-dot ${state}"></i></span><div class="session-heading"><h2 title="${esc(r.title)}">${esc(r.title)}</h2><div class="session-meta">${nodeTag(r.nodeId, true)}<span class="project-name">${esc(r.projectName)}</span><span class="branch-meta">${icon('changes', 12)}<code title="${esc(r.branch)}">${esc(r.branch)}</code></span></div></div><div class="session-stats">${r.diff ? diffStat(r) : ''}<span class="card-elapsed">${elapsed(r)}</span></div>${ib('external', 'focus-detail', route.p.focus === '1' ? '恢复分栏' : '展开详情', '', 'desktop-only')}${ib('close', 'close-inspector', '关闭详情（Esc）', 'id="inspector-close"')}</header>`;
     const strip = live ? `<button class="session-live ${running ? '' : 'failed'}" data-action="live-command" data-id="${esc(live.id)}">${running ? '<span class="spinner"></span>' : icon('failed', 14)}<span class="agent-label">${esc(live.agent)}</span><code>${esc(live.command)}</code><span class="live-meta">${running ? '运行中' : live.exit == null ? '最近执行失败' : '最近退出码 ' + live.exit}</span>${icon('chevron', 12)}</button>` : '';
@@ -498,8 +500,8 @@ function inspector() {
         body = d.agents.length ? `<div class="agent-list">${d.agents.map(a => `<article class="agent-card"><span class="agent-avatar">${icon('bot', 17)}</span><div class="agent-main"><div class="section-line"><h3>${esc(a.name)}</h3>${status(a.status)}</div><p>${esc(a.role)}</p><div class="small muted">${a.tokens == null ? '用量未上报' : compact(a.tokens) + ' Token'}</div></div></article>`).join('')}</div>` : empty('暂无代理');
     else
         body = `${phaseCards(d)}<section class="detail-section"><h3>${r.phaseRefs && r.phaseRefs.length > 1 ? '任务汇总与主记录' : '工作区'}</h3><dl class="context-table">${[['项目', r.projectName], ['路径', r.root], ['节点', node(r.nodeId)?.name || r.nodeId], ['分支', r.branch], ['基线', r.baseSha], ['执行 ID', r.id], ['来源', r.origin], ['开始', fullTime(r.startedAt)], ['结束', r.finishedAt ? fullTime(r.finishedAt) : '—'], ['执行状态', r.executionStatus], ['验收状态', r.acceptanceStatus]].map(([k, v]) => `<div><dt>${k}</dt><dd title="${esc(v)}">${esc(v)}</dd></div>`).join('')}</dl></section><section class="detail-section"><h3>项目指令</h3><dl class="context-table">${(d.instructions || []).map(item => '<div><dt>' + esc(item.status === 'loaded' ? '已读取' : '可读取') + '</dt><dd>' + esc(item.path) + '</dd></div>').join('') || '<div class="muted">未发现项目指令</div>'}</dl><h3 class="section-gap">技能</h3><dl class="context-table">${(d.skills || []).map(item => '<div><dt>' + esc(item.state === 'read' ? '已使用' : '可使用') + '</dt><dd>' + esc(item.name) + '</dd></div>').join('') || '<div class="muted">未发现技能</div>'}</dl></section>`;
-    const footer = `<span class="card-footer-state">${runBadges(r)}<span class="revision" title="回执版本">r${r.revision}</span></span><span class="spacer"></span>${['running', 'queued', 'stopping'].includes(state) ? btn(icon('stopping', 13) + (state === 'queued' ? '取消排队' : '中断'), 'run-control', `data-id="${esc(id)}" data-value="interrupt" ${r.actions?.interrupt ? writeAttrs() : 'disabled title="当前节点没有可控制的后台执行句柄"'}`, 'danger small') : state === 'interrupted' ? btn(icon('running', 13) + '恢复', 'run-control', `data-id="${esc(id)}" data-value="resume" ${r.actions?.resume ? writeAttrs() : 'disabled title="需要从原工作入口继续"'}`, 'primary small') : ''}${r.actions.complete ? btn('结束请求', 'finish-task', `data-id="${esc(id)}" ${writeAttrs()}`, 'primary small') : ''}${r.actions.review ? btn('驳回', 'single-reject', `data-id="${esc(id)}" ${writeAttrs()}`, 'small') + btn(icon('check', 13) + '验收', 'single-accept', `data-id="${esc(id)}" ${writeAttrs()}`, 'primary small') : ''}${d.files.length && r.actions?.patch !== false ? btn(icon('download', 13) + '补丁', 'patch', `data-id="${esc(id)}"`, 'small') : ''}${d.files.length && r.actions?.revert && !['running', 'queued', 'stopping'].includes(state) ? ib('undo', 'revert', '还原文件', `data-id="${esc(id)}" ${writeAttrs('revert')}`) : ''}`;
-    return `<aside class="inspector" id="inspector" aria-label="执行详情" tabindex="-1"><button class="resize-handle" role="separator" aria-label="调整列表宽度" aria-orientation="vertical" aria-valuemin="270" aria-valuemax="520" aria-valuenow="${pref.listWidth}" title="拖动调整列表宽度"></button>${head}${strip}${tabsHTML}<div class="inspector-body" data-key="body-${esc(id)}-${tab}">${staleNotice(path)}${r.warnings?.length ? `<div class="notice warn">${r.warnings.map(esc).join('<br>')}</div>` : ''}${body}</div><footer class="inspector-footer">${footer}</footer></aside>`;
+    const footer = `<span class="card-footer-state">${runBadges(r)}<span class="revision" title="回执版本">r${r.revision}</span></span><span class="spacer"></span>${['running', 'queued', 'stopping'].includes(state) ? btn(icon('stopping', 13) + (state === 'queued' ? '取消排队' : '中断'), 'run-control', `data-id="${esc(id)}" data-value="interrupt" ${r.actions?.interrupt ? writeAttrs() : 'disabled title="当前节点没有可控制的后台执行句柄"'}`, 'danger small') : state === 'interrupted' ? btn(icon('running', 13) + '恢复', 'run-control', `data-id="${esc(id)}" data-value="resume" ${r.actions?.resume ? writeAttrs() : 'disabled title="需要从原工作入口继续"'}`, 'primary small') : ''}${r.actions.complete ? btn('结束请求', 'finish-task', `data-id="${esc(id)}" ${writeAttrs()}`, 'primary small') : ''}${r.actions.review ? btn('驳回', 'single-reject', `data-id="${esc(id)}" ${captureAttrs || writeAttrs()}`, 'small') + btn(icon('check', 13) + '验收', 'single-accept', `data-id="${esc(id)}" ${captureAttrs || writeAttrs()}`, 'primary small') : ''}${d.files.length && r.actions?.patch !== false ? btn(icon('download', 13) + '补丁', 'patch', `data-id="${esc(id)}" ${captureAttrs}`, 'small') : ''}${d.files.length && r.actions?.revert && !['running', 'queued', 'stopping'].includes(state) ? ib('undo', 'revert', '还原文件', `data-id="${esc(id)}" ${captureAttrs || writeAttrs('revert')}`) : ''}`;
+    return `<aside class="inspector" id="inspector" aria-label="执行详情" tabindex="-1"><button class="resize-handle" role="separator" aria-label="调整列表宽度" aria-orientation="vertical" aria-valuemin="270" aria-valuemax="520" aria-valuenow="${pref.listWidth}" title="拖动调整列表宽度"></button>${head}${strip}${tabsHTML}<div class="inspector-body" data-key="body-${esc(id)}-${tab}">${staleNotice(path, shownCaptures)}${runWarnings.length ? `<div class="notice warn">${runWarnings.map(esc).join('<br>')}</div>` : ''}${tab !== 'diff' && captureBlocked ? changeCaptureNotice(d.changeCaptures) : ''}${body}</div><footer class="inspector-footer">${footer}</footer></aside>`;
 }
 
 const highlightCache = new Map<string, string>(), diffOpen = new Map<string, Set<string>>();
@@ -562,11 +564,12 @@ function diffFile(d: RunDetail, f: ChangeFile) {
     return `${staleNotice(path)}${payload.complete ? '' : '<div class="panel-foot">差异尚未读取完毕 ' + btn('读取后续差异', 'more-file', 'data-path="' + esc(path) + '"', 'small') + '</div>'}<div class="diff-scroll">${table}</div>${all.length > rows.length ? `<div class="panel-foot"><span>${rows.length} / ${all.length} 行</span><span class="spacer"></span>${btn('继续显示', 'more-diff', `data-run="${esc(d.run.id)}" data-id="${esc(f.id)}"`, 'small')}</div>` : ''}`;
 }
 function diffView(d: RunDetail) {
+    const captureNotice = changeCaptureNotice(d.changeCaptures);
     if (!d.files.length)
-        return empty('暂无文件改动');
+        return captureNotice + (changeCaptureBlockReason(d.changeCaptures) ? '' : empty('暂无已记录的文件改动'));
     const files = visibleFiles(d), opened = openFiles(d);
     const toolbar = `<div class="diff-toolbar">${searchField(fileSearch, '查找文件…', 'files')}<span class="spacer"></span><label class="switch"><input type="checkbox" data-diff-wrap ${pref.wrap ? 'checked' : ''} aria-label="代码自动换行">换行</label><span class="desktop-only">${segmented([['unified', '统一'], ['split', '并排']], diffMode, 'diff-mode')}</span>${ib('panel', 'files-toggle-all', '展开或收起文件', `aria-label="展开或收起文件"`)}</div>`;
-    return `<div class="session-diff">${toolbar}${files.map(f => { const on = opened.has(f.id), parts = f.path.split('/'), name = parts.pop(), dir = parts.join('/'); return `<section class="file-section ${on ? 'expanded' : ''}" data-key="file-${esc(d.run.id)}-${esc(f.id)}"><header class="file-header"><button class="file-toggle" data-action="toggle-file" data-id="${esc(f.id)}" aria-expanded="${on}" title="${esc(f.path)}">${icon(on ? 'down' : 'chevron', 13)}<span class="file-status ${f.kind}">${f.kind}</span><span class="file-path">${dir ? `<span>${esc(dir)}/</span>` : ''}<b>${esc(name)}</b>${f.source ? `<small class="file-source">${esc(f.source.nodeId)} · ${esc(f.source.projectName)} · ${esc(f.source.root)}</small>` : ''}</span><span class="diff-summary"><span class="green">+${fmt(f.add)}</span><span class="red">−${fmt(f.del)}</span></span></button>${ib('copy', 'copy-path', '复制文件路径', `data-text="${esc(f.source ? f.source.root.replace(/[\\/]$/, '') + '/' + f.path : f.path)}"`, 'file-copy')}</header>${on ? diffFile(d, f) : ''}</section>`; }).join('') || empty('没有匹配文件')}</div>`;
+    return `<div class="session-diff">${captureNotice}${toolbar}${files.map(f => { const on = opened.has(f.id), parts = f.path.split('/'), name = parts.pop(), dir = parts.join('/'); return `<section class="file-section ${on ? 'expanded' : ''}" data-key="file-${esc(d.run.id)}-${esc(f.id)}"><header class="file-header"><button class="file-toggle" data-action="toggle-file" data-id="${esc(f.id)}" aria-expanded="${on}" title="${esc(f.path)}">${icon(on ? 'down' : 'chevron', 13)}<span class="file-status ${f.kind}">${f.kind}</span><span class="file-path">${dir ? `<span>${esc(dir)}/</span>` : ''}<b>${esc(name)}</b>${f.source ? `<small class="file-source">${esc(f.source.nodeId)} · ${esc(f.source.projectName)} · ${esc(f.source.root)}</small>` : ''}</span><span class="diff-summary"><span class="green">+${fmt(f.add)}</span><span class="red">−${fmt(f.del)}</span></span></button>${ib('copy', 'copy-path', '复制文件路径', `data-text="${esc(f.source ? f.source.root.replace(/[\\/]$/, '') + '/' + f.path : f.path)}"`, 'file-copy')}</header>${on ? diffFile(d, f) : ''}</section>`; }).join('') || empty('没有匹配文件')}</div>`;
 }
 function machinesPage() {
     const f = fleet();
@@ -753,12 +756,18 @@ finally {
 function findLoadedRun(id: string) { return data<RunDetail>('runs/' + enc(id))?.run || data<RunPage>(runPath())?.items?.find(r => r.id === id) || overview()?.active.find(r => r.id === id) || overview()?.recent.find(r => r.id === id); }
 async function reviewRuns(ids: string[], verdict: 'accept' | 'reject') {
     ensureWritable();
-    const rs = ids.map(findLoadedRun).filter((r): r is Run => Boolean(r && r.actions.review));
+    const candidates = ids.map(findLoadedRun).filter((r): r is Run => Boolean(r && r.actions.review));
+    const checked = await Promise.all(candidates.map(async run => {
+        const detail = await API.get<RunDetail>('runs/' + enc(run.id) + '?fresh=1');
+        return {run: detail.run, blocked: changeCaptureBlockReason(detail.changeCaptures)};
+    }));
+    const skipped = checked.filter(item => item.blocked || !item.run.actions.review);
+    const rs = checked.filter(item => !item.blocked && item.run.actions.review).map(item => item.run);
     if (!rs.length)
-        return toast('所选任务没有可验收的结果', 'warn');
+        return toast(skipped.some(item => item.blocked) ? '所选任务的文件证据仍待确认，请打开改动详情核对后刷新' : '所选任务没有可验收的结果', 'warn');
     const intent = new WriteIntent(API, 'runs/review');
     const refs = rs.map(r => ({ id: r.id, expectedRevision: r.revision }));
-    const result = await dialog({ title: verdict === 'accept' ? `验收 ${rs.length} 项结果` : `驳回 ${rs.length} 项结果`, danger: verdict === 'reject', confirm: verdict === 'accept' ? '确认验收' : '确认驳回', body: `<div class="panel" style="margin-bottom:16px">${rs.map(r => `<div class="panel-foot"><span class="ellipsis">${esc(r.title)}</span><span class="spacer"></span><span class="mono">rev ${r.revision}</span></div>`).join('')}</div><label class="field">${verdict === 'reject' ? '驳回原因（必填）' : '验收说明（可选）'}<textarea name="note" ${verdict === 'reject' ? 'required' : ''} placeholder="记录你核对过的证据与结论…" maxlength="4000"></textarea></label>`, onSubmit: form => intent.submit<ReviewReceipt>({ refs, verdict, note: formObject(form).note?.trim() || '' }) });
+    const result = await dialog({ title: verdict === 'accept' ? `验收 ${rs.length} 项结果` : `驳回 ${rs.length} 项结果`, danger: verdict === 'reject', confirm: verdict === 'accept' ? '确认验收' : '确认驳回', body: `${skipped.length ? `<div class="notice warn"><div>以下 ${skipped.length} 项未纳入本次提交：${skipped.map(item => `<p>${esc(item.run.title)}：${esc(item.blocked || '当前没有可验收的结果')}</p>`).join('')}</div></div>` : ''}<div class="panel" style="margin-bottom:16px">${rs.map(r => `<div class="panel-foot"><span class="ellipsis">${esc(r.title)}</span><span class="spacer"></span><span class="mono">rev ${r.revision}</span></div>`).join('')}</div><label class="field">${verdict === 'reject' ? '驳回原因（必填）' : '验收说明（可选）'}<textarea name="note" ${verdict === 'reject' ? 'required' : ''} placeholder="记录你核对过的证据与结论…" maxlength="4000"></textarea></label>`, onSubmit: form => intent.submit<ReviewReceipt>({ refs, verdict, note: formObject(form).note?.trim() || '' }) });
     if (!result)
         return;
     if (!Array.isArray(result.results))
@@ -795,6 +804,9 @@ async function finishTask(id: string) {
     if (result) { await invalidateAfterWrite(); toast('请求结束结果已记录，可继续查看或验收。','good'); }
 }
 async function getPatch(id: string) {
+  const detail = await API.get<RunDetail>('runs/' + enc(id) + '?fresh=1');
+  const blocked = changeCaptureBlockReason(detail.changeCaptures);
+  if (blocked) return toast(blocked, 'warn');
   const controller = new AbortController();
   const view: {progress?: HTMLElement | null} = {};
   let finished = false;
@@ -828,7 +840,7 @@ async function getPatch(id: string) {
     if (!controller.signal.aborted) throw error;
   }
 }
-async function revertRun(id: string) { ensureWritable('revert'); const d = data<RunDetail>('runs/' + enc(id)) || await API.get<RunDetail>('runs/' + enc(id)), r = d.run; const previewIntent = new WriteIntent(API,'runs/revert/preview'); const preview = await dialog({ title: '选择要还原的文件', wide: true, confirm: '检查还原计划', body: `<div class="panel">${d.files.map(f => `<label class="panel-foot" style="cursor:pointer"><input type="checkbox" name="files" value="${esc(f.id)}" ${f.revertible ? 'checked' : 'disabled'}><code class="break">${esc(f.path)}</code><span class="spacer"></span><span class="green">+${f.add}</span><span class="red">−${f.del}</span></label>`).join('')}</div>`, onSubmit: form => { const files = new FormData(form).getAll('files'); if (!files.length)
+async function revertRun(id: string) { ensureWritable('revert'); const d = await API.get<RunDetail>('runs/' + enc(id) + '?fresh=1'), r = d.run; const blocked = changeCaptureBlockReason(d.changeCaptures); if (blocked) return toast(blocked, 'warn'); const previewIntent = new WriteIntent(API,'runs/revert/preview'); const preview = await dialog({ title: '选择要还原的文件', wide: true, confirm: '检查还原计划', body: `<div class="panel">${d.files.map(f => `<label class="panel-foot" style="cursor:pointer"><input type="checkbox" name="files" value="${esc(f.id)}" ${f.revertible ? 'checked' : 'disabled'}><code class="break">${esc(f.path)}</code><span class="spacer"></span><span class="green">+${f.add}</span><span class="red">−${f.del}</span></label>`).join('')}</div>`, onSubmit: form => { const files = new FormData(form).getAll('files'); if (!files.length)
         throw new Error('至少选择一个文件'); return previewIntent.submit<RevertPreview>({ id, files, expectedRevision: r.revision }); } }); if (!preview)
     return; const intent = new WriteIntent(API,'runs/revert/commit'); const result = await dialog({ title: '确认还原计划', danger: true, confirm: '确认还原所选文件', body: `<p>将还原 <b>${preview.files.length}</b> 个文件。预览有效期至 ${esc(fullTime(preview.expiresAt))}。</p><pre class="code-block">执行：${esc(id)}\n文件：${preview.files.length}</pre>`, onSubmit: () => intent.submit<RevertReceipt>({ previewId: preview.id, confirmationHash: preview.hash }) }); if (result) {
     await invalidateAfterWrite();

@@ -375,7 +375,7 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
       const parameters = new URLSearchParams(cursor === undefined ? {} : { cursor });
       return call(target.node, `/workbench/runs/${encodeURIComponent(target.local)}/patch?${parameters}`);
     }
-    const { phases, complete } = await taskPhases(reference);
+    const { phases, complete } = await taskPhases(reference, true);
     if (!complete) throw new WorkbenchError('部分工作区状态尚未取得，请刷新后再导出补丁',409,'task_incomplete','none');
     const current = phases.filter((phase) => phase.currentPhase !== false);
     if (current.length !== 1) throw new WorkbenchError('此任务包含多个当前工作区，请进入具体工作区后导出补丁',409,'cross_workspace_patch_not_supported','none');
@@ -615,6 +615,9 @@ function mergeTaskDetails(task: Run, phases: RoutedTaskDetail[], observation:{co
   const currentRefs = new Set(task.currentPhaseRefs ?? task.phaseRefs ?? phases.map((item) => item.phase));
   const current = phases.filter((item) => currentRefs.has(item.phase));
   const singleCurrentPhase = current.length === 1;
+  const changeCaptures = current.flatMap(({phase,detail}) => (detail.changeCaptures ?? [])
+    .map(capture => ({...capture,runId:phase})));
+  const captureBlocked = changeCaptures.some(capture => capture.state === 'pending' || capture.state === 'failed');
   const files = current.flatMap(({ phase, detail }) => detail.files.map((file) => ({
     ...file,
     id: encodeTaskPart(phase, file.id),
@@ -639,13 +642,14 @@ function mergeTaskDetails(task: Run, phases: RoutedTaskDetail[], observation:{co
       actions: {
         interrupt: task.actions.interrupt,
         resume: task.actions.resume,
-        review: task.actions.review,
-        complete: task.actions.complete,
-        revert: singleCurrentPhase && task.actions.revert,
-        patch: singleCurrentPhase && task.actions.patch !== false,
+        review: !captureBlocked && task.actions.review,
+        complete: !captureBlocked && task.actions.complete,
+        revert: !captureBlocked && singleCurrentPhase && task.actions.revert,
+        patch: !captureBlocked && singleCurrentPhase && task.actions.patch !== false,
       },
     },
     summary,
+    changeCaptures,
     phases:phases.map(({phase,detail})=>({id:phase,run:detail.run,summary:detail.summary})),
     complete:observation.complete,sources:observation.sources,missingPhases:observation.missing,
     evidence,

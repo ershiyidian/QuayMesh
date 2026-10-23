@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { readFile, writeFile, stat, mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import test from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
 import express from "express";
 import { chromium } from "@playwright/test";
 import { createTwoFilesPatch } from "diff";
@@ -10,7 +9,7 @@ import { diffPage } from "../../src/console-workbench/diff.js";
 import { ProcessSessionManager } from "../../src/process-sessions.js";
 import { WorkLedger } from "../../src/work-ledger.js";
 import { workspaceHandle } from "../../src/federation/routing.js";
-import { callOpen, createRealTestServer, structured, freePort } from "../session-card/server-fixture.js";
+import { callOpen, createRealTestServer, structured, freePort, waitForFixture, waitForRecordedTool } from "../session-card/server-fixture.js";
 
 test("Console v5 reads all recorded tasks and renders real file, command and review data", { timeout: 120_000 }, async (t) => {
   const fixture = await createRealTestServer({ prefix: "quaymesh-console-v5-", files: { "AGENTS.md": "使用当前项目的数据。\n" } });
@@ -80,31 +79,33 @@ test("Console v5 reads all recorded tasks and renders real file, command and rev
 
   const meta = { "openai/session": "console-v5-real-work" };
   const opened = structured(await callOpen(fixture.client, fixture.project, "console-v5-real-work"));
+  const scope = { sessionId: String(opened.session_id), workspaceId: String(opened.workspace_id),
+    conversationId: "console-v5-real-work", paths: ["owned-a.ts", "owned-b.ts", "command.mjs"] };
   const patch = ["*** Begin Patch", "*** Add File: owned-a.ts", "+export const answer = 42;", "*** Add File: owned-b.ts", "+export const preserved = true;", "*** End Patch"].join("\n");
   const changed = await fixture.client.callTool({ name: "apply_patch", arguments: { workspace_id: opened.workspace_id, patch }, _meta: meta });
-  assert.notEqual(changed.isError, true, JSON.stringify(changed));
+  await waitForRecordedTool(fixture, scope, changed);
   await writeFile(join(fixture.project, "command.mjs"), "process.stdout.write('真实命令输出\\n');\n");
   const command = `"${process.execPath}" "${join(fixture.project, "command.mjs")}"`;
   const executed = await fixture.client.callTool({ name: "exec_command", arguments: { workspace_id: opened.workspace_id, cmd: command, yield_time_ms: 1000 }, _meta: meta });
-  assert.notEqual(executed.isError, true, JSON.stringify(executed));
-  const execution = structured(executed);
-  if (execution.running) await fixture.client.callTool({ name: "write_stdin", arguments: { workspace_id: opened.workspace_id, session_id: execution.session_id, chars: "", yield_time_ms: 1000 }, _meta: meta });
+  await waitForRecordedTool(fixture, scope, executed);
   const link = ledger.db.prepare("SELECT run_id FROM qm_run_links WHERE session_id=? ORDER BY rowid DESC LIMIT 1").get(opened.session_id) as { run_id: string };
   assert.ok(link);
   const runId = workspaceHandle(fixture.config.federation?.nodeId ?? "local", link.run_id);
-  let detail: any;
-  for (let count = 0; count < 30; count++) {
-    detail = await api("runs/" + encodeURIComponent(runId));
-    if (detail.files.some((file: any) => file.path === "owned-a.ts") && detail.commands.some((row: any) => row.status === "done")) break;
-    await delay(100);
-  }
+  const detail = await waitForFixture(fixture, scope, "settled file capture and completed command in run detail",
+    () => api("runs/" + encodeURIComponent(runId)), value =>
+      ["owned-a.ts", "owned-b.ts"].every(path => value.files.some((file: any) => file.path === path))
+      && value.commands.some((row: any) => row.status === "done")
+      && value.changeCaptures.length > 0
+      && value.changeCaptures.every((capture: any) => capture.state === "idle"));
 
   await t.test("saved changes, output and selected-file revert use the real run and member", async () => {
     assert.equal(detail.commands.length, 1);
     assert.equal(detail.commands[0].command, command);
+    assert.equal(detail.commands[0].exit, 0);
     const output = await api(`runs/${encodeURIComponent(runId)}/commands/${encodeURIComponent(detail.commands[0].id)}?cursor=0`);
     assert.equal(output.chunk, "真实命令输出\n");
     const file = detail.files.find((file: any) => file.path === "owned-a.ts");
+    assert.ok(file, JSON.stringify(detail.files));
     const diff = await api(`runs/${encodeURIComponent(runId)}/files/${encodeURIComponent(file.id)}`);
     assert.ok(diff.file.rows.some((row: any) => row.text.includes("answer = 42")));
     const fileLink = structured(await fixture.client.callTool({ name: "qm_file_url", arguments: {

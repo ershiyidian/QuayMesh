@@ -11,8 +11,8 @@ test("两个实际入口访问同一个服务，停止一个入口后另一个�
   const root=await directory(t);
   const origin=await new RegistryServer({cluster:cluster(),token:token(),stateDir:root,host:"127.0.0.1",port:0}).start();
   const upstream=`http://127.0.0.1:${origin.port}`;
-  const first=await new McpRelay({origin:upstream,port:0}).start();
-  const second=await new McpRelay({origin:upstream,port:0}).start();
+  const first=await new McpRelay({origin:upstream,port:await freePort()}).start();
+  const second=await new McpRelay({origin:upstream,port:await freePort()}).start();
   t.after(async()=>{await first.close();await second.close();await origin.close();});
   assert.equal((await requestJson(`http://127.0.0.1:${first.port}/healthz`)).service,"quaymesh-registry");
   assert.equal((await requestJson(`http://127.0.0.1:${second.port}/healthz`)).service,"quaymesh-registry");
@@ -24,7 +24,7 @@ test("两个实际入口访问同一个服务，停止一个入口后另一个�
 
 test("实际源服务不可达时入口返回503并保留后续恢复能力",async t=>{
   const root=await directory(t);const port=await freePort();
-  const relay=await new McpRelay({origin:`http://127.0.0.1:${port}`,port:0}).start();
+  const relay=await new McpRelay({origin:`http://127.0.0.1:${port}`,port:await freePort()}).start();
   t.after(()=>relay.close());
   await assert.rejects(requestJson(`http://127.0.0.1:${relay.port}/healthz`),/503/);
   const origin=await new RegistryServer({cluster:cluster(),token:token(),stateDir:root,host:"127.0.0.1",port}).start();
@@ -60,7 +60,7 @@ test("MCP 长 SSE 响应经真实 HTTP 转发后保留保活帧及终态", async
     setTimeout(() => { clearInterval(timer);res.end('data: {"result":"ok"}\n\n'); }, 135);
   });
   origin.listen(0, "127.0.0.1"); await once(origin, "listening");
-  const relay = await new McpRelay({ origin: `http://127.0.0.1:${origin.address().port}`, port: 0 }).start();
+  const relay = await new McpRelay({ origin: `http://127.0.0.1:${origin.address().port}`, port: await freePort() }).start();
   t.after(async () => { await relay.close(); await new Promise(resolve => origin.close(resolve)); });
   const response = await fetch(`http://127.0.0.1:${relay.port}/mcp`, { method: "POST", body: "{}" });
   assert.equal(response.status, 200);
@@ -80,7 +80,7 @@ test("上游半途断开 SSE 时下游立即失败，绝不记录成功", async 
   });
   origin.listen(0, "127.0.0.1"); await once(origin, "listening");
   let successes = 0;
-  const relay = await new McpRelay({ origin: `http://127.0.0.1:${origin.address().port}`, port: 0,
+  const relay = await new McpRelay({ origin: `http://127.0.0.1:${origin.address().port}`, port: await freePort(),
     onSuccess: () => { successes += 1; } }).start();
   t.after(async () => { await relay.close(); await new Promise(resolve => origin.close(resolve)); });
   const response = await fetch(`http://127.0.0.1:${relay.port}/mcp`, { method: "POST", body: "{}" });

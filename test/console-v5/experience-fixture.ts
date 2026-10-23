@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
-import {createRealTestServer,structured} from '../session-card/server-fixture.js';
+import {createRealTestServer,structured,waitForRecordedTool} from '../session-card/server-fixture.js';
 import {openDatabase} from '../../src/db/client.js';
+import {SessionChangeCollector} from '../../src/session/changes.js';
+import {SessionStore} from '../../src/session/store.js';
+import {canonicalWorkspaceRoot} from '../../src/roots.js';
 
 export async function consoleExperienceFixture() {
   const server=await createRealTestServer({git:false,uiEnabled:true});
+  try {
   const meta={'openai/session':'console-experience'};
   const call=async(name:string,args:Record<string,unknown>)=>{
     const result=await server.client.callTool({name,arguments:args,_meta:meta});
@@ -16,7 +20,8 @@ export async function consoleExperienceFixture() {
   const completed=await call('start_session',{title:'已经完成的改动',request_key:'experience-complete'});
   await call('read',{workspace_id:workspace.workspace_id,path:'README.md'});
   const second=await call('attach_workspace',{session_id:completed.session_id,path:server.secondRoot});
-  await call('apply_patch',{workspace_id:second.workspace_id,patch:'*** Begin Patch\n*** Add File: finished.txt\n+真实完成的文件内容\n*** End Patch'});
+  const patch=await server.client.callTool({name:'apply_patch',arguments:{workspace_id:second.workspace_id,patch:'*** Begin Patch\n*** Add File: finished.txt\n+真实完成的文件内容\n*** End Patch'},_meta:meta});
+  await waitForRecordedTool(server,{sessionId:String(completed.session_id),workspaceId:String(second.workspace_id),conversationId:meta['openai/session'],paths:['finished.txt']},patch);
   await call('finish_task',{task_id:completed.task_id,status:'completed',summary:'文件已经写入'});
   const waiting=await call('start_session',{title:'等待下一步的工作',request_key:'experience-wait'});
   await call('read',{workspace_id:workspace.workspace_id,path:'README.md'});
@@ -38,4 +43,29 @@ export async function consoleExperienceFixture() {
     return await response.json() as any;
   };
   return {server,call,get,cookie,auth,old,completed,waiting,workspace,second};
+  } catch(error) {await server.dispose();throw error;}
+}
+
+/** Obtain the real collector without adding a production-only test hook. */
+export async function liveCaptureFixture(f:Awaited<ReturnType<typeof consoleExperienceFixture>>) {
+  await f.call('read',{workspace_id:f.second.workspace_id,path:'finished.txt'});
+  const reference='qmtask:'+f.waiting.task_id;
+  const observed:{collector?:SessionChangeCollector}={};
+  const original=SessionChangeCollector.prototype.captureObservation;
+  let detail:any;
+  try {
+    SessionChangeCollector.prototype.captureObservation=function(memberId,taskId){
+      if(taskId===f.waiting.task_id)observed.collector=this;
+      return original.call(this,memberId,taskId);
+    };
+    detail=await f.get('runs/'+encodeURIComponent(reference)+'?fresh=1');
+  } finally {SessionChangeCollector.prototype.captureObservation=original;}
+  assert.ok(observed.collector,'The real live detail must observe its capture scope');
+  const phase=detail.phases.find((value:any)=>canonicalWorkspaceRoot(value.run.root)===canonicalWorkspaceRoot(f.server.secondRoot));
+  assert.ok(phase?.run.memberId,'The current task must have a phase in the shared workspace');
+  const database=openDatabase(f.server.config.stateDir);
+  try {
+    const member=new SessionStore(database.sqlite).getMember(f.waiting.session_id,phase.run.memberId);
+    return {collector:observed.collector,member,taskId:f.waiting.task_id as string,phaseId:phase.id as string,reference};
+  } finally {database.close();}
 }

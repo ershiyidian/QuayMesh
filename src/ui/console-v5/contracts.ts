@@ -12,7 +12,12 @@ export type Overview = Awaited<ReturnType<WorkbenchFeed["overview"]>>;
 export type RunPage = Awaited<ReturnType<WorkbenchFeed["runs"]>>;
 export type UsageReport = Awaited<ReturnType<WorkbenchFeed["usage"]>>;
 type BaseRunDetail = Awaited<ReturnType<typeof readRunDetail>>;
-export type RunDetail = Omit<BaseRunDetail, 'files'> & {
+export interface ChangeCapture {
+  runId: string; nodeId: string; projectName: string; root: string;
+  state: 'idle' | 'pending' | 'failed'; error: string | null;
+}
+export type RunDetail = Omit<BaseRunDetail, 'files' | 'changeCaptures'> & {
+  changeCaptures?: ChangeCapture[];
   phases?: Array<{ id: string; run: Run; summary: string }>;
   files: Array<BaseRunDetail['files'][number] & { source?: { runId: string; nodeId: string; projectName: string; root: string } }>;
 };
