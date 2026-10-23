@@ -42,7 +42,7 @@ Receipts distinguish no effect, applied, partial, and unknown effects. Acknowled
 
 ### History, settings, and usage
 
-Conversation search spans projects and nodes, and requests without an execution phase remain accessible. Multi-workspace task details identify each file's source and provide phase links for workspace-specific patch and revert operations. Task pagination preserves the chosen ordering for fifteen minutes; refresh the first page to include later tasks or a new ordering.
+Conversation search spans projects and nodes, and requests without an execution phase remain accessible. Multi-workspace task details identify each file's source and provide phase links for workspace-specific patch and revert operations. Task pagination preserves the chosen ordering for up to fifteen minutes. Cache capacity or a server restart can expire it earlier; an expired page prompts you to return to the first page. Refresh the first page to include later tasks or a new ordering.
 
 Settings forms read the saved configuration with its revision, including changes awaiting application. Refresh compares the original values, local edits, and the newly saved values. Conflicting fields require an explicit choice. Saved and applied revisions, pending application, and application errors remain distinct.
 

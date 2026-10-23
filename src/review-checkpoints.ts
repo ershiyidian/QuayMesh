@@ -304,8 +304,9 @@ export async function createWorkingTreeSnapshot(
       paths = paths.filter(path => trackedOrNew.some(file => file === path || file.startsWith(`${path.replace(/\/$/u, "")}/`)));
     }
     if (paths.length) await git(gitRoot, ["add", "-A", "--", ...paths], { env });
-    // 只修改临时 index，避免 Git 把已忽略的排除目录当作显式添加目标。
-    if (excludes.length) await git(gitRoot, ["rm", "--cached", "-r", "--ignore-unmatch", "--", ...excludes], { env });
+    // 只清理独立的临时 index；恢复元数据可能在 add 后继续变化，或来自旧快照。
+    // --force 允许它与 HEAD、工作区都不同，--cached 保留工作文件。
+    if (excludes.length) await git(gitRoot, ["rm", "--cached", "--force", "-r", "--ignore-unmatch", "--", ...excludes], { env });
     const tree = (await git(gitRoot, ["write-tree"], { env })).stdout.trim();
     const commitArgs = ["commit-tree", tree];
     if (parent) commitArgs.push("-p", parent);

@@ -11,13 +11,13 @@
 | 门禁 | 实际结果 |
 | --- | --- |
 | `pnpm install --frozen-lockfile` | 通过，使用锁定依赖与随包原生二进制 |
-| `pnpm typecheck` | 通过，015 批次 20.42 秒 |
-| 数据库、控制台服务、收尾、升级、归档、传输、卡片及路径别名核心回归 | **134/134 通过**，014 批次 99.36 秒 |
-| `pnpm test:console` | **52/52 通过**，015 批次 88.92 秒；三节点控制单独 **1/1 通过**，17.20 秒 |
+| `pnpm typecheck` | 通过，017 批次 19.27 秒 |
+| 数据库、控制台服务、收尾、升级、归档、传输、卡片、路径别名及快照核心回归 | **149/149 通过**，017 批次 129.62 秒；包含完整 15 项真实 Git checkpoint 回归 |
+| `pnpm test:console` | **52/52 通过**，017 批次 89.52 秒；包括真实三节点控制、回执恢复与离线部分成功 |
 | `pnpm test:node` | **50/50 通过**，010 批次 3.44 秒；后续没有节点实现或节点夹具变更 |
-| `pnpm build` | 通过，014 批次 14.45 秒，包括控制台、会话卡片和 TypeScript 构建 |
-| `pnpm test:console:browser` | **9/9 通过**，014 批次 27.17 秒，真实 Chromium |
-| 扩展 Session / federation / reliability 回归 | **177/177 通过**，014 批次 244.83 秒，包含最终生产源码、路径别名与真实后台进程的 Task 交接隔离 |
+| `pnpm build` | 通过，017 批次 14.91 秒，包括控制台、会话卡片和 TypeScript 构建 |
+| `pnpm test:console:browser` | **9/9 通过**，017 批次 26.00 秒，真实 Chromium |
+| 扩展 Session / federation / reliability 回归 | **177/177 通过**，017 批次 243.62 秒，包含最终生产源码、路径别名、快照修复与真实后台进程的 Task 交接隔离 |
 | SQLite 关闭/GC 回归 | 真实 `node --expose-gc` 子进程中 **500 次**交替内存可写、文件只读打开/查询/关闭，正常退出 |
 | 视觉复核 | 实看深色总览、浅色会话、加载态、窄屏传输与任务详情；012 批次重新实看桌面采集中及窄屏真实采集失败，核对重复提示和错误待验收徽章均已消除 |
 | 补丁一致性 | `git diff --check` 通过；同步前逐文件比对已审核的内容哈希，未覆盖其它工作目录 |
@@ -25,7 +25,7 @@
 核心回归命令：
 
 ```text
-pnpm exec tsx --test --test-concurrency=1 --test-timeout=120000 src/roots.test.ts src/session/path-alias.test.ts src/db/*.test.ts src/console-workbench/*.test.ts src/session/console-lifecycle.test.ts src/session/admission-retry.test.ts src/session/revert.test.ts src/project-archive.test.ts src/federation/transfer-store.test.ts test/lifecycle-view.test.ts test/reliability-system/card-timing.test.ts
+pnpm exec tsx --test --test-concurrency=1 --test-timeout=120000 src/roots.test.ts src/review-checkpoints.test.ts src/session/path-alias.test.ts src/db/*.test.ts src/console-workbench/*.test.ts src/session/console-lifecycle.test.ts src/session/admission-retry.test.ts src/session/revert.test.ts src/project-archive.test.ts src/federation/transfer-store.test.ts test/lifecycle-view.test.ts test/reliability-system/card-timing.test.ts
 ```
 
 扩展回归命令：
@@ -52,7 +52,9 @@ pnpm exec tsx --test --test-concurrency=1 --test-timeout=120000 src/session/*.te
 
 014 批次的三节点控制用例另有一次 `409 revision_conflict / effect:none`。该拒绝发生于保存跨节点控制计划之前；worker 的控制拒绝则会进入逐项结果，不能把两者混为一谈。夹具此前没有等待补丁的持久终态和命令的真实启动输出，第一次详情读取也未要求 fresh，而控制入口会失效缓存后重读。回归改为等待原操作及真实启动证据；对读取后仍合法发生的版本变化，只在验证无控制计划、无目标控制回执且命令仍运行后，以新 key 建立有界的新意图。仍必须验证成功停止、原回执恢复，以及缺失节点情况下的逐项 partial 结果。015 批次单独用例和控制台整组均已通过；没有用重放未知操作取得成功。
 
-路径、操作等待与端口夹具的修正属于验收契约，不单独计作产品根因。007 批次的相关真实集成测试 **9/9**、浏览器 **8/8** 通过；端口检查及夹具修正后节点回归 **50/50** 通过。推送后的最终 CI 状态以对应提交的 GitHub Checks 为准。
+浏览器路径断言、操作等待与端口分配夹具的修正属于验收契约，不单独计作产品根因；正式文件证据链的物理路径修复与快照排除竞态分别记录于 E63、E64。007 批次的相关真实集成测试 **9/9**、浏览器 **8/8** 通过；端口检查及夹具修正后节点回归 **50/50** 通过。推送后的最终 CI 状态以对应提交的 GitHub Checks 为准。
+
+`b54fadf` 的整合分支 Windows/Linux 检查全部通过，主线 Linux 也通过。Windows 路径用例实际运行于 `C:\Users\RUNNER~1\...`，报告 `actualShortName:true`，并通过只读 `C:\PROGRA~1` 的原生解析检查，确认 E63 覆盖真实短名环境。主线 Windows 控制台随后暴露另一个真实竞态：`git add` 已读取的 `.quaymesh/Sessions.md`、`sessions.json` 在排除前被恢复元数据写入更新，`git rm --cached` 拒绝移除“同时不同于 HEAD 和工作文件”的临时索引项，采集因此失败。该错误没有通过放宽断言或直接重跑 CI 处理；E64 增加旧增量快照与真实 Git clean filter 两条确定性回归，修复只允许从独立临时索引排除指定元数据，保留用户暂存区、HEAD 和工作文件。
 
 ## 验证入口
 
@@ -69,7 +71,7 @@ pnpm exec tsx --test --test-concurrency=1 --test-timeout=120000 src/session/*.te
 | A | `src/project-archive.test.ts`；真实 SQLite/资源声明，受控 provider 验证器，未知副作用不重放 |
 | O | `src/console-workbench/activity-usage.test.ts`、`src/federation/transfer-store.test.ts`、审计/迁移测试；真实持久历史 |
 | Q | `src/console-workbench/query-scoping.test.ts`；300 行真实 SQLite、EXPLAIN、候选分类计数、SQL/内存/游标排序一致性 |
-| P | `src/console-workbench/change-capture.test.ts`、`src/console-workbench/review-actions.test.ts`、`src/session/revert.test.ts`、`src/session/path-alias.test.ts`；真实 Git/文件、SQLite 与 HTTP/MCP，采集状态、历史隔离、预览版本、恢复副作用、Windows 路径别名及旧基准身份 |
+| P | `src/console-workbench/change-capture.test.ts`、`src/console-workbench/review-actions.test.ts`、`src/review-checkpoints.test.ts`、`src/session/revert.test.ts`、`src/session/path-alias.test.ts`；真实 Git/文件、SQLite 与 HTTP/MCP，采集状态、历史隔离、预览版本、恢复副作用、Windows 路径别名、旧基准身份及快照元数据并发排除 |
 
 ## 原 85 项逐项处理
 
@@ -138,7 +140,7 @@ pnpm exec tsx --test --test-concurrency=1 --test-timeout=120000 src/session/*.te
 | **N02** 后台执行数量包含停止中，下钻却只看 running | 总览执行下钻含 running/stopping，排队保留独立入口；主活动分组计数包含三种真实状态。 | F,U | 停止中不等于停止已经确认。 |
 | **N03** 最近需要处理的计数，与下钻的时间口径不一致 | 需要处理使用共享 attention 并 days=0，不再隐含创建近七天。 | L,F | 未解决问题不会因任务早创建而无声消失。 |
 | **N04** 机器页把总览抽样卡片当作节点完整任务统计 | 机器数字来自完整本节点 phase 聚合；跨节点 Task 在别处运行不会虚增本节点运行数。 | F | 预览样本不再承担完整统计。 |
-| **N05** 动态排序翻页会重复并漏任务，cursor 实际还是 offset | 分页保存 15 分钟有界快照及排序键/计数；实时 token 变化和新任务不会让翻页重复漏项，过期明确 409 并回第一页。 | F,U | 快照在进程内，重启后需重新开始分页。 |
+| **N05** 动态排序翻页会重复并漏任务，cursor 实际还是 offset | 分页保存最多 15 分钟的有界快照及排序键/计数；实时 token 变化和新任务不会让同一有效快照翻页重复漏项，过期明确 409 并回第一页。 | F,U | 进程内最多 32 个快照；容量淘汰或重启也会使游标过期，15 分钟不是最低保留保证。 |
 | **N06** 有会话但无 taskId 的历史记录可见，点详情却 404 | qmtask、qmsession、qm 各自保留身份；历史 session-only 引用和旧前缀链接可定位。 | F,C | 不伪造 sessionId 为真实 Task。 |
 | **N07** 任务已成功，概要仍可能突出较早失败的命令 | 概要突出当前/最新未被取代的命令结果；旧失败保留在历史，null exit 不直接显示。 | U,B | 已成功接续的失败不继续作为当前错误。 |
 | **N08** 任务聚合详情丢掉真正的完成总结，换成通用套话 | 聚合详情保留实际保存的总结及各 phase 总结，状态原因单列。 | C,B | 通用原因不再覆盖业务交付内容。 |
@@ -259,6 +261,7 @@ pnpm exec tsx --test --test-concurrency=1 --test-timeout=120000 src/session/*.te
 | E61 | 撤销恢复可先替换文件、随后 chmod 等步骤失败；原事件因尚未登记 restored 而错误写成 not_started。现记录实际进入恢复的 attempted_paths：已确认部分完成为 partial，尝试后未获完成确认为 unknown，从未进入恢复才为 not_started；保留错误并禁止原请求盲重放。 |
 | E62 | 主状态与筛选已限制只有 completed 阶段需要验收，但 runBadges 的附加徽章仍把默认 pending 显示为“结果待验收”；仅执行读取的开放请求及没有交付结果的历史请求会误报。附加徽章现按阶段执行事实限制 pending，保留已有明确验收结论；真实浏览器和状态组合回归覆盖开放请求、执行中、未知及已结束阶段。 |
 | E63 | Windows 的 JS realpath 保留 8.3 短名，Git 返回长路径；正式工作区入口可把短名传给 member，造成基准查找失败、文件集合被越界比较误过滤、撤销误报无自有改动。新增独立的物理文件路径解析，Windows 使用 native realpath，并处理未创建/已删除的叶路径；文件证据及相对路径比较使用相同物理根，保留文件名大小写，拒绝坏链接和真实越界。基准先按原键查找，未命中才在同一 Session/member/Task 内找物理别名；事务内复用原 repo_root 和 baseline_ref，不迁移项目、成员或旧基准身份，不为历史缺失证据伪造归属。真实 Git、普通目录、junction/符号链接、旧 legacy/Task 基准、跨范围拒绝和只读原生 8.3 检查加入回归；测试保留原临时路径并输出实际路径诊断。 |
+| E64 | `.quaymesh` 恢复元数据在 Git 暂存后继续变化，或增量采集沿用的旧快照与 HEAD、当前文件都不同，`git rm --cached` 会因安全检查拒绝排除，导致整次文件采集失败。仅对每次快照独立 `GIT_INDEX_FILE` 中的明确排除列表添加 `--force`，仍使用 `--cached`，不改用户索引、HEAD 或工作文件。两条真实 Git 回归在旧实现均重现同类错误：一条保留旧快照的未选中文件，另一条以仓库局部 clean filter 确定性模拟读后并发元数据写入；修复后核验排除结果、用户索引逐字节不变、HEAD 不变及工作文件内容保留。 |
 
 ## Git 整合依据
 
@@ -270,7 +273,7 @@ pnpm exec tsx --test --test-concurrency=1 --test-timeout=120000 src/session/*.te
 - 旧 session 工作目录里的 Task 作用域基准草稿已被现行 Task 级基准实现取代；不把过时迁移重复应用到新 schema。
 - 原有 8 个工作目录不删除、不重置；本轮使用已清洁的原仓库集成分支，提交和 push 只包含本次审核的修复文件。
 
-## 仍保留的设计边界
+## 保留的边界与尚未定位的现场现象
 
 1. **没有证据的副作用仍需核对。** 不能把未知批量标完成；归档/控制的查询不重放未知动作。
 2. **等待及交接尚无完整业务编排。** 不再用不实等待文案；责任人、外部依赖、解除条件、接管者需要真实业务数据。

@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
-import { createReviewCheckpointManager, readReviewRef } from "./review-checkpoints.js";
+import { createReviewCheckpointManager, createWorkingTreeSnapshot, readReviewRef } from "./review-checkpoints.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -291,6 +291,110 @@ test("an unborn review baseline survives the first user commit", async (t) => {
   assert.deepEqual(review.files.map((file) => file.path), ["after-first-commit.txt"]);
   assert.match(review.patch, /created after commit/);
   assert.doesNotMatch(review.patch, /reviewed before commit/);
+});
+
+test("incremental snapshots exclude older metadata that differs from HEAD and the working tree without changing the user's index", { timeout: 60_000 }, async t => {
+  const root = await committedRepository(t);
+  await mkdir(join(root, ".quaymesh"));
+  await writeFile(join(root, ".quaymesh", "Sessions.md"), "HEAD sessions\n");
+  await writeFile(join(root, ".quaymesh", "sessions.json"), '{"state":"HEAD"}\n');
+  await writeFile(join(root, "unchosen.txt"), "HEAD unchosen\n");
+  await git(root, ["add", "."]);
+  await git(root, ["commit", "-m", "Tracked metadata fixture"]);
+  const head = await gitOutput(root, ["rev-parse", "HEAD"]);
+
+  await writeFile(join(root, ".quaymesh", "Sessions.md"), "user staged sessions\n");
+  await writeFile(join(root, ".quaymesh", "sessions.json"), '{"state":"user staged"}\n');
+  await git(root, ["add", ".quaymesh"]);
+  await writeFile(join(root, ".quaymesh", "Sessions.md"), "older captured sessions\n");
+  await writeFile(join(root, ".quaymesh", "sessions.json"), '{"state":"older captured"}\n');
+  await writeFile(join(root, "unchosen.txt"), "previous snapshot unchosen\n");
+  const previousRef = await createWorkingTreeSnapshot(root, head);
+
+  const workingFiles: Record<string, string> = {
+    ".quaymesh/Sessions.md": "current recovery sessions\n",
+    ".quaymesh/sessions.json": '{"state":"current recovery"}\n',
+    "README.md": "hello\nselected change\n",
+    "new.txt": "selected new file\n",
+    "unchosen.txt": "later unselected working change\n",
+  };
+  for (const [path, contents] of Object.entries(workingFiles)) await writeFile(join(root, path), contents);
+  const userIndex = await readFile(join(root, ".git", "index"));
+  const indexMetadata = await gitOutput(root, ["show", ":.quaymesh/Sessions.md"]);
+  assert.equal(indexMetadata, "user staged sessions");
+  assert.equal(await gitOutput(root, ["show", `${previousRef}:.quaymesh/Sessions.md`]), "older captured sessions");
+
+  const snapshot = await createWorkingTreeSnapshot(root, head, [".quaymesh"], {
+    previousRef, paths: ["README.md", "new.txt"],
+  });
+  assert.deepEqual((await gitOutput(root, ["ls-tree", "-r", "--name-only", snapshot])).split("\n"),
+    ["README.md", "new.txt", "unchosen.txt"]);
+  assert.equal(await gitOutput(root, ["show", `${snapshot}:README.md`]), "hello\nselected change");
+  assert.equal(await gitOutput(root, ["show", `${snapshot}:new.txt`]), "selected new file");
+  assert.equal(await gitOutput(root, ["show", `${snapshot}:unchosen.txt`]), "previous snapshot unchosen",
+    "incremental capture keeps the previous snapshot for paths outside the requested selection");
+  assert.deepEqual(await readFile(join(root, ".git", "index")), userIndex, "the user's index bytes are unchanged");
+  assert.equal(await gitOutput(root, ["rev-parse", "HEAD"]), head);
+  assert.equal(await gitOutput(root, ["show", ":.quaymesh/Sessions.md"]), indexMetadata);
+  for (const [path, contents] of Object.entries(workingFiles)) assert.equal(await readFile(join(root, path), "utf8"), contents);
+});
+
+test("full snapshots exclude recovery metadata changed by a real Git clean filter during staging", { timeout: 60_000 }, async t => {
+  const root = await committedRepository(t);
+  await mkdir(join(root, ".quaymesh"));
+  await writeFile(join(root, ".quaymesh", "Sessions.md"), "HEAD sessions\n");
+  await writeFile(join(root, ".quaymesh", "sessions.json"), '{"state":"HEAD"}\n');
+  await git(root, ["add", "."]);
+  await git(root, ["commit", "-m", "Tracked metadata fixture"]);
+  const head = await gitOutput(root, ["rev-parse", "HEAD"]);
+  await writeFile(join(root, ".quaymesh", "Sessions.md"), "user staged sessions\n");
+  await writeFile(join(root, ".quaymesh", "sessions.json"), '{"state":"user staged"}\n');
+  await git(root, ["add", ".quaymesh"]);
+  const capturedMetadata = "metadata read by git add\n";
+  await writeFile(join(root, ".quaymesh", "Sessions.md"), capturedMetadata);
+  await writeFile(join(root, ".quaymesh", "sessions.json"), '{"state":"before concurrent write"}\n');
+  const workingFiles: Record<string, string> = {
+    "README.md": "hello\nfull capture change\n",
+    "new.txt": "new file included in full snapshot\n",
+  };
+  for (const [path, contents] of Object.entries(workingFiles)) await writeFile(join(root, path), contents);
+  const concurrentMetadata: Record<string, string> = {
+    ".quaymesh/Sessions.md": "new recovery content written after staging read\n",
+    ".quaymesh/sessions.json": '{"state":"concurrent recovery write"}\n',
+  };
+  const filterPath = join(root, ".git", "snapshot-race-filter.cjs");
+  const evidencePath = join(root, ".git", "snapshot-race-evidence.jsonl");
+  await writeFile(filterPath, `const fs = require("node:fs");
+const path = require("node:path");
+const input = fs.readFileSync(0);
+const root = ${JSON.stringify(root)};
+const writes = ${JSON.stringify(concurrentMetadata)};
+for (const [name, content] of Object.entries(writes)) fs.writeFileSync(path.join(root, name), content);
+fs.appendFileSync(${JSON.stringify(evidencePath)}, JSON.stringify({ input: input.toString("base64"), index: process.env.GIT_INDEX_FILE }) + "\\n");
+process.stdout.write(input);
+`);
+  // Git executes filters through its shell on both supported platforms. Quote
+  // actual executable paths, and keep the filter and configuration in this repo.
+  const shellQuote = (value: string) => `'${value.replaceAll("\\", "/").replaceAll("'", "'\\''")}'`;
+  await git(root, ["config", "--local", "filter.qm-snapshot-race.clean", `${shellQuote(process.execPath)} ${shellQuote(filterPath)}`]);
+  await git(root, ["config", "--local", "filter.qm-snapshot-race.required", "true"]);
+  await writeFile(join(root, ".git", "info", "attributes"), ".quaymesh/Sessions.md filter=qm-snapshot-race\n");
+  const userIndexPath = join(root, ".git", "index"), userIndex = await readFile(userIndexPath);
+
+  const snapshot = await createWorkingTreeSnapshot(root, head, [".quaymesh"]);
+  const evidence = (await readFile(evidencePath, "utf8")).trim().split("\n")
+    .map(line => JSON.parse(line) as { input: string; index: string });
+  assert.equal(Buffer.from(evidence[0]!.input, "base64").toString("utf8"), capturedMetadata,
+    "the real filter returned the old contents to git add while writing newer metadata to disk");
+  assert.ok(evidence.every(entry => entry.index && entry.index !== userIndexPath), "staging used a separate GIT_INDEX_FILE");
+  assert.deepEqual((await gitOutput(root, ["ls-tree", "-r", "--name-only", snapshot])).split("\n"), ["README.md", "new.txt"]);
+  assert.equal(await gitOutput(root, ["show", `${snapshot}:README.md`]), workingFiles["README.md"]!.trim());
+  assert.equal(await gitOutput(root, ["show", `${snapshot}:new.txt`]), workingFiles["new.txt"]!.trim());
+  assert.deepEqual(await readFile(userIndexPath), userIndex, "the user's index bytes are unchanged");
+  assert.equal(await gitOutput(root, ["rev-parse", "HEAD"]), head);
+  assert.equal(await gitOutput(root, ["show", ":.quaymesh/Sessions.md"]), "user staged sessions");
+  for (const [path, contents] of Object.entries({ ...workingFiles, ...concurrentMetadata }))
+    assert.equal(await readFile(join(root, path), "utf8"), contents, "snapshot exclusion does not remove or rewrite working files");
 });
 
 async function committedRepository(t: TestContext): Promise<string> {
