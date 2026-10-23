@@ -124,7 +124,8 @@ test("Console规范URL、带版本静态缓存、HEAD和多个cookie保持真实
   const head = await fetch(base+'/console/assets/console-abcdefgh.js',{method:"HEAD"});assert.equal(await head.text(),"");
   const api = await fetch(base+'/console/api/read');assert.equal(api.headers.getSetCookie().length,2);await api.text();
   relay.setAccepting(false);
-  assert.equal((await fetch(base+'/mcp',{method:"POST",body:"{}"})).status,503);
+  assert.equal((await fetch(base+'/mcp',{method:"POST",body:"{}"})).status,401);
+  assert.equal((await fetch(base+'/mcp',{method:"POST",headers:{authorization:"Bearer test"},body:"{}"})).status,503);
   assert.equal((await fetch(base+'/readyz')).status,200);
 });
 
