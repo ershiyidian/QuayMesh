@@ -89,12 +89,14 @@ test("持久安装标记阻止自动或无归属恢复准入", async t => {
 test("升级快照使用真实 SQLite 一致备份，后续迁移保留原结构", async t => {
   const root = await directory(t); await mkdir(join(root, "core"));
   const path = join(root, "core", "quaymesh.sqlite"), backup = join(root, "rollback.sqlite");
-  const db = new Database(path); t.after(() => db.close());
-  db.pragma("journal_mode = WAL"); db.exec("CREATE TABLE qm_schema_migrations(version INTEGER);INSERT INTO qm_schema_migrations VALUES(6);CREATE TABLE work(value TEXT);INSERT INTO work VALUES('retained');");
-  const { stdout } = await promisify(execFile)(process.execPath, [fileURLToPath(new URL("../database-snapshot.mjs", import.meta.url)), root, backup]);
-  assert.equal(JSON.parse(stdout).version, 6);
-  db.exec("INSERT INTO qm_schema_migrations VALUES(8);ALTER TABLE work ADD COLUMN owner TEXT;");
-  const saved = new Database(backup, { readonly: true });
-  try { assert.equal(saved.prepare("SELECT max(version) AS version FROM qm_schema_migrations").get().version, 6); assert.equal(saved.prepare("SELECT value FROM work").get().value, "retained"); }
-  finally { saved.close(); }
+  const db = new Database(path);
+  try {
+    db.pragma("journal_mode = WAL"); db.exec("CREATE TABLE qm_schema_migrations(version INTEGER);INSERT INTO qm_schema_migrations VALUES(6);CREATE TABLE work(value TEXT);INSERT INTO work VALUES('retained');");
+    const { stdout } = await promisify(execFile)(process.execPath, [fileURLToPath(new URL("../database-snapshot.mjs", import.meta.url)), root, backup]);
+    assert.equal(JSON.parse(stdout).version, 6);
+    db.exec("INSERT INTO qm_schema_migrations VALUES(8);ALTER TABLE work ADD COLUMN owner TEXT;");
+    const saved = new Database(backup, { readonly: true });
+    try { assert.equal(saved.prepare("SELECT max(version) AS version FROM qm_schema_migrations").get().version, 6); assert.equal(saved.prepare("SELECT value FROM work").get().value, "retained"); }
+    finally { saved.close(); }
+  } finally { db.close(); }
 });
