@@ -8,6 +8,7 @@ import { writeJson, atomicWrite, readOptionalJson } from "./files.mjs";
 import { requestJson } from "./network.mjs";
 import { restrictedEnvironment } from "./environment.mjs";
 import { packageRoot } from "./app.mjs";
+import { componentPlans } from "./compile.mjs";
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve,ms));
 const REQUIRED_RELEASE_ENTRIES=["bin","node","dist","schema","skills","package.json","node_modules","components","runtime","release.json","components.lock.json","docs","scripts"];
@@ -167,16 +168,40 @@ async function runningStatus(port) {
   catch (error) { if (error.code === "ECONNREFUSED") return null; throw error; }
 }
 export async function waitRunning(manifest,token,timeoutMs,{stableMs=60000,resume=true}={}) {
-  const deadline = Date.now()+timeoutMs;
+  const deadline = performance.now()+timeoutMs;
   const release=manifest.directory?await readOptionalJson(join(manifest.directory,"release.json")):undefined;
   const fingerprints=Boolean(release?.runtime||release?.nativeDependencies);
+  const configuration=manifest.config?await loadNodeConfig(manifest.config):undefined;
+  const requiredIds=new Set(configuration?componentPlans(configuration.node,configuration.cluster,configuration.env,{
+    root:manifest.directory,generatedDir:join(configuration.node.stateDir,"generated"),
+    configDir:join(configuration.node.stateDir,"generated","core"),release:manifest.sourceCommit,
+  }).map(plan=>plan.id):["core"]);
+  requiredIds.add("core");
   let stableSince=0,identity,lastFailure;
-  while (Date.now()<deadline) {
+  while (performance.now()<deadline) {
     const state = await runningStatus(manifest.adminPort).catch(error=>{
       if(["ECONNRESET","ECONNREFUSED","ETIMEDOUT","ECONNABORTED"].includes(error.code))return null;
       throw error;
     });
     const core=state?.components?.find(value=>value.id==="core");
+    const components=Array.isArray(state?.components)?state.components:[];
+    // Compatibility for callers without a configuration manifest: once
+    // observed, a component cannot disappear from this verification window.
+    if(!configuration){
+      for(const value of components)requiredIds.add(value.id);
+      if(state?.capabilities?.discovery)requiredIds.add("discovery");
+    }
+    const required=[...requiredIds].sort().map(id=>({id,matches:components.filter(value=>value.id===id)}));
+    const unready=required.filter(({matches})=>{
+      const value=matches[0];
+      return matches.length!==1||value.state!=="ready"||value.processState!=="running"||
+        !Number.isInteger(value.pid)||value.pid<=0||!Number.isInteger(value.restarts)||value.restarts<0||
+        !Number.isFinite(value.startedAt)||value.startedAt<=0||
+        !Number.isFinite(value.observedAt)||Date.now()-value.observedAt>20000||
+        value.observedAt-Date.now()>5000||value.crashLoop||value.error||value.probeError;
+    });
+    if(unready.length)lastFailure="必要组件未就绪："+unready.map(({id,matches})=>
+      id+"("+((matches.length===1?matches[0].state:matches.length?"duplicate":"missing")||"unknown")+")").join(", ");
     let activeRelease,coreIdentityMatches=true;
     if(fingerprints){
       activeRelease=await readOptionalJson(join(manifest.stateDir,"core","active-release.json"));
@@ -190,10 +215,11 @@ export async function waitRunning(manifest,token,timeoutMs,{stableMs=60000,resum
       if(!coreIdentityMatches)lastFailure="Core 进程身份、Node 或 SQLite 实际指纹与发行清单不符";
     }
     if (state?.nodeId===manifest.nodeId && state.release===manifest.sourceCommit &&
-      core?.state==="ready" && core.pid && !core.crashLoop && coreIdentityMatches) {
-      const nextIdentity=`${core.pid}:${core.startedAt??""}:${core.restarts??0}`;
-      if(identity!==nextIdentity){identity=nextIdentity;stableSince=Date.now();}
-      if(Date.now()-stableSince>=stableMs){
+      !unready.length && coreIdentityMatches) {
+      const nextIdentity=JSON.stringify(required.map(({id,matches:[value]})=>[id,value.pid,value.startedAt,value.restarts]));
+      if(identity!==nextIdentity){identity=nextIdentity;stableSince=performance.now();}
+      lastFailure=undefined;
+      if(performance.now()-stableSince>=stableMs){
         if(resume)await requestJson(`http://127.0.0.1:${manifest.adminPort}/maintenance/resume`,{method:"POST",token,timeoutMs:10000});
         return {...state,...(activeRelease?{activeCoreRelease:activeRelease}:{})};
       }

@@ -6,6 +6,11 @@ import { basename, extname, join, normalize, resolve, sep } from "node:path";
 import { createAgent } from "./network.mjs";
 
 const HOP_HEADERS = new Set(["connection","keep-alive","proxy-authenticate","proxy-authorization","te","trailer","transfer-encoding","upgrade"]);
+const DISCOVERY_METADATA_PATHS = new Set([
+  "/.well-known/oauth-protected-resource",
+  "/.well-known/oauth-protected-resource/mcp",
+  "/.well-known/oauth-authorization-server",
+]);
 const PATHS = ["/mcp","/authorize","/token","/register","/revoke","/introspect","/.well-known/","/console","/healthz","/readyz","/oauth"];
 const CONSOLE_REQUEST_HEADERS = ["accept","content-type","cookie","origin","referer","if-none-match","if-modified-since","x-quaymesh-csrf"];
 const CONSOLE_RESPONSE_HEADERS = ["content-type","cache-control","etag","last-modified","set-cookie","location","content-disposition"];
@@ -61,8 +66,20 @@ export class McpRelay {
   async route(req, res) {
     const pathname = new URL(req.url,"http://relay.local").pathname;
     const health = req.method === "GET" && ["/readyz","/healthz"].includes(pathname);
-    if (!this.accepting && !health) { res.writeHead(503,{"retry-after":"2"}).end('{"error":"node_maintenance"}'); return; }
-    const blocking = !health && !(req.method === "GET" && pathname === "/mcp");
+    const discoveryMetadata = req.method === "GET" && DISCOVERY_METADATA_PATHS.has(pathname);
+    if (!this.accepting && !health && !discoveryMetadata) {
+      // Discovery performs unauthenticated startup probes while admission is
+      // paused. Answer locally: no JSON-RPC body or upstream work is accepted.
+      if (["GET","POST"].includes(req.method) && ["/mcp","/mcp/"].includes(pathname) &&
+          req.headers.authorization === undefined) {
+        res.writeHead(401, {"www-authenticate":"Bearer", "cache-control":"no-store",
+          "content-type":"application/json; charset=utf-8", "connection":"close"})
+          .end('{"error":"authentication_required"}');
+        req.resume();
+      } else res.writeHead(503,{"retry-after":"2"}).end('{"error":"node_maintenance"}');
+      return;
+    }
+    const blocking = !health && !discoveryMetadata && !(req.method === "GET" && pathname === "/mcp");
     if (blocking) this.activeRequests++;
     let released = false;
     const release = () => { if (!released) { released = true; if (blocking) this.activeRequests--; } };

@@ -76,18 +76,20 @@ Browser acceptance covers real local MCP sessions, SQLite finalization intent, p
 
 ## Incident remediation register
 
-This register retains all 42 findings from the lifecycle investigation. “Implemented” describes source behavior and regression coverage; a running node receives it only after its actual release has been verified. “Boundary” records a limitation that must remain visible rather than being converted into a successful result.
+This register retains all 42 findings from the lifecycle investigation and adds A09 and A10 from deployment cold-start verification, for 44 findings. “Implemented” describes source behavior and regression coverage; a running node receives it only after its actual release has been verified. “Boundary” records a limitation that must remain visible rather than being converted into a successful result.
 
 | ID | Finding | Implemented behavior or remaining boundary |
 | --- | --- | --- |
 | A01 | Native SQLite cleanup crashes | Pin SQLite 13.0.3; verify 500 real database/statement/GC cycles with the exact packaged Node runtime before activation. |
 | A02 | Source version differs from installed contents | Record source commit, Node version/ABI/hash, lockfile hash, and actual loaded SQLite package/native hash in release and runtime identities. |
 | A03 | A restart loop briefly appears healthy | Report recent restart rate, crash-loop condition, last exit, and readiness separately; exclude unstable Core instances from gateway selection. |
-| A04 | First successful readiness check accepts an upgrade | Require sixty continuous seconds with the same ready Core PID/start/restart identity and matching actual runtime identity. |
+| A04 | First successful readiness check accepts an upgrade | Require matching actual Core runtime identity and sixty continuous seconds with unchanged ready PID/start/restart identities for every required managed component. |
 | A05 | Old binaries cannot read a newly migrated database | Make a real SQLite backup before activation; migration failure keeps new data and its backup in recovery_required instead of blindly starting old binaries. |
 | A06 | Core owns command pipes and terminal processes | Preserve live execution ownership and quarantine unconfirmed dead-owner claims. Transparent command/PTY reattachment after Core death still requires a separate command runner. |
 | A07 | Stopping a service can stop its child cgroup/Job | Upgrade only after admission freeze and execution/stream drain. Windows activation runs independently through Task Scheduler. Existing command ownership still has the A06 boundary. |
 | A08 | Maintenance recovery and activation timestamps are ambiguous | Persist installation transition ownership; keep activation time distinct from Core process start time. |
+| A09 | Maintenance blocks discovery's one-time startup probes | Allow only the exact public OAuth metadata GET routes. Unauthenticated MCP startup probes receive a local Relay 401 without parsing or forwarding business requests. Authenticated MCP, registration, token, and other business requests remain closed. |
+| A10 | A ready Core hides required discovery startup failure | Derive required components from the actual component plan. Missing, duplicate, stale, failed, or restarted components block verification or reset the shared stability window. |
 | B01 | Startup reconciliation rewrites live execution owners | Match owner token, PID, and OS creation identity before recovery; preserve a living owner. |
 | B02 | A verified completion cannot close a recovered execution | Accept the current execution owner's proven terminal receipt; retain generation checks and cancellation protection. |
 | B03 | Dead Core automatically releases command claims | Retain and audit the isolation claim until terminal or ownership-transfer evidence exists. |
@@ -124,6 +126,8 @@ This register retains all 42 findings from the lifecycle investigation. “Imple
 | E04 | A generic probe or 503 hides the failure layer | Report proxy connection, tunnel, target TLS, and HTTP probe stages with safe error codes; generic reachability does not establish provider business health. |
 
 ## Activation and verification
+
+Maintenance preserves the existing responses from the two OAuth metadata endpoints and the root metadata fallback candidate. Unauthenticated GET/POST `/mcp` startup probes receive only a local authentication challenge; no upstream execution starts. Discovery can therefore initialize while business admission remains paused, without a circular dependency in installation verification. An absent root metadata route still returns 404 rather than fabricated metadata. The external tunnel component can retain other one-time discovery failures; verification of every required component prevents committing that state as a successful upgrade.
 
 Build an immutable platform release from a clean Git commit with Node 24.21.0 and the frozen package lock. `release.json` identifies the actual packaged Node and native dependency bytes. `verify-installed.mjs` performs real SQLite/GC and schema checks before the service changes.
 

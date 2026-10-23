@@ -18,7 +18,7 @@ test("升级验证要求同一进程连续就绪，首次ready和重启都会重
     res.setHeader("content-type", "application/json");
     if (req.url === "/maintenance/resume") { resumed++; res.end("{}"); return; }
     polls++;
-    res.end(JSON.stringify({ nodeId: "fixture", release: "commit", components: [{ id: "core", state: polls === 2 ? "starting" : "ready",
+    res.end(JSON.stringify({ nodeId: "fixture", release: "commit", components: [{ id: "core", processState:"running", observedAt:Date.now(), state: polls === 2 ? "starting" : "ready",
       pid: polls < 3 ? 101 : 102, startedAt: polls < 3 ? 1 : 2, restarts: polls < 3 ? 0 : 1 }] }));
   });
   const port = await freePort(); await new Promise(resolve => server.listen(port, "127.0.0.1", resolve));
@@ -38,7 +38,7 @@ test("manager 已更新而 Core 仍加载旧原生模块时拒绝激活", async 
   await writeFile(join(root, "core", "active-release.json"), JSON.stringify(active));
   const server = http.createServer((_req, res) => {
     res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({ nodeId: "fixture", release: "commit", components: [{ id: "core", state: "ready", pid: 101 }] }));
+    res.end(JSON.stringify({ nodeId: "fixture", release: "commit", components: [{ id: "core", state: "ready", processState:"running", observedAt:Date.now(), startedAt:1, restarts:0, pid: 101 }] }));
   });
   const port = await freePort(); await new Promise(resolve => server.listen(port, "127.0.0.1", resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
