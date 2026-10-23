@@ -6,6 +6,8 @@ import { runSqliteWrite, type SqliteWriteOptions } from "./db/async-write.js";
 import { canonicalPathIdentity } from "./roots.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { pidAlive } from "./process-liveness.js";
+import { readMaintenanceStatus } from "./maintenance-status.js";
+import { changeAdmission, readAdmissionState, type AdmissionState, type AdmissionChange } from "./admission-state.js";
 import { canonicalResourcePath, normalizeExecutionResources, resourcesConflict,
   resourceContains, type ExecutionResource } from "./execution-resources.js";
 
@@ -145,10 +147,7 @@ export class ExecutionCoordinator {
   }
 
   pause(reason = "维护操作"): void {
-    this.database.sqlite.transaction(() => {
-      this.database.sqlite.prepare("UPDATE qm_runtime_admission SET accepting=0,reason=?,changed_at=? WHERE id=1")
-        .run(reason, new Date().toISOString());
-    }).immediate();
+    changeAdmission(this.database.sqlite, { accepting: false, reason });
   }
 
   async pauseAsync(reason = "维护操作", options?: SqliteWriteOptions): Promise<void> {
@@ -156,17 +155,21 @@ export class ExecutionCoordinator {
   }
 
   resume(): void {
-    this.database.sqlite.prepare("UPDATE qm_runtime_admission SET accepting=1,reason=NULL,changed_at=? WHERE id=1")
-      .run(new Date().toISOString());
+    changeAdmission(this.database.sqlite, { accepting: true, reason: null });
+  }
+
+  compareAndSetAdmission(expected: AdmissionState, next: Pick<AdmissionState, "accepting" | "reason">): AdmissionChange {
+    return changeAdmission(this.database.sqlite, next, expected);
   }
 
   /** 只清除服务正常退出留下的暂停标记，维护暂停由维护流程显式恢复。 */
   resumeAfterRestart(): boolean {
-    const state = this.database.sqlite.prepare("SELECT accepting,reason FROM qm_runtime_admission WHERE id=1")
-      .get() as { accepting: number; reason: string | null };
-    if (state.accepting !== 0 || !["服务正在退出", "服务准备停止"].includes(state.reason ?? "")) return false;
-    this.resume();
-    return true;
+    return this.database.sqlite.transaction(() => {
+      const state = readAdmissionState(this.database.sqlite);
+      if (state.accepting || !["服务正在退出", "服务准备停止"].includes(state.reason ?? "")) return false;
+      this.resume();
+      return true;
+    }).immediate();
   }
   beginWork(input: RuntimeWorkInput): RuntimeWorkLease {
     if (this.closed || this.closePromise) throw new Error("Execution coordinator is closed or closing.");
@@ -300,38 +303,12 @@ export class ExecutionCoordinator {
       resourceContains(scope,{kind:"file",path:canonicalResourcePath(path),access:"read"}));
   }
 
-  admissionState(): {accepting:boolean;reason:string|null;changedAt:string} {
-    const state=this.database.sqlite.prepare("SELECT accepting,reason,changed_at FROM qm_runtime_admission WHERE id=1")
-      .get() as {accepting:number;reason:string|null;changed_at:string};
-    return {accepting:state.accepting===1,reason:state.reason,changedAt:state.changed_at};
+  admissionState(): AdmissionState {
+    return readAdmissionState(this.database.sqlite);
   }
 
   admissionStatus() {
-    return this.database.sqlite.transaction(() => {
-      const state = this.database.sqlite.prepare("SELECT accepting,reason,changed_at FROM qm_runtime_admission WHERE id=1").get() as { accepting: number; reason: string | null; changed_at: string };
-      const count = (sql: string) => Number((this.database.sqlite.prepare(sql).get() as { n: number }).n);
-      const claims = count("SELECT COUNT(*) AS n FROM execution_claims");
-      const waiting = count("SELECT COUNT(*) AS n FROM execution_waiters WHERE expires_at_ms>strftime('%s','now')*1000");
-      const operations = count("SELECT COUNT(*) AS n FROM console_operations WHERE status IN ('running','starting')");
-      const executions = count("SELECT COUNT(*) AS n FROM console_executions WHERE status IN ('running','starting')");
-      const queuedOperations = count("SELECT COUNT(*) AS n FROM console_operations WHERE status='queued'");
-      const queuedExecutions = count("SELECT COUNT(*) AS n FROM console_executions WHERE status='queued'");
-      const unresolvedOperations = count("SELECT COUNT(*) AS n FROM console_operations WHERE status IN ('unknown','reconciliation_required')");
-      const unresolvedExecutions = count("SELECT COUNT(*) AS n FROM console_executions WHERE status IN ('unknown','reconciliation_required')");
-      const rows = this.database.sqlite.prepare(`SELECT kind,owner_pid,COUNT(*) AS count FROM qm_runtime_work
-        WHERE blocking=1 GROUP BY kind,owner_pid ORDER BY kind,owner_pid`).all() as { kind: string; owner_pid: number; count: number }[];
-      const owners = new Map<number, boolean>();
-      const counts = new Map<string, number>();
-      for (const row of rows) {
-        if (!owners.has(row.owner_pid)) owners.set(row.owner_pid, pidAlive(row.owner_pid));
-        if (owners.get(row.owner_pid)) counts.set(row.kind, (counts.get(row.kind) ?? 0) + row.count);
-      }
-      const work = [...counts].map(([kind, count]) => ({ kind, count }));
-      const activeWork = work.reduce((n, item) => n + item.count, 0);
-      return { accepting: state.accepting === 1, reason: state.reason, changedAt: state.changed_at,
-        idle: claims + waiting + operations + executions + queuedOperations + queuedExecutions + unresolvedOperations + unresolvedExecutions + activeWork === 0,
-        claims, waiting, operations, executions, queuedOperations, queuedExecutions, unresolvedOperations, unresolvedExecutions, activeWork, work };
-    }).deferred();
+    return readMaintenanceStatus(this.database.sqlite);
   }
 
   private row(input: ExecutionClaimInput): ClaimRow {

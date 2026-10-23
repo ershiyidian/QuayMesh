@@ -17,7 +17,10 @@ import { WorkLedger as ProjectWorkLedger } from "./work-ledger.js";
 import { admittedTools } from "./tool-admission.js";
 import { localAgentProviderEnvironment } from "./local-agent-config.js";
 import type { ExecutionCoordinator, RuntimeWorkLease } from "./execution-coordinator.js";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync } from "node:fs";
+import { installationTransitionPending } from "./installation-transition.js";
+import { isAdmissionPrecondition, sameAdmissionInstance } from "./admission-state.js";
+import { processOwner } from "./process-identity.js";
 import { realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { relative, resolve as resolveSessionPath } from "node:path";
@@ -1115,7 +1118,8 @@ export function createServer(
     diagnostics: (event, fields, level) => options.diagnostics
       ? options.diagnostics.record(event, fields, level) : logEvent(config.logging, level, event, fields) });
   const installationTransitionFile = process.env.QUAYMESH_INSTALL_TRANSITION_FILE;
-  const installationPending = () => Boolean(installationTransitionFile && existsSync(installationTransitionFile));
+  const installationPending = () => installationTransitionPending(installationTransitionFile);
+  const admissionInstance = Object.freeze({ pid: processOwner.pid, processStart: processOwner.start, token: processOwner.token });
   // A first install or an externally stopped old Core may have no persisted
   // pause. Keep direct peer calls and egress frozen during release validation,
   // before federation starts accepting connections.
@@ -1248,7 +1252,7 @@ export function createServer(
   app.get("/internal/quaymesh/idle", (req, res) => {
     const token = process.env[config.federation?.tokenEnv || "QUAYMESH_CLUSTER_TOKEN"];
     if (!token || req.headers.authorization !== `Bearer ${token}`) { res.status(401).json({error:"unauthorized"}); return; }
-    res.json({ ok: true, ...processSessions.executionCoordinator!.admissionStatus() });
+    res.json({ ok: true, ...processSessions.executionCoordinator!.admissionStatus(), instance: admissionInstance });
   });
 
   app.post("/internal/quaymesh/admission", express.json({ limit: "4kb" }), (req, res) => {
@@ -1256,13 +1260,37 @@ export function createServer(
     if (!token || req.headers.authorization !== `Bearer ${token}`) { res.status(401).json({ error: "unauthorized" }); return; }
     const action = req.body?.action;
     if (action !== "pause" && action !== "resume") { res.status(400).json({ error: "invalid_admission_action" }); return; }
+    const conditional = Object.prototype.hasOwnProperty.call(req.body ?? {}, "expected");
+    const expected: unknown = req.body?.expected;
+    if (conditional && !isAdmissionPrecondition(expected)) {
+      res.status(400).json({ error: "INVALID_ADMISSION_PRECONDITION" }); return;
+    }
+    const execution = processSessions.executionCoordinator!;
+    if (conditional && isAdmissionPrecondition(expected) && !sameAdmissionInstance(expected.instance, admissionInstance)) {
+      res.status(409).json({ error: "ADMISSION_PRECONDITION_FAILED", conflict: "instance",
+        ...execution.admissionState(), instance: admissionInstance }); return;
+    }
+    if (conditional && action === "pause"
+        && (typeof req.body.reason !== "string" || !req.body.reason.trim() || req.body.reason.length > 1024)) {
+      res.status(400).json({ error: "invalid_admission_reason" }); return;
+    }
     if (action === "resume" && installationPending()) {
       res.status(409).json({ error: "INSTALLATION_VALIDATION_PENDING", message: "发行切换仍在验证或等待恢复，准入保持暂停。" }); return;
     }
-    if (action === "pause") processSessions.executionCoordinator!.pause(typeof req.body.reason === "string" ? req.body.reason : undefined);
-    else processSessions.executionCoordinator!.resume();
+    if (conditional && isAdmissionPrecondition(expected)) {
+      const result = execution.compareAndSetAdmission(expected, { accepting: action === "resume",
+        reason: action === "pause" ? req.body.reason : null });
+      if (!result.changed) {
+        res.status(409).json({ error: "ADMISSION_PRECONDITION_FAILED", conflict: "state",
+          ...result.state, instance: admissionInstance }); return;
+      }
+      federation?.refreshAdmission();
+      res.json({ ok: true, ...execution.admissionStatus(), ...result.state, instance: admissionInstance }); return;
+    }
+    if (action === "pause") execution.pause(typeof req.body.reason === "string" ? req.body.reason : undefined);
+    else execution.resume();
     federation?.refreshAdmission();
-    res.json({ ok: true, ...processSessions.executionCoordinator!.admissionStatus() });
+    res.json({ ok: true, ...execution.admissionStatus(), instance: admissionInstance });
   });
 
   app.post("/internal/quaymesh/console", express.json({ limit: "2mb" }), async (req, res) => {

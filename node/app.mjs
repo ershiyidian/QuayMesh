@@ -15,10 +15,11 @@ import { McpRelay } from "./relay.mjs";
 import { requestJson, requestDiscoveryReady, connectSocket } from "./network.mjs";
 import { assertMeshPortFree, assertManagedMeshListener } from "./easytier-health.mjs";
 import { SourceErrors } from "./source-errors.mjs";
-import { resumeAdmissionWithRetry, reconcileAbandonedMaintenance } from "./maintenance-recovery.mjs";
+import { resumeAdmissionWithRetry } from "./maintenance-recovery.mjs";
 
 export const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const admissionExpectation=state=>state?.instance?{instance:state.instance,accepting:state.accepting,reason:state.reason,changedAt:state.changedAt}:undefined;
 
 export class QuayMeshNode {
   constructor(configuration, { root = packageRoot, intervalMs = 1000, readinessMs = 30000 } = {}) {
@@ -31,6 +32,9 @@ export class QuayMeshNode {
     this.corePort = configuration.node.corePort; this.maintenance = false;
     this.maintenanceReleasePending = false;
     this.maintenanceRelease = null;
+    this.maintenanceReleaseExpected = undefined;
+    this.maintenancePauseExpected = undefined;
+    this.maintenanceOwner = null;
     this.maintenanceRecovery = null;
     this.maintenanceRecoveryTimer = null;
     this.statusFile = join(configuration.node.stateDir, "node-status.json");
@@ -221,7 +225,7 @@ export class QuayMeshNode {
     const status=await requestJson(`http://127.0.0.1:${this.corePort}/internal/quaymesh/idle`,{
       token:this.token,timeoutMs:3000,
     });
-    return status.idle===true;
+    return (status.quiescent??status.idle)===true;
   }
   async applySettingsRevision(expectedRevision) {
     if(this.application)await this.application;
@@ -242,10 +246,10 @@ export class QuayMeshNode {
     const previous = this.generation;
     const prepared = await this.prepare(next, this.configRevision);
     const changed = this.supervisor.changedIds(prepared.plans);
-    let switching = false,committed=false;
+    let switching = false,committed=false,maintenanceOwner;
     try {
       if (changed.size) {
-        await this.beginMaintenance();
+        maintenanceOwner=await this.beginMaintenance();
         switching = true;
         await this.supervisor.replacePlans(prepared.plans);
         await this.supervisor.waitReady(changed, this.readinessMs);
@@ -255,7 +259,7 @@ export class QuayMeshNode {
       this.pendingSettingsRevision = null;
       this.errors.recover("configuration");
       this.errors.recover("settings");
-      if (switching) await this.endMaintenance();
+      if (switching) await this.endMaintenanceAfterReplacement(maintenanceOwner,changed);
       return authority.node.settingsRevision;
     } catch (error) {
       if(committed){this.errors.fail("admission",error);throw error;}
@@ -263,7 +267,7 @@ export class QuayMeshNode {
         try {
           const changed=await this.supervisor.replacePlans(previous.plans);
           await this.supervisor.waitReady(changed,this.readinessMs);
-          await this.endMaintenance();
+          await this.endMaintenanceAfterReplacement(maintenanceOwner,changed);
         } catch (rollback) {
           throw new AggregateError([error, rollback], "设置已经保存，应用失败，恢复旧运行配置也未完成");
         }
@@ -289,7 +293,8 @@ export class QuayMeshNode {
       configRevision:this.configRevision,pendingConfigRevision:this.pendingConfiguration?.revision || null,
       configuration:{applied:this.configRevision,desired:this.pendingConfiguration?.revision || this.configRevision,
         state:this.applying ? "applying" : this.pendingConfiguration?.failed ? "rejected" : this.pendingConfiguration ? "pending" : "applied"},
-      maintenance:this.maintenance,components:this.supervisor?.snapshot() || [],discovery:this.discovery,
+      maintenance:this.maintenance,maintenanceProtocol:2,relayActiveRequests:this.relay?.activeRequests??0,
+      components:this.supervisor?.snapshot() || [],discovery:this.discovery,
       installationTransition:this.installationTransition??null,
       activeCoreRelease:this.activeCoreRelease??null,
       membership:this.membership?.state || {connected:false,lastSuccessAt:null,error:null},
@@ -304,15 +309,27 @@ export class QuayMeshNode {
     try { await this.statusWriting; this.errors.recover("status"); }
     finally { this.statusWriting = null; }
   }
-  async admission(action) {
+  async admission(action, expected) {
     return requestJson(`http://127.0.0.1:${this.corePort}/internal/quaymesh/admission`,{
-      method:"POST",token:this.token,timeoutMs:3000,body:{action,reason:"node-maintenance"},
+      method:"POST",token:this.token,timeoutMs:3000,body:{action,reason:"node-maintenance",...(expected===undefined?{}:{expected})},
     });
   }
   async admissionState() {
     return requestJson(`http://127.0.0.1:${this.corePort}/internal/quaymesh/idle`, {
       token:this.token,timeoutMs:3000,
     });
+  }
+  async resumeAdmissionConditionally(expected) {
+    try { return await this.admission("resume",expected); }
+    catch(error){
+      // A successful CAS may lose its HTTP response. Only the same Core
+      // instance, currently open with no pause owner, can confirm that case.
+      // A second CAS closes the GET/POST race with another maintenance owner.
+      const state=await this.admissionState();
+      if(state.accepting!==true||state.reason!==null||!expected?.instance||
+          ["pid","processStart","token"].some(key=>state.instance?.[key]!==expected.instance[key]))throw error;
+      return this.admission("resume",{instance:state.instance,accepting:true,reason:null,changedAt:state.changedAt});
+    }
   }
   async reconcileMaintenance() {
     if (this.stopped || this.maintenanceRecovery || this.applying || this.application || this.settingsApply) return;
@@ -325,52 +342,89 @@ export class QuayMeshNode {
       }
       // A timer and a real maintenance operation must never race: check
       // ownership again after querying the asynchronous Core state.
-      await reconcileAbandonedMaintenance(
-        async () => {
-          const state = await this.admissionState();
-          if (this.stopped || this.maintenance || this.applying || this.application || this.settingsApply) return null;
-          return state;
-        },
-        async () => {
-          if (this.stopped || this.maintenance || this.applying || this.application || this.settingsApply) return;
-          await this.endMaintenance();
-        },
-      );
+      const state=await this.admissionState();
+      if(this.stopped||this.maintenance||this.applying||this.application||this.settingsApply)return;
+      if(state?.accepting===false&&state.reason==="node-maintenance")
+        await this.endMaintenance(admissionExpectation(state));
     })().finally(() => { if (this.maintenanceRecovery === job) this.maintenanceRecovery = null; });
     this.maintenanceRecovery = job;
     await job;
   }
   async beginMaintenance(timeoutMs = 30000) {
     if (this.maintenance) throw Object.assign(new Error("节点已有维护操作"),{status:409});
+    const before=await this.admissionState();
+    if(this.maintenance||before.accepting!==true)
+      throw Object.assign(new Error("准入已由其他暂停持有，不能覆盖其维护状态"),{status:409});
     this.maintenance = true; this.relay?.setAccepting(false);
+    const owner=randomUUID();this.maintenanceOwner=owner;
+    let pauseAcquired=false;
     try {
-      await this.admission("pause");
+      const paused=await this.admission("pause",admissionExpectation(before));
+      pauseAcquired=true;this.maintenancePauseExpected=admissionExpectation(paused);
       const deadline = Date.now() + timeoutMs;
       do {
         const idle = await requestJson(`http://127.0.0.1:${this.corePort}/internal/quaymesh/idle`,{token:this.token,timeoutMs:3000});
-        if (idle.idle && !this.relay?.activeRequests) return;
+        if ((idle.quiescent??idle.idle)===true && !this.relay?.activeRequests) return owner;
         await sleep(100);
       } while (!this.stopped && Date.now() < deadline);
       throw Object.assign(new Error("已接受的工作尚未结束，保留当前组件"),{status:409});
     } catch (error) {
+      if(!pauseAcquired){
+        // A 409 confirms the CAS did not write. An uncertain HTTP result must
+        // stay closed for explicit reconciliation, never resume another owner.
+        if(error.status===409){this.maintenance=false;this.maintenanceOwner=null;this.relay?.setAccepting(true);}
+        else this.errors.fail("admission",error);
+        throw error;
+      }
       try { await this.endMaintenance(); }
       catch (recovery) { throw new AggregateError([error,recovery],"维护失败，恢复准入仍待重试"); }
       throw error;
     }
   }
-  async endMaintenance() {
+  async endMaintenanceAfterReplacement(owner, changed) {
+    if(!owner||!this.maintenance||this.maintenanceOwner!==owner)
+      throw Object.assign(new Error("组件替换的维护归属已改变"),{status:409});
+    if(!changed.has("core"))return this.endMaintenance();
+    const observed=this.supervisor.snapshot().find(value=>value.id==="core");
+    if(observed?.state!=="ready"||!observed.pid)throw Object.assign(new Error("替换的Core尚未就绪，保留维护暂停"),{status:409});
+    const state=await this.admissionState();
+    const current=this.supervisor.snapshot().find(value=>value.id==="core");
+    if(!this.maintenance||this.maintenanceOwner!==owner||current?.state!=="ready"||
+        (this.maintenancePauseExpected?.instance&&!state.instance)||
+        ["pid","startedAt","restarts"].some(key=>current?.[key]!==observed[key])||(state.instance&&state.instance.pid!==current.pid)||
+        !((state.accepting===false&&state.reason==="node-maintenance")||(state.accepting===true&&state.reason===null)))
+      throw Object.assign(new Error("替换Core的代次或暂停归属不能确认"),{status:409});
+    return this.endMaintenance(admissionExpectation(state));
+  }
+  async endMaintenance(expected) {
     if(await readOptionalJson(join(this.config.node.stateDir,"installation-transition.json")))
       throw Object.assign(new Error("发行切换仍在验证或等待恢复，准入保持暂停。"),{status:409});
     // Admin resume, timer recovery and rollback may converge here. One
     // Core resume transaction owns the latch; callers share its outcome.
-    if (this.maintenanceRelease) return this.maintenanceRelease;
+    if (this.maintenanceRelease) {
+      if(expected!==undefined&&JSON.stringify(expected)!==JSON.stringify(this.maintenanceReleaseExpected))
+        throw Object.assign(new Error("另一个带条件的维护释放仍在进行"),{status:409});
+      return this.maintenanceRelease;
+    }
+    if(expected!==undefined)this.maintenanceReleaseExpected=structuredClone(expected);
+    else if(this.maintenanceReleaseExpected===undefined&&this.maintenancePauseExpected!==undefined)
+      this.maintenanceReleaseExpected=structuredClone(this.maintenancePauseExpected);
+    const releaseExpected=this.maintenanceReleaseExpected;
     this.maintenanceReleasePending = true;
+    this.maintenance = true;this.relay?.setAccepting(false);
     const release = (async () => {
       try {
-        await resumeAdmissionWithRetry(() => this.admission("resume"));
+        // A conditional resume is not blindly idempotent: if its reply is
+        // lost, the same expected state may already have changed. Keep that
+        // exact condition for timer retries; never fall back to plain resume.
+        if(releaseExpected!==undefined)await this.resumeAdmissionConditionally(releaseExpected);
+        else await resumeAdmissionWithRetry(() => this.admission("resume"));
         this.maintenance = false;
         this.installationTransition=null;
         this.maintenanceReleasePending = false;
+        this.maintenanceReleaseExpected = undefined;
+        this.maintenancePauseExpected = undefined;
+        this.maintenanceOwner = null;
         this.relay?.setAccepting(true);
         this.errors.recover("admission");
       } catch (error) {
@@ -389,15 +443,15 @@ export class QuayMeshNode {
   }
   async applyPending() {
     const next = this.pendingConfiguration, previous = this.generation;
-    let prepared, switching = false, committed = false;
+    let prepared, switching = false, committed = false,maintenanceOwner,changed;
     this.applying = true;
     try {
       const node = validateNode(this.config.rawNode,next.cluster,dirname(this.config.configFile));
       prepared = await this.prepare({...this.config,node,cluster:next.cluster},next.revision);
-      const changed = this.supervisor.changedIds(prepared.plans);
+      changed = this.supervisor.changedIds(prepared.plans);
       const relayChanged = this.config.cluster.discovery.localPort !== next.cluster.discovery.localPort;
       if (changed.size || relayChanged) {
-        await this.beginMaintenance(); switching = true;
+        maintenanceOwner=await this.beginMaintenance(); switching = true;
         if (relayChanged) { await this.relay?.close(); this.relay = await this.createRelay(prepared.configuration); }
         await this.supervisor.replacePlans(prepared.plans);
         await this.supervisor.waitReady(changed,this.readinessMs);
@@ -406,7 +460,7 @@ export class QuayMeshNode {
       committed = true;
       if (this.pendingConfiguration === next) this.pendingConfiguration = null;
       this.errors.recover("configuration");
-      if (switching) await this.endMaintenance();
+      if (switching) await this.endMaintenanceAfterReplacement(maintenanceOwner,changed);
     } catch (error) {
       if (committed) { this.errors.fail("admission",error); throw error; }
       next.failed = error.status !== 409;
@@ -417,7 +471,7 @@ export class QuayMeshNode {
           const changed = await this.supervisor.replacePlans(previous.plans);
           await this.supervisor.waitReady(changed,this.readinessMs);
           this.config = previous.configuration; this.generation = previous; this.configRevision = previous.revision;
-          await this.endMaintenance();
+          await this.endMaintenanceAfterReplacement(maintenanceOwner,changed);
         } catch (rollback) { throw new AggregateError([error,rollback],"配置切换失败，恢复也未完成"); }
       }
       if (prepared && prepared !== this.generation) await rm(prepared.generatedDir,{recursive:true,force:true});
@@ -464,7 +518,10 @@ export class QuayMeshNode {
           await this.beginMaintenance(); res.writeHead(200,{"content-type":"application/json"}).end('{"paused":true}'); return;
         }
         if (req.method === "POST" && path === "/maintenance/resume") {
-          await this.endMaintenance(); res.writeHead(200,{"content-type":"application/json"}).end('{"paused":false}'); return;
+          const chunks=[];let bytes=0;
+          for await(const chunk of req){bytes+=chunk.length;if(bytes>65536)throw Object.assign(new Error("维护请求过大"),{status:413});chunks.push(chunk);}
+          const body=JSON.parse(Buffer.concat(chunks).toString("utf8")||"{}");
+          await this.endMaintenance(body.expected);res.writeHead(200,{"content-type":"application/json"}).end('{"paused":false}');return;
         }
         if (req.method === "POST" && path === "/configuration/retry") {
           if (this.pendingConfiguration) this.pendingConfiguration.failed = false;
@@ -478,9 +535,9 @@ export class QuayMeshNode {
         if (req.method === "POST" && path.startsWith("/components/") && path.endsWith("/restart")) {
           const id = path.split("/")[2];
           if (!this.supervisor.components.has(id)) { res.writeHead(404).end(); return; }
-          await this.beginMaintenance();
-          try { const changed = await this.supervisor.restart(id); await this.supervisor.waitReady(changed,this.readinessMs); }
-          finally { await this.endMaintenance(); }
+          const owner=await this.beginMaintenance();let changed=new Set([id]);
+          try { changed = await this.supervisor.restart(id); await this.supervisor.waitReady(changed,this.readinessMs); }
+          finally { await this.endMaintenanceAfterReplacement(owner,changed); }
           res.writeHead(200,{"content-type":"application/json"}).end('{"ok":true}'); return;
         }
         res.writeHead(404).end();

@@ -65,7 +65,7 @@ test("root exit with a live descendant stays running past the drain timeout", { 
   assert.equal(closed.outputComplete, true);
 });
 
-test("windows inherited stdio keeps the session open until the drain timeout", { timeout: 20_000 }, async (t) => {
+test("owned descendants retaining inherited stdio keep the session open past the drain timeout", { timeout: 20_000 }, async (t) => {
   const pidDir = mkdtempSync(join(tmpdir(), "quaymesh-stdio-"));
   const pidFiles = [join(pidDir, "hang.txt"), join(pidDir, "release.txt")];
   const killRecorded = () => {
@@ -82,7 +82,10 @@ test("windows inherited stdio keeps the session open until the drain timeout", {
   });
   const commandFor = (pidFile: string) => {
     const quoted = pidFile.replaceAll("\\", "\\\\");
-    return `${node} -e "const fs=require('fs'); const child=require('child_process').spawn(process.execPath,['-e','setTimeout(()=>{},20000)'],{stdio:['ignore',1,2],detached:true,windowsHide:true}); fs.writeFileSync('${quoted}', String(child.pid)); child.unref(); setTimeout(()=>process.exit(0), 300)"`;
+    // Windows detached children still inherit the owned Job. On POSIX, a
+    // detached child creates a different process group; keep the real child
+    // in the command's owned group rather than simulating a Windows Job.
+    return `${node} -e "const fs=require('fs'); const child=require('child_process').spawn(process.execPath,['-e','setTimeout(()=>{},20000)'],{stdio:['ignore',1,2],detached:${process.platform === "win32"},windowsHide:true}); fs.writeFileSync('${quoted}', String(child.pid)); child.unref(); setTimeout(()=>process.exit(0), 300)"`;
   };
   const hanging = new ProcessSessionManager({ stdioDrainTimeoutMs: 15_000 });
   t.after(() => hanging.shutdown());
@@ -90,11 +93,20 @@ test("windows inherited stdio keeps the session open until the drain timeout", {
   assert.equal(open.running, true);
   assert.equal(open.phase, "root_exited_stdio_open");
 
-  const releasing = new ProcessSessionManager({ stdioDrainTimeoutMs: 400 });
+  let ownedGroup: number | undefined;
+  const releasing = new ProcessSessionManager({ stdioDrainTimeoutMs: 400,diagnostics:(event,fields)=>{
+    if(event==="process_started")ownedGroup=Number(fields.childPid);
+  } });
   t.after(() => releasing.shutdown());
   const started = await releasing.start({ ...base, command: commandFor(pidFiles[1]), yieldTimeMs: 900 });
   assert.equal(started.running, true);
   assert.equal(started.phase, "root_exited_stdio_open");
+  if(process.platform==="linux"){
+    const descendant=Number(readFileSync(pidFiles[1],"utf8"));
+    const stat=readFileSync(`/proc/${descendant}/stat`,"utf8");
+    const group=Number(stat.slice(stat.lastIndexOf(")")+2).trim().split(/\s+/u)[2]);
+    assert.ok(Number.isSafeInteger(ownedGroup));assert.equal(group,ownedGroup,"fixture must remain inside the real owned process group");
+  }
   const drainDeadline = Date.now() + 3_000;
   let drained = started;
   while (drained.disposition !== "waiting_for_descendants" && Date.now() < drainDeadline) {

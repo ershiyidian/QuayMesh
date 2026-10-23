@@ -12,6 +12,35 @@ import { taskSchema } from "./task-schema.js";
 import { resourceSchema } from "./resource-schema.js";
 import { reliabilitySchema } from "./reliability-schema.js";
 
+function removeQuiescenceMigration(db: Database.Database) {
+  for (const { name } of db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'execution_quiescence_%'").all() as {name:string}[])
+    db.exec(`DROP TRIGGER "${name}"`);
+  db.exec(`DROP TABLE execution_quiescence;
+    DROP INDEX console_operations_maintenance_status;
+    DROP INDEX console_executions_maintenance_status;
+    DELETE FROM qm_schema_migrations WHERE version=9;`);
+}
+
+test("版本八增量升级只增加物理证据结构，不推断旧unknown已完成或已排空",()=>{
+  const db=new Database(":memory:");
+  try{
+    migrateDatabase(db);removeQuiescenceMigration(db);
+    db.prepare("INSERT INTO console_projects(id,root,name,created_at) VALUES('project','/project','history','2026-10-12')").run();
+    db.prepare("INSERT INTO console_work_items(id,project_id,item_key,title,created_at) VALUES('item','project','key','history','2026-10-12')").run();
+    db.prepare(`INSERT INTO console_work_runs(id,project_id,item_id,run_key,request_hash,origin,created_at,status)
+      VALUES('run','project','item','key','hash','{}','2026-10-12','reconciliation_required')`).run();
+    db.prepare(`INSERT INTO console_operations(id,run_id,request_key,kind,label,status,evidence,created_at,finished_at)
+      VALUES('legacy','run','key','command','history','reconciliation_required','[]','2026-10-12','2026-10-13')`).run();
+    const before=db.prepare("SELECT * FROM console_operations").all();
+    migrateDatabase(db);migrateDatabase(db);
+    assert.deepEqual(db.prepare("SELECT * FROM console_operations").all(),before);
+    assert.equal(db.prepare("SELECT count(*) FROM execution_quiescence").pluck().get(),0);
+    assert.equal(db.prepare("SELECT status FROM console_work_runs").pluck().get(),"reconciliation_required");
+    assert.equal(db.prepare("SELECT max(version) FROM qm_schema_migrations").pluck().get(),9);
+    assert.equal(db.pragma("integrity_check",{simple:true}),"ok");
+  }finally{db.close();}
+});
+
 test("初始数据库创建全部工作区、任务和认证表", () => {
   const db = new Database(":memory:");
   try {
@@ -19,11 +48,11 @@ test("初始数据库创建全部工作区、任务和认证表", () => {
     assert.deepEqual(db.prepare("SELECT version,name FROM qm_schema_migrations").all(),
       [{version:1,name:"quaymesh-initial"},{version:2,name:"quaymesh-runtime-ownership"},{version:3,name:"quaymesh-durable-results"},{version:4,name:"quaymesh-task-lifecycle"},
         {version:5,name:"quaymesh-execution-observation"},{version:6,name:"quaymesh-invocation-attempts"},{version:7,name:"quaymesh-console-audit"},
-        {version:8,name:"quaymesh-execution-owner"}]);
+        {version:8,name:"quaymesh-execution-owner"},{version:9,name:"quaymesh-execution-quiescence"}]);
     for (const name of ["workspace_sessions","oauth_clients","console_work_runs","execution_claims",
       "local_agent_sessions","qm_sessions","qm_tasks","qm_task_members","qm_task_snapshots","qm_task_context",
       "qm_runtime_work","qm_runtime_admission","qm_transfers","qm_task_change_baselines","qm_task_file_changes","qm_task_finalizations",
-      "console_audit","console_archive_steps","execution_owners"]) {
+      "console_audit","console_archive_steps","execution_owners","execution_quiescence"]) {
       assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(name));
     }
     assert.equal(db.pragma("foreign_keys",{simple:true}),1);
@@ -188,7 +217,7 @@ test("首次建表和旧版本升级失败均回滚全部迁移，再次升级�
     assert.deepEqual(fresh.prepare("SELECT name FROM sqlite_master WHERE type='table'").all(),[{name:"oauth_clients"}]);
     assert.equal(fresh.inTransaction,false);
 
-    migrateDatabase(old);
+    migrateDatabase(old);removeQuiescenceMigration(old);
     old.exec(`DROP INDEX qm_invocations_retry_of;
       ALTER TABLE qm_invocations DROP COLUMN retry_of_invocation_id;
       ALTER TABLE qm_invocations DROP COLUMN task_id;
@@ -216,7 +245,7 @@ test("首次建表和旧版本升级失败均回滚全部迁移，再次升级�
 test("版本六调用保留历史结果，升级不把当前终态结果冒充首响应", () => {
   const db = new Database(":memory:");
   try {
-    migrateDatabase(db);
+    migrateDatabase(db);removeQuiescenceMigration(db);
     db.exec(`ALTER TABLE qm_invocations DROP COLUMN response_json;
       DROP TABLE console_archive_steps;
       DROP TABLE console_audit;
