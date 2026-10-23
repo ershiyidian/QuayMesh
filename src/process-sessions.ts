@@ -15,6 +15,8 @@ import { diagnosticError } from "./server-diagnostics.js";
 import { currentInvocation } from "./session/invocations.js";
 import { requireCommandScope } from "./command-profiles.js";
 import { type ExecutionResource } from "./execution-resources.js";
+import { quiescenceSubject, recordExecutionQuiescence } from "./maintenance-status.js";
+import { processOwner } from "./process-identity.js";
 
 const DEFAULT_EXEC_YIELD_MS = 2_000;
 const DEFAULT_INTERACTIVE_YIELD_MS = 250;
@@ -150,11 +152,13 @@ interface ProcessSession {
   resolveRootExit: () => void;
   cleanupTimer?: NodeJS.Timeout;
   stdioDrainTimer?: NodeJS.Timeout;
+  stdioDrainStartedAt?: number;
   stopOwnedWatch?: () => void;
   wrapperPid?: number;
   pipeClosed?: boolean;
   closePromise?: Promise<void>;
   descendantLookupFailed?: boolean;
+  physicalQuiescent?: boolean;
   commandJob?: WindowsCommandJob;
   executionClaim?: ExecutionClaim;
   workOperationId?: string;
@@ -733,7 +737,7 @@ export class ProcessSessionManager {
     child.once("close", (code, signal) => {
       rootExited(code, signal);
       session.pipeClosed = true;
-      void stdioCompletion.then(() => resolveClose());
+      void stdioCompletion.then(() => { this.checkOwnedCompletion(session, child); resolveClose(); });
     });
     if (!windows) {
       child.once("exit", rootExited);
@@ -795,6 +799,7 @@ export class ProcessSessionManager {
     if (!session.running || session.finalizing || session.rootExitedAt === undefined) return;
     const alive = this.ownedProcessesAlive(session);
     if (alive === true) {
+      session.stdioDrainStartedAt = undefined;
       session.disposition = "waiting_for_descendants";
       return;
     }
@@ -803,11 +808,24 @@ export class ProcessSessionManager {
       return;
     }
     if ((session.pendingOutputWrites ?? 0) > 0) return;
-    if (Date.now() - session.rootExitedAt < this.stdioDrainTimeoutMs) return;
-    session.disposition = alive === null ? "reconciliation_required" : "incomplete_output";
+    // Waiting for living descendants is execution time, not an output-drain
+    // timeout. Once the owned group is positively empty, give its final EOF
+    // and pipeline callbacks their own drain budget. A natural EOF can settle
+    // before ChildProcess.close publishes pipeClosed in the same event turn.
+    if (alive === false) {
+      session.stdioDrainStartedAt ??= Date.now();
+      if (session.disposition === "waiting_for_descendants") session.disposition = undefined;
+      if (Date.now() - session.stdioDrainStartedAt < this.stdioDrainTimeoutMs) return;
+    } else {
+      session.stdioDrainStartedAt = undefined;
+      if (Date.now() - session.rootExitedAt < this.stdioDrainTimeoutMs) return;
+    }
+    const disposition = alive === null ? "reconciliation_required" : "incomplete_output";
+    const changed = session.disposition !== disposition;
+    session.disposition = disposition;
     session.outputComplete = false;
     session.failure = { code: session.disposition };
-    this.record(session, "process_stdio_drain_timeout", {
+    if (changed) this.record(session, "process_stdio_drain_timeout", {
       rootExitCode: session.rootExitCode, elapsedSinceRootExitMs: Date.now() - session.rootExitedAt,
       disposition: session.disposition,
     }, "warn");
@@ -869,6 +887,19 @@ export class ProcessSessionManager {
 
   private finish(session: ProcessSession, exitCode?: number, signal?: string): void {
     if (session.finalizing) return;
+    // A root exit, closed pipe or delivered signal does not prove that the
+    // owned process group / Windows Job has stopped. Keep its claim and Job
+    // handle until the physical query positively reports no descendants.
+    const alive = this.ownedProcessesAlive(session);
+    if (alive !== false) {
+      session.disposition = alive === true ? "waiting_for_descendants" : "reconciliation_required";
+      if (alive === null) {
+        session.outputComplete = false;
+        session.failure ??= { code: "PROCESS_PHYSICAL_STATE_UNKNOWN" };
+      }
+      return;
+    }
+    session.physicalQuiescent = true;
     session.finalizing = (async () => {
       await session.stdioCompletion;
       if (session.outputPending && session.sessionOperationId && this.outputSink) {
@@ -894,7 +925,7 @@ export class ProcessSessionManager {
     })();
     void session.finalizing.catch(async error => {
       this.record(session,"process_finalization_failed",diagnosticError(error),"error");
-      try { await this.releaseClaim(session.executionClaim); }
+      try { if (session.physicalQuiescent) await this.releaseClaim(session.executionClaim); }
       catch (releaseError) { this.record(session, "process_claim_release_pending", diagnosticError(releaseError), "error"); }
       session.running=false;session.failure=diagnosticError(error);session.disposition="reconciliation_required";
       session.resolveExit();
@@ -977,6 +1008,14 @@ export class ProcessSessionManager {
           outputRecovery: outputPersisted ? "bounded_log_tail" : "metadata_only", hostAcknowledgment: "unknown", ...session.failure, retry: "reconcile_before_replay" }),
         outcome: success ? "passed" : session.disposition === "reconciliation_required" ? "not_run" : "failed",
         }]);
+        if (operationStatus === "reconciliation_required" && session.physicalQuiescent) {
+          recordExecutionQuiescence(activeLedger.db, [quiescenceSubject(activeLedger.db, "operation", session.workOperationId!)], {
+            id: `process:${session.id}:${processOwner.token}`, verifiedAt: new Date().toISOString(),
+            evidence: { version: 1, boundary: "managed_process_group_empty", sessionId: session.id,
+              ownerPid: processOwner.pid, processStart: processOwner.start, pgid: session.pgid ?? null,
+              rootPid: session.rootPid ?? null, rootExitedAt: session.rootExitedAt ?? null },
+          });
+        }
         if (operationStatus === "reconciliation_required" && session.workRunId) {
           activeLedger.markRunReconciliationRequired(session.workRunId);
         }
@@ -1048,7 +1087,11 @@ export class ProcessSessionManager {
         : "root_exited_stdio_open";
 
     const recoverableDescription = isRootExitedStdioOpen
-      ? `Root process exited with code ${session.rootExitCode ?? "unknown"}, but background descendant processes are still active and holding output streams open. Session remains running until stdio closes or termination is requested.`
+      ? session.disposition === "reconciliation_required"
+        ? "The root process exited, but the owned process group could not be verified. Its claim is retained; the command is not confirmed stopped."
+        : session.stdioDrainStartedAt !== undefined
+          ? "The root process and its owned process group have exited; output streams are still draining. The session remains running until output is settled."
+        : `Root process exited with code ${session.rootExitCode ?? "unknown"}, but background descendant processes are still active and holding output streams open. Session remains running until stdio closes or termination is requested.`
       : undefined;
 
     const snapshot: ProcessSnapshot = {

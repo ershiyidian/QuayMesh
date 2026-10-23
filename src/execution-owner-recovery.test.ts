@@ -24,20 +24,23 @@ async function fixture(t:TestContext,mode="agent") {
     function finish(error?:Error,value?:unknown){clearTimeout(timer);child.off("message",onMessage);child.off("exit",onExit);error?reject(error):resolve(value);}
     child.on("message",onMessage);child.on("exit",onExit);
   });
-  const ready=await wait("ready");
-  const ledger=new WorkLedger(directory),reconciler=new WorkRunReconciler(directory),coordinator=new ExecutionCoordinator(directory);
+  let ready:any;
+  let ledger!:WorkLedger,reconciler!:WorkRunReconciler,coordinator!:ExecutionCoordinator;
   let sequence=0;
   const rpc=(action:string)=>{const id=++sequence,result=wait("reply",id);child.send({id,action});return result;};
   t.after(async()=>{
     if (child.exitCode===null && child.signalCode===null) {
-      const ended=once(child,"exit");try{await rpc("close");}catch{child.kill();}await ended;
+      const ended=once(child,"exit");try{if(ready)await rpc("close");else child.kill();}catch{child.kill();}await ended;
     }
-    if (ready.descendantPid && pidAlive(ready.descendantPid)) {
+    if (ready?.descendantPid && pidAlive(ready.descendantPid)
+      && (ready.descendantStart===null || processStartIdentity(ready.descendantPid)===ready.descendantStart)) {
       try{process.kill(ready.descendantPid,"SIGKILL");}catch{}
       for(let i=0;i<100&&pidAlive(ready.descendantPid);i++)await new Promise(resolve=>setTimeout(resolve,10));
     }
-    await reconciler.close();coordinator.close();ledger.close();await rm(directory,{recursive:true,force:true});
+    await reconciler?.close();coordinator?.close();ledger?.close();await rm(directory,{recursive:true,force:true});
   });
+  ready=await wait("ready");
+  ledger=new WorkLedger(directory);reconciler=new WorkRunReconciler(directory);coordinator=new ExecutionCoordinator(directory);
   return {ready,ledger,reconciler,coordinator,rpc,child,directory};
 }
 
@@ -97,9 +100,14 @@ test("agent 控制操作结束不能替代该 agent 的真实执行终态来释�
 
 test("Core owner 退出后仍存活的真实子进程保留 claim，禁止新写入和升级空闲判定",{timeout:20_000},async t=>{
   const f=await fixture(t,"command"),ended=once(f.child,"exit");
+  assert.equal(pidAlive(f.ready.descendantPid),true,"descendant must be alive before its owner exits");
+  const descendantStart=processStartIdentity(f.ready.descendantPid);
+  if(f.ready.descendantStart!==null)assert.equal(descendantStart,f.ready.descendantStart);
   await f.rpc("abandon");await ended;
   assert.equal(pidAlive(f.ready.pid),false);
   assert.equal(pidAlive(f.ready.descendantPid),true);
+  if(descendantStart!==null)assert.equal(processStartIdentity(f.ready.descendantPid),descendantStart,
+    "the same descendant generation must survive its owner");
   f.reconciler.startup();
   assert.ok(f.ledger.db.prepare("SELECT 1 FROM execution_claims WHERE id=?").get(f.ready.claimId));
   assert.equal(f.ledger.db.prepare("SELECT status FROM console_operations WHERE id=?").pluck().get(f.ready.operationId),"reconciliation_required");

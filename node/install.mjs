@@ -9,6 +9,7 @@ import { requestJson } from "./network.mjs";
 import { restrictedEnvironment } from "./environment.mjs";
 import { packageRoot } from "./app.mjs";
 import { componentPlans } from "./compile.mjs";
+import { beginInstallationMaintenance, runMaintenanceProof } from "./maintenance-lease.mjs";
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve,ms));
 const REQUIRED_RELEASE_ENTRIES=["bin","node","dist","schema","skills","package.json","node_modules","components","runtime","release.json","components.lock.json","docs","scripts"];
@@ -229,59 +230,93 @@ export async function waitRunning(manifest,token,timeoutMs,{stableMs=60000,resum
   throw new Error(`新发行服务没有在规定时间内报告正确身份和就绪状态${lastFailure?`：${lastFailure}`:""}`);
 }
 
-function databaseSnapshot(manifest,target) {
+function databaseSnapshot(manifest,target,timeoutMs=60000) {
   return new Promise((resolveSnapshot,reject)=>{
     const child=spawn(manifest.nodeExecutable,[join(manifest.directory,"node","database-snapshot.mjs"),manifest.stateDir,...(target?[target]:[])],
       {stdio:["ignore","pipe","inherit"],shell:false,windowsHide:true,env:restrictedEnvironment(process.env)});
-    let output="";
+    let output="",failure,force;
+    const timer=setTimeout(()=>{
+      failure=new Error("数据库快照超时，等待自有备份进程退出后终止发行切换");child.kill();
+      force=setTimeout(()=>child.kill("SIGKILL"),1000);
+    },timeoutMs);
     child.stdout.on("data",chunk=>{output+=chunk;if(output.length>65536)child.kill();});
-    child.once("error",reject);
+    child.once("error",error=>{failure??=error;});
     child.once("close",code=>{
+      clearTimeout(timer);clearTimeout(force);
+      if(failure){reject(failure);return;}
       if(code!==0){reject(new Error(`数据库升级前检查失败，退出码 ${code}`));return;}
       try{resolveSnapshot(JSON.parse(output));}catch(error){reject(error);}
     });
   });
 }
 
-export async function activateInstallation(manifestFile,{timeoutMs=180000}={}) {
+export async function activateInstallation(manifestFile,{timeoutMs=180000,maintenanceLease}={}) {
   const manifest = JSON.parse(await readFile(resolve(manifestFile),"utf8"));
   if (manifest.version!==1) throw new Error("安装记录版本无效");
-  await preserveLatestNodeSettings(manifest.stagedConfig,manifest.config,manifest.nodeId,manifest.settingsRevisionAtPrepare??1);
-  const loaded = await loadNodeConfig(manifest.stagedConfig);
-  const token = secret(loaded.env,loaded.cluster.tokenEnv,24);
   const recordFile = join(manifest.configDir,"installation.json");
   const previous = await readOptionalJson(recordFile);
   const running = await runningStatus(previous?.adminPort ?? manifest.adminPort);
   if (running && running.nodeId!==manifest.nodeId) throw new Error("该管理端口属于其他节点");
   if (running && !previous) throw new Error("当前服务尚无安装记录；请在独立维护窗口停止它，再激活已准备的发行包");
   if (previous && previous.nodeId!==manifest.nodeId) throw new Error("安装目录属于其他节点");
+  if(maintenanceLease&&!running)throw new Error("外部维护租约要求核验正在运行的旧节点代次");
+  if(maintenanceLease&&running.release!==previous.sourceCommit)throw new Error("外部维护的旧发行与安装记录不一致");
+  await preserveLatestNodeSettings(manifest.stagedConfig,manifest.config,manifest.nodeId,manifest.settingsRevisionAtPrepare??1);
+  const loaded = await loadNodeConfig(manifest.stagedConfig);
+  const token = secret(loaded.env,loaded.cluster.tokenEnv,24);
   const oldConfig = await readFile(manifest.config).catch(error => { if(error.code==="ENOENT")return null;throw error; });
   const oldUnit = manifest.unitFile ? await readFile(manifest.unitFile).catch(error => {if(error.code==="ENOENT")return null;throw error;}) : null;
   let stopped = false, stopAttempted = false, maintenanceBegun = false, activationCommitted=false;
+  let externalLease, transition;
   const transitionFile=join(manifest.stateDir,"installation-transition.json");
   const priorTransition=await readOptionalJson(transitionFile);
   if(priorTransition)throw new Error(`已有未收口的发行切换 ${priorTransition.sourceCommit}；请先核对安装记录与数据库备份。`);
   let snapshot;
   try {
     if (running) {
-      await requestJson(`http://127.0.0.1:${previous.adminPort}/maintenance/begin`,{method:"POST",token,timeoutMs:35000});
+      externalLease=await beginInstallationMaintenance({provider:maintenanceLease,manifest,manifestFile,
+        previous,running,token,corePort:loaded.node.corePort});
       maintenanceBegun = true;
+      await externalLease?.assertHeld("before_backup");
     }
-    snapshot=await databaseSnapshot(manifest,join(dirname(resolve(manifestFile)),"rollback-core.sqlite"));
-    await writeJson(transitionFile,{id:randomUUID(),sourceCommit:manifest.sourceCommit,previousCommit:previous?.sourceCommit??null,
-      startedAt:new Date().toISOString(),ownerPid:process.pid,database:snapshot,phase:"validating"});
+    snapshot=await databaseSnapshot(manifest,join(dirname(resolve(manifestFile)),
+      externalLease?`rollback-core-${externalLease.context.attemptId}.sqlite`:"rollback-core.sqlite"));
+    await externalLease?.assertHeld("after_backup");
+    transition={id:externalLease?.context.attemptId??randomUUID(),sourceCommit:manifest.sourceCommit,previousCommit:previous?.sourceCommit??null,
+      startedAt:new Date().toISOString(),ownerPid:process.pid,database:snapshot,phase:"validating",
+      ...(externalLease?{maintenanceLease:{attemptId:externalLease.context.attemptId,pause:externalLease.lease.pause,
+        receiptFile:externalLease.context.receiptFile,manifestSha256:externalLease.context.manifestSha256}}:{})};
+    await writeJson(transitionFile,transition);
     if(running){
+      await externalLease?.assertHeld("before_stop");
       stopAttempted = true;
       await stopService(previous); stopped = true;
+      await externalLease?.assertHeld("after_stop");
     }
     await atomicWrite(manifest.config,await readFile(manifest.stagedConfig));
     await registeredService(manifest,true);
     const status = await waitRunning(manifest,token,timeoutMs,{resume:false});
+    if(externalLease?.lease.subjects.length){
+      const newCorePid=status.components.find(value=>value.id==="core").pid;
+      const observed=await runMaintenanceProof(manifest,{action:"inspect",stateDir:manifest.stateDir,pids:[newCorePid]});
+      const core=observed.processes.find(value=>value.pid===newCorePid);
+      if(!core?.alive||!core.start)throw new Error("新Core进程代次尚未确认，保留暂停与历史记录");
+      const result=await runMaintenanceProof(manifest,{action:"record",stateDir:manifest.stateDir,
+        attemptId:externalLease.context.attemptId,targetCommit:manifest.sourceCommit,core,
+        previousProcesses:[externalLease.context.manager,externalLease.context.core],subjects:externalLease.lease.subjects,
+        receipt:{id:externalLease.context.attemptId,verifiedAt:new Date().toISOString(),
+          evidence:{version:1,boundary:"reviewed_installation_stop_domain",context:externalLease.context,
+            pause:externalLease.lease.pause,stages:externalLease.receipt.stages}}});
+      if(!result.admission.quiescent||result.admission.accepting)throw new Error("历史物理证据写入后新Core仍未排空或暂停所有权丢失");
+    }
     await writeJson(recordFile,{...manifest,activatedAt:new Date().toISOString(),pid:status.components.find(value=>value.id==="core")?.pid});
     await writeJson(join(manifest.configDir,"previous-installation.json"),previous??null);
     activationCommitted=true;
-    await rm(transitionFile,{force:true});
-    await requestJson(`http://127.0.0.1:${manifest.adminPort}/maintenance/resume`,{method:"POST",token,timeoutMs:10000});
+    if(externalLease)await externalLease.release({outcome:"activated",transition,activeStatus:status});
+    else{
+      await rm(transitionFile,{force:true});
+      await requestJson(`http://127.0.0.1:${manifest.adminPort}/maintenance/resume`,{method:"POST",token,timeoutMs:10000});
+    }
     return {directory:manifest.directory,config:manifest.config,sourceCommit:manifest.sourceCommit,activated:true};
   } catch (error) {
     if(activationCommitted)throw new Error("发行已经验证并提交，恢复准入尚待确认；保留当前服务，请查询管理端状态。",{cause:error});
@@ -291,22 +326,31 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000}={}) {
         if (active?.nodeId === manifest.nodeId) await stopService(manifest);
         const current=await databaseSnapshot(manifest);
         if(snapshot && current.version!==snapshot.version){
-          await writeJson(transitionFile,{sourceCommit:manifest.sourceCommit,previousCommit:previous?.sourceCommit??null,
+          await writeJson(transitionFile,{...transition,sourceCommit:manifest.sourceCommit,previousCommit:previous?.sourceCommit??null,
             database:snapshot,currentDatabaseVersion:current.version,phase:"recovery_required",error:String(error)});
           throw new Error(`数据库已从 ${snapshot.version} 升级到 ${current.version}，保留新版数据和备份 ${snapshot.backup}；旧版本无法自动启动，请完成升级恢复。`);
         }
         if (oldConfig) await atomicWrite(manifest.config,oldConfig); else await rm(manifest.config,{force:true});
         if (oldUnit) await atomicWrite(manifest.unitFile,oldUnit,0o644);
-        await rm(transitionFile,{force:true});
-        if (previous) { await registeredService(previous,true); await waitRunning(previous,token,timeoutMs); }
+        if(!externalLease)await rm(transitionFile,{force:true});
+        if (previous) {
+          await registeredService(previous,true);
+          const restored=await waitRunning(previous,token,timeoutMs,{resume:!externalLease});
+          if(externalLease)await externalLease.release({outcome:"rolled-back",transition,activeStatus:restored});
+        }
         else if (manifest.unitFile) {
           await rm(manifest.unitFile,{force:true});
           await run("systemctl",[...(manifest.user?["--user"]:[]),"daemon-reload"]);
         } else await run("powershell.exe",["-NoProfile","-ExecutionPolicy","Bypass","-File",join(manifest.directory,"node","windows-stop.ps1"),"-Unregister"]);
       } catch (recovery) { throw new AggregateError([error,recovery],"发行切换失败，恢复未完成"); }
     } else if (maintenanceBegun && running) {
-      await rm(transitionFile,{force:true});
-      await requestJson(`http://127.0.0.1:${previous.adminPort}/maintenance/resume`,{method:"POST",token,timeoutMs:10000});
+      try{
+        if(externalLease)await externalLease.release({outcome:"aborted-before-stop",transition:transition??null,activeStatus:running});
+        else{
+          await rm(transitionFile,{force:true});
+          await requestJson(`http://127.0.0.1:${previous.adminPort}/maintenance/resume`,{method:"POST",token,timeoutMs:10000});
+        }
+      }catch(recovery){throw new AggregateError([error,recovery],"发行切换未开始；恢复自有维护租约尚待确认，保留维护记录");}
     }
     throw error;
   }

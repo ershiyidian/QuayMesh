@@ -258,8 +258,21 @@ test("schema upgrade binds historical worker attempts using their run link and d
     invoke: async () => {throw new ExecutionConflictError("held", undefined, "busy");}, forwarded: true,
   }).catch(() => {});
   const before = f.ledger.db.prepare("SELECT id,operation_id,result_json FROM qm_invocations ORDER BY rowid").all();
+  const beforeRuns = f.ledger.db.prepare("SELECT * FROM console_work_runs ORDER BY id").all();
+  const beforeOperations = f.ledger.db.prepare("SELECT * FROM console_operations ORDER BY id").all();
+  const quiescenceObjects = f.ledger.db.prepare(`SELECT type,name,sql FROM sqlite_master
+    WHERE name GLOB 'execution_quiescence*'
+      OR name IN ('console_operations_maintenance_status','console_executions_maintenance_status') ORDER BY name`);
+  const latestQuiescenceObjects = quiescenceObjects.all() as Array<{type:string;name:string;sql:string}>;
+  const quiescenceTriggers = latestQuiescenceObjects.filter(row => row.type === "trigger");
+  assert.equal(quiescenceTriggers.length, 9);
   // 用真实数据库还原版本 5，保留原始回执与运行关联后执行升级。
-  f.ledger.db.exec(`DROP INDEX qm_invocations_retry_of;
+  // 这些触发器挂在 operation/execution/owner 表上，删证据表不会自动移除它们。
+  for (const {name} of quiescenceTriggers) f.ledger.db.exec(`DROP TRIGGER "${name}"`);
+  f.ledger.db.exec(`DROP TABLE execution_quiescence;
+    DROP INDEX console_operations_maintenance_status;
+    DROP INDEX console_executions_maintenance_status;
+    DROP INDEX qm_invocations_retry_of;
     ALTER TABLE qm_invocations DROP COLUMN retry_of_invocation_id;
     ALTER TABLE qm_invocations DROP COLUMN task_id;
     ALTER TABLE qm_invocations DROP COLUMN response_json;
@@ -271,14 +284,22 @@ test("schema upgrade binds historical worker attempts using their run link and d
     DROP INDEX qm_events_operation_type;
     DELETE FROM qm_schema_migrations WHERE version>=6;`);
   assert.equal(f.ledger.db.prepare('SELECT max(version) FROM qm_schema_migrations').pluck().get(),5);
-  assert.ok(!(f.ledger.db.pragma('table_info(qm_invocations)') as Array<{name:string}>).some(column=>column.name==='task_id'));
+  assert.deepEqual(quiescenceObjects.all(), []);
+  assert.equal(f.ledger.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='execution_owners'").get(), undefined);
+  assert.ok(!(f.ledger.db.pragma('table_info(qm_invocations)') as Array<{name:string}>)
+    .some(column=>["task_id","retry_of_invocation_id","response_json"].includes(column.name)));
+  assert.deepEqual(f.ledger.db.prepare("SELECT id,operation_id,result_json FROM qm_invocations ORDER BY rowid").all(), before);
   migrateDatabase(f.ledger.db); migrateDatabase(f.ledger.db);
   assert.equal(f.ledger.db.prepare('SELECT max(version) FROM qm_schema_migrations').pluck().get(),LATEST_DATABASE_VERSION);
+  assert.deepEqual(quiescenceObjects.all(), latestQuiescenceObjects);
   assert.equal(f.store.findInvocation("owner", "transport", "worker")!.task_id, f.task.id);
   assert.equal(f.store.findInvocation("owner", "transport", "receipt")!.task_id, null);
   assert.equal(f.store.findInvocation("owner", "transport", "worker")!.response_json,null);
   assert.equal(f.store.findInvocation("owner", "transport", "receipt")!.response_json,null);
   assert.deepEqual(f.ledger.db.prepare("SELECT id,operation_id,result_json FROM qm_invocations ORDER BY rowid").all(), before);
+  assert.deepEqual(f.ledger.db.prepare("SELECT * FROM console_work_runs ORDER BY id").all(), beforeRuns);
+  assert.deepEqual(f.ledger.db.prepare("SELECT * FROM console_operations ORDER BY id").all(), beforeOperations);
+  assert.equal(f.ledger.db.pragma("integrity_check", {simple:true}), "ok");
   assert.deepEqual(f.ledger.db.pragma("foreign_key_check"), []);
 });
 

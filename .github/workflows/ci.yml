@@ -25,6 +25,7 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm build
       - run: pnpm exec tsx --test --test-concurrency=1 --test-timeout=120000 src/roots.test.ts src/review-checkpoints.test.ts src/session/path-alias.test.ts src/db/*.test.ts src/console-workbench/*.test.ts src/session/console-lifecycle.test.ts src/session/admission-retry.test.ts src/session/revert.test.ts src/project-archive.test.ts src/federation/transfer-store.test.ts test/lifecycle-view.test.ts test/reliability-system/card-timing.test.ts
+      - run: pnpm exec tsx --test --test-concurrency=1 --test-timeout=120000 src/admission-state.test.ts src/maintenance-status.test.ts src/process-maintenance.test.ts src/server-installation-admission.test.ts src/execution-coordinator.test.ts src/execution-owner-recovery.test.ts src/process-descendants.test.ts src/process-cancel-live.test.ts src/process-ownership.test.ts src/process-recovery.test.ts src/process-platform.test.ts src/process-evidence.test.ts
       - run: pnpm test:console
       - if: runner.os == 'Linux'
         run: pnpm exec playwright install --with-deps chromium
