@@ -34,12 +34,14 @@ function redirectHostAllowed(redirectUri: string, allowedHosts: string[]): boole
   }
 
   if (["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)) return true;
-  // Gemini Web 在一次 DCR 中会注册多个 Google 回调入口。只允许明确
-  // 配置了 Google relay 的 Owner 使用其编号变体，并限定 HTTPS + MCP 路径。
+  // Gemini Web 注册的六个地址来自 production/test/sandbox 三个域，
+  // 每个域都同时使用 /r/ 与 /a/。保持显式授权和固定回调用途。
   if (allowedHosts.includes("oauth-redirect.googleusercontent.com")
-      && parsed.protocol === "https:"
-      && /^oauth-redirect[1-9][0-9]?\.googleusercontent\.com$/u.test(parsed.hostname)
-      && parsed.pathname.startsWith("/r/user_bound_custom-mcp-")) return true;
+      && /^oauth-redirect(?:-sandbox|-test|[1-9][0-9]?)?\.googleusercontent\.com$/u.test(parsed.hostname)) {
+    return parsed.protocol === "https:"
+      && !parsed.username && !parsed.password && !parsed.hash && !parsed.search
+      && /^\/(?:r|a)\/user_bound_custom-mcp-[a-zA-Z0-9_.-]+$/u.test(parsed.pathname);
+  }
   return allowedHosts.includes(parsed.hostname);
 }
 

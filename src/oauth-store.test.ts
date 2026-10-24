@@ -21,18 +21,24 @@ const mcpUrl = new URL("https://agent.example.com/mcp");
 const tunnelUrl = new URL(oauthConfig.allowedResourceUrls[0]!);
 const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
 
-const geminiCallbacks = [
-  "https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-home",
-  ...[1,2,3,4,5].map(i=>`https://oauth-redirect${i}.googleusercontent.com/r/user_bound_custom-mcp-home`),
-];
+const geminiCallbacks = ["oauth-redirect-sandbox","oauth-redirect-test","oauth-redirect"]
+  .flatMap(host => ["r","a"].map(path =>
+    `https://${host}.googleusercontent.com/${path}/user_bound_custom-mcp-123456789-quaymesh-mcp-home_tail2e51e6_ts_net`));
 assert.equal(createRegisteredOAuthClient(
-  {redirect_uris:geminiCallbacks},
+  {client_name:"Google",redirect_uris:geminiCallbacks,
+    response_types:["code"],grant_types:["authorization_code","refresh_token"],
+    token_endpoint_auth_method:"client_secret_post"},
   ["chatgpt.com","oauth-redirect.googleusercontent.com"],
 ).redirect_uris.length,6);
 for (const uri of [
   "https://malicious.googleusercontent.com/r/user_bound_custom-mcp-home",
   "https://oauth-redirect1.googleusercontent.com/r/other-product",
   "http://oauth-redirect1.googleusercontent.com/r/user_bound_custom-mcp-home",
+  "https://oauth-redirect-sandbox.googleusercontent.com/a/other-product",
+  "https://oauth-redirect-test.googleusercontent.com/b/user_bound_custom-mcp-home",
+  "https://oauth-redirect-sandbox.googleusercontent.com/a/user_bound_custom-mcp-home?redirect=https://evil.example",
+  "https://oauth-redirect-test.googleusercontent.com/a/user_bound_custom-mcp-home#frag",
+  "https://oauth-redirect-sandbox.googleusercontent.com.evil.example/r/user_bound_custom-mcp-home",
 ]) {
   assert.throws(()=>createRegisteredOAuthClient(
     {redirect_uris:[uri]},
