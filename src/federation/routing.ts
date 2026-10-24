@@ -21,7 +21,10 @@ export function selectRoot(nodes: NodeView[], id: string): { node: NodeView; roo
   throw new Error(`目录 ${id} 尚未导出。请使用 workspace_catalog 选择根目录。`);
 }
 export function catalog(nodes: NodeView[], query = "", includeOffline = true): JsonRecord {
-  const words = query.toLocaleLowerCase().trim().split(/\s+/).filter(Boolean);
+  // 常见的“列出全部”语句不应被当作项目名称关键词过滤。
+  const raw = query.toLocaleLowerCase().trim();
+  const listAll = /^(?:all|all (?:available )?(?:workspaces|roots|nodes)|全部|所有|所有工作区|全部工作区)$/u.test(raw);
+  const words = (listAll ? "" : raw).split(/\s+/).filter(Boolean);
   const roots = nodes.flatMap((node) => node.roots.filter((root) => root.enabled).map((root) => ({
     root_id: rootHandle(node.id, root.id), nickname: root.nickname, description: root.description,
     tags: root.tags, node_id: node.id, node_nickname: node.nickname, online: node.online,
@@ -41,6 +44,26 @@ export function catalog(nodes: NodeView[], query = "", includeOffline = true): J
     offline_nodes: offlineNodes,
     instruction: "按任务语义选择 root_id，调用 open_workspace({root_id})，后续复用 workspace_id。数据在所属节点分析。",
   };
+}
+
+/** 兼容只显示 MCP text content、忽略 structuredContent 的模型客户端。 */
+export function catalogToolSummary(catalogResult: JsonRecord, allResult: JsonRecord): string {
+  const selected = catalogResult.workspaces as Array<{
+    root_id: string; nickname: string; node_id: string; online: boolean; platform: string;
+  }>;
+  const all = allResult.workspaces as typeof selected;
+  const visible = selected.length ? selected : all;
+  const intro = selected.length
+    ? `Found ${selected.length} exported workspaces. Available root_id values:`
+    : all.length
+      ? `No roots match that search. The cluster still exports ${all.length} workspaces; select an existing root_id:`
+      : "No exported workspaces are currently known to this Coordinator.";
+  const lines = visible.map(root =>
+    `- ${root.root_id}: ${root.nickname} (node=${root.node_id}, ${root.online ? "online" : "offline"}, ${root.platform})`);
+  return [intro,...lines,
+    "Call open_workspace({root_id:\"desktop/main\"}) or another listed root_id, not an invented absolute path.",
+    "Cloud is the Coordinator; file access, shell commands, patches and agents must run on an exported worker workspace.",
+  ].join("\n");
 }
 /** Route generated identities without changing file bytes, shell output or agent prose. */
 export function routedResult(value: unknown, node: string, options: { textReferences?: boolean; jsonText?: boolean } = {}): unknown {

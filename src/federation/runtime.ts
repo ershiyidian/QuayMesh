@@ -6,7 +6,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import type { Duplex, Readable } from "node:stream";
 import { PeerTransport, PeerLink, NodeUnavailableError, PeerApplicationError, RpcRequestTimeoutError, bridge, type PeerProgressNotification } from "./transport.js";
-import { catalog, chooseGateway, parseWorkspaceHandle, routedResult, selectRoot } from "./routing.js";
+import { catalog, catalogToolSummary, chooseGateway, parseWorkspaceHandle, routedResult, selectRoot } from "./routing.js";
 import { EgressListener, connectProxy, dialTcp, probeProxy } from "./egress.js";
 import { capabilities } from "./capabilities.js";
 import { sampleHealth } from "./health.js";
@@ -511,7 +511,19 @@ export class FederationRuntime extends EventEmitter {
       let currentNodes: NodeView[];
       try { currentNodes = this.nodes(); } catch { currentNodes = []; }
       const structured = catalog(currentNodes, String(input.query ?? ""), input.include_offline !== false);
-      return jsonReply(structured);
+      return jsonReply(structured, catalogToolSummary(structured, catalog(currentNodes, "", true)));
+    }
+    if ((name === "open_workspace" || name === "attach_workspace")
+        && this.config.capabilities.coordinator && !this.config.capabilities.worker
+        && typeof input.root_id !== "string" && typeof input.workspace_id !== "string") {
+      const known = catalog(this.nodes(), "", true);
+      const roots = (known.workspaces as Array<{root_id:string}>).map(root => root.root_id);
+      throw Object.assign(new Error(
+        `WORKSPACE_ROOT_REQUIRED: Cloud is a Coordinator with no file execution capability. `
+        + `Choose an exported worker root_id and call ${name}({root_id:"..."}). `
+        + `Available root_id values: ${roots.join(", ") || "(none registered)"}.`),
+      { code: "WORKSPACE_ROOT_REQUIRED", effect: "not_started", retryHint: "fix_input",
+        details: { available_root_ids: roots } });
     }
     let node = this.localId; let args = { ...input };
     if (name === 'read_diagnostics' && typeof input.node_id === 'string') {

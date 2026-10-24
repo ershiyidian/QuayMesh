@@ -116,6 +116,24 @@ try {
   }, 3);
   assert.equal(Boolean(read.error), false);
   assert.ok(read.result, "MCP tool call returned no result");
+  const available = read.result.structuredContent?.workspaces;
+  assert.ok(Array.isArray(available) && available.length >= 6,
+    "The real Gemini OAuth MCP client must see the federated worker roots");
+  assert.ok(available.some(root => root.root_id === "desktop/main"));
+  assert.ok(available.some(root => root.root_id === "s2/data"));
+  const readable = read.result.content?.find(item => item.type === "text")?.text ?? "";
+  assert.match(readable, /desktop\/main/);
+  assert.match(readable, /s2\/data/);
+  console.log("Gemini text-only workspace catalog: " + available.length + " worker roots PASS");
+
+  const invalidPath = await mcp("tools/call", {
+    name: "open_workspace", arguments: { path: "/tmp/gemini-fabricated-health-check", create_directory: true },
+  }, 4);
+  assert.equal(invalidPath.result?.isError, true);
+  const explanation = invalidPath.result?.content?.find(item => item.type === "text")?.text ?? "";
+  assert.match(explanation, /WORKSPACE_ROOT_REQUIRED/);
+  assert.match(explanation, /desktop\/main/);
+  console.log("Unroutable absolute path now suggests exported roots: PASS");
   console.log("Real read-only federated tool invocation: PASS");
 } finally {
   await Promise.all([

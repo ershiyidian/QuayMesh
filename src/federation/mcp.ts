@@ -19,10 +19,12 @@ export function federatedTools(target: McpRegistrationTarget, runtime: Federatio
         return handler(schema.parse(input) as JsonRecord, extra);
       });
       const wrapped = name === "open_workspace" || name === "attach_workspace" ? { ...definition,
+        annotations: { ...definition.annotations, readOnlyHint:false, destructiveHint:false, openWorldHint:false },
         description: name === "attach_workspace"
-          ? "Attach root_id/subdirectory or an absolute path to the same session, or restore its pruned workspace with workspace_id alone. Restore retains the original workspace and saved tracked changes."
-          : "Open root_id/subdirectory or an absolute path. Reuse the returned workspace_id; restore a pruned one with attach_workspace.",
-        inputSchema: { ...originalShape, path: z.string().optional(), root_id: z.string().optional().describe("Exported root from workspace_catalog."),
+          ? "Attach a previously exported worker root using root_id from workspace_catalog. To restore a pruned workspace, pass only its workspace_id. Cloud has no file execution capability. Reuse returned workspace_id; do not invent /tmp paths on Cloud."
+          : "FIRST call workspace_catalog without query, then open_workspace({root_id:\"desktop/main\"}) or another listed root_id. Cloud is Coordinator only, with no shell or filesystem execution. Do not invent /tmp or absolute paths on Cloud. Reuse returned workspace_id for all reads, commands and edits.",
+        inputSchema: { ...originalShape, path: z.string().optional().describe("Absolute path only when already executing on a Worker. In federated Gemini/ChatGPT sessions prefer exported root_id."),
+          root_id: z.string().optional().describe("Use an exact exported root_id from workspace_catalog, e.g. desktop/main, s1/data, s2/data."),
           subdirectory: z.string().optional().describe("Path within root_id.") },
       } : definition;
       const recorded = sessionRecordedTool(handler);
@@ -46,8 +48,8 @@ export function registerFederationTools(target: McpRegistrationTarget, runtime: 
   runtime.addModelTool("workspace_catalog");
   runtime.addModelTool("copy_artifact");
   target.registerTool("workspace_catalog", {
-    title: "Choose a workspace", description: "List exported roots and node capabilities. Select root_id for open_workspace.",
-    inputSchema: { query: z.string().optional(), include_offline: z.boolean().optional() },
+    title: "Choose a workspace", description: "List worker nodes and exported roots. Call WITHOUT query to see all roots. The text response includes root_id values even for clients that ignore structuredContent. Cloud is Coordinator only. Pass a listed root_id to open_workspace or attach_workspace; never fabricate an absolute /tmp path.",
+    inputSchema: { query: z.string().optional().describe("Optional name filter. Omit this field to show ALL exported workspaces."), include_offline: z.boolean().optional() },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, async (input) => await runtime.tool("workspace_catalog", input) as any);
   target.registerTool("copy_artifact", {

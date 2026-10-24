@@ -368,7 +368,7 @@ function registerMcpSurface(
     "start_session",
     {
       title: "Start QuayMesh session",
-      description: "Start one task card per user request; reuse request_key when retrying.",
+      description: "Start one task card per user request; reuse request_key when retrying. The returned workspaces list contains only workspaces ALREADY ATTACHED to the new task and is normally empty. To discover available worker machines and exported root_id values, call workspace_catalog with NO query, then open_workspace with a returned root_id. Cloud is a Coordinator, not a file execution worker.",
       inputSchema: {
         title: z.string().min(1).max(200).describe("Task title."),
         request_key: z.string().min(1).max(128).describe("Stable request key; reuse for retries."),
@@ -381,7 +381,7 @@ function registerMcpSurface(
         workspaces: z.array(z.unknown()),
       },
       ...workspaceAppDescriptorMeta(config),
-      annotations: { readOnlyHint:false, destructiveHint:true, idempotentHint:true, openWorldHint:false },
+      annotations: { readOnlyHint:false, destructiveHint:false, idempotentHint:true, openWorldHint:false },
     },
     async ({ title, request_key, source_task_id }, extra) => {
       if (!sessionRuntime) throw new Error("SESSION_RUNTIME_UNAVAILABLE");
@@ -395,7 +395,8 @@ function registerMcpSurface(
       const projection = await sessionRuntime.projector.readTask(task.id, -1);
       return {
         content: [{ type: "text", text: "QuayMesh task " + task.id + " started in session " + session.id + ": " + task.title
-          + "\n" + taskConsoleUrl(config,task.id) }],
+          + "\n" + taskConsoleUrl(config,task.id)
+          + "\nTask workspaces are initially empty until a worker root is opened. Call workspace_catalog({}) to discover exported roots, then open_workspace({root_id:\"desktop/main\"}) or another listed root." }],
         _meta: {
           quaymesh: {
             session_id: session.id,

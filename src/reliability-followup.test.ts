@@ -144,10 +144,31 @@ test("workspace_catalog answers from memory without dialing an offline peer", as
   } as FederationHooks;
   const runtime = new FederationRuntime(config, "token", hooks);
   const started = Date.now();
-  const result = await runtime.tool("workspace_catalog", { include_offline: true, query: "" }) as { structuredContent: { offline_nodes: { node_id: string }[]; workspaces: unknown[] } };
+  const result = await runtime.tool("workspace_catalog", { include_offline: true, query: "" }) as {
+    structuredContent: { offline_nodes: { node_id: string }[]; workspaces: unknown[] };
+    content: Array<{type:string;text:string}>;
+  };
   assert.ok(Date.now() - started < 100);
   assert.equal(result.structuredContent.workspaces.length, 1);
   assert.equal(result.structuredContent.offline_nodes[0]?.node_id, "campus-s2");
+  assert.match(result.content[0].text,/local\/proj/,"MCP clients that only render text still receive available roots");
+  assert.match(result.content[0].text,/Cloud is the Coordinator/);
+  const allAlias = await runtime.tool("workspace_catalog", { query: "all" }) as typeof result;
+  assert.equal(allAlias.structuredContent.workspaces.length, 1);
+  const none = await runtime.tool("workspace_catalog", { query: "unmatched-search-phrase" }) as typeof result;
+  assert.equal(none.structuredContent.workspaces.length, 0);
+  assert.match(none.content[0].text,/No roots match that search/);
+  assert.match(none.content[0].text,/local\/proj/,"An unmatched filter must not be misread as a dead cluster");
+  for (const name of ["open_workspace","attach_workspace"]) {
+    await assert.rejects(
+      runtime.tool(name,{path:"/tmp/gemini-tool-healthcheck",create_directory:true}),
+      (error:unknown) => {
+        assert.equal((error as {code?:string}).code,"WORKSPACE_ROOT_REQUIRED");
+        assert.match((error as Error).message,/local\/proj/);
+        return true;
+      },
+    );
+  }
   await runtime.close();
   await rm(root, { recursive: true, force: true });
 });
