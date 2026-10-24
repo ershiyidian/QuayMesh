@@ -17,6 +17,15 @@ The gateway rejects Console and internal management requests, forwards the
 OAuth owner's grant to the existing server, and emits a public HTTPS OAuth
 metadata document instead of the internal 127.0.0.1 resource URL.
 
+Gemini's connector may also probe the issuer discovery document at
+`/.well-known/oauth-authorization-server/mcp`; the gateway serves the
+same RFC 8414 metadata there. Browser-based discovery from the Gemini
+web origin has explicit CORS headers and preflight support without opening
+management or Console endpoints. Caddy serves only HTTP/1.1 and HTTP/2,
+since its local port 28443 must not be advertised as a public HTTP/3 port.
+The public MCP adapter is deployed independently from the Coordinator
+release at `gemini-mcp-ingress-20261024/public-mcp.mjs`.
+
 Add the following to the Home Coordinator's `/home/quaymesh/.config/quaymesh-coordinator/node.json`:
 
 ```json

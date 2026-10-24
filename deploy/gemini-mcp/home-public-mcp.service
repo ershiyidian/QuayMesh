@@ -5,7 +5,7 @@ After=network-online.target quaymesh-coordinator.service
 
 [Service]
 Type=simple
-ExecStart=/home/quaymesh/.local/share/quaymesh/releases/GEMINI_RELEASE_PLACEHOLDER-linux-x64/runtime/node /home/quaymesh/.local/share/quaymesh/releases/GEMINI_RELEASE_PLACEHOLDER-linux-x64/node/public-mcp.mjs --config /home/quaymesh/.config/quaymesh-coordinator/node.json --port 29176
+ExecStart=/home/quaymesh/.local/share/quaymesh/releases/2dab7fd19a89ce7decb265f07c26a7540ffe8d26-linux-x64/runtime/node /home/quaymesh/quaymesh-archive/releases/gemini-mcp-ingress-20261024/public-mcp.mjs --config /home/quaymesh/.config/quaymesh-coordinator/node.json --port 29176
 Restart=on-failure
 RestartSec=3
 UMask=0077

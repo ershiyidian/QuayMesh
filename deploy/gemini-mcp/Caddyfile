@@ -3,6 +3,9 @@
     http_port 28080
     https_port 28443
     auto_https disable_redirects
+    servers :28443 {
+        protocols h1 h2
+    }
 }
 
 http://139-196-215-153.sslip.io {

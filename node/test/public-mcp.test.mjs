@@ -30,6 +30,36 @@ test("公网元数据完整采用 HTTPS 原点，内部 loopback 地址从不泄
   assert.equal(meta.registration_endpoint,"https://139-196-215-153.sslip.io/register");
   assert.deepEqual(meta.code_challenge_methods_supported,["S256"]);
   assert.doesNotMatch(JSON.stringify({root,meta}),/127\.0\.0\.1/);
+  const pathAware = await fetch(base+"/.well-known/oauth-authorization-server/mcp");
+  assert.equal(pathAware.status,200);
+  assert.deepEqual(await pathAware.json(),meta);
+});
+
+test("Gemini web OAuth discovery supports CORS with exposed 401 challenge and browser preflight",async t=>{
+  const {base}=await fixture(t,(_req,res)=>{
+    res.writeHead(401,{"www-authenticate":'Bearer resource_metadata="http://127.0.0.1:17676/.well-known/oauth-protected-resource/mcp"'}).end();
+  });
+  const headers={"Origin":"https://gemini.google.com"};
+  for(const path of ["/mcp","/.well-known/oauth-protected-resource/mcp",
+    "/.well-known/oauth-authorization-server","/.well-known/oauth-authorization-server/mcp"]) {
+    const response=await fetch(base+path,{method:"GET",headers});
+    assert.equal(response.headers.get("access-control-allow-origin"),"https://gemini.google.com");
+    assert.match(response.headers.get("access-control-expose-headers")??"",/WWW-Authenticate/);
+  }
+  for(const path of ["/register","/token","/mcp"]) {
+    const response=await fetch(base+path,{method:"OPTIONS",
+      headers:{...headers,"Access-Control-Request-Method":"POST",
+        "Access-Control-Request-Headers":"content-type,authorization"}});
+    assert.equal(response.status,204,path);
+    assert.equal(response.headers.get("access-control-allow-origin"),"https://gemini.google.com");
+    assert.match(response.headers.get("access-control-allow-headers")??"",/Authorization/);
+  }
+  const hostile=await fetch(base+"/register",{method:"OPTIONS",
+    headers:{"Origin":"https://attacker.example"}});
+  assert.equal(hostile.headers.get("access-control-allow-origin"),null);
+  assert.equal(hostile.status,404);
+  const secret=await fetch(base+"/console/api",{method:"OPTIONS",headers});
+  assert.equal(secret.status,404);
 });
 
 test("MCP 401 保留真实认证失败，同时把 resource_metadata 指向公网", async t => {

@@ -9,7 +9,9 @@ const METADATA_PATHS = new Set([
   "/.well-known/oauth-protected-resource",
   "/.well-known/oauth-protected-resource/mcp",
   "/.well-known/oauth-authorization-server",
+  "/.well-known/oauth-authorization-server/mcp",
 ]);
+const BROWSER_ORIGINS = new Set(["https://gemini.google.com", "https://www.google.com"]);
 const HOP_HEADERS = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
   "te", "trailer", "transfer-encoding", "upgrade", "proxy-connection"]);
 
@@ -19,7 +21,8 @@ function htmlEscape(text) {
 }
 
 function metadata(base, pathname) {
-  if (pathname === "/.well-known/oauth-authorization-server") return {
+  if (pathname === "/.well-known/oauth-authorization-server"
+      || pathname === "/.well-known/oauth-authorization-server/mcp") return {
     issuer: base + "/",
     authorization_endpoint: base + "/authorize",
     token_endpoint: base + "/token",
@@ -74,13 +77,37 @@ export function createPublicMcpIngress({
   const server = createServer((req, res) => {
     const started = Date.now();
     const method = req.method ?? "GET";
+    const origin = typeof req.headers.origin === "string" && BROWSER_ORIGINS.has(req.headers.origin)
+      ? req.headers.origin : null;
+    if (origin) {
+      res.setHeader("access-control-allow-origin", origin);
+      res.setHeader("vary", "Origin");
+      res.setHeader("access-control-expose-headers",
+        "WWW-Authenticate, MCP-Session-Id, MCP-Protocol-Version");
+    }
     const raw = req.url ?? "";
     if (!raw.startsWith("/") || raw.startsWith("//")) {
       res.writeHead(400).end(); req.resume(); return;
     }
     const url = new URL(raw, base);
     const pathname = url.pathname;
-    res.once("finish", () => onRequest({ method, path: pathname, status: res.statusCode, ms: Date.now()-started }));
+    res.once("finish", () => onRequest({
+      method, path: pathname, status: res.statusCode, ms: Date.now()-started,
+      // 只记录发现请求特征，不记录 OAuth code/state、Authorization 或 Cookie。
+      origin: typeof req.headers.origin === "string" ? req.headers.origin.slice(0, 100) : null,
+      agent: String(req.headers["user-agent"] ?? "").slice(0, 120),
+      accept: String(req.headers.accept ?? "").slice(0, 100),
+    }));
+    if (method === "OPTIONS" && origin &&
+        (METADATA_PATHS.has(pathname) || MCP_PATHS.has(pathname) || AUTH_PATHS.has(pathname))) {
+      res.writeHead(204, {
+        "access-control-allow-methods": "GET, HEAD, POST, DELETE, OPTIONS",
+        "access-control-allow-headers": "Authorization, Content-Type, Accept, MCP-Protocol-Version, MCP-Session-Id",
+        "access-control-max-age": "300",
+        "cache-control": "no-store",
+      }).end();
+      return;
+    }
     if (!acceptPath(pathname, method)) {
       res.writeHead(404, { "content-type": "application/json" }).end('{"error":"not_found"}');
       req.resume(); return;
