@@ -33,10 +33,10 @@ export function compileCore(node, cluster, { root, tokenFile, ownerToken, member
   const publicOrigin = hostUrl("127.0.0.1", cluster.discovery.localPort);
   const coordinatorEndpoint = hostUrl(coordinator.address, coordinator.peerPort);
   const proxyUrl = node.network.proxyUrl || "http://127.0.0.1:7890";
+  const publicUrls = [node.publicMcp?.url,...(node.publicMcp?.legacyUrls??[])].filter(Boolean);
   const aliases = [...new Set([
     cluster.discovery.resourceUrl,
-    node.publicMcp?.url,
-    node.publicMcp?.url ? new URL(node.publicMcp.url).origin : undefined,
+    ...publicUrls.flatMap(url => [url,new URL(url).origin]),
   ].filter(Boolean))];
   const providers = caps.worker && node.network.externalAccess
     ? (node.core.subagents || { enabled:true, instructions:"on-demand", providers:[{ id:"codex", enabled:true }] })
@@ -47,7 +47,7 @@ export function compileCore(node, cluster, { root, tokenFile, ownerToken, member
     server: {
       host: caps.coordinator ? "0.0.0.0" : "127.0.0.1", port:node.corePort, publicBaseUrl: publicOrigin,
       allowedHosts: ["127.0.0.1","localhost",node.mesh.address,coordinator.address,
-        ...(node.publicMcp?.url ? [new URL(node.publicMcp.url).hostname] : [])], trustProxy:true,
+        ...publicUrls.map(url => new URL(url).hostname)], trustProxy:true,
     },
     workspaces: { allowedRoots:caps.worker ? node.roots.filter(entry=>entry.enabled).map(entry => entry.path) : [],
       worktreeRoot:join(node.stateDir,"worktrees") },

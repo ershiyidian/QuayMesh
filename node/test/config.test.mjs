@@ -61,6 +61,23 @@ test("Gemini 公网 MCP 资源可在保留 ChatGPT 旧 URL 的同时添加 OAuth
   assert.throws(()=>validateNode({...n,publicMcp:{url:"http://139.196.215.153/mcp"}},c,root),/HTTPS/);
   assert.throws(()=>validateNode({...n,publicMcp:{url:"https://example.com/console"}},c,root),/\/mcp/);
   assert.throws(()=>validateNode({...n,publicMcp:{url:"https://example.com/mcp",allowedRedirectHosts:["*"]}},c,root),/回调域名/);
+  const dual = validateNode({...n,publicMcp:{
+    url:"https://quaymesh-mcp-home.tail2e51e6.ts.net/mcp",
+    legacyUrls:["https://139-196-215-153.sslip.io/mcp"],
+    allowedRedirectHosts:["oauth-redirect.googleusercontent.com"],
+  }},c,root);
+  const compiledDual=compileCore(dual,c,{root,tokenFile:join(root,'token'),ownerToken:token(),
+    membershipFile:join(root,'membership'),statusFile:join(root,'status')});
+  assert.deepEqual(compiledDual.runtime.oauth.resourceAliases,[
+    "https://openai.example.com/mcp",
+    "https://quaymesh-mcp-home.tail2e51e6.ts.net/mcp",
+    "https://quaymesh-mcp-home.tail2e51e6.ts.net",
+    "https://139-196-215-153.sslip.io/mcp",
+    "https://139-196-215-153.sslip.io",
+  ]);
+  assert.ok(compiledDual.runtime.server.allowedHosts.includes("quaymesh-mcp-home.tail2e51e6.ts.net"));
+  assert.ok(compiledDual.runtime.server.allowedHosts.includes("139-196-215-153.sslip.io"));
+  assert.throws(()=>validateNode({...n,publicMcp:{url:n.publicMcp.url,legacyUrls:["http://bad.example/mcp"]}},c,root),/HTTPS/);
 });
 
 test("三个发现端使用同一 HTTP origin 和通道，保留独立工作区",async t=>{

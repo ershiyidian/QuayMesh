@@ -168,11 +168,20 @@ export function validateNode(input, cluster, directory = process.cwd()) {
   check(value.capabilities.coordinator === (value.id === cluster.coordinator.id), "Coordinator 能力与 cluster.coordinator.id 必须一致");
   if (value.publicMcp !== undefined) {
     check(value.capabilities.coordinator, "只有 Coordinator 可以配置公网 MCP 资源");
-    keys(value.publicMcp, ["url","allowedRedirectHosts"], "node.publicMcp");
+    keys(value.publicMcp, ["url","allowedRedirectHosts","legacyUrls"], "node.publicMcp");
     const publicUrl = httpUrl(value.publicMcp.url,"node.publicMcp.url");
     check(publicUrl.protocol === "https:" && publicUrl.pathname === "/mcp" && !publicUrl.search && !publicUrl.hash,
       "公网 MCP 地址必须是 HTTPS 且路径恰好为 /mcp");
     value.publicMcp.url = publicUrl.href;
+    value.publicMcp.legacyUrls ??= [];
+    check(Array.isArray(value.publicMcp.legacyUrls) && value.publicMcp.legacyUrls.length <= 4,
+      "旧公网 MCP 资源地址最多保留 4 个");
+    value.publicMcp.legacyUrls = value.publicMcp.legacyUrls.map((entry,index) => {
+      const url = httpUrl(entry,`node.publicMcp.legacyUrls[${index}]`);
+      check(url.protocol === "https:" && url.pathname === "/mcp" && !url.search && !url.hash,
+        "旧公网 MCP 资源也必须为 HTTPS /mcp");
+      return url.href;
+    });
     value.publicMcp.allowedRedirectHosts ??= [];
     check(Array.isArray(value.publicMcp.allowedRedirectHosts)
       && value.publicMcp.allowedRedirectHosts.every(host => typeof host === "string"
