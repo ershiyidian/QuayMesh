@@ -1,0 +1,14 @@
+[Unit]
+Description=QuayMesh Home Coordinator TCP ingress %i
+After=easytier.service
+Wants=easytier.service
+
+[Socket]
+ListenStream=10.144.144.254:%i
+ListenStream=127.0.0.1:%i
+FreeBind=yes
+NoDelay=yes
+Accept=no
+
+[Install]
+WantedBy=sockets.target

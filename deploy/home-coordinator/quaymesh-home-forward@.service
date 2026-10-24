@@ -1,0 +1,15 @@
+[Unit]
+Description=QuayMesh TCP forwarding %i to the Home Coordinator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/lib/systemd/systemd-socket-proxyd 10.144.144.3:2%i
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+Restart=on-failure
+RestartSec=2s
