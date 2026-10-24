@@ -6,11 +6,12 @@ export const READ_ATTEMPT_TIMEOUT_MS = 10_000;
 export const MAX_READ_RETRIES = 3;
 
 export function isTransientPeerFailure(error: unknown): boolean {
-  if (error instanceof PeerApplicationError) return false;
   if (!error) return false;
   if (typeof error === "object") {
     const err = error as Record<string, unknown>;
     const code = String(err.code ?? err.name ?? "");
+    // 远端已经执行的业务异常不能重试；只有明确定性的传输中断可重试只读请求。
+    if (error instanceof PeerApplicationError) return ["RPC_INTERRUPTED", "REQUEST_TIMEOUT", "NODE_UNAVAILABLE", "PEER_BUSY"].includes(code);
     const status = Number(err.status ?? err.statusCode ?? 0);
     if (code === "NODE_UNAVAILABLE" || code === "RPC_INTERRUPTED" || code === "REQUEST_TIMEOUT") return true;
     if (status === 502 || status === 503 || status === 504) return true;
@@ -144,6 +145,7 @@ export async function executeBoundedRead<T>(options: PeerDispatchOptions<T>): Pr
 }
 
 function readAttemptTimeout(method: string, params: unknown): number {
+  if (method === "console" && (params as {method?:unknown}|null)?.method === "GET") return 18_000;
   if (method !== "tool" || !params || typeof params !== "object") return READ_ATTEMPT_TIMEOUT_MS;
   const request = params as { name?: unknown; input?: Record<string, unknown> };
   if (request.name === "open_workspace" || request.name === "attach_workspace") {

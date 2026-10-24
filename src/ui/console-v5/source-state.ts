@@ -1,8 +1,9 @@
 import type { CacheEntry, SourceState } from './contracts.js';
 
-export function sourceWarning(source: SourceState): string | null {
+export function sourceWarning(source: SourceState, now = Date.now()): string | null {
   if (source.state === 'error' || source.state === 'offline') return source.error || '当前无法读取，保留最近确认的数据';
   if (source.state === 'loading' && !source.observedAt) return '尚未取得数据';
+  if (source.state === 'refreshing' && !source.stale && source.observedAt !== null && !source.error && now-source.observedAt <= 30_000) return null;
   if (source.stale || source.state === 'refreshing') return source.observedAt ? '正在刷新，当前显示上次确认的数据' : '正在读取数据';
   return null;
 }

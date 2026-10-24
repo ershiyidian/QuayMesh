@@ -6,7 +6,7 @@ import test from "node:test";
 import { WorkLedger } from "./work-ledger.js";
 import { WorkRunReconciler } from "./work-run-reconciler.js";
 import { dispatchPeerRequest, READ_TOTAL_BUDGET_MS } from "./federation/read-retry.js";
-import { NodeUnavailableError, RpcInterruptedError } from "./federation/transport.js";
+import { NodeUnavailableError, PeerApplicationError, RpcInterruptedError } from "./federation/transport.js";
 import { FederationRuntime, type FederationHooks } from "./federation/runtime.js";
 import type { FederationConfig } from "./federation/types.js";
 import type { ReadRetryLink } from "./federation/read-retry.js";
@@ -77,6 +77,50 @@ test("idempotent reads retry inside 30s and mutations are not replayed", async (
     getLink: () => link(async () => { openCalls += 1; throw new RpcInterruptedError("s2", "open", "timeout"); }),
   }));
   assert.equal(openCalls, 1);
+});
+
+test("large-frame stream interruption retries console GET only, never writes or application errors", async () => {
+  let reads = 0;
+  const readLink = link(async () => {
+    if (++reads === 1) throw new PeerApplicationError("desktop", "传输流在响应头前被取消", "RPC_INTERRUPTED");
+    return { status: 200, body: { items: ["confirmed"] } };
+  });
+  const read = await dispatchPeerRequest({
+    node: "desktop", method: "console", params: { method: "GET", path: "/workbench/task-index" },
+    rpcTimeoutMs: 120_000, sleep: async () => {}, random: () => 0, getLink: () => readLink,
+  });
+  assert.deepEqual(read, { status: 200, body: { items: ["confirmed"] } });
+  assert.equal(reads, 2);
+
+  let writes = 0;
+  await assert.rejects(() => dispatchPeerRequest({
+    node: "desktop", method: "console", params: { method: "POST", path: "/workbench/something" },
+    rpcTimeoutMs: 120_000, getLink: () => link(async () => {
+      writes++;
+      throw new PeerApplicationError("desktop", "传输流在响应头前被取消", "RPC_INTERRUPTED");
+    }),
+  }), { code: "RPC_INTERRUPTED" });
+  assert.equal(writes, 1);
+
+  let rejected = 0;
+  await assert.rejects(() => dispatchPeerRequest({
+    node: "desktop", method: "console", params: { method: "GET", path: "/workbench/task-index" },
+    rpcTimeoutMs: 120_000, sleep: async () => {}, getLink: () => link(async () => {
+      rejected++;
+      throw new PeerApplicationError("desktop", "业务校验拒绝", "INVALID_ARGUMENT");
+    }),
+  }), { code: "INVALID_ARGUMENT" });
+  assert.equal(rejected, 1);
+
+  let busyReads = 0;
+  await dispatchPeerRequest({
+    node: "desktop", method: "console", params: { method: "GET", path: "/workbench/session-titles" },
+    rpcTimeoutMs: 120_000, sleep: async () => {}, getLink: () => link(async () => {
+      if (++busyReads === 1) throw new PeerApplicationError("desktop", "接收流已满", "PEER_BUSY");
+      return { status: 200 };
+    }),
+  });
+  assert.equal(busyReads, 2);
 });
 
 test("workspace_catalog answers from memory without dialing an offline peer", async () => {

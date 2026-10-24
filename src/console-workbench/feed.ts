@@ -47,7 +47,7 @@ export class WorkbenchFeed {
     if (!this.runtime) throw new WorkbenchError("当前未启用节点转发", 503, "federation_unavailable");
     // The read transport supports a bounded retry window. Five seconds was
     // shorter than healthy Desktop reads after Modern Standby (6–10 seconds).
-    const reply = await this.runtime.request<ConsoleReply>(nodeId, "console", { method: body === undefined ? "GET" : "POST", path, body }, body === undefined ? 20_000 : undefined);
+    const reply = await this.runtime.request<ConsoleReply>(nodeId, "console", { method: body === undefined ? "GET" : "POST", path, body }, body === undefined ? 30_000 : undefined);
     if (reply.status >= 400) {
       const error = reply.body as { message?: string; code?: string; effect?: WorkbenchError["effect"] } | null;
       throw new WorkbenchError(error?.message || "节点操作失败", reply.status, error?.code || "node_operation_failed", error?.effect ?? "unknown");
@@ -68,7 +68,8 @@ export class WorkbenchFeed {
     // otherwise makes every page paint report all sources as "refreshing".
     const effectiveTtl = Math.max(ttl, 12_000);
     const previous = (state: SourceReadState, error: string | null): NodeResource<T> => ({ data: cached?.data as T ?? null,
-      source: { nodeId: node.id, name: node.nickname, online: node.online, state, observedAt: cached?.loadedAt || null, stale: state === "refreshing" || state === "offline" || state === "error", error } });
+      source: { nodeId: node.id, name: node.nickname, online: node.online, state, observedAt: cached?.loadedAt || null,
+        stale: state === "offline" || state === "error" || state === "refreshing" && (!cached?.loadedAt || Date.now()-cached.loadedAt > 30_000), error } });
     if (!node.online) return previous("offline", "节点离线");
     if (cached?.error && !cached.wait && Date.now() < cached.retryAt) return previous("error", cached.error);
     if (cached && !cached.wait && !cached.error && Date.now() - cached.loadedAt < effectiveTtl) return previous("ready", null);

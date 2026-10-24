@@ -99,7 +99,7 @@ test("响应头前 RST_STREAM 立即拒绝建流，保留 control 连接", async
     await until(() => !!caller!.links.get("target")); const link = caller.links.get("target")!;
     assert.equal(link.frameStreams, false, "旧节点继续走兼容协议");
     await assert.rejects(Promise.race([link.openStream("fixture"), delay(1000).then(() => { throw new Error("test_deadline"); })]),
-      error => error instanceof Error && /响应头前/.test(error.message));
+      error => error instanceof Error && /响应头前/.test(error.message) && (error as Error & {code?:string}).code === "RPC_INTERRUPTED");
     assert.equal(link.connected, true);
     await assert.rejects(link.call("oversized", { image: "x".repeat(9 * 1024 * 1024) }), { code: "PEER_PAYLOAD_TOO_LARGE", effect: "not_started" });
     assert.equal(link.connected, true);

@@ -98,6 +98,12 @@ function unsentError(code: string, message: string): Error {
   return Object.assign(new Error(message), { code, effect: "not_started", retryHint: "retry_later", details: { dispatch_state: "not_sent" } });
 }
 
+function interruptedStream(message: string, cause?: Error): Error {
+  return Object.assign(new Error(message, cause ? { cause } : undefined), {
+    code: "RPC_INTERRUPTED", effect: "unknown", retryHint: "query_original",
+  });
+}
+
 /** One bidirectional control stream and independent flow-controlled data streams per peer.
  * A desktop behind NAT can receive calls AND byte streams on its outbound connection. */
 export class PeerLink extends EventEmitter {
@@ -503,13 +509,13 @@ export class PeerTransport extends EventEmitter {
         if (error) { reject(error); stream.close(constants.NGHTTP2_CANCEL); }
         else resolve(stream);
       };
-      const timer = setTimeout(() => finish(new Error("传输流握手超时")), 10_000); timer.unref();
-      stream.on("error", error => finish(error));
-      stream.once("aborted", () => finish(new Error("传输流在响应头前被取消")));
+      const timer = setTimeout(() => finish(interruptedStream("传输流握手超时")), 10_000); timer.unref();
+      stream.on("error", error => finish(interruptedStream("传输流在响应头前出错", error)));
+      stream.once("aborted", () => finish(interruptedStream("传输流在响应头前被取消")));
       stream.once("response", (headers) => {
         finish(headers[":status"] !== 200 ? new Error(`传输流被拒绝 (${headers[":status"]})`) : undefined);
       });
-      stream.once("close", () => finish(new Error(`传输流在响应头前关闭 (rstCode=${stream.rstCode})`)));
+      stream.once("close", () => finish(interruptedStream(`传输流在响应头前关闭 (rstCode=${stream.rstCode})`)));
     });
   }
   async openReverse(link: PeerLink, params: { id: string; service: string; metadata: unknown }): Promise<void> {
@@ -551,9 +557,9 @@ export class PeerTransport extends EventEmitter {
         stream.off("error", failed); stream.off("close", closed);
         if (error) { stream.destroy(); reject(error); } else resolve();
       };
-      const failed = (error: Error) => finish(error);
-      const closed = () => finish(new Error("节点正文流在发送完成前关闭"));
-      const timer = setTimeout(() => finish(new Error("节点正文流发送超时")), Math.max(10_000, this.config.rpcTimeoutMs));
+      const failed = (error: Error) => finish(interruptedStream("节点正文流传输中断", error));
+      const closed = () => finish(interruptedStream("节点正文流在发送完成前关闭"));
+      const timer = setTimeout(() => finish(interruptedStream("节点正文流发送超时")), Math.max(10_000, this.config.rpcTimeoutMs));
       timer.unref();
       stream.once("error", failed); stream.once("close", closed);
       // 数据流按 HTTP/2 帧调度，小控制消息无需排在整段 JSON 正文之后。

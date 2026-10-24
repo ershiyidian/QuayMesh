@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { WorkbenchFeed } from "../../src/console-workbench/feed.js";
+import { sourceWarning } from "../../src/ui/console-v5/source-state.js";
 import type { FederationRuntime } from "../../src/federation/runtime.js";
 import type { ServerConfig } from "../../src/config.js";
 
@@ -18,14 +19,14 @@ function stub(call: (timeoutMs: number) => Promise<unknown>) {
   } } as unknown as FederationRuntime;
 }
 
-test("Console remote GET budget covers healthy 6–10 second Desktop reads", async () => {
+test("Console remote GET budget covers a slow large-frame Desktop read plus retry", async () => {
   let observed = 0;
   const feed = new WorkbenchFeed(config,stub(async timeout => {
     observed = timeout;
     return payload("Desktop");
   }));
   const result = await feed.metadata();
-  assert.equal(observed,20_000);
+  assert.equal(observed,30_000);
   assert.equal(result.complete,true);
   assert.equal(result.projects[0].name,"Desktop");
 });
@@ -46,13 +47,19 @@ test("TTL refresh returns a timestamped snapshot while one remote refresh replac
   assert.ok(performance.now()-start < 500,"stale cache must not wait for a blocked remote RPC");
   assert.equal(first.projects[0].name,"old");
   assert.equal(first.sources[0].state,"refreshing");
-  assert.equal(first.sources[0].stale,true);
+  assert.equal(first.sources[0].stale,false,"12s 内的已确认数据在后台刷新时仍是新鲜快照");
+  assert.equal(sourceWarning(first.sources[0]),null,"正常轮询不应触发五节点过期横幅");
+  assert.match(sourceWarning({...first.sources[0],stale:true})??"",/正在刷新/,"真实过期仍需提示");
   assert.equal(first.complete,true,"a complete cached snapshot remains usable while refreshing");
   // Give the background job a microtask to begin.
   await delay(10);
   const second = await feed.metadata();
   assert.equal(second.projects[0].name,"old");
   assert.equal(requests,2,"multiple reads must reuse a single pending request");
+  t.mock.timers.tick(18_000);
+  const old = await feed.metadata();
+  assert.equal(old.sources[0].stale,true,"超过 30s 且尚未确认的新数据必须报告过期");
+  assert.match(sourceWarning(old.sources[0])??"",/正在刷新/);
   release(payload("new"));
   await delay(15);
   const updated = await feed.metadata();
