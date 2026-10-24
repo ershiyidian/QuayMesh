@@ -119,6 +119,36 @@ preserve it across upgrades or restarts.
   test tokens were revoked and the test-client registration was removed.
 - Actual Gemini Web account-side connection still requires verification.
 
+### Gemini workspace discovery and cloud-node routing
+
+Gemini was observed to call `workspace_catalog` and receive a full 7 KB
+`structuredContent` catalog but conclude that no worker roots existed.
+The old MCP text block said only that a result was available in structured
+form; some model clients do not read that structured result reliably.
+The Coordinator now returns the exact exported `root_id` values and online
+worker names in both the structured reply and human-readable text. An
+unmatched query explicitly lists the available alternatives.
+
+The Cloud Coordinator has no worker filesystem or shell capability.
+Opening an arbitrary path such as `/tmp/healthcheck` without a `root_id`
+therefore failed with a generic execution error. The MCP tool descriptions
+now instruct clients to select `desktop/main`, `s1/data`, `s2/data`,
+`home-gateway/reports` or another exported root. An unrouteable request
+returns `WORKSPACE_ROOT_REQUIRED` with the exact available IDs and
+`retry_hint=fix_input`, before any directory is created.
+
+The `start_session` workspaces field counts roots attached to that task,
+not all available cluster roots. Its response now explains this distinction.
+Additive session/bootstrap tool annotations are explicitly non-destructive;
+Gemini may still require per-action approval for write operations.
+
+The versioned Coordinator release `64aa30259436a60b4a6ed1edac9f9f4d446b8472`
+was deployed with `home-worker-catalog-upgrade.sh` and an online SQLite
+backup. Production validation from the public `ts.net` domain confirmed
+six exported roots in both reply shapes, a real open of
+`home-gateway/reports`, a directory listing on that worker, and an
+actionable rejection of an unrouteable absolute path.
+
 Check `https://139-196-215-153.sslip.io/.well-known/oauth-authorization-server`
 and `/mcp` from outside the cluster, then choose Add custom app in
 Gemini Connected Apps, paste the URL, leave Client ID/secret empty, and
