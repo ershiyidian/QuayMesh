@@ -37,14 +37,16 @@ console.log("Trusted HTTPS metadata and PKCE: PASS");
 const registerResponse = await fetch(base + "/register", {
   method: "POST", headers: { "content-type": "application/json" },
   body: JSON.stringify({ client_name: "QuayMesh Gemini compatibility smoke",
-    redirect_uris: [callback,...[1,2,3,4,5].map(n=>
-      `https://oauth-redirect${n}.googleusercontent.com/r/user_bound_custom-mcp-quaymesh-smoke`)],
+    redirect_uris: ["oauth-redirect-sandbox","oauth-redirect-test","oauth-redirect"].flatMap(host =>
+      ["r","a"].map(part => `https://${host}.googleusercontent.com/${part}/user_bound_custom-mcp-quaymesh-smoke`)),
     response_types: ["code"],
-    grant_types: ["authorization_code", "refresh_token"], token_endpoint_auth_method: "none" }),
+    grant_types: ["authorization_code", "refresh_token"], token_endpoint_auth_method: "client_secret_post" }),
 });
 assertResponse(registerResponse, 201, "Dynamic client registration");
 const client = await registerResponse.json();
 assert.match(client.client_id, /^quaymesh-/);
+assert.ok(client.client_secret && client.client_secret.length >= 32);
+assert.equal(client.token_endpoint_auth_method, "client_secret_post");
 console.log("Google relay redirect registration: PASS");
 
 const authorization = {
@@ -74,7 +76,7 @@ console.log("Owner consent, OAuth code and Google callback handoff: PASS");
 const tokenResponse = await fetch(base + "/token", {
   method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
   body: params({ grant_type: "authorization_code", client_id: client.client_id,
-    code, redirect_uri: callback, code_verifier: verifier, resource }),
+    code, redirect_uri: callback, code_verifier: verifier, client_secret: client.client_secret, resource }),
 });
 assertResponse(tokenResponse, 200, "OAuth token exchange");
 const token = await tokenResponse.json();
@@ -121,7 +123,7 @@ try {
   ].map(async tokenValue => {
     const response = await fetch(base + "/revoke", {
       method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: params({ client_id: client.client_id, token: tokenValue }),
+      body: params({ client_id: client.client_id, client_secret: client.client_secret, token: tokenValue }),
     });
     assert.equal(response.status, 200);
   }));

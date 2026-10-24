@@ -33,9 +33,22 @@ Gemini Web integration compatibility:
   restart to activate the resource-alias change, with the old systemd unit
   retained for automatic rollback if the new Core fails readiness checks.
 - `smoke-test.mjs` exercises the real public HTTPS endpoint with six
-  registered callback URIs, Owner authorization, long OAuth state,
-  PKCE token issuance, MCP initialize, tools/list and a read-only
+  registered sandbox/test/production callback URIs (each using /r/ and /a/),
+  confidential client credentials issued through DCR, Owner authorization,
+  long OAuth state, PKCE token issuance, MCP initialize, tools/list and a read-only
   federated tool call; it revokes its disposable tokens afterward.
+
+The Google web app registers as `OpenAuth` with six redirect URIs and
+`token_endpoint_auth_method=client_secret_post`. The old QuayMesh host
+allowlist accepted numbered oauth-redirect hosts but rejected Google's
+`oauth-redirect-sandbox` and `oauth-redirect-test` hosts and /a/ paths.
+That produced `POST /register HTTP 400` with
+`Client redirect_uri is not allowed for this QuayMesh server`.
+The host validator now allows only the observed Google relay hosts, HTTPS,
+and `/r/user_bound_custom-mcp-...` or `/a/user_bound_custom-mcp-...`
+callback paths. The MCP SDK mints a random `client_secret` for
+`client_secret_post`. The full six-callback confidential-client smoke
+flow now passes and revokes the test credentials using that secret.
 
 Gemini's connector may also probe the issuer discovery document at
 `/.well-known/oauth-authorization-server/mcp`; the gateway serves the
