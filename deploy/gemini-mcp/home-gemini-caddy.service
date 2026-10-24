@@ -1,0 +1,18 @@
+[Unit]
+Description=QuayMesh Gemini HTTPS ingress and certificate management
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/quaymesh/quaymesh-archive/releases/gemini-mcp-ingress-20261024/caddy-root/usr/bin/caddy run --config /home/quaymesh/quaymesh-archive/releases/gemini-mcp-ingress-20261024/Caddyfile --adapter caddyfile
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+Environment=XDG_DATA_HOME=/home/quaymesh/.local/share/quaymesh-gemini-tls
+Environment=XDG_CONFIG_HOME=/home/quaymesh/.config/quaymesh-gemini-tls
+
+[Install]
+WantedBy=default.target

@@ -137,7 +137,7 @@ export function validateCluster(input) {
 export function validateNode(input, cluster, directory = process.cwd()) {
   const value = structuredClone(input);
   keys(value, ["schemaVersion","id","nickname","settingsRevision","consoleSettings","clusterFile","secretsFile","stateDir","capabilities","network","mesh",
-    "components","roots","core","adminPort","peerPort","corePort","registryPort","nodeRuntime"], "node");
+    "components","roots","core","adminPort","peerPort","corePort","registryPort","nodeRuntime","publicMcp"], "node");
   check(value.schemaVersion === 1, "node.schemaVersion 必须是 1");
   identifier(value.id, "node.id");
   value.nickname ??= value.id;
@@ -166,6 +166,19 @@ export function validateNode(input, cluster, directory = process.cwd()) {
   }
   check(CAPABILITIES.some(name => value.capabilities[name]), "节点至少需要一项能力");
   check(value.capabilities.coordinator === (value.id === cluster.coordinator.id), "Coordinator 能力与 cluster.coordinator.id 必须一致");
+  if (value.publicMcp !== undefined) {
+    check(value.capabilities.coordinator, "只有 Coordinator 可以配置公网 MCP 资源");
+    keys(value.publicMcp, ["url","allowedRedirectHosts"], "node.publicMcp");
+    const publicUrl = httpUrl(value.publicMcp.url,"node.publicMcp.url");
+    check(publicUrl.protocol === "https:" && publicUrl.pathname === "/mcp" && !publicUrl.search && !publicUrl.hash,
+      "公网 MCP 地址必须是 HTTPS 且路径恰好为 /mcp");
+    value.publicMcp.url = publicUrl.href;
+    value.publicMcp.allowedRedirectHosts ??= [];
+    check(Array.isArray(value.publicMcp.allowedRedirectHosts)
+      && value.publicMcp.allowedRedirectHosts.every(host => typeof host === "string"
+        && /^[a-z0-9.-]+$/u.test(host) && !host.includes("..") && !host.startsWith(".") && !host.endsWith(".")),
+      "OAuth 回调域名必须逐个明确列出");
+  }
   value.network ??= {};
   keys(value.network, ["externalAccess","inheritProxy","proxyUrl"], "network");
   value.network.externalAccess ??= !value.capabilities.coordinator;

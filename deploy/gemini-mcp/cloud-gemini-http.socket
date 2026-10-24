@@ -1,0 +1,11 @@
+[Unit]
+Description=Public HTTP for QuayMesh Gemini MCP HTTPS certificates
+After=network-online.target
+
+[Socket]
+ListenStream=0.0.0.0:80
+NoDelay=yes
+Accept=no
+
+[Install]
+WantedBy=sockets.target

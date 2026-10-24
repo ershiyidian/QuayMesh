@@ -1,0 +1,14 @@
+[Unit]
+Description=Proxy public HTTP to the Home Gateway certificate endpoint
+After=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/lib/systemd/systemd-socket-proxyd 10.144.144.3:28080
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+Restart=on-failure
+RestartSec=3

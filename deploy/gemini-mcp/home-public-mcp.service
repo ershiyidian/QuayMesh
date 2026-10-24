@@ -1,0 +1,16 @@
+[Unit]
+Description=QuayMesh restricted Gemini MCP OAuth adapter
+Wants=network-online.target
+After=network-online.target quaymesh-coordinator.service
+
+[Service]
+Type=simple
+ExecStart=/home/quaymesh/.local/share/quaymesh/releases/GEMINI_RELEASE_PLACEHOLDER-linux-x64/runtime/node /home/quaymesh/.local/share/quaymesh/releases/GEMINI_RELEASE_PLACEHOLDER-linux-x64/node/public-mcp.mjs --config /home/quaymesh/.config/quaymesh-coordinator/node.json --port 29176
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

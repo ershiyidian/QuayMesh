@@ -43,6 +43,25 @@ test("Coordinator 支持在中继后使用独立的本机端口，同时保留�
   assert.throws(()=>validateNode({...node,id:'worker',capabilities:{worker:true},registryPort:27681},c,root),/Coordinator/);
 });
 
+test("Gemini 公网 MCP 资源可在保留 ChatGPT 旧 URL 的同时添加 OAuth 受众和受控回调",async t=>{
+  const root=await directory(t),c=cluster({discovery:{resourceUrl:"https://openai.example.com/mcp"}});
+  const n=validateNode({schemaVersion:1,id:c.coordinator.id,stateDir:root,
+    capabilities:{coordinator:true},network:{externalAccess:false},
+    mesh:{enabled:false,address:c.coordinator.address},
+    publicMcp:{url:"https://139-196-215-153.sslip.io/mcp",
+      allowedRedirectHosts:["oauth-redirect.googleusercontent.com"]}},c,root);
+  const compiled=compileCore(n,c,{root,tokenFile:join(root,'token'),ownerToken:token(),
+    membershipFile:join(root,'membership'),statusFile:join(root,'status')});
+  assert.deepEqual(compiled.runtime.oauth.resourceAliases,[
+    "https://openai.example.com/mcp","https://139-196-215-153.sslip.io/mcp"]);
+  assert.ok(compiled.runtime.oauth.allowedRedirectHosts.includes("chatgpt.com"));
+  assert.ok(compiled.runtime.oauth.allowedRedirectHosts.includes("oauth-redirect.googleusercontent.com"));
+  assert.ok(compiled.runtime.server.allowedHosts.includes("139-196-215-153.sslip.io"));
+  assert.throws(()=>validateNode({...n,publicMcp:{url:"http://139.196.215.153/mcp"}},c,root),/HTTPS/);
+  assert.throws(()=>validateNode({...n,publicMcp:{url:"https://example.com/console"}},c,root),/\/mcp/);
+  assert.throws(()=>validateNode({...n,publicMcp:{url:"https://example.com/mcp",allowedRedirectHosts:["*"]}},c,root),/回调域名/);
+});
+
 test("三个发现端使用同一 HTTP origin 和通道，保留独立工作区",async t=>{
   const root=await directory(t);
   const c=cluster({discovery:{resourceUrl:"https://example.invalid/mcp"}});

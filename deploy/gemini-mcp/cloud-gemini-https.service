@@ -1,0 +1,14 @@
+[Unit]
+Description=Pass public TLS through EasyTier to Home Gateway
+After=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/lib/systemd/systemd-socket-proxyd 10.144.144.3:28443
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+Restart=on-failure
+RestartSec=3
