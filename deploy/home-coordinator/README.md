@@ -44,3 +44,26 @@ the newest Home database back before any rollback to prevent data loss.
 
 Neither the Cloud proxy nor the Coordinator contacts Google/OpenAI directly.
 The existing discovery nodes and their OAuth origin remain unchanged.
+
+## Cutover outcome (2026-10-24)
+
+The Home Gateway Coordinator started at 06:38 UTC, and Cloud's independent
+EasyTier service and socket forwarders remained active. The Cloud cutover
+finished with `CUTOVER_OK` after all five node identities reported online.
+
+The authoritative database is now:
+
+`/home/quaymesh/.local/state/quaymesh-coordinator/core/quaymesh.sqlite`
+
+Immutable, SQLite-verified snapshots and the original Cloud configuration
+are stored on Home:
+
+`/home/quaymesh/quaymesh-archive/releases/coordinator-migration-20261024/artifacts/`
+
+The Cloud side was subsequently pruned using
+`cloud-prune-after-cutover.sh`: it checks the new release identity, current
+five-node membership, Core and Registry health, and the disabled legacy
+service before removing old binaries, databases, caches and backup histories.
+Only the EasyTier service, TCP forwarders and essential operating system
+files remain on Cloud. No ongoing synchronization from Cloud to Home is
+required.
