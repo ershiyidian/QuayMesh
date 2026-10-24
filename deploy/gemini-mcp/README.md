@@ -17,6 +17,26 @@ The gateway rejects Console and internal management requests, forwards the
 OAuth owner's grant to the existing server, and emits a public HTTPS OAuth
 metadata document instead of the internal 127.0.0.1 resource URL.
 
+Gemini Web integration compatibility:
+
+- The public MCP endpoint is still `/mcp`, but OAuth Protected Resource
+  Metadata declares the origin `https://139-196-215-153.sslip.io` as the
+  resource, matching the successfully connected Coding Tools MCP reference.
+- The unauthenticated Bearer challenge points to
+  `/.well-known/oauth-protected-resource` and advertises realm `QuayMesh`.
+- The Home Coordinator accepts both the public origin and its `/mcp`
+  endpoint as OAuth resource aliases; the existing ChatGPT resource remains.
+- Dynamic client registration accepts six Google relay callback hostnames:
+  the base `oauth-redirect.googleusercontent.com` and numbered variants.
+  Variant callbacks require HTTPS and the Google user-bound custom-MCP path.
+- `home-issuer-compat-upgrade.sh` performs the controlled Coordinator
+  restart to activate the resource-alias change, with the old systemd unit
+  retained for automatic rollback if the new Core fails readiness checks.
+- `smoke-test.mjs` exercises the real public HTTPS endpoint with six
+  registered callback URIs, Owner authorization, long OAuth state,
+  PKCE token issuance, MCP initialize, tools/list and a read-only
+  federated tool call; it revokes its disposable tokens afterward.
+
 Gemini's connector may also probe the issuer discovery document at
 `/.well-known/oauth-authorization-server/mcp`; the gateway serves the
 same RFC 8414 metadata there. Browser-based discovery from the Gemini
