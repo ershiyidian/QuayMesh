@@ -23,7 +23,7 @@ function htmlEscape(text) {
 function metadata(base, pathname) {
   if (pathname === "/.well-known/oauth-authorization-server"
       || pathname === "/.well-known/oauth-authorization-server/mcp") return {
-    issuer: base + "/",
+    issuer: base,
     authorization_endpoint: base + "/authorize",
     token_endpoint: base + "/token",
     registration_endpoint: base + "/register",
@@ -36,7 +36,7 @@ function metadata(base, pathname) {
   };
   return {
     resource: base + "/mcp",
-    authorization_servers: [base + "/"],
+    authorization_servers: [base],
     scopes_supported: ["quaymesh"],
     resource_name: "QuayMesh",
   };
@@ -147,9 +147,13 @@ export function createPublicMcpIngress({
       if (status === 401 && MCP_PATHS.has(pathname)) {
         const original = String(replyHeaders["www-authenticate"] ?? 'Bearer error="invalid_token"');
         const marker = 'resource_metadata="' + base + '/.well-known/oauth-protected-resource/mcp"';
-        replyHeaders["www-authenticate"] = original.includes("resource_metadata=")
-          ? original.replace(/resource_metadata="[^"]*"/u, marker)
-          : original + ", " + marker;
+        // RFC 6750 §3.1: unauthenticated discovery has no invalid_token error.
+        // Invalid supplied bearer tokens retain the original authentication error.
+        replyHeaders["www-authenticate"] = req.headers.authorization === undefined
+          ? 'Bearer scope="quaymesh", ' + marker
+          : original.includes("resource_metadata=")
+            ? original.replace(/resource_metadata="[^"]*"/u, marker)
+            : original + ", " + marker;
       }
       const location = String(replyHeaders.location ?? "");
       if (pathname === "/authorize" && method === "POST" && status === 302 && redirectToGeminiRelay(location)) {

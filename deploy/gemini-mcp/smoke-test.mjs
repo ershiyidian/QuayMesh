@@ -25,7 +25,7 @@ function mcpSummary(text) {
 const metadataResponse = await fetch(base + "/.well-known/oauth-authorization-server");
 assertResponse(metadataResponse, 200, "OAuth metadata");
 const metadata = await metadataResponse.json();
-assert.equal(metadata.issuer, base + "/");
+assert.equal(metadata.issuer, base);
 assert.equal(metadata.registration_endpoint, base + "/register");
 assert.deepEqual(metadata.code_challenge_methods_supported, ["S256"]);
 console.log("Trusted HTTPS metadata and PKCE: PASS");

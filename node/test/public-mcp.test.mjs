@@ -22,11 +22,11 @@ test("公网元数据完整采用 HTTPS 原点，内部 loopback 地址从不泄
   const {base} = await fixture(t, (_req,res) => res.writeHead(502).end());
   const resource = await fetch(base+"/.well-known/oauth-protected-resource/mcp");
   assert.equal(resource.status, 200);
-  assert.deepEqual((await resource.json()).authorization_servers, ["https://139-196-215-153.sslip.io/"]);
+  assert.deepEqual((await resource.json()).authorization_servers, ["https://139-196-215-153.sslip.io"]);
   const root = await (await fetch(base+"/.well-known/oauth-protected-resource")).json();
   assert.equal(root.resource, "https://139-196-215-153.sslip.io/mcp");
   const meta = await (await fetch(base+"/.well-known/oauth-authorization-server")).json();
-  assert.equal(meta.issuer,"https://139-196-215-153.sslip.io/");
+  assert.equal(meta.issuer,"https://139-196-215-153.sslip.io");
   assert.equal(meta.registration_endpoint,"https://139-196-215-153.sslip.io/register");
   assert.deepEqual(meta.code_challenge_methods_supported,["S256"]);
   assert.doesNotMatch(JSON.stringify({root,meta}),/127\.0\.0\.1/);
@@ -72,6 +72,22 @@ test("MCP 401 保留真实认证失败，同时把 resource_metadata 指向公�
   const header=res.headers.get("www-authenticate");
   assert.match(header,/https:\/\/139-196-215-153\.sslip\.io\/\.well-known\/oauth-protected-resource\/mcp/);
   assert.doesNotMatch(header,/127\.0\.0\.1/);
+  assert.doesNotMatch(header,/invalid_token|error_description/);
+});
+
+test("Bearer token failure preserves invalid_token while empty authorization uses an OAuth discovery challenge",async t=>{
+  const {base}=await fixture(t, (req,res)=>{
+    res.writeHead(401,{"www-authenticate":
+      'Bearer error="invalid_token", error_description="Invalid token", scope="quaymesh", resource_metadata="http://127.0.0.1:17676/.well-known/oauth-protected-resource/mcp"'}).end();
+  });
+  const challenge=await fetch(base+"/mcp",{method:"HEAD"});
+  assert.equal(challenge.status,401);
+  assert.doesNotMatch(challenge.headers.get("www-authenticate"),/invalid_token/);
+  const invalid=await fetch(base+"/mcp",{method:"HEAD",headers:{Authorization:"Bearer invalid"}});
+  assert.equal(invalid.status,401);
+  const failedHeader=invalid.headers.get("www-authenticate");
+  assert.match(failedHeader,/error="invalid_token"/);
+  assert.match(failedHeader,/https:\/\/139-196-215-153\.sslip\.io\/\.well-known/);
 });
 
 test("公网严禁 console、internal、以及不在白名单中的 RPC 路径", async t => {
