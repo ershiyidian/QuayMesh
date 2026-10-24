@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { databasePath, openDatabase } from "./db/client.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
-import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
+import { createRegisteredOAuthClient, SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
 
 const root = await mkdtemp(join(tmpdir(), "quaymesh-oauth-test-"));
 const oauthConfig = {
@@ -20,6 +20,25 @@ const oauthConfig = {
 const mcpUrl = new URL("https://agent.example.com/mcp");
 const tunnelUrl = new URL(oauthConfig.allowedResourceUrls[0]!);
 const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
+
+const geminiCallbacks = [
+  "https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-home",
+  ...[1,2,3,4,5].map(i=>`https://oauth-redirect${i}.googleusercontent.com/r/user_bound_custom-mcp-home`),
+];
+assert.equal(createRegisteredOAuthClient(
+  {redirect_uris:geminiCallbacks},
+  ["chatgpt.com","oauth-redirect.googleusercontent.com"],
+).redirect_uris.length,6);
+for (const uri of [
+  "https://malicious.googleusercontent.com/r/user_bound_custom-mcp-home",
+  "https://oauth-redirect1.googleusercontent.com/r/other-product",
+  "http://oauth-redirect1.googleusercontent.com/r/user_bound_custom-mcp-home",
+]) {
+  assert.throws(()=>createRegisteredOAuthClient(
+    {redirect_uris:[uri]},
+    ["chatgpt.com","oauth-redirect.googleusercontent.com"],
+  ));
+}
 
 try {
   await testDatabaseConfiguration(join(root, "database-configuration"));
@@ -49,6 +68,11 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       {version:2,name:"quaymesh-runtime-ownership"},
       {version:3,name:"quaymesh-durable-results"},
       {version:4,name:"quaymesh-task-lifecycle"},
+      {version:5,name:"quaymesh-execution-observation"},
+      {version:6,name:"quaymesh-invocation-attempts"},
+      {version:7,name:"quaymesh-console-audit"},
+      {version:8,name:"quaymesh-execution-owner"},
+      {version:9,name:"quaymesh-execution-quiescence"},
     ]);
   } finally {
     database.close();

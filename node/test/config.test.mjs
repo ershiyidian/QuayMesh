@@ -53,7 +53,8 @@ test("Gemini 公网 MCP 资源可在保留 ChatGPT 旧 URL 的同时添加 OAuth
   const compiled=compileCore(n,c,{root,tokenFile:join(root,'token'),ownerToken:token(),
     membershipFile:join(root,'membership'),statusFile:join(root,'status')});
   assert.deepEqual(compiled.runtime.oauth.resourceAliases,[
-    "https://openai.example.com/mcp","https://139-196-215-153.sslip.io/mcp"]);
+    "https://openai.example.com/mcp","https://139-196-215-153.sslip.io/mcp",
+    "https://139-196-215-153.sslip.io"]);
   assert.ok(compiled.runtime.oauth.allowedRedirectHosts.includes("chatgpt.com"));
   assert.ok(compiled.runtime.oauth.allowedRedirectHosts.includes("oauth-redirect.googleusercontent.com"));
   assert.ok(compiled.runtime.server.allowedHosts.includes("139-196-215-153.sslip.io"));

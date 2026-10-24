@@ -35,8 +35,11 @@ function metadata(base, pathname) {
     scopes_supported: ["quaymesh"],
   };
   return {
-    resource: base + "/mcp",
+    // Gemini Web 经实测读取本元数据后中止；兼容已成功连接的
+    // Coding Tools MCP 所用的同源资源标识，内部仍提供 /mcp。
+    resource: base,
     authorization_servers: [base],
+    bearer_methods_supported: ["header"],
     scopes_supported: ["quaymesh"],
     resource_name: "QuayMesh",
   };
@@ -146,11 +149,11 @@ export function createPublicMcpIngress({
         .filter(([name]) => !HOP_HEADERS.has(name.toLowerCase())));
       if (status === 401 && MCP_PATHS.has(pathname)) {
         const original = String(replyHeaders["www-authenticate"] ?? 'Bearer error="invalid_token"');
-        const marker = 'resource_metadata="' + base + '/.well-known/oauth-protected-resource/mcp"';
+        const marker = 'resource_metadata="' + base + '/.well-known/oauth-protected-resource"';
         // RFC 6750 §3.1: unauthenticated discovery has no invalid_token error.
         // Invalid supplied bearer tokens retain the original authentication error.
         replyHeaders["www-authenticate"] = req.headers.authorization === undefined
-          ? 'Bearer scope="quaymesh", ' + marker
+          ? 'Bearer realm="QuayMesh", scope="quaymesh", ' + marker
           : original.includes("resource_metadata=")
             ? original.replace(/resource_metadata="[^"]*"/u, marker)
             : original + ", " + marker;

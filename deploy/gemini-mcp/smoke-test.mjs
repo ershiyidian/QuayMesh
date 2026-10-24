@@ -3,7 +3,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
 const base = "https://139-196-215-153.sslip.io";
-const resource = base + "/mcp";
+const resource = base;
+const endpoint = base + "/mcp";
 const callback = "https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-quaymesh-smoke";
 const ownerFile = "/home/quaymesh/.local/state/quaymesh-coordinator/owner.json";
 const owner = JSON.parse(await readFile(ownerFile, "utf8")).token;
@@ -28,12 +29,17 @@ const metadata = await metadataResponse.json();
 assert.equal(metadata.issuer, base);
 assert.equal(metadata.registration_endpoint, base + "/register");
 assert.deepEqual(metadata.code_challenge_methods_supported, ["S256"]);
+const protectedResource = await (await fetch(base+"/.well-known/oauth-protected-resource")).json();
+assert.equal(protectedResource.resource, resource);
+assert.deepEqual(protectedResource.bearer_methods_supported,["header"]);
 console.log("Trusted HTTPS metadata and PKCE: PASS");
 
 const registerResponse = await fetch(base + "/register", {
   method: "POST", headers: { "content-type": "application/json" },
   body: JSON.stringify({ client_name: "QuayMesh Gemini compatibility smoke",
-    redirect_uris: [callback], response_types: ["code"],
+    redirect_uris: [callback,...[1,2,3,4,5].map(n=>
+      `https://oauth-redirect${n}.googleusercontent.com/r/user_bound_custom-mcp-quaymesh-smoke`)],
+    response_types: ["code"],
     grant_types: ["authorization_code", "refresh_token"], token_endpoint_auth_method: "none" }),
 });
 assertResponse(registerResponse, 201, "Dynamic client registration");
@@ -76,7 +82,7 @@ assert.ok(token.access_token && token.refresh_token);
 console.log("PKCE authorization-code exchange: PASS");
 
 async function mcp(method, paramsValue, id) {
-  const response = await fetch(resource, {
+  const response = await fetch(endpoint, {
     method: "POST",
     headers: {
       "authorization": "Bearer " + token.access_token,

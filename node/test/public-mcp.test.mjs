@@ -24,7 +24,8 @@ test("公网元数据完整采用 HTTPS 原点，内部 loopback 地址从不泄
   assert.equal(resource.status, 200);
   assert.deepEqual((await resource.json()).authorization_servers, ["https://139-196-215-153.sslip.io"]);
   const root = await (await fetch(base+"/.well-known/oauth-protected-resource")).json();
-  assert.equal(root.resource, "https://139-196-215-153.sslip.io/mcp");
+  assert.equal(root.resource, "https://139-196-215-153.sslip.io");
+  assert.deepEqual(root.bearer_methods_supported,["header"]);
   const meta = await (await fetch(base+"/.well-known/oauth-authorization-server")).json();
   assert.equal(meta.issuer,"https://139-196-215-153.sslip.io");
   assert.equal(meta.registration_endpoint,"https://139-196-215-153.sslip.io/register");
@@ -70,7 +71,9 @@ test("MCP 401 保留真实认证失败，同时把 resource_metadata 指向公�
   const res = await fetch(base+"/mcp",{method:"POST",headers:{"content-type":"application/json"},body:"{}"});
   assert.equal(res.status,401);
   const header=res.headers.get("www-authenticate");
-  assert.match(header,/https:\/\/139-196-215-153\.sslip\.io\/\.well-known\/oauth-protected-resource\/mcp/);
+  assert.match(header,/https:\/\/139-196-215-153\.sslip\.io\/\.well-known\/oauth-protected-resource/);
+  assert.doesNotMatch(header,/oauth-protected-resource\/mcp/);
+  assert.match(header,/realm="QuayMesh"/);
   assert.doesNotMatch(header,/127\.0\.0\.1/);
   assert.doesNotMatch(header,/invalid_token|error_description/);
 });

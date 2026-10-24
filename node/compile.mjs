@@ -33,7 +33,11 @@ export function compileCore(node, cluster, { root, tokenFile, ownerToken, member
   const publicOrigin = hostUrl("127.0.0.1", cluster.discovery.localPort);
   const coordinatorEndpoint = hostUrl(coordinator.address, coordinator.peerPort);
   const proxyUrl = node.network.proxyUrl || "http://127.0.0.1:7890";
-  const aliases = [...new Set([cluster.discovery.resourceUrl,node.publicMcp?.url].filter(Boolean))];
+  const aliases = [...new Set([
+    cluster.discovery.resourceUrl,
+    node.publicMcp?.url,
+    node.publicMcp?.url ? new URL(node.publicMcp.url).origin : undefined,
+  ].filter(Boolean))];
   const providers = caps.worker && node.network.externalAccess
     ? (node.core.subagents || { enabled:true, instructions:"on-demand", providers:[{ id:"codex", enabled:true }] })
     : { enabled:false, instructions:"on-demand", providers:[] };
