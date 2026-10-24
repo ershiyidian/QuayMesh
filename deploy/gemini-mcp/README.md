@@ -60,6 +60,52 @@ Google redirect is allowlisted by exact hostname. Existing ChatGPT resource
 aliases remain authorized. Keep the Caddy/Gemini Node service on Home;
 never make Alibaba Cloud initiate a Google or Let's Encrypt request.
 
+## Stable free Gemini endpoint
+
+Tailscale Funnel now provides a fixed HTTPS host:
+`https://quaymesh-mcp-home.tail2e51e6.ts.net/mcp`.
+On the Home Gateway it runs in an isolated userspace `tailscaled` service
+using a separate state and socket, so it cannot alter EasyTier routes.
+The public Funnel points only to the loopback Gemini adapter on port 29177.
+The original `sslip.io` adapter stays on port 29176 with its own config.
+
+The Coordinator config supports `publicMcp.legacyUrls`, keeping the previous
+public OAuth resources and ChatGPT tunnel alias when changing the primary
+resource to `ts.net`. `home-tsnet-upgrade.sh` validates the dual resources,
+uses an already-verified online SQLite backup, switches the Home Coordinator
+in an independent service, and restores the old unit/config on failure.
+The production Funnel is pinned to Tailscale 1.102.4 after an upstream
+1.104.2 TLS-handshake regression was reproduced; avoid switching client
+versions without an external HTTPS test.
+
+The userspace `tailscaled` systemd service must pass both its private
+`--state` file and explicit `--statedir` directory. Omitting
+`--statedir` caused `no TailscaleVarRoot` and prevented automatic
+certificate issuance. The service does not enable TUN, DNS changes, route
+acceptance, or an exit node. Keep the separate state directory private and
+preserve it across upgrades or restarts.
+
+### Verified migration, 2026-10-24
+
+- Funnel serves HTTPS 443 from the fixed `ts.net` address to
+  `127.0.0.1:29177` on the Home Gateway.
+- The original `sslip.io` adapter uses a separate immutable node-config
+  copy to keep its issuer unchanged after Coordinator configuration updates.
+- Home Coordinator release `190b01bad9f31de02a97af6ec514295638caf9f6`
+  includes the new primary ts.net OAuth resource, the old sslip.io root
+  and /mcp resources, and the original OpenAI discovery alias.
+- `home-tsnet-upgrade.sh` used a verified SQLite online backup,
+  performed a controlled Coordinator restart and completed with
+  `TSNET_COORDINATOR_UPGRADE_OK`.
+- Desktop, outside the Home Tailscale daemon, received HTTP 200 for
+  OAuth metadata and HTTP 401 for anonymous MCP over valid HTTPS.
+- `smoke-test-tsnet.mjs` ran via the existing Home HTTPS proxy with
+  `NODE_USE_ENV_PROXY=1`, passing DCR, six Google callback URIs,
+  Owner consent, long OAuth state, PKCE issuance, MCP initialization,
+  discovery of 32 tools and a real read-only workspace call. Disposable
+  test tokens were revoked and the test-client registration was removed.
+- Actual Gemini Web account-side connection still requires verification.
+
 Check `https://139-196-215-153.sslip.io/.well-known/oauth-authorization-server`
 and `/mcp` from outside the cluster, then choose Add custom app in
 Gemini Connected Apps, paste the URL, leave Client ID/secret empty, and
