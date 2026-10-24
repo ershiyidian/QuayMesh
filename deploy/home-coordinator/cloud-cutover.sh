@@ -7,6 +7,8 @@ remote=rsync://10.144.144.3:18730/coordinator-data
 mkdir -p "$root"
 exec >> "$root/cutover.log" 2>&1
 echo "$(date -u +%FT%TZ) Starting QuayMesh state cutover"
+echo 'Allowing the deployment command receipt to return before stopping its Coordinator connection'
+sleep 8
 
 old_stopped=false
 committed=false
