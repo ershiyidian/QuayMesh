@@ -117,6 +117,21 @@ test("Gemini OAuth POST 的 Google 回调使用安全页面导航，普通回调
   assert.doesNotMatch(html,/<script/);
 });
 
+test("Gemini 1112 字符的 state 在授权页面与回调之间完整保留",async t=>{
+  const state="s".repeat(1112);
+  const {base}=await fixture(t,(_req,res)=>{
+    res.writeHead(302,{Location:"https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-test?code=abc&state="+state});
+    res.end();
+  });
+  const response=await fetch(base+"/authorize",{method:"POST",body:"owner_token=x",redirect:"manual"});
+  assert.equal(response.status,200);
+  const html=await response.text();
+  const link=html.match(/<a rel="noreferrer" href="([^"]+)"/)?.[1];
+  assert.ok(link);
+  const decoded=new URL(link.replaceAll("&amp;","&"));
+  assert.equal(decoded.searchParams.get("state"),state);
+});
+
 test("公网不转发客户端 Cookie，也不转发无关头部",async t=>{
   const {base}=await fixture(t,(req,res)=>{
     assert.equal(req.headers.cookie,undefined);
