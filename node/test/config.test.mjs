@@ -27,6 +27,22 @@ test("同一配置模型支持云端和组合能力，云端禁用外网组件",
   assert.throws(()=>validateNode({...cloud,capabilities:{coordinator:true,discovery:true}},c,root),/关闭外网/);
 });
 
+test("Coordinator 支持在中继后使用独立的本机端口，同时保留集群公布的入口",async t=>{
+  const root=await directory(t);const c=cluster();
+  const node=validateNode({schemaVersion:1,id:c.coordinator.id,stateDir:root,
+    capabilities:{coordinator:true},network:{externalAccess:false},
+    mesh:{enabled:false,address:c.coordinator.address},
+    corePort:27676,peerPort:27680,registryPort:27681,adminPort:27677},c,root);
+  assert.equal(node.registryPort,27681);
+  const compiled=compileCore(node,c,{root,tokenFile:join(root,'token'),ownerToken:token(),
+    membershipFile:join(root,'membership'),statusFile:join(root,'status')});
+  assert.equal(compiled.runtime.server.port,27676);
+  assert.equal(compiled.runtime.federation.port,27680);
+  assert.equal(compiled.runtime.federation.peers.length,0);
+  assert.throws(()=>validateNode({...node,registryPort:node.corePort},c,root),/端口发生冲突/);
+  assert.throws(()=>validateNode({...node,id:'worker',capabilities:{worker:true},registryPort:27681},c,root),/Coordinator/);
+});
+
 test("三个发现端使用同一 HTTP origin 和通道，保留独立工作区",async t=>{
   const root=await directory(t);
   const c=cluster({discovery:{resourceUrl:"https://example.invalid/mcp"}});

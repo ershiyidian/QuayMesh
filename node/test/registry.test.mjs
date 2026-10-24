@@ -6,7 +6,7 @@ import { readFile } from "node:fs/promises";
 import { RegistryServer } from "../registry.mjs";
 import { MembershipClient } from "../membership.mjs";
 import { requestJson } from "../network.mjs";
-import { validateCluster } from "../config.mjs";
+import { validateCluster, validateNode } from "../config.mjs";
 import { cluster, directory, token, nodeConfig, until, freePort } from "./helpers.mjs";
 
 test("真实节点注册、配置发布、冲突检测和重启恢复",async t=>{
@@ -48,6 +48,21 @@ test("真实 MembershipClient 持久化目录与公共配置，断线保留已�
   await registry.close();
   await until(()=>client.state,state=>!state.connected);
   assert.equal(JSON.parse(await readFile(join(n.stateDir,"membership.json"),"utf8")).nodes[0].id,"edge");
+});
+
+test("中继后的 Coordinator 在目录中公布公网监听端口，不暴露本机端口",async t=>{
+  const root=await directory(t),secret=token(),port=await freePort();
+  const c=validateCluster({...cluster(),coordinator:{...cluster().coordinator,apiPort:port}});
+  const registry=await new RegistryServer({cluster:c,token:secret,stateDir:join(root,'registry'),host:'127.0.0.1'}).start();
+  const cloud=validateNode({schemaVersion:1,id:c.coordinator.id,stateDir:join(root,'cloud'),
+    capabilities:{coordinator:true},mesh:{enabled:false,address:c.coordinator.address},
+    network:{externalAccess:false},peerPort:27680,corePort:27676,registryPort:27681,adminPort:27677},c,root);
+  const client=await new MembershipClient({node:cloud,cluster:c,token:secret,release:'test',intervalMs:500}).start();
+  try {
+    await until(()=>client.state,state=>state.connected);
+    const reply=await requestJson(`http://127.0.0.1:${port}/v1/membership`,{token:secret});
+    assert.equal(reply.nodes.find(node=>node.id===c.coordinator.id).peerPort,c.coordinator.peerPort);
+  } finally {await client.close();await registry.close();}
 });
 
 test("目录 SSE 发出实际注册变更，并可从当前目录重新连接",async t=>{

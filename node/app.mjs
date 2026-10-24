@@ -159,7 +159,8 @@ export class QuayMeshNode {
       if (client) this.discovery = {ready:client.state === "ready",lastSuccessAt:client.lastReadyAt,lastError:client.error};
     });
     try {
-      if (node.capabilities.coordinator) this.registry = await new RegistryServer({cluster,token:this.token,stateDir:join(node.stateDir,"coordinator")}).start();
+      if (node.capabilities.coordinator) this.registry = await new RegistryServer({cluster,token:this.token,
+        stateDir:join(node.stateDir,"coordinator"),port:node.registryPort ?? cluster.coordinator.apiPort}).start();
       this.relay = await this.createRelay(this.config);
       if(this.installationTransition)this.relay?.setAccepting(false);
       await this.startAdmin();

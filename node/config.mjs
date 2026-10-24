@@ -137,7 +137,7 @@ export function validateCluster(input) {
 export function validateNode(input, cluster, directory = process.cwd()) {
   const value = structuredClone(input);
   keys(value, ["schemaVersion","id","nickname","settingsRevision","consoleSettings","clusterFile","secretsFile","stateDir","capabilities","network","mesh",
-    "components","roots","core","adminPort","peerPort","corePort","nodeRuntime"], "node");
+    "components","roots","core","adminPort","peerPort","corePort","registryPort","nodeRuntime"], "node");
   check(value.schemaVersion === 1, "node.schemaVersion 必须是 1");
   identifier(value.id, "node.id");
   value.nickname ??= value.id;
@@ -195,6 +195,10 @@ export function validateNode(input, cluster, directory = process.cwd()) {
   port(value.mesh.socksPort, "mesh.socksPort");
   value.corePort ??= value.capabilities.coordinator ? cluster.coordinator.mcpPort : DEFAULT_PORTS.core;
   value.peerPort ??= value.capabilities.coordinator ? cluster.coordinator.peerPort : DEFAULT_PORTS.peer;
+  if (value.registryPort !== undefined) {
+    check(value.capabilities.coordinator, "只有 Coordinator 可以指定 registryPort");
+    port(value.registryPort, "registryPort");
+  }
   value.adminPort ??= DEFAULT_PORTS.admin;
   for (const field of ["corePort","peerPort","adminPort"]) port(value[field], field);
   value.stateDir = expandPath(value.stateDir || defaultStateDir(), directory);
@@ -236,7 +240,7 @@ export function validateNode(input, cluster, directory = process.cwd()) {
   if (value.nodeRuntime) value.nodeRuntime = expandPath(value.nodeRuntime, directory);
   if (value.capabilities.discovery) check(!!cluster.discovery.resourceUrl, "discovery 需要配置 tunnel 的 resourceUrl");
   const ports = [value.corePort,value.peerPort,value.adminPort];
-  if (value.capabilities.coordinator) ports.push(cluster.coordinator.apiPort);
+  if (value.capabilities.coordinator) ports.push(value.registryPort ?? cluster.coordinator.apiPort);
   if (value.capabilities.discovery || value.capabilities.desktopUi || value.capabilities.consoleRelay) ports.push(cluster.discovery.localPort);
   if (value.capabilities.discovery) ports.push(cluster.discovery.healthPort);
   if (value.mesh.enabled) ports.push(value.mesh.rpcPort);

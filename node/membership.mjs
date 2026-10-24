@@ -32,7 +32,10 @@ export class MembershipClient {
       const result = await requestJson(new URL("/v1/heartbeat", this.url), {
         method: "POST", token: this.token, agent: this.agent, signal: controller.signal, timeoutMs: 6000,
         body: { id: this.node.id, instanceId: this.identity.instanceId, nickname: this.node.nickname,
-          address: this.node.mesh.address, peerPort: this.node.peerPort, capabilities: this.node.capabilities,
+          address: this.node.mesh.address,
+          // Coordinator 可部署在公网中继后面，目录必须公布稳定入口而不是本机监听端口。
+          peerPort: this.node.capabilities.coordinator ? this.cluster.coordinator.peerPort : this.node.peerPort,
+          capabilities: this.node.capabilities,
           release: this.release, startedAt: this.startedAt, ...this.status() },
       });
       check(result.clusterId === this.cluster.id, "收到其他集群的节点目录");
