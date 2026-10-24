@@ -67,3 +67,10 @@ service before removing old binaries, databases, caches and backup histories.
 Only the EasyTier service, TCP forwarders and essential operating system
 files remain on Cloud. No ongoing synchronization from Cloud to Home is
 required.
+
+The post-migration legacy cleanup also removed inactive TaskQuay binaries,
+outdated QuayMesh distribution caches and Cloud-local historical archives,
+using `cloud-prune-legacy-staging.sh`. Both cleanup scripts require a healthy
+Home-backed Core and Registry through the Cloud forwarders before deleting
+anything. The Cloud root filesystem measured 9% usage with approximately
+36 GB free after the cleanup.
