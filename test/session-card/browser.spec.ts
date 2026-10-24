@@ -86,11 +86,12 @@ test("disconnect error, reconnect and teardown keep the background operation",as
   await page.getByRole("button",{name:"Disconnect MCP"}).click();
   await expect.poll(async()=>(await(await page.request.get("/api/state")).json()).connected,POLL).toBe(false);
   await frame.locator("#toggle").click();await frame.locator("#toggle").click();
-  await expect(frame.locator("#prog")).toContainText("状态更新暂不可用",POLL);
+  await expect(frame.locator("#prog")).toContainText("更新延迟",POLL);
+  await expect(frame.locator("#prog")).toContainText("上次确认",POLL);
   await page.getByRole("button",{name:"Reconnect MCP"}).click();
   await expect.poll(async()=>(await(await page.request.get("/api/state")).json()).connected,POLL).toBe(true);
   await frame.locator("#toggle").click();await frame.locator("#toggle").click();
-  await expect(frame.locator("#prog")).not.toContainText("状态更新暂不可用",POLL);
+  await expect(frame.locator("#prog")).not.toContainText("更新延迟",POLL);
   const marker="teardown-"+Date.now()+".txt";
   const started=await page.evaluate(command=>window.__quaymeshHost.runCommand(command,1500),process.platform==="win32"?`cmd /c "ping -n 4 127.0.0.1 > nul & echo done > ${marker}"`:`sleep 3; printf done > ${marker}`);
   expect(started.isError,JSON.stringify(started)).not.toBe(true);

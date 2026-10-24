@@ -149,6 +149,8 @@ export const executionObservationSchema = z.object({
   activeOperationIds: z.array(z.string().min(1).max(256)).max(4096),
   preparingOperationIds: z.array(z.string().min(1).max(256)).max(4096),
   staleOperationIds: z.array(z.string().min(1).max(256)).max(4096),
+  operationObservedAt: z.record(z.string().min(1).max(256), z.number().finite().nonnegative()).optional(),
+  stale: z.boolean().optional(),
 }).strict();
 
 export const snapshotLiveStateSchema = z.object({

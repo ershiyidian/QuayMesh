@@ -15,7 +15,7 @@ import "prismjs/components/prism-python.js";
 import { createApi, ApiError } from "./client.js";
 import { cacheRatio, noncachedInput, usageParts } from "./usage.js";
 import { CommandOutputs } from "./command-output.js";
-import { sourceWarning, resourceHealth } from './source-state.js';
+import { sourceWarning, sourceWarnings, resourceHealth } from './source-state.js';
 import { readFields, fieldsFromHTML, refreshFields, type FieldValues } from './settings-form.js';
 import { EventNotifications, type NotificationMemory, type NotificationPage } from './notifications.js';
 import { receiptLabel, canQueryReceipt } from './receipt-presentation.js';
@@ -262,9 +262,8 @@ function resourceState(path: string) { const e = CACHE.get(path); if (e?.data)
     return `<div class="panel">${empty('读取失败', e.error.message, btn('重试', 'retry', `data-path="${esc(path)}"`))}</div>`; return `<div class="panel loading" aria-busy="true" aria-label="正在读取数据"><p><span class="spinner"></span> 正在读取${esc(resourceName(path))}…</p><div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div><p class="small muted">${e?.startedAt ? "开始于 " + esc(fullTime(e.startedAt)) : "等待数据返回"}</p></div>`; }
 function staleNotice(path: string, captures?: RunDetail['changeCaptures']) {
   const entry = CACHE.get(path);
-  const sources = (entry?.data as { sources?: SourceState[] } | null)?.sources?.filter(source => sourceWarning(source)) || [];
   const warnings = dedupeCaptureWarnings((entry?.data as { warnings?: string[] } | null)?.warnings || [], captures);
-  const messages = [entry?.error?.message, ...sources.map(source => (source.name || source.nodeId) + '：' + sourceWarning(source) + (source.observedAt ? ' · 最后确认 ' + fullTime(source.observedAt) : '')), ...warnings].filter(Boolean);
+  const messages = warnings.filter(Boolean);
   if (!messages.length) return '';
   return '<div class="notice warn visually-spaced">' + icon('alert') + '<div>' + messages.map(esc).join('<br>') + '</div>' + btn('重试', 'retry', 'data-path="' + esc(path) + '"', 'small') + '</div>';
 }
@@ -290,23 +289,28 @@ function pagination(d: RunPage | ActivityPage<unknown>) {
 const deviceTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 function chrome() {
     const ov = overview(), f = fleet(), health = resourceHealth([...activePaths].map(p => CACHE.get(p)));
+    const connectionLabel = health.errors || health.stale ? (health.confirmedAt ? '上次读取 ' + tm(health.confirmedAt) : '等待数据') : health.label;
     const nav = NAV.map(([v, t, i], index) => `${index === 4 ? '<div class="nav-label">基础设施</div>' : ''}${index === 8 ? '<div class="nav-divider"></div>' : ''}<button type="button" class="nav-item ${route.view === v ? 'active' : ''}" data-action="nav" data-view="${v}" ${route.view === v ? 'aria-current="page"' : ''} title="${t}">${icon(i, 16)}<span class="label">${t}</span>${v === 'tasks' && ov?.runningCount ? `<span class="nav-count" title="${ov.runningCount} 项运行中">${ov.runningCount}</span>` : ''}</button>`).join('');
     updateHTML($('#sidebar'), `<div class="brand">${brand()}<span class="brand-text">QuayMesh</span>${ib('panel', 'sidebar', '折叠侧栏')}</div><div class="nav-label">工作台</div><nav aria-label="主导航">${nav}</nav><div class="sidebar-bottom"><button class="nav-item" data-action="palette" title="搜索与命令">${icon('terminal')}<span class="label">命令面板</span><kbd class="nav-count">${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'} K</kbd></button><div class="profile"><span class="avatar">W</span><div class="profile-text"><b>${esc(API.session?.user?.name || 'Owner')}</b><small>${canWrite() ? '管理员' : '只读'}</small></div>${ib('settings', 'nav', '设置', 'data-view="settings"')}</div></div>`);
     updateHTML($('#topbar'), `<button class="collapsed-toggle icon-btn" data-action="sidebar" aria-label="展开侧栏">${icon('panel')}</button><div class="breadcrumb"><span class="workspace-label">个人工作区</span><span class="slash">/</span><b>${esc(titleOf(route.view))}</b></div><button class="top-search" data-action="palette" aria-label="搜索与命令面板">${icon('search', 14)}<span>搜索任务或命令</span><kbd>${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'} K</kbd></button><button class="demo-tag" data-action="diagnostics">诊断</button>${desktopActions()}${ib('refresh', 'refresh', refreshInFlight ? '重新发起当前页面读取' : '刷新当前页面')}${ib(document.documentElement.dataset.theme === 'dark' ? 'sun' : 'moon', 'theme', '切换主题', '', 'theme-top')}`);
     updateHTML($('#global-notice'), failureSummary());
-    updateHTML($('#statusbar'), `<span class="inline ${booting || authRequired || bootstrapError ? 'muted' : health.tone}" title="${esc(health.confirmedAt ? '本页最近确认：' + fullTime(health.confirmedAt) : '尚无已确认数据')}"><i class="dot"></i>${booting ? '连接中' : authRequired ? '请登录' : bootstrapError ? '未连接' : health.label}</span><button data-action="nav" data-view="machines">${f ? f.nodes.filter(n => n.online).length + '/' + f.nodes.length + ' 节点在线' : '读取节点'}</button><span>出网 ${esc(node(f?.gatewayId)?.short || '—')}</span><span class="spacer"></span><span>${document.hidden || backgroundPaused ? '已暂停' : pref.poll ? pref.poll + ' 秒检查更新' : '手动刷新'}</span><span>${timeZone() || deviceTimeZone}</span><button data-action="shortcuts">快捷键</button>`);
+    updateHTML($('#statusbar'), `<span class="inline ${booting || authRequired || bootstrapError || health.errors || health.stale ? 'muted' : health.tone}" title="${esc(health.confirmedAt ? '本页最近确认：' + fullTime(health.confirmedAt) : '尚无已确认数据')}"><i class="dot"></i>${booting ? '连接中' : authRequired ? '请登录' : bootstrapError ? '未连接' : connectionLabel}</span><button data-action="nav" data-view="machines">${f ? f.nodes.filter(n => n.online).length + '/' + f.nodes.length + ' 节点在线' : '读取节点'}</button><span>出网 ${esc(node(f?.gatewayId)?.short || '—')}</span><span class="spacer"></span><span>${document.hidden || backgroundPaused ? '已暂停' : pref.poll ? pref.poll + ' 秒检查更新' : '手动刷新'}</span><span>${timeZone() || deviceTimeZone}</span><button data-action="shortcuts">快捷键</button>`);
     updateHTML($('#bottom-nav'), [['overview', '总览', 'overview'], ['tasks', '任务', 'tasks'], ['sessions', '会话', 'sessions'], ['machines', '机器', 'machines'], ['more', '更多', 'more']].map(([v, t, i]) => `<button class="${v === route.view || v === 'more' && !['overview', 'tasks', 'sessions', 'machines'].includes(route.view) ? 'active' : ''}" data-action="${v === 'more' ? 'more' : 'nav'}" data-view="${v}" aria-label="${t}">${icon(i, 19)}<span>${t}</span></button>`).join(''));
 }
 function failureSummary() {
   if (authRequired) return '<div class="notice global-notice warn">' + icon('lock', 14) + '登录已过期</div>';
-  const failed = [...activePaths].filter(path => CACHE.get(path)?.error);
-  const sources = new Map();
-  for (const path of activePaths) for (const source of data<{ sources?: SourceState[] }>(path)?.sources || []) if (sourceWarning(source)) sources.set(source.nodeId, source);
-  const notices = [];
+  const failed = [...activePaths].filter(path => CACHE.get(path)?.error && CACHE.get(path)?.data);
+  const sources = sourceWarnings([...activePaths].map(path => CACHE.get(path)));
+  const notices: string[] = [], details: string[] = [];
   if (failed.length) notices.push(failed.length + ' 项读取失败');
-  if (sources.size) notices.push([...sources.values()].map(source => source.name || source.nodeId).join('、') + '数据未更新，统计仅包含已读取记录');
-  if (pref.notifications && notificationGaps.size) notices.push([...notificationGaps].map(([id,message]) => (node(id)?.name || id) + '：' + message).join('；'));
-  return notices.length ? '<div class="notice global-notice warn">' + icon('alert', 14) + '<span>' + esc(notices.join(' · ')) + '</span>' + btn('重试', 'refresh', '', 'small') + '</div>' : '';
+  details.push(...failed.map(path => resourceName(path) + '：' + CACHE.get(path)!.error!.message));
+  if (sources.length) notices.push(sources.length + ' 个节点的数据更新延迟');
+  details.push(...sources.map(source => (source.name || source.nodeId) + '：' + sourceWarning(source) + (source.observedAt ? ' · 上次确认 ' + fullTime(source.observedAt) : '')));
+  if (pref.notifications && notificationGaps.size) {
+    notices.push('活动通知待更新');
+    details.push(...[...notificationGaps].map(([id,message]) => (node(id)?.name || id) + '：' + message));
+  }
+  return notices.length ? '<div class="notice global-notice warn">' + icon('alert', 14) + '<details><summary>' + esc(notices.join(' · ')) + '</summary><div class="source-details">' + [...new Set(details)].map(esc).join('<br>') + '</div></details>' + btn('重试', 'refresh', '', 'small') + '</div>' : '';
 }
 let bootstrapError:ConsoleError|null=null;
 let bootstrapRetryTimer:ReturnType<typeof setTimeout>|undefined;

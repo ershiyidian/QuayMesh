@@ -18,6 +18,8 @@ export interface CardPresentation {
   executionActivityAgeMs: number | null;
   activityAgeMs: number;
   outputAgeMs: number | null;
+  observationStale: boolean;
+  confirmedAt: number;
   taskClockDynamic: boolean;
   commandClockDynamic: boolean;
 }
@@ -64,7 +66,7 @@ function executionView(snapshot: Snapshot, now: number, silenceWarningMs = DEFAU
     queued: observation.preparingOperationIds.length > 0, finalizing: finalizationPending(snapshot),
     finalizationFailed: snapshot.finalization?.state === 'failed',
     unresolved: observation.staleOperationIds.length > 0,
-    stale: snapshot.host_status === "disconnected" && (!snapshot.executionObservation || !(observation.activeOperationIds.length || observation.preparingOperationIds.length)),
+    stale: observation.stale || snapshot.host_status === "disconnected" && (!snapshot.executionObservation || !(observation.activeOperationIds.length || observation.preparingOperationIds.length)),
     lastProgressAt: lastProgressAt(snapshot),
     now: now + (TASK_SILENCE_MS - silenceWarningMs)});
 }
@@ -73,11 +75,7 @@ export function taskElapsedMs(snapshot: Snapshot, now: number): number | null {
   const end = deliveryEnd(snapshot);
   if (end !== null) return nonNegative(end - snapshot.startedAt);
   if (snapshot.taskState === 'closed' || snapshot.closureReason === "superseded" || snapshot.closureReason === "legacy_archive") return null;
-  if (executionView(snapshot, now).clockRunning) return nonNegative(now - snapshot.startedAt);
-  const observed = snapshot.executionObservation;
-  const previouslyActive = observed && (observed.activeOperationIds.length > 0 || observed.preparingOperationIds.length > 0);
-  const recordedEnd = previouslyActive ? Math.max(lastProgressAt(snapshot), observed.observedAt) : lastProgressAt(snapshot);
-  return nonNegative(Math.min(now, recordedEnd) - snapshot.startedAt);
+  return nonNegative(now - snapshot.startedAt);
 }
 
 export function commandElapsedMs(command: CommandSummary | null | undefined, now: number): number | null {
@@ -93,8 +91,9 @@ export function commandTiming(snapshot: Snapshot, command: CommandSummary | null
   const dynamic = (Boolean(snapshot.executionObservation) || snapshot.host_status !== 'disconnected') && observation.activeOperationIds.includes(command.operation_id);
   if (dynamic) return {elapsedMs: commandElapsedMs(command, now), dynamic: true, confirmed: true};
   const original = snapshot.executionObservation;
-  const confirmedAt = original?.activeOperationIds.includes(command.operation_id) ? original.observedAt
-    : !original && command.status === 'run' ? snapshot.observedAt : null;
+  const confirmedAt = original?.operationObservedAt?.[command.operation_id]
+    ?? (original?.activeOperationIds.includes(command.operation_id) ? original.observedAt
+      : !original && command.status === 'run' ? snapshot.observedAt : null);
   return {elapsedMs: confirmedAt === null ? null : nonNegative(Math.min(now, confirmedAt) - command.startedAt), dynamic: false, confirmed: false};
 }
 
@@ -107,12 +106,13 @@ export function cardPresentation(snapshot: Snapshot, now: number, silenceWarning
   const shared = executionView(snapshot, now, silenceWarningMs);
   const modelAt = modelActivityAt(snapshot);
   const executionAt = snapshot.lastExecutionActivityAt ?? snapshot.lastOperation?.endedAt ?? snapshot.lastOperation?.startedAt ?? null;
+  const observationStale = Boolean(observation.stale) && snapshot.taskState !== 'closed';
   const backgroundStatus: BackgroundStatus = shared.backgroundActive
     ? observation.activeOperationIds.length ? 'running' : 'queued'
-    : observation.staleOperationIds.length ? 'unconfirmed' : 'idle';
+    : observation.staleOperationIds.length || observationStale ? 'unconfirmed' : 'idle';
   const backgroundLabel = backgroundStatus === 'running' ? `后台仍在执行${observation.staleOperationIds.length?' · 另有命令结果待核对':''}`
     : backgroundStatus === 'queued' ? `后台正在准备${observation.staleOperationIds.length?' · 另有命令结果待核对':''}`
-    : backgroundStatus === 'unconfirmed' ? '后台命令结果待核对' : null;
+    : backgroundStatus === 'unconfirmed' ? observation.staleOperationIds.length ? '后台命令结果待核对' : '后台状态待更新' : null;
   let status: CardStatus, label: string;
   // 本轮交付和后台命令各有自己的状态，失联回执不改写已保存的交付结果。
   const delivery = taskDelivery(snapshot.taskState, snapshot.taskResult);
@@ -123,7 +123,7 @@ export function cardPresentation(snapshot: Snapshot, now: number, silenceWarning
   } else if (shared.status === 'running' || shared.status === 'queued' || shared.status === 'stopping') {
     status = 'running'; label = shared.status === 'queued' ? '准备执行' : shared.status === 'stopping' ? '正在停止' : '执行中';
   } else if (shared.status === 'unknown') {
-    status = 'unavailable'; label = snapshot.host_status === 'disconnected' ? '暂时无法读取执行状态' : '执行结果待核对';
+    status = 'unavailable'; label = shared.stale ? '状态更新延迟' : '执行结果待核对';
   } else if (shared.status === 'finalizing') {status = snapshot.finalization?.state === 'failed' ? 'failed' : 'finalizing'; label = snapshot.finalization?.state === 'failed' ? '交付确认失败' : '交付确认中';}
   else if (shared.status === 'failed') {status = 'failed'; label = '未完成';}
   else if (shared.status === 'cancelled') {status = 'cancelled'; label = '已停止';}
@@ -131,15 +131,17 @@ export function cardPresentation(snapshot: Snapshot, now: number, silenceWarning
   else if (shared.status === 'completed') {status = 'success'; label = '已完成';}
   else if (snapshot.closureReason === 'superseded' || snapshot.closureReason === 'legacy_archive') {status = 'archived'; label = '已归档 · 交付未确认';}
   else if (shared.status === 'interrupted_recoverable') {status = 'stalled'; label = '执行已中断';}
-  else if (shared.status === 'stalled') {status = 'stalled'; label = '长时间没有新的执行进展';}
+  else if (shared.status === 'stalled') {status = 'stalled'; label = '10 分钟没有新的执行记录';}
   else {status = 'idle'; label = '当前无后台执行';}
   const command = snapshot.runningCommand ?? snapshot.lastCommand ?? snapshot.currentCommand ?? null;
   const timing = commandTiming(snapshot, command, now);
-  const taskClockDynamic = shared.clockRunning && deliveryEnd(snapshot) === null && snapshot.taskState !== 'closed';
+  const taskClockDynamic = deliveryEnd(snapshot) === null && snapshot.taskState !== 'closed'
+    && snapshot.closureReason !== 'superseded' && snapshot.closureReason !== 'legacy_archive';
   return {status, label, backgroundStatus, backgroundLabel,
-    taskElapsedMs: taskElapsedMs(snapshot, now), taskClockLabel: deliveryEnd(snapshot) !== null ? '本轮交付耗时' : taskClockDynamic ? '本轮耗时' : '耗时截至最近确认的活动',
+    taskElapsedMs: taskElapsedMs(snapshot, now), taskClockLabel: '本轮耗时',
     commandElapsedMs: timing.elapsedMs, taskClockDynamic, commandClockDynamic: timing.dynamic,
     modelActivityAgeMs: age(now, modelAt), executionActivityAgeMs: age(now, executionAt),
+    observationStale, confirmedAt: observation.observedAt,
     activityAgeMs: nonNegative(now - lastProgressAt(snapshot)), outputAgeMs: age(now, snapshot.lastOutputAt ?? null)};
 }
 
@@ -162,11 +164,17 @@ export function needsLocalTimer(snapshot: Snapshot | null): boolean {
   return Boolean(snapshot && !isFinal(snapshot));
 }
 
-export function elapsedText(milliseconds: number): string {
-  const seconds = Math.max(0, Math.floor(milliseconds / 1000));
-  const minutes = Math.floor(seconds / 60);
-  return seconds < 3600 ? `${String(minutes).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`
-    : `${Math.floor(seconds / 3600)}:${String(minutes % 60).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+export function durationText(milliseconds: number): string {
+  const value = nonNegative(milliseconds);
+  if (value > 0 && value < 100) return '不足 0.1 秒';
+  if (value < 60_000) return `${Math.round(value / 100) / 10} 秒`;
+  const seconds = Math.floor(value / 1000), minutes = Math.floor(seconds / 60);
+  if (seconds < 3600) return `${minutes} 分 ${seconds % 60} 秒`;
+  return `${Math.floor(seconds / 3600)} 小时 ${minutes % 60} 分 ${seconds % 60} 秒`;
+}
+
+export function activityAgeText(milliseconds: number): string {
+  return milliseconds < 1000 ? '刚刚' : `${durationText(Math.floor(milliseconds / 1000) * 1000)}前`;
 }
 
 export function taskLabel(snapshot: Snapshot): string {return cardPresentation(snapshot, Date.now()).label;}

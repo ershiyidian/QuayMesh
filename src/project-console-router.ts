@@ -3,7 +3,7 @@ import { mountFleetApi } from "./federation/console-router.js";
 import type { FederationRuntime } from "./federation/runtime.js";
 import express, { type Request, type Response } from "express";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import * as z from "zod/v4";
 import type { ServerConfig } from "./config.js";
 import { assertAllowedPath } from "./roots.js";
@@ -114,8 +114,14 @@ export function createProjectConsoleRouter(config: ServerConfig, options: {
   router.use(express.json({ limit: options.federation ? "4mb" : "32kb", strict: true }));
   // Resolve the fixed entry relative to the trusted build root. Absolute sendFile
   // paths containing a parent .cache directory can be rejected as dotfiles.
-  router.get("/", (_req, res) => res.sendFile("console.html", { root: resolve(options.assetDirectory), dotfiles: "deny" }));
-  router.use("/assets", express.static(resolve(options.assetDirectory, "assets"), { fallthrough: false, index: false, dotfiles: "deny" }));
+  router.get(["/", "/console.html"], (_req, res) => res.sendFile("console.html", { root: resolve(options.assetDirectory), dotfiles: "deny" }));
+  router.use("/assets", express.static(resolve(options.assetDirectory, "assets"), {
+    fallthrough: false, index: false, dotfiles: "deny",
+    setHeaders(res, path) {
+      res.setHeader("Cache-Control", /-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$/.test(basename(path))
+        ? "public, max-age=31536000, immutable" : "no-cache");
+    },
+  }));
   if (options.fleetDirectory) router.use("/fleet", express.static(resolve(options.fleetDirectory), { index: "index.html", dotfiles: "deny" }));
   router.use("/api", (req, res, next) => {
     if (!["GET", "POST"].includes(req.method)) { res.sendStatus(405); return; }
@@ -267,8 +273,9 @@ export function createProjectConsoleRouter(config: ServerConfig, options: {
     .all(stringParam(req.params.projectId)) })));
   mountConsoleWorkbench(router, operations, config, options.federation, options.sessionRuntime, options.processSessions);
   router.use((error: unknown, _req: Request, res: Response, _next: express.NextFunction) => {
-    if (!res.headersSent) res.status(400).json({ code: "CONSOLE_REQUEST_REJECTED" });
-    void error;
+    const status = (error as { status?: unknown } | null)?.status;
+    if (!res.headersSent) res.status(typeof status === "number" && Number.isInteger(status) && status >= 400 && status < 600 ? status : 400)
+      .json({ code: "CONSOLE_REQUEST_REJECTED" });
   });
   return { router, dispatch: operations.dispatch.bind(operations), close: () => { attempts.clear(); sessionDb.close(); } };
 }

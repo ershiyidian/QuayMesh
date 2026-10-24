@@ -1,8 +1,6 @@
 import http from "node:http";
 import https from "node:https";
-import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
-import { basename, extname, join, normalize, resolve, sep } from "node:path";
+import { createHash } from "node:crypto";
 import { createAgent } from "./network.mjs";
 
 const HOP_HEADERS = new Set(["connection","keep-alive","proxy-authenticate","proxy-authorization","te","trailer","transfer-encoding","upgrade"]);
@@ -13,8 +11,9 @@ const DISCOVERY_METADATA_PATHS = new Set([
 ]);
 const PATHS = ["/mcp","/authorize","/token","/register","/revoke","/introspect","/.well-known/","/console","/healthz","/readyz","/oauth"];
 const CONSOLE_REQUEST_HEADERS = ["accept","content-type","cookie","origin","referer","if-none-match","if-modified-since","x-quaymesh-csrf"];
-const CONSOLE_RESPONSE_HEADERS = ["content-type","cache-control","etag","last-modified","set-cookie","location","content-disposition"];
-const STATIC_TYPES = { ".html":"text/html; charset=utf-8", ".js":"text/javascript; charset=utf-8", ".mjs":"text/javascript; charset=utf-8", ".css":"text/css; charset=utf-8", ".json":"application/json; charset=utf-8", ".svg":"image/svg+xml", ".png":"image/png", ".ico":"image/x-icon", ".map":"application/json", ".woff2":"font/woff2", ".woff":"font/woff", ".txt":"text/plain; charset=utf-8" };
+const CONSOLE_RESPONSE_HEADERS = ["content-type","content-length","cache-control","etag","last-modified","set-cookie","location","content-disposition","content-security-policy","x-content-type-options","referrer-policy"];
+const CONSOLE_RECOVERY_SCRIPT = 'const reconnect=()=>location.reload();document.getElementById("reconnect").addEventListener("click",reconnect);setTimeout(reconnect,5000);';
+const CONSOLE_RECOVERY_SCRIPT_HASH = createHash("sha256").update(CONSOLE_RECOVERY_SCRIPT).digest("base64");
 
 function forwardedHeaders(headers) {
   const excluded = new Set(HOP_HEADERS);
@@ -48,7 +47,7 @@ function readBody(req) {
 }
 
 export class McpRelay {
-  constructor({ origin, host = "127.0.0.1", port = 17676, socksUrl, onError = () => {}, onSuccess = () => {}, consoleRpc, consoleAssetDir, mcpResponseTimeoutMs = 125000 }) {
+  constructor({ origin, host = "127.0.0.1", port = 17676, socksUrl, onError = () => {}, onSuccess = () => {}, consoleRpc, mcpResponseTimeoutMs = 125000 }) {
     this.origin = new URL(origin);
     this.host = host; this.port = port; this.onError = onError;
     this.onSuccess = onSuccess; this.accepting = true; this.activeRequests = 0;
@@ -56,7 +55,6 @@ export class McpRelay {
     this.agent = createAgent(this.origin, { socksUrl });
     this.requests = new Set();
     this.consoleRpc = consoleRpc || null;
-    this.consoleAssetDir = consoleAssetDir ? resolve(consoleAssetDir) : null;
     this.server = http.createServer((req, res) => { void this.route(req, res).catch(error => this.fail(req, res, error)); });
     this.server.requestTimeout = 0;
     this.server.headersTimeout = 20000;
@@ -101,17 +99,12 @@ export class McpRelay {
     this.forward(req, res, parsed);
   }
 
-  // Console 页面：静态文件从本机 release 提供，API 经已认证的 federation RPC 送到 Coordinator。
+  // 页面、资源和 API 统一由 Coordinator 提供，避免本机旧页面配上新版接口。
   async serveConsole(req, res, parsed) {
     const path = parsed.pathname;
     if (path === "/console") { res.writeHead(303,{location:`/console/${parsed.search}`}).end(); return; }
-    const isApi = path.startsWith("/console/api/");
-    if (!isApi) {
-      await this.serveStatic(req, res, path);
-      return;
-    }
     const method = String(req.method || "GET").toUpperCase();
-    if (!["GET", "POST"].includes(method)) { res.writeHead(405, { "content-type": "application/json" }).end('{"code":"CONSOLE_METHOD_REJECTED"}'); return; }
+    if (!["GET", "HEAD", "POST"].includes(method)) { res.writeHead(405, { "content-type": "application/json" }).end('{"code":"CONSOLE_METHOD_REJECTED"}'); return; }
     const raw = method === "POST" ? await readBody(req) : Buffer.alloc(0);
     const headers = pickHeaders(req.headers, CONSOLE_REQUEST_HEADERS);
     headers["x-quaymesh-relay"] = "browser";
@@ -127,44 +120,40 @@ export class McpRelay {
       deadlineAt:Date.now() + 30000,
       signal:controller.signal,
     }).finally(() => res.off("close",cancel));
+    if (res.destroyed) return;
+    const status = reply.status || 200;
+    if (status >= 500 && this.consoleEntry(req, parsed)) {
+      this.consoleUnavailable(res);
+      return;
+    }
     const outHeaders = pickHeaders(reply.headers || {}, CONSOLE_RESPONSE_HEADERS);
     if (!outHeaders["content-type"]) outHeaders["content-type"] = "application/json; charset=utf-8";
     const bodyText = typeof reply.body === "string" ? reply.body : JSON.stringify(reply.body ?? null);
     const buffer = reply.bodyBase64 ? Buffer.from(String(reply.body), "base64") : Buffer.from(bodyText, "utf8");
-    outHeaders["content-length"] = String(buffer.length);
-    res.writeHead(reply.status || 200, outHeaders);
-    res.end(buffer);
-    if (reply.status < 500) this.onSuccess(`relay:${path}`);
+    const noBody = method === "HEAD" || status === 204 || status === 304;
+    if (!noBody) outHeaders["content-length"] = String(buffer.length);
+    res.writeHead(status, outHeaders);
+    res.end(noBody ? undefined : buffer);
+    if (status < 500) this.onSuccess(`relay:${path}`);
   }
 
-  async serveStatic(req, res, path) {
-    if (!this.consoleAssetDir) { res.writeHead(404, { "content-type": "application/json" }).end('{"error":"console_assets_unavailable"}'); return; }
-    const relative = path.replace(/^\/console\/?/, "") || "console.html";
-    const safe = normalize(relative).replace(/^(\.\.(\/|\\|$))+/, "");
-    const file = resolve(join(this.consoleAssetDir, safe));
-    if (file !== this.consoleAssetDir && !file.startsWith(this.consoleAssetDir + sep)) {
-      res.writeHead(403).end(); return;
-    }
-    let info;
-    try { info = await stat(file); if (!info.isFile()) throw new Error("not_file"); }
-    catch { res.writeHead(404, { "content-type": "application/json" }).end('{"error":"not_found"}'); return; }
-    const type = STATIC_TYPES[extname(file).toLowerCase()] || "application/octet-stream";
-    const immutable = /-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$/.test(basename(file));
-    const cache = immutable ? "public, max-age=31536000, immutable" : "no-cache";
-    const etag = `W/"${info.size.toString(16)}-${Math.floor(info.mtimeMs).toString(16)}"`;
-    if (req.headers["if-none-match"] === etag) { res.writeHead(304,{etag,"cache-control":cache}).end(); return; }
-    res.writeHead(200, { "content-type": type, "content-length": info.size, "cache-control":cache, etag });
-    if (req.method === "HEAD") { res.end(); return; }
-    const stream = createReadStream(file);
-    stream.once("error", error => res.destroy(error));
-    res.once("close", () => stream.destroy());
-    stream.pipe(res);
+  consoleEntry(req, parsed) {
+    return req.method === "GET" && ["/console/", "/console/console.html"].includes(parsed.pathname);
+  }
+
+  consoleUnavailable(res) {
+    res.writeHead(503, { "content-type":"text/html; charset=utf-8", "cache-control":"no-store", "retry-after":"5",
+      "content-security-policy":`default-src 'none'; script-src 'sha256-${CONSOLE_RECOVERY_SCRIPT_HASH}'; style-src 'unsafe-inline'; frame-ancestors 'none'`, "x-content-type-options":"nosniff" })
+      .end(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>QuayMesh · 连接恢复中</title><style>body{margin:0;padding:12vh 24px;background:#111214;color:#e9eaed;font:16px/1.6 system-ui,sans-serif}main{max-width:480px;margin:auto}h1{font-size:24px;font-weight:500}p{color:#aaaeb6}button{margin-top:12px;padding:10px 20px;border:1px solid #626771;border-radius:8px;background:#272b32;color:inherit;font:inherit;cursor:pointer}</style><main><h1>控制台暂未连接</h1><p>正在恢复连接，已有登录会话会保留。</p><button type="button" id="reconnect">重新连接</button></main><script>${CONSOLE_RECOVERY_SCRIPT}</script></html>`);
   }
 
   fail(req, res, error) {
+    if (res.destroyed || req.aborted) return;
     error.source = `relay:${new URL(req.url,"http://relay.local").pathname}`;
     this.onError(error);
     if (res.headersSent) { res.destroy(error); return; }
+    const parsed = new URL(req.url,"http://relay.local");
+    if (this.consoleRpc && this.consoleEntry(req, parsed)) { this.consoleUnavailable(res); return; }
     res.writeHead(error.status || 503, { "content-type": "application/json", "retry-after": "2" }).end(JSON.stringify({ error: "coordinator_unavailable",message:error.message }));
   }
 

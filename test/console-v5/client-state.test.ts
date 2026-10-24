@@ -6,9 +6,9 @@ import { mergeFields } from '../../src/ui/console-v5/settings-form.js';
 import { elapsed, esc, percent, resultExplanation, changeCaptureBlockReason, changeCaptureNotice, dedupeCaptureWarnings, acceptanceBadge, lifecycleBadges, executionObservationForRun, status, transferPercent } from '../../src/ui/console-v5/presentation.js';
 import { fullTime, setDisplayTimeZone, day, timestamp } from '../../src/ui/console-v5/format.js';
 import { taskStages, taskStage } from '../../src/console-task-state.js';
-import { resourceHealth } from '../../src/ui/console-v5/source-state.js';
+import { resourceHealth, sourceWarning, sourceWarnings } from '../../src/ui/console-v5/source-state.js';
 import { CommandOutputs } from '../../src/ui/console-v5/command-output.js';
-import type { Run, ActionReceipt, ChangeCapture } from '../../src/ui/console-v5/contracts.js';
+import type { Run, ActionReceipt, ChangeCapture, CacheEntry, SourceState } from '../../src/ui/console-v5/contracts.js';
 import { EventNotifications, type NotificationMemory, type NotificationPage } from '../../src/ui/console-v5/notifications.js';
 import { filterTaskIndex, type TaskIndex } from '../../src/console-workbench/task-aggregation.js';
 import { receiptLabel, canQueryReceipt } from '../../src/ui/console-v5/receipt-presentation.js';
@@ -67,6 +67,23 @@ test('不完整的总览被资源层拒绝，读取中或陈旧来源不会显�
   assert.equal(resourceHealth([pending]).label,'正在读取当前页面');
   const stale={data:{sources:[{nodeId:'n',name:'n',state:'refreshing',stale:true,online:true,observedAt:1,error:null}]},time:2,error:null,loading:false};
   assert.equal(resourceHealth([stale]).tone,'amber');
+});
+
+test('正常刷新和首次读取保持中性，同一节点的重复异常只保留一条', () => {
+  const now = Date.now();
+  const source: SourceState = { nodeId: 'desktop', name: 'Desktop', state: 'refreshing', stale: false, online: true, observedAt: now - 10_000, error: null };
+  const entry = (sources: SourceState[]): CacheEntry => ({ data: { sources }, time: now, error: null, loading: false });
+  assert.equal(sourceWarning(source, now), null);
+  assert.equal(resourceHealth([entry([source])]).tone, 'green');
+  const pending = { ...source, state: 'loading' as const, observedAt: null };
+  assert.equal(sourceWarning(pending, now), null);
+  assert.equal(resourceHealth([entry([pending])]).label, '正在读取当前页面');
+  const old = { ...source, observedAt: now - 60_000, stale: true };
+  const failed = { ...old, state: 'error' as const, error: '连接已断开' };
+  const warnings = sourceWarnings([entry([old]), entry([failed]), entry([old])], now);
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].error, '连接已断开');
+  assert.equal(resourceHealth([entry([failed])]).tone, 'amber');
 });
 
 test('配置三方合并更新未编辑字段、保留独立编辑并明确冲突', () => {

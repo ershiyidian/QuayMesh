@@ -2,7 +2,7 @@ import type { ConsoleReply, JsonRecord } from "./types.js";
 
 export const CONSOLE_REQUEST_LIMIT_BYTES = 1024 * 1024;
 const FORWARD_HEADERS = ["accept", "content-type", "cookie", "origin", "referer", "if-none-match", "if-modified-since", "x-quaymesh-csrf"] as const;
-const RESPONSE_HEADERS = ["content-type", "cache-control", "etag", "last-modified", "set-cookie", "location", "content-disposition"] as const;
+const RESPONSE_HEADERS = ["content-type", "content-length", "cache-control", "etag", "last-modified", "set-cookie", "location", "content-disposition", "content-security-policy", "x-content-type-options", "referrer-policy"] as const;
 const TEXTUAL = /(^text\/|json|javascript|ecmascript|xml|html|css|svg|x-www-form-urlencoded|charset)/i;
 
 export interface ConsoleHttpRequest {
@@ -41,7 +41,7 @@ export function pickResponseHeaders(headers: Record<string, unknown>): Record<st
 export async function dispatchConsoleRequest(httpPort: number, relayNodeId: string, params: JsonRecord): Promise<ConsoleReply> {
   const method = typeof params.method === "string" ? params.method.toUpperCase() : "";
   const path = typeof params.path === "string" ? params.path : "";
-  if (!["GET", "POST"].includes(method)) return { status: 405, body: { code: "CONSOLE_METHOD_REJECTED" } };
+  if (!["GET", "HEAD", "POST"].includes(method)) return { status: 405, body: { code: "CONSOLE_METHOD_REJECTED" } };
   if (!path.startsWith("/console/") && path !== "/console") return { status: 400, body: { code: "CONSOLE_PATH_REJECTED" } };
   const headers = params.headers && typeof params.headers === "object" ? params.headers as Record<string, unknown> : {};
   const headerList: [string, string][] = [
@@ -61,7 +61,8 @@ export async function dispatchConsoleRequest(httpPort: number, relayNodeId: stri
   }
   let response: Response;
   try {
-    response = await fetch(`http://127.0.0.1:${httpPort}${path}`, { method, headers: headerList, body: body ? new Uint8Array(body) : undefined, redirect: "manual" });
+    // 显式重验证，避免 fetch 为条件请求补上 no-cache 并使服务端忽略 ETag。
+    response = await fetch(`http://127.0.0.1:${httpPort}${path}`, { method, headers: headerList, body: body ? new Uint8Array(body) : undefined, redirect: "manual", cache: "no-cache" });
   } catch (error) {
     return { status: 503, body: { code: "CONSOLE_UPSTREAM_UNAVAILABLE", message: error instanceof Error ? error.message : String(error) } };
   }

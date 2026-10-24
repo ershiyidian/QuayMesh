@@ -18,6 +18,7 @@ import type {
   TaskRecord,
 } from "./types.js";
 import type { SessionStore } from "./store.js";
+import type { SqliteWriteOptions } from "../db/async-write.js";
 
 import { mergeExecutionObservations, EXECUTION_OBSERVATION_TTL_MS, type ExecutionObservation } from "../execution-observation.js";
 
@@ -39,6 +40,7 @@ const PAGE_ROWS = 50;
 
 export class SessionProjector {
   private readonly scheduled = new Map<string, Promise<void>>();
+  private refreshRemoteTask?: (taskId: string, memberId?: string) => Promise<void>;
   private closed = false;
 
   constructor(
@@ -49,6 +51,10 @@ export class SessionProjector {
     private readonly localNodeId?: string,
   ) {}
 
+  setRemoteTaskRefresher(refresh?: (taskId: string, memberId?: string) => Promise<void>): void {
+    this.refreshRemoteTask = refresh;
+  }
+
   observeTask(taskId: string, memberId?: string): ExecutionObservation {
     const task=this.store.getTask(taskId),at=Date.now();
     const ids=memberId?[memberId]:this.store.taskMemberIds(taskId);
@@ -57,12 +63,15 @@ export class SessionProjector {
       if(this.localNodeId!==undefined&&member.node_id!==this.localNodeId){
         const cached=this.store.taskData.projection(taskId,id)?.snapshot;
         const observation=cached?.executionObservation;
-        if(observation)return member.online?observation:{...observation,observedAt:0};
+        if(observation)return member.online?observation:{...observation,stale:true,
+          activeOperationIds:[],preparingOperationIds:[],
+          staleOperationIds:[...new Set([...observation.staleOperationIds,...observation.activeOperationIds,...observation.preparingOperationIds])]};
         return {observedAt:0,activeOperationIds:cached?.commands.filter(c=>c.status==='run'||c.status==='queued').map(c=>c.operation_id)??[],preparingOperationIds:[],staleOperationIds:[]};
       }
-      const value:ExecutionObservation={observedAt:at,activeOperationIds:[],preparingOperationIds:[],staleOperationIds:[]};
+      const value:ExecutionObservation={observedAt:at,activeOperationIds:[],preparingOperationIds:[],staleOperationIds:[],operationObservedAt:{}};
       for(const row of this.store.taskData.operationObservations(taskId,id)){
         const observedAt=Date.parse(row.observed_at??'');
+        if(Number.isFinite(observedAt))value.operationObservedAt![row.id]=observedAt;
         if(['unknown','reconciliation_required'].includes(row.status)||!Number.isFinite(observedAt)||at-observedAt>EXECUTION_OBSERVATION_TTL_MS)value.staleOperationIds.push(row.id);
         else if(row.effect==='not_started'||row.status==='queued')value.preparingOperationIds.push(row.id);
         else value.activeOperationIds.push(row.id);
@@ -80,10 +89,10 @@ export class SessionProjector {
         ? memberExecutionState(this.store, taskId, member.id, observation)
         : this.store.taskData.projection(taskId, member.id)?.snapshot.execution_status ?? ExecutionState.idle);
     return {
-      observedAt: observation.observedAt,
+      observedAt: Date.now(),
       hostStatus: members.some(member => !member.online) ? HostState.disconnected : members.length ? HostState.connected : HostState.unknown,
       executionStatus: observation.activeOperationIds.length || observation.preparingOperationIds.length ? ExecutionState.active
-        : observation.staleOperationIds.length ? ExecutionState.interrupted : aggregateExecutionStates(states),
+        : observation.stale || observation.staleOperationIds.length ? ExecutionState.interrupted : aggregateExecutionStates(states),
     };
   }
 
@@ -115,7 +124,9 @@ export class SessionProjector {
     void pending.catch(()=>{});
   }
 
-  async materialize(sessionId: SessionId, memberId: string, taskId?: string): Promise<Snapshot> {
+  async materialize(sessionId: SessionId, memberId: string, taskId?: string, writeOptions?: SqliteWriteOptions): Promise<Snapshot> {
+    const deadline=writeOptions?Date.now()+(writeOptions.timeoutMs??5000):undefined;
+    writeOptions?.signal?.throwIfAborted();
     const session = this.store.getSession(sessionId);
     const member = this.store.getMember(sessionId, memberId);
     const memberRevisionBefore = member.revision;
@@ -164,7 +175,7 @@ export class SessionProjector {
       taskState:task?.state,
       taskResult:task?.result_status,
       lastOperation,
-      lastActivityAt:activity.lastModelToolAt??activity.lastExecutionActivityAt,
+      lastActivityAt:maxTime([activity.lastModelToolAt,activity.lastExecutionActivityAt,activity.lastOutputAt]),
       lastModelToolAt:activity.lastModelToolAt,
       lastExecutionActivityAt:activity.lastExecutionActivityAt,
       lastOutputAt:activity.lastOutputAt,
@@ -219,20 +230,26 @@ export class SessionProjector {
       },
       notices,
     };
-    const currentTask = task && session.current_task_id === task.id && task.state === "active";
-    if (task && this.store.getTask(task.id).revision === revisionBefore) {
-      this.store.taskData.putProjection(task.id,memberId,revisionBefore,snapshot);
-    }
-    if ((!task || currentTask) && this.store.memberRevision(memberId) === memberRevisionBefore) {
-      this.store.putSnapshot(sessionId, memberId, memberRevisionBefore, snapshot);
-    }
+    const persist=()=>{
+      const current=task?this.store.getTask(task.id):null;
+      const currentTask=current&&this.store.getSession(sessionId).current_task_id===current.id&&current.state==="active";
+      if(task&&current?.revision===revisionBefore)this.store.taskData.putProjection(task.id,memberId,revisionBefore,snapshot);
+      if((!task||currentTask)&&this.store.memberRevision(memberId)===memberRevisionBefore)
+        this.store.putSnapshot(sessionId,memberId,memberRevisionBefore,snapshot);
+    };
+    // 联邦只读请求可取消地等待缓存写锁，其余既有调用保留原有行为。
+    if(writeOptions)await this.store.writeAsync(persist,{...writeOptions,timeoutMs:Math.max(0,deadline!-Date.now())});
+    else persist();
     return snapshot;
   }
 
   async readTask(taskId: string, sinceRev: number, memberId?: string, cursor?: string): Promise<ProjectionReadResult> {
+    const initialTask = this.store.getTask(taskId);
+    this.store.taskData.requireScope(taskId,initialTask.session_id,memberId);
+    // 先补齐来源，再比较显示版本；进程重启和 unchanged 读取同样能够恢复订阅。
+    await this.refreshRemoteTask?.(taskId,memberId);
     const task = this.store.getTask(taskId);
     const session = this.store.getSession(task.session_id);
-    this.store.taskData.requireScope(taskId,session.id,memberId);
     const observation=this.observeTask(taskId,memberId);
     const live=this.liveTaskState(taskId,memberId,observation);
     if (task.revision === sinceRev && !cursor) return { unchanged: true, rev: task.revision, observation, live };
@@ -318,7 +335,7 @@ export class SessionProjector {
       taskResult:task.result_status,
       finalization:this.finalizationView(task),
       lastOperation,
-      lastActivityAt:lastModelToolAt??lastExecutionActivityAt,
+      lastActivityAt:maxTime([lastModelToolAt,lastExecutionActivityAt,lastOutputAt]),
       lastModelToolAt,
       lastExecutionActivityAt,
       lastOutputAt,

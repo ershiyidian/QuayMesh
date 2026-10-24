@@ -117,10 +117,10 @@ export function readLocalSessionTitles(config: ServerConfig): { items: SessionTi
     const rows = ledger.db.prepare(`SELECT id,title,revision,last_activity_at FROM qm_sessions ORDER BY last_activity_at DESC,id`)
       .all() as Array<{ id: string; title: string; revision: number; last_activity_at: string }>;
     const nodeId = config.federation?.nodeId ?? 'local';
-    const tasks = ledger.db.prepare(`SELECT t.id,t.session_id,t.title,t.state,t.result_status,t.revision,t.created_at,t.finished_at,t.last_activity_at,t.source_task_id,
+    const tasks = ledger.db.prepare(`SELECT t.id,t.session_id,t.title,t.state,t.result_status,t.revision,t.created_at,t.finished_at,t.delivery_ended_at,t.last_activity_at,t.source_task_id,
       f.requested_at,f.completed_at,f.error FROM qm_tasks t LEFT JOIN qm_task_finalizations f ON f.task_id=t.id`).all() as Array<{
       id:string; session_id:string; source_task_id:string|null; title:string; state:string; result_status:string|null; revision:number;
-      created_at:string; finished_at:string|null; last_activity_at:string; requested_at:string|null; completed_at:string|null; error:string|null;
+      created_at:string; finished_at:string|null; delivery_ended_at:string|null; last_activity_at:string; requested_at:string|null; completed_at:string|null; error:string|null;
     }>;
     const members = ledger.db.prepare(`WITH membership AS (
       SELECT task_id,member_id FROM qm_task_members UNION SELECT task_id,member_id FROM qm_events WHERE task_id IS NOT NULL
@@ -143,6 +143,7 @@ export function readLocalSessionTitles(config: ServerConfig): { items: SessionTi
     return { authoritative:config.federation?.capabilities.coordinator ?? true,
       tasks:visibleTasks.map(row=>{
         const own = (byTask.get(row.id) ?? []).filter(member => member.node_id !== nodeId || permitted(config, member.root));
+        const finishedAt = row.result_status && row.delivery_ended_at ? row.delivery_ended_at : row.finished_at;
         return {id:row.id,sessionId:row.session_id,sourceTaskId:row.source_task_id,title:row.title,state:row.state,resultStatus:row.result_status,
           nodeId,createdAt:Date.parse(row.created_at),memberNodeIds:[...new Set(own.map(member=>member.node_id))],
           workspaces:own.map(member=>({nodeId:member.node_id,projectId:member.project_id ? workspaceHandle(member.node_id,member.project_id) : '',
@@ -150,7 +151,7 @@ export function readLocalSessionTitles(config: ServerConfig): { items: SessionTi
           finalization:row.requested_at && (!row.completed_at || row.state==='active') ? {
             status:row.error ? 'failed' as const : 'pending' as const,requestedAt:Date.parse(row.requested_at),error:row.error,
           } : null,
-          revision:row.revision,finishedAt:row.finished_at ? Date.parse(row.finished_at) : null,lastActivityAt:Date.parse(row.last_activity_at)};
+          revision:row.revision,finishedAt:finishedAt ? Date.parse(finishedAt) : null,lastActivityAt:Date.parse(row.last_activity_at)};
       }),
       items: rows.filter(row=>visibleSessions.has(row.id) || !taskSessions.has(row.id)).map((row) => ({ id: row.id, title: row.title, revision: row.revision,
       lastActivityAt: Date.parse(row.last_activity_at) })), observedAt: Date.now() };

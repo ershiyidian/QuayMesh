@@ -36,10 +36,13 @@ export function taskView(input: TaskViewInput): TaskView {
   const active = input.active ?? ['running', 'starting', 'stopping'].includes(input.execution);
   const queued = input.queued ?? input.execution === 'queued';
   const stale = input.stale === true;
+  // 显式活性来自已确认的操作；汇总中的其它过期成员不能掩盖这部分执行。
+  const confirmedActive = active && (!stale || input.active === true);
+  const confirmedQueued = queued && (!stale || input.queued === true);
   const terminalResult=['completed','failed','cancelled','handed_off'].includes(input.result??'');
   let status: string;
-  if (active && !stale) status = input.execution === 'stopping' ? 'stopping' : 'running';
-  else if (queued && !stale) status = 'queued';
+  if (confirmedActive) status = input.execution === 'stopping' ? 'stopping' : 'running';
+  else if (confirmedQueued) status = 'queued';
   else if (input.unresolved || input.execution === 'unknown' || stale&&(active||queued||!terminalResult)) status = 'unknown';
   else if (input.finalizing || input.execution === 'finalizing') status = 'finalizing';
   else if (input.result === 'completed' || input.result === 'failed' || input.result === 'cancelled') status = input.result;
@@ -52,7 +55,7 @@ export function taskView(input: TaskViewInput): TaskView {
   else if (input.lastOutcome === 'cancelled' || input.lastOutcome === 'stopped') status = 'interrupted_recoverable';
   else if (input.lastProgressAt != null && input.now != null && input.now - input.lastProgressAt >= TASK_SILENCE_MS) status = 'stalled';
   else status = 'waiting';
-  return {status, requestEnded: ended, resultStatus: input.result ?? null, backgroundActive: (active || queued) && !stale, stale,
+  return {status, requestEnded: ended, resultStatus: input.result ?? null, backgroundActive: confirmedActive || confirmedQueued, stale,
     clockRunning: !ended && !(status === 'finalizing' && input.finalizationFailed)
       && ['running', 'queued', 'stopping', 'finalizing'].includes(status)};
 }

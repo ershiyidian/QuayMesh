@@ -21,14 +21,14 @@ test("设计师卡片默认折叠、活动摘要、任务计时、窄屏和终�
   expect((await root.boundingBox())!.height).toBeLessThan(150);
   await expect(card.locator("#stats")).toContainText("命令");
   await expect(card.locator("#ws")).not.toBeEmpty();
-  await expect(card.locator("#clock")).toHaveText(/\d{2}:\d{2}/);
+  await expect(card.locator("#clock")).toHaveText(/本轮耗时 .*秒/);
   await root.screenshot({path:"releases/session-acceptance/browser/card-default.png"});
 
   const worker=await page.evaluate(()=>window.__quaymeshHost.processWorker);
   const command=await page.evaluate(path=>window.__quaymeshHost.runCommand(`node "${path}" stdout-child 8000 reliability-running`,100),worker);
   expect(command.isError,JSON.stringify(command)).not.toBe(true);
   await expect(card.locator("#act")).toContainText("reliability-running",{timeout:15000});
-  await expect(card.locator("#prog")).toContainText("命令");
+  await expect(card.locator("#prog")).toContainText("最近活动");
   await root.screenshot({path:"releases/session-acceptance/browser/card-running.png"});
 
   await toggle.click();await expect(card.locator("#details")).toBeVisible();

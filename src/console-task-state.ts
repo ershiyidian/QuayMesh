@@ -2,7 +2,7 @@ import { taskView } from './task-view.js';
 
 export const taskStages: ReadonlyArray<readonly [string, string]> = [
   ['running', '执行中'], ['stopping', '正在停止'], ['queued', '排队'], ['waiting', '当前无后台执行'],
-  ['stalled', '长时间无进展'], ['finalizing', '交付确认中'],
+  ['stalled', '长时间无新执行记录'], ['finalizing', '交付确认中'],
   ['unknown', '待核对'], ['review', '待验收'], ['failed', '失败'],
   ['interrupted', '中断'], ['accepted', '已验收'], ['done', '已完成'],
   ['ended', '已结束'], ['handed_off', '已交接'], ['cancelled', '已取消'], ['rejected', '已驳回'],
@@ -61,24 +61,30 @@ export interface TaskLifecycle {
 export function withTaskLifecycle<T extends {
   taskId: string | null; executionStatus: string; acceptanceStatus: string;
   finishedAt: number | null; lastActivityAt: number;
+  startedAt?: number;
   reason?: string | null;
   phaseExecutionStatus?: string;
 }>(value: T, task?: TaskLifecycle): T {
   if (!task || task.id !== value.taskId) return value;
   const awaitingDelivery=task.state==='active' && !task.finalization && value.executionStatus==='completed';
-  const status = taskView({requestState:task.state, result:task.resultStatus, execution:awaitingDelivery?'waiting':value.executionStatus,
-    finalizing:Boolean(task.finalization),finalizationFailed:Boolean(task.finalization?.error)}).status;
+  const newerActivity = value.executionStatus === 'stalled' && task.lastActivityAt > value.lastActivityAt;
+  const lastActivityAt = Math.max(value.lastActivityAt, task.lastActivityAt);
+  const status = taskView({requestState:task.state, result:task.resultStatus, execution:awaitingDelivery||newerActivity?'waiting':value.executionStatus,
+    finalizing:Boolean(task.finalization),finalizationFailed:Boolean(task.finalization?.error),
+    ...(newerActivity ? {lastProgressAt: lastActivityAt, now: Date.now()} : {})}).status;
   return {...value, executionStatus:status, sourceTaskId:task.sourceTaskId??null,
+    ...(task.createdAt !== undefined ? {startedAt: task.createdAt} : {}),
     phaseExecutionStatus:value.phaseExecutionStatus ?? value.executionStatus,
     requestState:task.state, resultStatus:task.resultStatus, taskRevision:task.revision, finalization:task.finalization??null,
     reason:task.finalization ? task.finalization.error ? `交付确认失败：${task.finalization.error}` : '执行结果正在进行最终确认'
       : task.state==='closed'&&activeExecution(status) ? '请求已结束，后台仍有执行活动'
       : task.state==='closed'&&status==='unknown' ? '请求已结束，后台执行结果仍待核对'
-      : awaitingDelivery ? '本阶段执行已结束，请求仍然开放' : value.reason,
+      : awaitingDelivery ? '本阶段执行已结束，请求仍然开放'
+      : newerActivity && status !== 'stalled' ? null : value.reason,
     acceptanceStatus:status === 'completed' && value.executionStatus !== 'completed'
       ? 'not_required' : value.acceptanceStatus,
     finishedAt:task.finalization && task.state!=='closed' ? null : task.state === 'closed' ? task.finishedAt ?? value.finishedAt : value.finishedAt,
-    lastActivityAt:Math.max(value.lastActivityAt,task.lastActivityAt)};
+    lastActivityAt};
 }
 
 export function observeSourceStates<T extends {nodeId:string;executionStatus:string}>(
@@ -96,6 +102,12 @@ export function observeSourceStates<T extends {nodeId:string;executionStatus:str
 export interface ExecutionTimeValue {
   executionStatus: string; finishedAt: number | null; lastActivityAt: number;
   observedAt?: number | null; stale?: boolean;
+}
+
+export function taskTimeEnd(value: ExecutionTimeValue & {requestState?: string}, now = Date.now()): number | null {
+  if (value.requestState === 'active') return now;
+  if (value.requestState === 'closed') return typeof value.finishedAt === 'number' && Number.isFinite(value.finishedAt) ? value.finishedAt : null;
+  return executionTimeEnd(value, now);
 }
 
 /** 运行中才推进时间；来源失联或执行未知时固定到最后可证明的时点。 */

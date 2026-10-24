@@ -323,7 +323,7 @@ export class FederationRuntime extends EventEmitter {
       case "tool": return this.invokeLocal(params.name, params.input, { ...(params.extra ?? {}), signal, sendNotification: notify });
       case "session.feed": {
         if (!this.sessionFeed) throw new Error("SESSION_FEED_UNAVAILABLE");
-        return this.sessionFeed.handleRequest(params, peer);
+        return this.sessionFeed.handleRequest(params, peer, signal);
       }
       case "session.feed.update": {
         if (!this.sessionFeed) throw new Error("SESSION_FEED_UNAVAILABLE");

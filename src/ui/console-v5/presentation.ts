@@ -1,7 +1,7 @@
 import { icon } from './icons.js';
 import { fmt, compact, duration, fullTime, ago, smartTime, validTime } from './format.js';
 import type { Run, ChangeCapture, SourceState } from './contracts.js';
-import { taskStage, taskStages, executionTimeEnd } from '../../console-task-state.js';
+import { taskStage, taskStages, executionTimeEnd, taskTimeEnd } from '../../console-task-state.js';
 import { taskDelivery } from '../../task-view.js';
 
 export const esc = (v: unknown): string => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
@@ -107,6 +107,11 @@ export function executionObservationForRun(run:Run,sources:readonly Pick<SourceS
 }
 
 export function elapsed(r: Run, observation?: { stale: boolean; observedAt: number | null }) {
+  if (r.requestState === 'active') return `<span class="num elapsed" title="本轮耗时" data-elapsed="${r.startedAt}" data-observed="0">${duration(Date.now() - r.startedAt)}</span>`;
+  if (r.requestState === 'closed') {
+    const end = taskTimeEnd(r);
+    return `<span class="num" title="本轮耗时">${duration(end === null ? null : end - r.startedAt)}</span>`;
+  }
   const active = ['running', 'stopping'].includes(r.executionStatus);
   const at = observation ? observation.observedAt : r.observedAt ?? null;
   const stale = (observation ? observation.stale : r.stale) || at !== null && Date.now() - at > 30_000;

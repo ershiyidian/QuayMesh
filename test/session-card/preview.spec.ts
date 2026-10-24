@@ -19,7 +19,7 @@ test("UI06：生产构建可导出无网络单文件预览",async({page})=>{
     await expect(page.locator("#card")).toBeVisible();
     await expect(page.locator("#card")).toHaveClass(/collapsed/);
     await expect(page.locator("#title")).toContainText("恢复可靠性");
-    await expect(page.locator("#clock")).toHaveText(/\d{2}:\d{2}/);
+    await expect(page.locator("#clock")).toHaveText(/本轮耗时 \d+ 分 \d+ 秒/);
     await page.locator("#toggle").click();
     await expect(page.locator("#details")).toBeVisible();
     await page.locator("#t-commands").click();

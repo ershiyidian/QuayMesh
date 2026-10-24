@@ -117,25 +117,50 @@ test('读取等待可见，刷新失败保留旧记录且明确标为未更新',
   await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>route.fulfill({json:{active:[]}}));
   await page.locator('#topbar [data-action=refresh]').click();
   await expect(page.locator('#global-notice')).toContainText('读取失败');
-  await expect(page.locator('#statusbar')).toContainText('保留上次数据');
+  await expect(page.locator('#statusbar')).toContainText('上次读取');
   await expect(page.locator('.summary-grid')).toBeVisible();
-  await expect(page.locator('#view')).toContainText('总览响应结构不完整');
+  await expect(page.locator('#view')).not.toContainText('总览响应结构不完整');
+  await page.locator('#global-notice summary').click();
+  await expect(page.locator('#global-notice')).toContainText('总览响应结构不完整');
+  await expect(page.locator('#global-notice .notice')).toHaveCount(1);
   await page.unrouteAll({behavior:'wait'});
   const snapshot=await f.get('overview'),running={...snapshot.waiting[0],executionStatus:'running',stale:false,observedAt:Date.now(),finishedAt:null};
   snapshot.active=[running];snapshot.runningCount=1;snapshot.waiting=[];snapshot.waitingCount=0;
   await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>route.fulfill({json:snapshot}));
   await page.locator('#topbar [data-action=refresh]').click();
-  await expect(page.locator('[data-elapsed]')).toHaveAttribute('data-observed',String(running.observedAt));
+  await expect(page.locator('[data-elapsed]')).toHaveAttribute('data-observed','0');
   running.observedAt+=1000;await page.locator('#topbar [data-action=refresh]').click();
-  await expect(page.locator('[data-elapsed]')).toHaveAttribute('data-observed',String(running.observedAt));
+  await expect(page.locator('[data-elapsed]')).toHaveAttribute('data-observed','0');
   const activeAt=Date.now();
   Object.assign(running,{nodeIds:[running.nodeId,'offline-other'],nodeStates:{[running.nodeId]:'running','offline-other':'unknown'},stale:true,observedAt:activeAt-60_000});
   snapshot.sources=snapshot.sources.map((source:any)=>({...source,observedAt:activeAt}));
   snapshot.sources.push({nodeId:'offline-other',name:'Offline peer',online:false,state:'offline',stale:true,observedAt:activeAt-60_000,error:'offline'});
   await page.locator('#topbar [data-action=refresh]').click();
-  await expect(page.locator('[data-elapsed]')).toHaveAttribute('data-observed',String(activeAt));
+  await expect(page.locator('[data-elapsed]')).toHaveAttribute('data-observed','0');
   await expect(page.locator('.overview-active .run-card')).toContainText('上次确认');
   await page.screenshot({path:screenshots+'/mixed-source-clock.png',fullPage:true});
+});
+
+test('正常后台刷新不报警，过期来源集中到一处可展开提示',async({page})=>{
+  await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
+  await login(page);
+  const snapshot=await f.get('overview');
+  snapshot.sources=snapshot.sources.map((source:any)=>({...source,state:'refreshing',stale:false,observedAt:Date.now(),error:null}));
+  await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>route.fulfill({json:snapshot}));
+  await page.locator('#topbar [data-action=refresh]').click();
+  await expect(page.locator('#global-notice .notice')).toHaveCount(0);
+  await expect(page.locator('#view')).not.toContainText('正在刷新，当前显示上次确认的数据');
+  await page.screenshot({path:screenshots+'/sources-refreshing.png',fullPage:true});
+  snapshot.sources=snapshot.sources.map((source:any)=>({...source,stale:true,observedAt:Date.now()-60_000}));
+  await page.locator('#topbar [data-action=refresh]').click();
+  await expect(page.locator('#global-notice .notice')).toHaveCount(1);
+  await expect(page.locator('#global-notice summary')).toContainText('数据更新延迟');
+  await expect(page.locator('#view')).not.toContainText('正在刷新，当前显示上次确认的数据');
+  await page.locator('#global-notice summary').click();
+  await expect(page.locator('#global-notice .source-details')).toContainText('上次确认');
+  await page.setViewportSize({width:760,height:900});
+  await page.screenshot({path:screenshots+'/sources-delayed-narrow.png',fullPage:true});
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
 });
 
 test('节点配置刷新合并独立修改，明确解决冲突后才提交新版本',async({page})=>{
@@ -364,19 +389,21 @@ test('后端连接中断时不要求重新输入口令，真实HTTP恢复后继�
   await new Promise<void>(resolve=>backend.listen(0,'127.0.0.1',resolve));
   const port=(backend.address() as AddressInfo).port;
   let base='';
-  const relay=await new McpRelay({origin:`http://127.0.0.1:${port}`,port:await freePort(),consoleAssetDir:join(process.cwd(),'dist','ui'),
+  const relay=await new McpRelay({origin:`http://127.0.0.1:${port}`,port:await freePort(),
     consoleRpc:(request:{method:string;path:string;headers:Record<string,string>;body?:string;signal:AbortSignal})=>
       new Promise((resolve,reject)=>{
         const upstream=httpRequest({host:'127.0.0.1',port,path:request.path,method:request.method,
           headers:{...request.headers,host:new URL(base).host},signal:request.signal},response=>{
             const chunks:Buffer[]=[];response.on('data',chunk=>chunks.push(chunk));response.on('error',reject);
-            response.on('end',()=>resolve({status:response.statusCode,headers:response.headers,body:Buffer.concat(chunks).toString('utf8')}));
+            response.on('end',()=>resolve({status:response.statusCode,headers:response.headers,body:Buffer.concat(chunks).toString('base64'),bodyBase64:true}));
           });
         upstream.on('error',reject);upstream.end(request.body);
       })}).start();
   base=`http://127.0.0.1:${relay.port}`;
   try{
     await login(page,base);
+    await page.goto(base+'/console/?entry=local#/overview');
+    await expect(page.locator('.summary-grid')).toBeVisible();
     backend.closeAllConnections();await new Promise<void>(resolve=>backend.close(()=>resolve()));
     await page.reload();
     await expect(page.getByRole('heading',{name:'控制台暂未连接'})).toBeVisible();
@@ -386,6 +413,15 @@ test('后端连接中断时不要求重新输入口令，真实HTTP恢复后继�
     await page.getByRole('button',{name:'重新连接',exact:true}).click();
     await expect(page.locator('.summary-grid')).toBeVisible();
     await expect(page.locator('#login-form')).toHaveCount(0);
+    await expect(page).toHaveURL(base+'/console/?entry=local#/overview');
+    backend.closeAllConnections();await new Promise<void>(resolve=>backend.close(()=>resolve()));
+    await page.reload();
+    await expect(page.getByRole('heading',{name:'控制台暂未连接'})).toBeVisible();
+    backend=createServer(f.server.running.app);
+    await new Promise<void>(resolve=>backend.listen(port,'127.0.0.1',resolve));
+    await expect(page.locator('.summary-grid')).toBeVisible({timeout:15_000});
+    await expect(page.locator('#login-form')).toHaveCount(0);
+    await expect(page).toHaveURL(base+'/console/?entry=local#/overview');
   }finally{
     await page.close();await relay.close();backend.closeAllConnections();
     await new Promise<void>(resolve=>backend.close(()=>resolve()));

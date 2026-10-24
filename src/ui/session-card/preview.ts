@@ -52,7 +52,7 @@ export const previewSnapshot:Snapshot={
 const diffs:Record<string,string>={
   f1:"@@ card header @@\n+ designer compact header\n+ task elapsed time\n+ current activity\n- legacy expanded header\n",
   f2:"@@ polling @@\n+ hidden/offscreen stop\n+ terminal stops polling\n",
-  f3:"+ export function elapsedText(ms) { ... }\n",
+  f3:"+ export function durationText(ms) { ... }\n",
   f4:"@@ output @@\n+ durable absolute cursor\n",
   f5:"+ # 长任务可靠性说明\n",
 };

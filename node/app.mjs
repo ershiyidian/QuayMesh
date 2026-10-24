@@ -132,7 +132,7 @@ export class QuayMeshNode {
       consoleRpc:request => requestJson(`http://127.0.0.1:${node.corePort}/internal/quaymesh/console`, {
         method:"POST", token:this.token, timeoutMs:30000, signal:request.signal,
         body:{nodeId:cluster.coordinator.id,request:{...request,signal:undefined}},
-      }), consoleAssetDir:join(this.root,"dist","ui"),
+      }),
     }).start();
   }
   async start() {

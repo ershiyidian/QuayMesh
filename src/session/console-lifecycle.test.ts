@@ -298,6 +298,9 @@ test('复用同一任务的收尾 Promise 前仍检查所属用户',async t=>{
 test('历史归档任务补充明确交付结果失败后仍能恢复，拒绝用结果覆盖另一个已确认终态',async t=>{
   const f=await fixture(t);
   f.store.archiveTask(f.task.id,'legacy_archive');
+  const at = Date.now(), archivedAt = at - 60_000;
+  f.ledger.db.prepare('UPDATE qm_tasks SET created_at=?,finished_at=?,archived_at=? WHERE id=?')
+    .run(new Date(at - 120_000).toISOString(), new Date(archivedAt).toISOString(), new Date(archivedAt).toISOString(), f.task.id);
   f.ledger.db.exec(`CREATE TRIGGER refuse_legacy_close BEFORE UPDATE OF result_status ON qm_tasks
     WHEN NEW.result_status IS NOT NULL BEGIN SELECT RAISE(ABORT,'legacy close refused'); END`);
   await assert.rejects(f.service.finishTask('owner',f.task.id,'completed','confirmed'),/legacy close refused/);
@@ -305,6 +308,14 @@ test('历史归档任务补充明确交付结果失败后仍能恢复，拒绝�
   f.ledger.db.exec('DROP TRIGGER refuse_legacy_close');
   await f.service.retryFinalizations();
   assert.equal(f.store.getTask(f.task.id).result_status,'completed');
+  const closed = f.store.getTask(f.task.id), lifecycle = readLocalSessionTitles(f.config).tasks[0]!;
+  assert.equal(Date.parse(closed.finished_at!), archivedAt);
+  assert.ok(Date.parse(closed.delivery_ended_at!) > archivedAt);
+  assert.equal(lifecycle.finishedAt, Date.parse(closed.delivery_ended_at!));
+  const projector = new SessionProjector(f.store, f.stateDir, null, undefined, 'local');
+  t.after(() => projector.close());
+  const snapshot = (await projector.readTask(f.task.id, -1)).snapshot!;
+  assert.equal(cardPresentation(snapshot, Date.now()).taskElapsedMs, lifecycle.finishedAt! - lifecycle.createdAt!);
   await assert.rejects(f.service.finishTask('owner',f.task.id,'cancelled','different'),/TASK_ALREADY_FINISHED_WITH_DIFFERENT_RESULT/);
 });
 
@@ -430,4 +441,26 @@ test('业务 revision 不变时，卡片轻量通道仍报告当前连接和执�
   assert.equal(recovered.unchanged,true);assert.equal(recovered.live?.hostStatus,HostState.connected);
   assert.equal(recovered.live?.executionStatus,ExecutionState.failed);
   assert.equal(f.store.getTask(f.task.id).revision,revision);
+});
+
+test('Console 列表和详情使用任务创建时间，全局新活动移除旧阶段闲置提示', async t => {
+  const f = await fixture(t), run = f.createRun('earlier-phase');
+  const at = Date.now(), createdAt = at - 60 * 60_000;
+  f.ledger.db.prepare('UPDATE qm_tasks SET created_at=?,last_activity_at=? WHERE id=?')
+    .run(new Date(createdAt).toISOString(), new Date(at - 25 * 60_000).toISOString(), f.task.id);
+  f.ledger.db.prepare('UPDATE console_work_runs SET created_at=?,last_activity_at=? WHERE id=?')
+    .run(new Date(at - 50 * 60_000).toISOString(), new Date(at - 25 * 60_000).toISOString(), run.id);
+  assert.equal(readLocalTaskIndex(f.config, at).items[0].executionStatus, 'stalled');
+  f.store.appendEvent({session_id: f.session.id, member_id: f.member.id, task_id: f.task.id,
+    type: 'file_changed', source_id: 'recent-workspace-change', timestamp: new Date(at - 10_000).toISOString(), payload: {}});
+  const feed = new WorkbenchFeed(f.config);
+  const listing = await feed.runs({days: '0', fresh: '1'});
+  const detail = await feed.taskRuns(f.task.id, true);
+  for (const task of [listing.items.find(value => value.taskId === f.task.id)!, detail.task!]) {
+    assert.ok(task);
+    assert.equal(task.startedAt, createdAt);
+    assert.equal(task.executionStatus, 'waiting');
+    assert.equal(task.lastActivityAt, at - 10_000);
+    assert.doesNotMatch(task.reason ?? '', /无进展|没有新的执行进展|长时间/);
+  }
 });

@@ -15,6 +15,10 @@ import { isReadOnlyObservation } from "../tool-admission.js";
 import { jsonReply } from "../bounded-reply.js";
 import { errorCode } from "../session/outcome.js";
 import { savedOperationStatus, operationReceiptSummary } from "../session/operation-status.js";
+import { EXECUTION_OBSERVATION_TTL_MS } from "../execution-observation.js";
+
+const TASK_REFRESH_WAIT_MS = 750;
+const TASK_REFRESH_TIMEOUT_MS = 5_000;
 
 interface RemoteSubscription {
   nodeId: string;
@@ -22,11 +26,16 @@ interface RemoteSubscription {
   memberId: string;
   taskId?: string;
   lastRevision: number;
+  confirmedAt: number;
+  generation: number;
   lastError?: string;
 }
 
 export class SessionFeed {
   private readonly subscriptions = new Map<string, RemoteSubscription>();
+  private readonly refreshing = new Map<string, Promise<void>>();
+  private readonly snapshots = new Map<string, Promise<SessionFeedUpdate>>();
+  private readonly refreshController = new AbortController();
   private readonly pendingPublishes = new Map<string, NodeJS.Timeout>();
   private readonly subscribers = new Map<string, Set<string>>();
   private readonly disposeStore: () => void;
@@ -47,13 +56,14 @@ export class SessionFeed {
       if (member.node_id !== runtime.localId) return;
       this.publishLocalChange(change.sessionId, change.memberId, change.revision, change.taskId);
     });
-    const onOffline = (nodeId: string) => { void this.onDisconnect(nodeId).catch(error=>runtime.emit("fault",error)); };
-    const onOnline = (link: PeerLink) => { void this.onReconnect(link.peerId).catch(error=>runtime.emit("fault",error)); };
+    const onOffline = (nodeId: string) => { void this.onDisconnect(nodeId).catch(error=>{if(!this.closed)runtime.emit("fault",error);}); };
+    const onOnline = (link: PeerLink) => { void this.onReconnect(link.peerId).catch(error=>{if(!this.closed)runtime.emit("fault",error);}); };
     runtime.transport.on("offline", onOffline);
     runtime.transport.on("online", onOnline);
     this.disposeSettlements.push(() => runtime.transport.off("offline", onOffline));
     this.disposeSettlements.push(() => runtime.transport.off("online", onOnline));
     runtime.setSessionFeed(this);
+    projector.setRemoteTaskRefresher((taskId,memberId)=>this.refreshTask(taskId,memberId));
     service.setRemoteFinalizer(async (task,status,summary) => {
       const session=store.getSession(task.session_id);
       const members=store.taskMemberIds(task.id).map(id=>store.getMember(session.id,id)).filter(member=>member.node_id!==runtime.localId);
@@ -183,7 +193,9 @@ export class SessionFeed {
       if (envelope.conversation_id && session.conversation_id && envelope.conversation_id !== session.conversation_id)
         throw new Error("SESSION_SCOPE_MISMATCH");
       const workspaceId = typeof input.workspace_id === "string" ? input.workspace_id : envelope.workspace_id;
-      if (workspaceId) {
+      // qm_session 在入口读成员投影；原 handler 的 requireSession/readTask.requireScope
+      // 核验 owner、session、task/member 归属，不在该成员的工作区执行操作。
+      if (workspaceId && name !== "qm_session") {
         if (!envelope.member_id) throw new Error("REMOTE_SESSION_MEMBER_REQUIRED");
         const member = this.store.getMember(sessionId, envelope.member_id);
         const handle = parseWorkspaceHandle(workspaceId);
@@ -244,6 +256,17 @@ export class SessionFeed {
     envelope: TrustedInvocationEnvelope | undefined,
   ): Promise<void> {
     if (!envelope || nodeId === this.runtime.localId) return;
+    if (name !== "open_workspace" && name !== "attach_workspace") {
+      const member=envelope.session_id&&envelope.member_id
+        ? this.store.findMember(envelope.session_id,envelope.member_id) : null;
+      if(member?.node_id===nodeId){
+        const key=subscriptionKey(envelope.session_id!,member.id,envelope.task_id);
+        const subscription=this.subscriptions.get(key);
+        if(subscription&&!isReadOnlyObservation(name,input))subscription.confirmedAt=0;
+        this.subscribe(envelope.session_id!,member.id,nodeId,envelope.task_id);
+      }
+      return;
+    }
     const structured = result && typeof result === "object" && !Array.isArray(result)
       ? (result as JsonRecord).structuredContent as JsonRecord | undefined
       : undefined;
@@ -285,7 +308,9 @@ export class SessionFeed {
     void input;
   }
 
-  async handleRequest(params: SessionFeedRequest, peerId: string): Promise<unknown> {
+  async handleRequest(params: SessionFeedRequest, peerId: string, signal?: AbortSignal): Promise<unknown> {
+    const deadline=Date.now()+TASK_REFRESH_TIMEOUT_MS;
+    signal?.throwIfAborted();
     validateRequest(params);
     const session=this.store.getSession(params.session_id);
     const member=this.store.getMember(session.id,params.member_id);
@@ -311,19 +336,27 @@ export class SessionFeed {
     if(params.kind==="subscribe"){
       const peers=this.subscribers.get(key)??new Set<string>();peers.add(peerId);this.subscribers.set(key,peers);
     }
-    const update=(snapshot?:Snapshot):SessionFeedUpdate=>({
+    const update=(snapshot?:Snapshot,revision=snapshot?.rev??(task?this.store.getTask(task.id).revision:this.store.memberRevision(member.id))):SessionFeedUpdate=>({
       owner_id:session.owner_id,node_id:this.runtime.localId,session_id:session.id,member_id:member.id,
       ...(task?{task_id:task.id}:{}),
-      revision:task?this.store.getTask(task.id).revision:this.store.memberRevision(member.id),
-      observed_at:new Date().toISOString(),...(snapshot?{snapshot}:{})
+      revision, observed_at:new Date().toISOString(),...(snapshot?{snapshot}:{}),
+      ...(task?{observation:this.projector.observeTask(task.id,member.id)}:{}),
     });
     if(params.kind==="revision")return update();
-    const frozen=task?.state==="closed"?this.store.getTaskSnapshot(task.id,member.id)?.snapshot:null;
-    const snapshot=validateSnapshot(frozen??await this.projector.materialize(session.id,member.id,task?.id)) as Snapshot;
-    return update(params.kind==="subscribe"?compactSnapshot(snapshot):snapshot);
+    if(params.kind==="subscribe"&&params.known_revision===(task?this.store.getTask(task.id).revision:this.store.memberRevision(member.id)))return update();
+    const frozen=task?.state==="closed"?this.store.getTaskSnapshot(task.id,member.id):null;
+    const cached=task?this.store.taskData.projection(task.id,member.id):this.store.getSnapshot(session.id,member.id);
+    const currentRevision=task?this.store.getTask(task.id).revision:this.store.memberRevision(member.id);
+    const snapshot=validateSnapshot(frozen&&frozen.revision>=task!.revision?frozen.snapshot
+      :cached?.snapshot&&cached.revision===currentRevision?cached.snapshot
+      :await this.projector.materialize(session.id,member.id,task?.id,{
+        timeoutMs:Math.max(0,deadline-Date.now()),
+        signal:signal?AbortSignal.any([signal,this.refreshController.signal]):this.refreshController.signal,
+      })) as Snapshot;
+    return update(params.kind==="subscribe"?compactSnapshot(snapshot):snapshot,snapshot.rev);
   }
 
-  async receiveUpdate(value: unknown, peerId: string): Promise<void> {
+  async receiveUpdate(value: unknown, peerId: string, deadline=Date.now()+TASK_REFRESH_TIMEOUT_MS): Promise<void> {
     const update=value as SessionFeedUpdate;validateUpdate(update);
     const key=subscriptionKey(update.session_id,update.member_id,update.task_id);
     const subscription=this.subscriptions.get(key);
@@ -334,26 +367,37 @@ export class SessionFeed {
     if(update.task_id && this.store.getTask(update.task_id).session_id!==session.id)throw new Error("TASK_SESSION_MISMATCH");
     if(update.revision<subscription.lastRevision)return;
     let received=update;
-    if(!received.snapshot&&received.revision>subscription.lastRevision){
-      received=await this.runtime.request<SessionFeedUpdate>(peerId,"session.feed",{
-        kind:"snapshot",session_id:session.id,member_id:member.id,
-        ...(update.task_id?{task_id:update.task_id}:{}),known_revision:subscription.lastRevision,
-      } satisfies SessionFeedRequest);
+    while(!received.snapshot&&received.revision>subscription.lastRevision){
+      const latest=await this.fetchSnapshot(key,subscription,deadline);
       if(this.closed)return;
-      validateUpdate(received);
+      validateUpdate(latest);
+      if(latest.revision<update.revision)continue;
+      received=latest;
     }
     if(received.session_id!==session.id||received.member_id!==member.id||received.node_id!==peerId||
       received.task_id!==update.task_id||received.owner_id!==session.owner_id)throw new Error("SESSION_FEED_RESPONSE_MISMATCH");
     if(received.revision<subscription.lastRevision)return;
-    if(received.snapshot){
-      const snapshot=validateSnapshot(received.snapshot) as Snapshot;
-      if((snapshot.taskId??undefined)!==received.task_id)throw new Error("TASK_SNAPSHOT_ID_MISMATCH");
-      this.store.putRemoteSnapshot(session.id,member.id,received.revision,snapshot);
-    }
-    if(update.task_id&&received.observation)this.store.taskData.observeProjection(update.task_id,member.id,received.observation);
-    if(!update.task_id)this.store.setMemberRevision(member.id,received.revision);
-    this.store.setMemberPresence(member.id,true,received.observed_at);
+    const snapshot=received.snapshot?validateSnapshot(received.snapshot) as Snapshot:undefined;
+    if(snapshot&&(snapshot.taskId??undefined)!==received.task_id)throw new Error("TASK_SNAPSHOT_ID_MISMATCH");
+    const observation=received.observation??received.snapshot?.executionObservation;
+    const remaining=deadline-Date.now();
+    if(remaining<=0)throw new Error("SESSION_REFRESH_TIMEOUT");
+    const saved=await this.store.writeAsync(()=>{
+      // 等锁期间可能已有更新抵达，不能用旧响应回写快照、在线状态或观测。
+      if(this.closed||this.subscriptions.get(key)!==subscription)return false;
+      const cached=update.task_id?this.store.taskData.projection(update.task_id,member.id):this.store.getSnapshot(session.id,member.id);
+      if(received.revision<Math.max(subscription.lastRevision,cached?.revision??-1))return false;
+      if(snapshot)this.store.putRemoteSnapshot(session.id,member.id,received.revision,snapshot);
+      if(update.task_id&&observation)this.store.taskData.observeProjection(update.task_id,member.id,observation);
+      if(!update.task_id)this.store.setMemberRevision(member.id,received.revision);
+      const current=this.store.getMember(session.id,member.id);
+      this.store.setMemberPresence(member.id,true,new Date(Math.max(Date.parse(current.last_observed_at),Date.parse(received.observed_at))).toISOString());
+      return true;
+    },{timeoutMs:remaining,signal:this.refreshController.signal});
+    if(!saved||this.closed||this.subscriptions.get(key)!==subscription)return;
     subscription.lastRevision=Math.max(subscription.lastRevision,received.revision);
+    subscription.confirmedAt=Date.now();
+    subscription.generation++;
     subscription.lastError=undefined;
     this.runtime.emit("change");
   }
@@ -361,28 +405,36 @@ export class SessionFeed {
   async onDisconnect(nodeId: string): Promise<void> {
     if(this.closed)return;
     for(const peers of this.subscribers.values())peers.delete(nodeId);
+    const disconnected:Array<{key:string;subscription:RemoteSubscription;generation:number}>=[];
     for(const [key,subscription] of this.subscriptions){
       if(subscription.nodeId!==nodeId)continue;
       const member=this.store.findMember(subscription.sessionId,subscription.memberId);
       if(!member){this.subscriptions.delete(key);continue;}
-      this.store.setMemberPresence(member.id,false,new Date().toISOString());
+      subscription.confirmedAt=0;
+      disconnected.push({key,subscription,generation:subscription.generation});
     }
+    if(!disconnected.length)return;
+    const observedAt=new Date().toISOString();
+    await this.store.writeAsync(()=>{
+      for(const {key,subscription,generation} of disconnected){
+        if(this.closed||this.subscriptions.get(key)!==subscription||subscription.generation!==generation)continue;
+        this.store.setMemberPresence(subscription.memberId,false,observedAt);
+      }
+    },{timeoutMs:TASK_REFRESH_TIMEOUT_MS,signal:this.refreshController.signal});
+    if(this.closed)return;
     this.runtime.emit("change");
   }
 
   async onReconnect(nodeId: string): Promise<void> {
     if(this.closed)return;
+    const pending:Promise<void>[]=[];
     for(const [key,subscription] of this.subscriptions){
       if(subscription.nodeId!==nodeId)continue;
       if(!this.store.findMember(subscription.sessionId,subscription.memberId)){this.subscriptions.delete(key);continue;}
-      try {
-        const update=await this.runtime.request<SessionFeedUpdate>(nodeId,"session.feed",{
-          kind:"subscribe",session_id:subscription.sessionId,member_id:subscription.memberId,
-          ...(subscription.taskId?{task_id:subscription.taskId}:{}),
-        } satisfies SessionFeedRequest);
-        await this.receiveUpdate(update,nodeId);
-      } catch(error){this.recordSubscriptionFailure(key,error);}
+      subscription.confirmedAt=0;
+      pending.push(this.refreshSubscription(key,subscription));
     }
+    await Promise.all(pending);
   }
 
   async fetchDetail(toolName: string, input: JsonRecord, extra: JsonRecord): Promise<unknown | undefined> {
@@ -416,25 +468,99 @@ export class SessionFeed {
 
   subscribe(sessionId: string, memberId: string, nodeId: string, taskId?: string): void {
     const key=subscriptionKey(sessionId,memberId,taskId);
+    const subscription=this.ensureSubscription(sessionId,memberId,nodeId,taskId);
+    if(subscription.confirmedAt&&Date.now()-subscription.confirmedAt<EXECUTION_OBSERVATION_TTL_MS&&!subscription.lastError)return;
+    void this.refreshSubscription(key,subscription);
+  }
+
+  private ensureSubscription(sessionId:string,memberId:string,nodeId:string,taskId?:string):RemoteSubscription {
+    const key=subscriptionKey(sessionId,memberId,taskId);
     const existing=this.subscriptions.get(key);
-    if(existing?.nodeId===nodeId)return;
-    this.subscriptions.set(key,{nodeId,sessionId,memberId,taskId,lastRevision:-1});
-    void this.runtime.request<SessionFeedUpdate>(nodeId,"session.feed",{
-      kind:"subscribe",session_id:sessionId,member_id:memberId,...(taskId?{task_id:taskId}:{}),
-    } satisfies SessionFeedRequest).then(update=>this.receiveUpdate(update,nodeId)).catch(error=>{
-      if(!this.closed)this.recordSubscriptionFailure(key,error);
-    });
+    if(existing?.nodeId===nodeId)return existing;
+    const cached=taskId?this.store.taskData.projection(taskId,memberId):this.store.getSnapshot(sessionId,memberId);
+    const subscription:RemoteSubscription={nodeId,sessionId,memberId,taskId,lastRevision:cached?.snapshot?cached.revision:-1,confirmedAt:0,generation:0};
+    this.subscriptions.set(key,subscription);
+    return subscription;
+  }
+
+  private async refreshTask(taskId:string,memberId?:string):Promise<void> {
+    if(this.closed)return;
+    const task=this.store.getTask(taskId);
+    const ids=memberId?[memberId]:this.store.taskMemberIds(taskId);
+    const pending:Promise<void>[]=[];
+    for(const id of ids){
+      const member=this.store.getMember(task.session_id,id);
+      if(member.node_id===this.runtime.localId)continue;
+      if(task.state==="closed"){
+        const projection=this.store.taskData.projection(taskId,id);
+        const frozen=this.store.getTaskSnapshot(taskId,id);
+        const snapshot=projection&&projection.revision>(frozen?.revision??-1)?projection.snapshot:frozen?.snapshot;
+        const observation=snapshot?.executionObservation;
+        if(!observation?.activeOperationIds.length&&!observation?.preparingOperationIds.length&&!observation?.staleOperationIds.length
+          &&!snapshot?.commands.some(command=>command.status==="run"||command.status==="queued")
+          &&!snapshot?.agents.some(agent=>agent.state==="working"||agent.state==="queued"))continue;
+      }
+      const subscription=this.ensureSubscription(task.session_id,id,member.node_id,taskId);
+      if(subscription.confirmedAt&&Date.now()-subscription.confirmedAt<EXECUTION_OBSERVATION_TTL_MS&&!subscription.lastError)continue;
+      pending.push(this.refreshSubscription(subscriptionKey(task.session_id,id,taskId),subscription));
+    }
+    if(!pending.length)return;
+    let timer:ReturnType<typeof setTimeout>;
+    try {
+      await Promise.race([Promise.all(pending),new Promise<void>(resolve=>{timer=setTimeout(resolve,TASK_REFRESH_WAIT_MS);})]);
+    } finally {clearTimeout(timer!);}
+  }
+
+  private refreshSubscription(key:string,subscription:RemoteSubscription):Promise<void> {
+    const existing=this.refreshing.get(key);
+    if(existing)return existing;
+    const generation=subscription.generation;
+    const deadline=Date.now()+TASK_REFRESH_TIMEOUT_MS;
+    const pending=this.runtime.request<SessionFeedUpdate>(subscription.nodeId,"session.feed",{
+      kind:"subscribe",session_id:subscription.sessionId,member_id:subscription.memberId,
+      known_revision:subscription.lastRevision,...(subscription.taskId?{task_id:subscription.taskId}:{}),
+    } satisfies SessionFeedRequest,TASK_REFRESH_TIMEOUT_MS,undefined,this.refreshController.signal)
+      .then(update=>this.receiveUpdate(update,subscription.nodeId,deadline))
+      .catch(async error=>{
+        // 请求期间收到的新状态优先；较早请求的失败不能覆盖它。
+        if(!this.closed&&this.subscriptions.get(key)===subscription&&subscription.generation===generation)await this.recordSubscriptionFailure(key,error,deadline);
+      }).finally(()=>{if(this.refreshing.get(key)===pending)this.refreshing.delete(key);});
+    this.refreshing.set(key,pending);
+    return pending;
+  }
+
+  private async fetchSnapshot(key:string,subscription:RemoteSubscription,deadline:number):Promise<SessionFeedUpdate> {
+    const remaining=deadline-Date.now();
+    if(remaining<=0)throw new Error("SESSION_REFRESH_TIMEOUT");
+    const existing=this.snapshots.get(key);
+    if(existing){
+      let timer:ReturnType<typeof setTimeout>;
+      try {return await Promise.race([existing,new Promise<never>((_,reject)=>{
+        timer=setTimeout(()=>reject(new Error("SESSION_REFRESH_TIMEOUT")),remaining);
+      })]);}finally{clearTimeout(timer!);}
+    }
+    const pending=this.runtime.request<SessionFeedUpdate>(subscription.nodeId,"session.feed",{
+      kind:"snapshot",session_id:subscription.sessionId,member_id:subscription.memberId,
+      ...(subscription.taskId?{task_id:subscription.taskId}:{}),known_revision:subscription.lastRevision,
+    } satisfies SessionFeedRequest,remaining,undefined,this.refreshController.signal)
+      .finally(()=>{if(this.snapshots.get(key)===pending)this.snapshots.delete(key);});
+    this.snapshots.set(key,pending);
+    return pending;
   }
 
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.refreshController.abort();
+    this.projector.setRemoteTaskRefresher(undefined);
     clearInterval(this.observationTimer);
     this.disposeStore();
     for (const dispose of this.disposeSettlements) dispose();
     for (const timer of this.pendingPublishes.values()) clearTimeout(timer);
     this.pendingPublishes.clear();
     this.subscriptions.clear();
+    this.refreshing.clear();
+    this.snapshots.clear();
     this.subscribers.clear();
   }
 
@@ -481,13 +607,29 @@ export class SessionFeed {
     return [...this.subscriptions.values()].find(value=>value.sessionId===sessionId&&value.memberId===memberId&&value.lastError)?.lastError??null;
   }
 
-  private recordSubscriptionFailure(key: string, error: unknown): void {
+  private async recordSubscriptionFailure(key: string, error: unknown, deadline: number): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
     const subscription = this.subscriptions.get(key);
-    if (subscription) subscription.lastError = message;
-    const { sessionId, memberId } = splitSubscriptionKey(key);
-    this.store.markProjectionError(sessionId, memberId, message);
-    this.runtime.emit("change");
+    if(!subscription)return;
+    subscription.lastError=message;
+    subscription.confirmedAt=0;
+    const generation=subscription.generation;
+    try {
+      await this.store.writeAsync(()=>{
+        if(this.closed||this.subscriptions.get(key)!==subscription||subscription.generation!==generation)return;
+        if(subscription.taskId){
+          const observation=this.store.taskData.projection(subscription.taskId,subscription.memberId)?.snapshot.executionObservation;
+          if(observation)this.store.taskData.observeProjection(subscription.taskId,subscription.memberId,{...observation,stale:true});
+        }
+        this.store.markProjectionError(subscription.sessionId,subscription.memberId,message);
+      },{timeoutMs:Math.max(0,deadline-Date.now()),signal:this.refreshController.signal});
+    } catch(persistenceError) {
+      if(this.closed)return;
+      // 失败标记仍共享原截止时间；锁未释放时保留内存错误，不再同步等第二轮锁。
+      const code=errorCode(persistenceError);
+      if(code!=="SQLITE_BUSY"&&!code.startsWith("SQLITE_BUSY_"))this.runtime.emit("fault",persistenceError);
+    }
+    if(!this.closed)this.runtime.emit("change");
   }
 
   private memberForTool(toolName: string, input: JsonRecord): { sessionId: string; member: SessionMember } | undefined {
@@ -627,7 +769,7 @@ function validateUpdate(value: unknown): asserts value is SessionFeedUpdate {
     typeof update.revision !== "number" ||
     !Number.isSafeInteger(update.revision) ||
     update.revision < 0 ||
-    typeof update.observed_at !== "string"
+    typeof update.observed_at !== "string" || !Number.isFinite(Date.parse(update.observed_at))
   ) {
     throw new Error("SESSION_FEED_UPDATE_INVALID");
   }
@@ -635,5 +777,3 @@ function validateUpdate(value: unknown): asserts value is SessionFeedUpdate {
 }
 
 function subscriptionKey(sessionId:string,memberId:string,taskId?:string):string {return JSON.stringify([sessionId,memberId,taskId??null]);}
-
-function splitSubscriptionKey(key:string):{sessionId:string;memberId:string;taskId?:string}{const [sessionId,memberId,taskId]=JSON.parse(key) as [string,string,string|null];return {sessionId,memberId,...(taskId?{taskId}:{})};}

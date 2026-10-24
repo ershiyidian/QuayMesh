@@ -3,7 +3,7 @@ import { dayAt, type Query } from "./query.js";
 import type { TaskPhaseIndex } from "./local-queries.js";
 import type { SessionTitleIndex } from "./local-queries.js";
 import type { Run, Usage } from "./types.js";
-import { needsAttention, relevantExecution, taskStage, withTaskLifecycle, executionTimeEnd, type TaskLifecycle } from '../console-task-state.js';
+import { needsAttention, relevantExecution, taskStage, withTaskLifecycle, taskTimeEnd, type TaskLifecycle } from '../console-task-state.js';
 import { taskView } from '../task-view.js';
 export { taskStage } from '../console-task-state.js';
 
@@ -75,7 +75,7 @@ export function taskOnlyIndex(task: TaskLifecycle, at = Date.now()): TaskIndex {
   },task);
 }
 
-export function aggregateTasks(runs: Run[]): Run[] {
+export function aggregateTasks(runs: Run[], at = Date.now()): Run[] {
   const groups = new Map<string, Run[]>();
   for (const run of runs) {
     const key = taskKey(run);
@@ -83,10 +83,10 @@ export function aggregateTasks(runs: Run[]): Run[] {
     if (group) group.push(run);
     else groups.set(key, [run]);
   }
-  return [...groups.values()].map(mergeTask);
+  return [...groups.values()].map(group => mergeTask(group, at));
 }
 
-export function aggregateTaskIndex(phases: TaskPhaseIndex[]): TaskIndex[] {
+export function aggregateTaskIndex(phases: TaskPhaseIndex[], at = Date.now()): TaskIndex[] {
   const groups = new Map<string, TaskPhaseIndex[]>();
   for (const phase of phases) {
     const key = phase.taskId ? `task:${phase.taskId}` : phase.sessionId ? `session:${phase.sessionId}` : `run:${phase.id}`;
@@ -100,6 +100,7 @@ export function aggregateTaskIndex(phases: TaskPhaseIndex[]): TaskIndex[] {
     const current = values.filter((value) => value.currentPhase);
     const stateValues = current.length ? values.filter(relevantExecution) : values;
     const tokenValues = values.map((value) => value.tokens).filter((value): value is number => value !== null);
+    const lastActivityAt = Math.max(...values.map(value => value.lastActivityAt));
     return {
       key,
       sessionId,
@@ -110,11 +111,11 @@ export function aggregateTaskIndex(phases: TaskPhaseIndex[]): TaskIndex[] {
       projectIds: [...new Set(values.map((value) => value.projectId))],
       projectNames: [...new Set(values.map((value) => value.projectName))],
       roots: [...new Set(values.map((value) => value.root))],
-      executionStatus: aggregateExecution(stateValues.map((value) => value.executionStatus)),
+      executionStatus: aggregateExecution(stateValues, lastActivityAt, at),
       acceptanceStatus: aggregateAcceptance(stateValues.map((value) => value.acceptanceStatus)),
       startedAt: Math.min(...values.map((value) => value.startedAt)),
       finishedAt: stateValues.every((value) => value.finishedAt !== null) ? Math.max(...stateValues.map((value) => value.finishedAt!)) : null,
-      lastActivityAt: Math.max(...values.map((value) => value.lastActivityAt)),
+      lastActivityAt,
       observedAt: stateValues.every(value => value.observedAt != null) ? Math.min(...stateValues.map(value => value.observedAt!)) : null,
       stale: stateValues.some(value => value.stale),
       tokens: tokenValues.length ? tokenValues.reduce((sum, value) => sum + value, 0) : null,
@@ -175,7 +176,7 @@ export function filterTaskIndex(tasks: TaskIndex[], query: Query, at: number): T
 
 export function compareTaskIndex(left: TaskIndex, right: TaskIndex, query: Query, at: number): number {
   const value = (task: TaskIndex) => {
-    const end = executionTimeEnd(task, at);
+    const end = taskTimeEnd(task, at);
     return query.sort === "tokens" ? task.tokens ?? -1
       : query.sort === "duration" ? end === null ? -1 : Math.max(0, end - task.startedAt) : task.startedAt;
   };
@@ -239,7 +240,7 @@ export function fallbackTask(task: TaskIndex): Run {
   };
 }
 
-function mergeTask(group: Run[]): Run {
+function mergeTask(group: Run[], at: number): Run {
   if (group.length === 1 && !group[0]!.taskId && !group[0]!.sessionId) return group[0]!;
   const current = [...group].sort((a, b) => b.lastActivityAt - a.lastActivityAt)[0]!;
   const nodeIds = [...new Set(group.flatMap((run) => run.nodeIds ?? [run.nodeId]))];
@@ -249,11 +250,13 @@ function mergeTask(group: Run[]): Run {
     memberId:run.memberId,name:run.projectName,root:run.root}]).map(value=>[JSON.stringify([value.nodeId,value.root]),value])).values()];
   const currentRuns = group.filter((run) => run.currentPhase !== false);
   const stateRuns = currentRuns.length ? group.filter(relevantExecution) : group;
-  const nodeStates=Object.fromEntries([...new Set(stateRuns.map(run=>run.nodeId))].map(nodeId=>[
-    nodeId,aggregateExecution(stateRuns.filter(run=>run.nodeId===nodeId).map(run=>run.executionStatus)),
-  ]));
+  const lastActivityAt = Math.max(...group.map(run => run.lastActivityAt));
+  const nodeStates = Object.fromEntries([...new Set(stateRuns.map(run => run.nodeId))].map(nodeId => {
+    const values = stateRuns.filter(run => run.nodeId === nodeId);
+    return [nodeId, aggregateExecution(values, Math.max(...values.map(run => run.lastActivityAt)), at)];
+  }));
   const diffRows = stateRuns.map((run) => run.diff).filter((value): value is NonNullable<Run["diff"]> => value !== null);
-  const executionStatus = aggregateExecution(stateRuns.map((run) => run.executionStatus));
+  const executionStatus = aggregateExecution(stateRuns, lastActivityAt, at);
   const acceptanceStatus = aggregateAcceptance(stateRuns.map((run) => run.acceptanceStatus));
   const usage = mergeUsage(group.map((run) => run.usage));
   const executions = stateRuns.map((run) => run.executionStatus);
@@ -274,7 +277,7 @@ function mergeTask(group: Run[]): Run {
     finalization:stateRuns.find(run=>run.finalization)?.finalization ?? null,
     startedAt: Math.min(...group.map((run) => run.startedAt)),
     finishedAt: stateRuns.every((run) => run.finishedAt !== null) ? Math.max(...stateRuns.map((run) => run.finishedAt!)) : null,
-    lastActivityAt: Math.max(...group.map((run) => run.lastActivityAt)),
+    lastActivityAt,
     observedAt: stateRuns.every(run => run.observedAt != null) ? Math.min(...stateRuns.map(run => run.observedAt!)) : null,
     stale: stateRuns.some(run => run.stale),
     revision: group.reduce((sum, run) => sum + run.revision, 0),
@@ -287,7 +290,7 @@ function mergeTask(group: Run[]): Run {
     } : null,
     command: stateRuns.find((run) => run.executionStatus === "running")?.command ?? current.command,
     agent: stateRuns.find((run) => run.executionStatus === "running")?.agent ?? current.agent,
-    reason: stateRuns.find((run) => run.reason)?.reason ?? null,
+    reason: stateRuns.find(run => run.executionStatus === executionStatus && run.reason)?.reason ?? null,
     actions: {
       interrupt: stateRuns.some((run) => run.actions.interrupt),
       resume: stateRuns.some((run) => run.actions.resume),
@@ -322,11 +325,28 @@ function isTaskTitle(title: string): boolean {
     && !/^(?:git|node|powershell|pwsh|python|pnpm|npm|yarn)\b/i.test(title);
 }
 
-function aggregateExecution(states: string[]): string {
-  for (const state of ["running", "stopping", "queued", "unknown", "finalizing", "failed", "interrupted_recoverable", "stalled", "waiting", "cancelled", "completed", "handed_off", "ended"]) {
-    if (states.includes(state)) return state;
-  }
-  return states[0] ?? "unknown";
+function aggregateExecution(
+  values: ReadonlyArray<Pick<Run, 'executionStatus' | 'requestState' | 'resultStatus' | 'finalization' | 'stale'>>,
+  lastActivityAt: number,
+  at: number,
+): string {
+  // 闲置由全任务最新活动判定，成员已经计算出的 stalled 不参与优先级竞争。
+  const states = values.map(value => value.stale && ['running', 'stopping', 'starting', 'queued'].includes(value.executionStatus)
+    ? 'unknown' : value.executionStatus === 'stalled' ? 'waiting' : value.executionStatus);
+  const execution = ['running', 'stopping', 'queued', 'unknown', 'finalizing', 'failed', 'interrupted_recoverable',
+    'waiting', 'cancelled', 'completed', 'handed_off', 'ended'].find(state => states.includes(state)) ?? states[0] ?? 'unknown';
+  const active = states.some(state => ['running', 'stopping', 'starting'].includes(state));
+  const queued = states.includes('queued');
+  return taskView({
+    requestState: values.find(value => value.requestState === 'closed')?.requestState ?? values.find(value => value.requestState)?.requestState,
+    result: values.find(value => value.resultStatus)?.resultStatus,
+    execution, active, queued, unresolved: states.includes('unknown'),
+    stale: !active && !queued && values.some(value => value.stale && (value.requestState === 'active'
+      || !['completed', 'failed', 'cancelled', 'handed_off', 'ended'].includes(value.executionStatus))),
+    finalizing: values.some(value => Boolean(value.finalization)),
+    finalizationFailed: values.some(value => Boolean(value.finalization?.error)),
+    lastProgressAt: lastActivityAt, now: at,
+  }).status;
 }
 
 function aggregateAcceptance(states: string[]): string {

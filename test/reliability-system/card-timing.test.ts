@@ -38,7 +38,7 @@ test("CD01/CD04：完成命令和完成Task在一小时后仍使用固定结束�
 test("CD02/CD06：无后台的一小时静默显示明确提示，卡片查询时间不冒充模型活动",()=>{
   const silent=snapshot({lastModelToolAt:NOW-3_600_000,lastActivityAt:NOW-3_600_000,lastExecutionActivityAt:NOW-3_600_000,serverNow:NOW+3_600_000,observedAt:NOW+3_600_000});
   const view=cardPresentation(silent,NOW);
-  assert.equal(view.status,"stalled");assert.equal(view.label,"长时间没有新的执行进展");
+  assert.equal(view.status,"stalled");assert.equal(view.label,"10 分钟没有新的执行记录");
   assert.equal(view.modelActivityAgeMs,3_600_000);
 });
 

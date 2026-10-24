@@ -3,7 +3,7 @@ import type { ExecutionCoordinator } from "./execution-coordinator.js";
 import { observationBudget, observeWithSignal } from "./observation-budget.js";
 
 export function isReadOnlyObservation(name: string, input: Record<string, unknown>): boolean {
-  if (["read_output", "read_diagnostics", "list_agents", "wait_agent"].includes(name)) return true;
+  if (["read_output", "read_diagnostics", "list_agents", "wait_agent", "qm_session"].includes(name)) return true;
   if (name === "workspace_context") return input.action === "status" || input.action === "recovery";
   return name === "write_stdin" && !input.chars && input.columns === undefined && input.rows === undefined;
 }

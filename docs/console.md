@@ -58,13 +58,15 @@ The account controls include signing out of the current device and revoking sess
 
 Enable `desktopUi` on a Windows node before installation. The application opens the same console through the node's local relay and follows its light or dark theme.
 
+The local entry loads the console page, versioned assets, and API from the coordinator through the same authenticated connection. Updating the coordinator updates the page served by every relay. If the page cannot load, a reconnect screen retries the current address and keeps the existing sign-in session.
+
 The tray, Host, browser favicon, and desktop application share the project icon in `app.ico`.
 
 ## Connection state
 
-The console reports node connectivity and the freshness of displayed data. Previously received data remains visible while the next refresh runs.
+The console reports node connectivity and the freshness of displayed data. Previously received data remains visible while the next refresh runs. Normal background refreshes have no warning. Delayed updates and failed reads appear in one expandable notice, with the affected sources and their last confirmation times.
 
-Resources refresh independently. Hiding the page or losing the connection cancels unnecessary reads; returning resumes them. A stale active observation becomes “Needs verification,” and its elapsed display stops at the last confirmed observation. Known counts and missing coverage are shown separately. The diagnostics panel provides resource timings, versions, source state, and an exportable record.
+Resources refresh independently. Hiding the page or losing the connection cancels unnecessary reads; returning resumes them. Stale execution observations show that an update is needed. The task timer measures time from request creation to delivery, while each command retains its own execution duration. Known counts and missing coverage are shown separately. The diagnostics panel provides resource timings, versions, source state, and an exportable record.
 
 Failure notifications use a separate saved event cursor for each node. An unavailable node keeps its cursor so events can be read when it returns. Notifications do not depend on the small sample shown in the overview.
 

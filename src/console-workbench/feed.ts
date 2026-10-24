@@ -254,8 +254,9 @@ export class WorkbenchFeed {
       && task.executionStatus!=='unknown' && !(task.executionStatus==='interrupted_recoverable'&&task.actionableInterruption);
     return {...run,title:task.title,executionStatus:task.executionStatus,acceptanceStatus:task.acceptanceStatus,sourceTaskId:task.sourceTaskId??null,
       requestState:task.requestState,resultStatus:task.resultStatus,phaseExecutionStatus:task.phaseExecutionStatus,finalization:task.finalization,actionableInterruption:task.actionableInterruption,
-      revision:run.revision+(task.taskRevision??0),taskRevision:task.taskRevision,reason:task.reason??run.reason,
-      finishedAt:task.finishedAt,lastActivityAt:task.lastActivityAt,
+      revision:run.revision+(task.taskRevision??0),taskRevision:task.taskRevision,
+      reason:task.reason ?? (run.executionStatus === task.executionStatus ? run.reason : null),
+      startedAt:task.startedAt,finishedAt:task.finishedAt,lastActivityAt:task.lastActivityAt,
       actions:{...run.actions,complete:canComplete,review:task.acceptanceStatus==='pending'&&run.actions.review}};
   }
 
@@ -270,7 +271,7 @@ export class WorkbenchFeed {
         const full=aggregate.get(task.taskId);
         const state=full?{...task,executionStatus:full.executionStatus,acceptanceStatus:full.acceptanceStatus,
           requestState:full.requestState,resultStatus:full.resultStatus,phaseExecutionStatus:full.phaseExecutionStatus,
-          finalization:full.finalization,finishedAt:full.finishedAt,lastActivityAt:full.lastActivityAt,workspaces:full.workspaces}
+          finalization:full.finalization,startedAt:full.startedAt,finishedAt:full.finishedAt,lastActivityAt:full.lastActivityAt,workspaces:full.workspaces}
           :withTaskLifecycle({...task,phaseExecutionStatus:task.executionStatus},titles.tasks.get(task.taskId ?? ''));
         return {...state,status:taskStage(state.executionStatus,state.acceptanceStatus,state.phaseExecutionStatus)};
       });

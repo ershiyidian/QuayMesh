@@ -161,6 +161,9 @@ textarea { width:100%;line-height:1.6;resize:vertical;min-height:72px }
 .notice.warn { background:var(--warn-bg);color:var(--amber);border-color:color-mix(in srgb,var(--amber) 24%,var(--border)) }
 .notice.bad { background:var(--bad-bg);color:var(--red) }
 .global-notice { margin:0;border-radius:0;border-width:0 0 1px;padding:6px 18px }
+.global-notice details { flex:1;min-width:0 }
+.global-notice summary { cursor:pointer }
+.global-notice .source-details { margin-top:8px;overflow-wrap:anywhere }
 .loading { display:flex;flex-direction:column;align-items:stretch;justify-content:center;gap:12px;padding:30px;color:var(--muted);min-height:180px }
 .loading p { display:flex;align-items:center;gap:8px;margin:0 }
 .skeleton { height:12px;width:100%;min-width:40px;background:var(--raised);border-radius:4px;margin:4px 0 }

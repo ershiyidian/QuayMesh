@@ -99,7 +99,20 @@ test("Console规范URL、带版本静态缓存、HEAD和多个cookie保持真实
   await mkdir(join(root,"assets"));
   await writeFile(join(root,"console.html"),'<script src="./assets/console-abcdefgh.js"></script>');
   await writeFile(join(root,"assets","console-abcdefgh.js"),'window.quaymesh=true;');
-  const source = http.createServer((_req,res) => {
+  const source = http.createServer(async(req,res) => {
+    const path = new URL(req.url,"http://console.local").pathname;
+    if (path === "/console/" || path.startsWith("/console/assets/")) {
+      const file = join(root,path === "/console/" ? "console.html" : path.slice("/console/".length));
+      const bytes = await readFile(file), info = await stat(file);
+      const etag = `W/"${info.size}-${info.mtimeMs}"`;
+      res.setHeader("content-type",path.endsWith(".js") ? "text/javascript; charset=utf-8" : "text/html; charset=utf-8");
+      res.setHeader("cache-control",path.endsWith(".js") ? "public, max-age=31536000, immutable" : "no-store");
+      res.setHeader("etag",etag);
+      if (req.headers["if-none-match"] === etag) { res.writeHead(304).end(); return; }
+      res.setHeader("content-length",bytes.length);
+      res.end(req.method === "HEAD" ? undefined : bytes);
+      return;
+    }
     res.setHeader("set-cookie",["one=1; Path=/","two=2; Path=/"]);
     res.end("ok");
   });
@@ -107,10 +120,9 @@ test("Console规范URL、带版本静态缓存、HEAD和多个cookie保持真实
   await new Promise(resolve=>source.listen(sourcePort,"127.0.0.1",resolve));
   t.after(()=>new Promise(resolve=>source.close(resolve)));
   const origin = `http://127.0.0.1:${source.address().port}`;
-  const relay = await new McpRelay({origin,port:await freePort(),
-    consoleAssetDir:root,consoleRpc:async request => {
+  const relay = await new McpRelay({origin,port:await freePort(),consoleRpc:async request => {
       const response=await fetch(origin+request.path,{method:request.method,headers:request.headers,signal:request.signal});
-      return {status:response.status,headers:{"set-cookie":response.headers.getSetCookie()},body:await response.text()};
+      return {status:response.status,headers:{...Object.fromEntries(response.headers),"set-cookie":response.headers.getSetCookie()},body:await response.text()};
     }}).start();
   t.after(()=>relay.close());
   const base = `http://127.0.0.1:${relay.port}`;
@@ -122,6 +134,11 @@ test("Console规范URL、带版本静态缓存、HEAD和多个cookie保持真实
   const unchanged = await fetch(base+'/console/assets/console-abcdefgh.js',{headers:{"if-none-match":asset.headers.get("etag")}});
   assert.equal(unchanged.status,304);
   const head = await fetch(base+'/console/assets/console-abcdefgh.js',{method:"HEAD"});assert.equal(await head.text(),"");
+  assert.equal(head.headers.get("content-length"),asset.headers.get("content-length"));
+  await writeFile(join(root,"console.html"),'<script src="./assets/console-nextbuild.js"></script>');
+  await writeFile(join(root,"assets","console-nextbuild.js"),'window.quaymesh="next";');
+  assert.match(await (await fetch(base+'/console/')).text(),/console-nextbuild/);
+  assert.match(await (await fetch(base+'/console/assets/console-nextbuild.js')).text(),/next/);
   const api = await fetch(base+'/console/api/read');assert.equal(api.headers.getSetCookie().length,2);await api.text();
   relay.setAccepting(false);
   assert.equal((await fetch(base+'/mcp',{method:"POST",body:"{}"})).status,401);

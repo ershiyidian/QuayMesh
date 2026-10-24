@@ -1,5 +1,6 @@
 import { executionObservationSchema, snapshotLiveStateSchema } from "./schema.js";
 import { projectionForCard } from './card-contract.js';
+import { errorCode } from './outcome.js';
 import * as z from "zod/v4";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -143,7 +144,7 @@ export function registerSessionAppTools(
     "qm_session",
     {
       title: "Read session snapshot",
-      description: "Reads the latest locally stored session snapshot without refreshing workspace state.",
+      description: "Reads the task snapshot and refreshes expired remote task state within a bounded wait.",
       inputSchema: appSchemas.session,
       outputSchema: sessionOutputSchema(),
       _meta: { ui: { visibility: ["app"] } },
@@ -158,11 +159,19 @@ export function registerSessionAppTools(
         dependencies.store.requireSession(ownerId, input.session_id);
         const result=projectionForCard(await dependencies.projector.readTask(input.task_id, input.since_rev, input.member_id, input.cursor), input.resource_version);
         if(input.mount_id&&input.resource_version){
-          dependencies.store.recordWidgetStage({taskId:task.id,sessionId:task.session_id,stage:"mount",
-            resourceVersion:input.resource_version,mountId:input.mount_id});
-          if(result.unchanged===true||result.snapshot){
-            dependencies.store.recordWidgetStage({taskId:task.id,sessionId:task.session_id,stage:"first_snapshot",
-              resourceVersion:input.resource_version,mountId:input.mount_id});
+          try {
+            // 附带挂载诊断不能让读取等待写锁；独立阶段上报仍按原接口确认落盘。
+            await dependencies.store.writeAsync(()=>{
+              dependencies.store.recordWidgetStage({taskId:task.id,sessionId:task.session_id,stage:"mount",
+                resourceVersion:input.resource_version!,mountId:input.mount_id});
+              if(result.unchanged===true||result.snapshot){
+                dependencies.store.recordWidgetStage({taskId:task.id,sessionId:task.session_id,stage:"first_snapshot",
+                  resourceVersion:input.resource_version!,mountId:input.mount_id});
+              }
+            },{timeoutMs:0});
+          } catch(error) {
+            const code=errorCode(error);
+            if(code!=="SQLITE_BUSY"&&!code.startsWith("SQLITE_BUSY_"))throw error;
           }
         }
         return jsonReply({...result});

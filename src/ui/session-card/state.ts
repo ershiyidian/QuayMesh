@@ -128,7 +128,7 @@ export function applySnapshot(
   }
   if (previous && previous.workspace?.id === next.workspace?.id && next.rev <= previous.rev) {
     const observation=next.rev===previous.rev && next.executionObservation &&
-      next.executionObservation.observedAt >= (previous.executionObservation?.observedAt??0) ? next.executionObservation : previous.executionObservation;
+      observationResponseAt(next) >= observationResponseAt(previous) ? next.executionObservation : previous.executionObservation;
     const live=next.rev===previous.rev && next.live && next.live.observedAt >= (previous.live?.observedAt??0) ? next.live : previous.live;
     const changed=!sameExecutionObservation(previous.executionObservation,observation)
       || live?.hostStatus!==previous.live?.hostStatus || live?.executionStatus!==previous.live?.executionStatus;
@@ -153,7 +153,7 @@ export function applySnapshot(
       archivedAt:previous.archivedAt??next.archivedAt,finalization:null};
   }
   if(previous&&previous.workspace?.id===next.workspace?.id){
-    if(previous.executionObservation&&(previous.executionObservation.observedAt>(next.executionObservation?.observedAt??-1)))
+    if(previous.executionObservation&&observationResponseAt(previous)>observationResponseAt(next))
       next={...next,executionObservation:previous.executionObservation};
     if(previous.live&&previous.live.observedAt>(next.live?.observedAt??-1))
       next={...next,live:previous.live,host_status:previous.live.hostStatus,execution_status:previous.live.executionStatus,serverNow:previous.live.observedAt};
@@ -217,6 +217,10 @@ export function applySnapshot(
     instructions: first || instructionChanged,
     status: first || statusChanged,
   };
+}
+
+function observationResponseAt(snapshot:Snapshot):number {
+  return snapshot.live?.observedAt ?? snapshot.serverNow ?? snapshot.executionObservation?.observedAt ?? snapshot.observedAt;
 }
 
 export function applyCommandOutput(

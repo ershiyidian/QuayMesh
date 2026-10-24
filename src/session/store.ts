@@ -554,8 +554,8 @@ export class SessionStore {
       this.db.prepare("UPDATE qm_session_members SET online=?,last_observed_at=? WHERE id=?")
         .run(online ? 1 : 0, observedAt, memberId);
       if (Boolean(previous.online) !== online) {
-        this.db.prepare(`UPDATE qm_tasks SET revision=revision+1,last_activity_at=? WHERE state='active'
-          AND id IN (SELECT task_id FROM qm_task_members WHERE member_id=?)`).run(observedAt, memberId);
+        this.db.prepare(`UPDATE qm_tasks SET revision=revision+1 WHERE state='active'
+          AND id IN (SELECT task_id FROM qm_task_members WHERE member_id=?)`).run(memberId);
       }
     }).immediate();
   }

@@ -55,6 +55,7 @@ export interface RealTestServer {
   accessToken: string;
   client: Client;
   running: ReturnType<typeof createServer>;
+  restart(beforeStart?: () => Promise<void>): Promise<void>;
   dispose(): Promise<void>;
 }
 
@@ -147,10 +148,10 @@ export async function createRealTestServer(options: RealTestServerOptions = {}):
   const loaded = loadConfig(env);
   const config = options.configure ? await options.configure(loaded) : loaded;
 
-  const running = createServer(config, { incomingArtifactAdapters: [], diagnostics: options.diagnostics });
+  let running = createServer(config, { incomingArtifactAdapters: [], diagnostics: options.diagnostics });
   await running.ready;
-  const httpServer = running.app.listen(httpPort, "127.0.0.1");
-  const client = new Client({ name: "session-card-test-client", version: "1.0.0" });
+  let httpServer = running.app.listen(httpPort, "127.0.0.1");
+  let client = new Client({ name: "session-card-test-client", version: "1.0.0" });
   let disposed = false;
   const dispose = async () => {
     if (disposed) return;
@@ -176,7 +177,27 @@ export async function createRealTestServer(options: RealTestServerOptions = {}):
     await client.connect(transport);
     // 与宿主一致，先发现工具并注册输出校验器，再开始任何工具调用。
     await client.listTools();
-    return { root, project, secondRoot, config, baseUrl, accessToken, client, running, dispose };
+    const fixture:RealTestServer={ root, project, secondRoot, config, baseUrl, accessToken, client, running, dispose,
+      restart:async(beforeStart)=>{
+        await client.close();
+        httpServer.closeAllConnections();
+        await new Promise<void>(resolve=>httpServer.close(()=>resolve()));
+        await running.close();
+        await beforeStart?.();
+        running=createServer(config,{incomingArtifactAdapters:[],diagnostics:options.diagnostics});
+        await running.ready;
+        httpServer=running.app.listen(httpPort,"127.0.0.1");
+        await new Promise<void>(resolve=>httpServer.once("listening",resolve));
+        client=new Client({name:"session-card-test-client",version:"1.0.0"});
+        await client.connect(new StreamableHTTPClientTransport(new URL("/mcp",baseUrl),{
+          requestInit:{headers:{authorization:"Bearer "+accessToken}},
+        }));
+        await client.listTools();
+        fixture.running=running;
+        fixture.client=client;
+      },
+    };
+    return fixture;
   } catch (error) {
     await dispose();
     throw error;
