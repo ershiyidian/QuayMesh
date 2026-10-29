@@ -258,22 +258,66 @@ export async function waitRunning(manifest,token,timeoutMs,{stableMs=60000,resum
   throw new Error(`新发行服务没有在规定时间内报告正确身份和就绪状态${lastFailure?`：${lastFailure}`:""}`);
 }
 
-function databaseSnapshot(manifest,target,timeoutMs=60000) {
+export function databaseSnapshot(manifest,target,{stallTimeoutMs=60000,maxTimeoutMs=1800000,
+  minimumBytesPerSecond=4*1024*1024,killGraceMs=1000}={}) {
+  if([stallTimeoutMs,maxTimeoutMs,minimumBytesPerSecond,killGraceMs].some(value=>!Number.isSafeInteger(value)||value<1))
+    throw new Error("数据库快照时限必须是正整数");
   return new Promise((resolveSnapshot,reject)=>{
     const child=spawn(manifest.nodeExecutable,[join(manifest.directory,"node","database-snapshot.mjs"),manifest.stateDir,...(target?[target]:[])],
-      {stdio:["ignore","pipe","inherit"],shell:false,windowsHide:true,env:restrictedEnvironment(process.env)});
-    let output="",failure,force;
-    const timer=setTimeout(()=>{
-      failure=new Error("数据库快照超时，等待自有备份进程退出后终止发行切换");child.kill();
-      force=setTimeout(()=>child.kill("SIGKILL"),1000);
-    },timeoutMs);
-    child.stdout.on("data",chunk=>{output+=chunk;if(output.length>65536)child.kill();});
+      {stdio:["ignore","pipe","inherit","ipc"],shell:false,windowsHide:true,env:restrictedEnvironment(process.env)});
+    const started=performance.now();
+    let output="",failure,force,timer,progress,completedPages=0,lastProgress=started,deadline=started+maxTimeoutMs;
+    const abort=error=>{
+      if(failure)return;
+      failure=error;clearTimeout(timer);child.kill();
+      force=setTimeout(()=>child.kill("SIGKILL"),killGraceMs);
+    };
+    const arm=()=>{
+      clearTimeout(timer);
+      timer=setTimeout(()=>{
+        const now=performance.now();
+        if(now<deadline&&now<lastProgress+stallTimeoutMs){arm();return;}
+        const total=progress?progress.totalPages*progress.pageSize:0,done=progress?completedPages*progress.pageSize:0;
+        const hard=now>=deadline;
+        abort(Object.assign(new Error(`数据库快照${hard?"达到总时限":"连续无复制进展"}（${done}/${total} bytes），等待自有备份进程退出后终止发行切换`),
+          {code:hard?"DATABASE_SNAPSHOT_DEADLINE":"DATABASE_SNAPSHOT_STALLED"}));
+      },Math.max(1,Math.min(deadline,lastProgress+stallTimeoutMs)-performance.now()));
+    };
+    arm();
+    child.on("message",value=>{
+      if(failure)return;
+      if(!target||value?.type!=="database_snapshot_progress"||
+          !Number.isSafeInteger(value.pageSize)||value.pageSize<512||value.pageSize>65536||
+          !Number.isSafeInteger(value.totalPages)||value.totalPages<0||
+          !Number.isSafeInteger(value.remainingPages)||value.remainingPages<0||value.remainingPages>value.totalPages||
+          !Number.isSafeInteger(value.totalPages*value.pageSize)||
+          (progress&&(progress.pageSize!==value.pageSize||progress.totalPages!==value.totalPages))) {
+        abort(new Error("数据库快照进度协议无效或源快照已改变"));return;
+      }
+      if(!progress){
+        // Calculate once from the pinned snapshot, never from destination
+        // file growth, heartbeats, or repeated copies of the same pages.
+        deadline=started+Math.min(maxTimeoutMs,stallTimeoutMs+Math.ceil(value.totalPages*value.pageSize/minimumBytesPerSecond*1000));
+        lastProgress=performance.now();
+      }
+      progress=value;
+      const copied=value.totalPages-value.remainingPages;
+      if(copied>completedPages){completedPages=copied;lastProgress=performance.now();}
+      arm();
+    });
+    child.stdout.on("data",chunk=>{output+=chunk;if(output.length>65536)abort(new Error("数据库快照回执超过大小限制"));});
     child.once("error",error=>{failure??=error;});
     child.once("close",code=>{
       clearTimeout(timer);clearTimeout(force);
       if(failure){reject(failure);return;}
       if(code!==0){reject(new Error(`数据库升级前检查失败，退出码 ${code}`));return;}
-      try{resolveSnapshot(JSON.parse(output));}catch(error){reject(error);}
+      try{
+        const result=JSON.parse(output);
+        if(typeof result.exists!=="boolean"||!Number.isSafeInteger(result.version)||result.version<0||
+            (target&&result.exists&&(result.backup!==resolve(target)||progress?.remainingPages!==0)))
+          throw new Error("数据库快照完成回执未通过验证");
+        resolveSnapshot(result);
+      }catch(error){reject(error);}
     });
   });
 }

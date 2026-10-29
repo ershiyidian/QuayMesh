@@ -131,6 +131,8 @@ Activation pauses admission and waits for accepted commands, agent turns, transf
 
 The prepared release is verified with its own Node runtime and installed SQLite dependency, including 500 native close/garbage-collection cycles. Activation takes a consistent SQLite backup, records `installation-transition.json`, and requires the same Core process to remain ready for 60 seconds before resuming work. A manager restart preserves this pause. `status` shows an unfinished transition so it can be recovered deliberately.
 
+The backup uses a fixed read snapshot so background bookkeeping cannot restart the copy. It aborts after 60 seconds without copied-page progress; the total budget is 60 seconds plus the snapshot size at 4 MiB/s, capped at 30 minutes. A failed backup stops only its own child process and waits for it to exit before abandoning activation; the current service remains running and no migration begins.
+
 Rollback is automatic only while the database schema remains compatible. If a failed upgrade has changed the schema, the installer preserves the new database, backup, and transition record instead of starting an incompatible previous binary. Check the recorded backup and every process using the state directory before restoring data. Existing command pipes, PTYs, and model streams remain owned by their original processes; upgrade waits for them to finish.
 
 When initiating a Windows upgrade from a QuayMesh command, prepare the release first, then start the independent activation task:
