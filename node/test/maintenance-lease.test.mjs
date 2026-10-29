@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import http from "node:http";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { beginInstallationMaintenance } from "../maintenance-lease.mjs";
 import { activateInstallation } from "../install.mjs";
@@ -211,11 +211,48 @@ test("manager条件resume通过真实HTTP转发，冲突保持relay关闭且time
   const url=`http://127.0.0.1:${node.admin.address().port}/maintenance/resume`;
   await assert.rejects(requestJson(url,{method:"POST",token,body:{expected}}),error=>error.status===409);
   assert.equal(node.maintenance,true);assert.equal(relayAccepting,false);
+  assert.ok(node.errors.snapshot().current.some(error=>error.source==="admission"));
   await assert.rejects(node.reconcileMaintenance(),error=>error.status===409);
+  assert.ok(node.errors.snapshot().current.some(error=>error.source==="admission"),"failed conditional mutation remains current");
   assert.equal(seen.length,2);assert.deepEqual(seen.map(value=>value.expected),[expected,expected]);
   conflict=false;await node.reconcileMaintenance();
   assert.equal(node.maintenance,false);assert.equal(relayAccepting,true);
   assert.deepEqual(seen[2].expected,expected);assert.equal(node.maintenanceReleasePending,false);
+  assert.equal(node.errors.snapshot().current.some(error=>error.source==="admission"),false);
+});
+
+test("一次真实idle超时仅在无维护归属且后续健康观测后恢复，历史回执仍保留",{timeout:10000},async t=>{
+  const root=await directory(t),marker=join(root,"installation-transition.json");
+  let reads=0,acquireDuringRead=false;
+  let state={accepting:false,reason:"release-preflight:other-owner"};
+  const port=await serve(t,async req=>{
+    assert.equal(req.url,"/internal/quaymesh/idle");
+    if(++reads===1)await new Promise(()=>{}); // Exercise requestJson's actual 3s timeout.
+    if(acquireDuringRead)node.maintenance=true;
+    return {body:state};
+  });
+  const node=new QuayMeshNode({revision:1,node:{stateDir:root,corePort:port}});node.token=token;
+  const reconcile=()=>node.reconcileMaintenance().catch(error=>{node.errors.fail("admission",error);throw error;});
+  await assert.rejects(reconcile(),/请求 \/internal\/quaymesh\/idle 超时/);
+  const original=node.errors.snapshot().current[0];
+  assert.equal(original.source,"admission");assert.equal(original.count,1);assert.equal(original.recoveredAt,null);
+  await reconcile();assert.deepEqual(node.errors.snapshot().current,[original],"another owner's pause is not a recovery");
+  state={accepting:true,reason:null};
+  await writeFile(marker,JSON.stringify({phase:"validating"}));
+  await reconcile();assert.equal(reads,2);assert.deepEqual(node.errors.snapshot().current,[original]);
+  await rm(marker);
+  node.maintenance=true;
+  await reconcile();assert.equal(reads,2);assert.deepEqual(node.errors.snapshot().current,[original]);
+  node.maintenance=false;acquireDuringRead=true;
+  await reconcile();assert.equal(reads,3);assert.deepEqual(node.errors.snapshot().current,[original],"ownership is rechecked after HTTP");
+  node.maintenance=false;acquireDuringRead=false;
+  node.errors.fail("configuration",new Error("unrelated configuration failure"));
+  await reconcile();assert.equal(reads,4);
+  const recovered=node.errors.snapshot();
+  assert.deepEqual(recovered.current.map(error=>error.source),["configuration"]);
+  const history=recovered.history.find(error=>error.source==="admission");
+  assert.deepEqual({...history,recoveredAt:null},original);
+  assert.ok(Number.isFinite(history.recoveredAt)&&history.recoveredAt>=original.lastOccurredAt);
 });
 
 for(const interveningPause of [false,true])test(`CAS恢复响应丢失${interveningPause?"且新owner在核验后暂停时绝不覆盖":"时同实例再次CAS确认恢复manager"}`,async t=>{

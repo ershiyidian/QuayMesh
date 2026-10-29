@@ -376,6 +376,8 @@ export class QuayMeshNode {
       if(this.stopped||this.maintenance||this.applying||this.application||this.settingsApply)return;
       if(state?.accepting===false&&state.reason==="node-maintenance")
         await this.endMaintenance(admissionExpectation(state));
+      else if(state?.accepting===true&&state.reason===null)
+        this.errors.recover("admission");
     })().finally(() => { if (this.maintenanceRecovery === job) this.maintenanceRecovery = null; });
     this.maintenanceRecovery = job;
     await job;
