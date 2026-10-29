@@ -7,6 +7,7 @@ import { canonicalWorkspaceRoot } from "../roots.js";
 import { samePhysicalPath } from "../physical-paths.js";
 import { LAST_RUN_OUTCOME_SQL } from "../work-outcome.js";
 import type { FileSummary, Snapshot } from "./types.js";
+import { upgradeCommandIdentity } from "./command-identity.js";
 
 export interface TaskBaseline {
   session_id: string; member_id: string; repo_root: string;
@@ -197,11 +198,22 @@ export class TaskDataStore {
     this.requireScope(taskId, snapshot.sessionId, memberId);
     if (snapshot.taskId !== taskId) throw new Error("TASK_SNAPSHOT_ID_MISMATCH");
     return this.db.transaction(() => {
+      let stored = snapshot, sameRevisionAllowed = !remote;
+      if (remote) {
+        const previous = this.projection(taskId, memberId);
+        if (previous?.revision === revision) {
+          const upgraded = upgradeCommandIdentity(previous.snapshot, snapshot);
+          if (!upgraded) return false;
+          stored = upgraded;
+          sameRevisionAllowed = true;
+        }
+      }
       const result = this.db.prepare(`INSERT INTO qm_task_projections(task_id,member_id,source_revision,snapshot_json,observed_at)
         VALUES(?,?,?,?,?) ON CONFLICT(task_id,member_id) DO UPDATE SET source_revision=excluded.source_revision,
           snapshot_json=excluded.snapshot_json,observed_at=excluded.observed_at
-        WHERE qm_task_projections.source_revision ${remote ? "<" : "<="} excluded.source_revision`)
-        .run(taskId, memberId, revision, JSON.stringify(snapshot), new Date().toISOString());
+        WHERE qm_task_projections.source_revision < excluded.source_revision
+          OR (qm_task_projections.source_revision = excluded.source_revision AND ?)`)
+        .run(taskId, memberId, revision, JSON.stringify(stored), new Date().toISOString(), sameRevisionAllowed ? 1 : 0);
       if (remote && result.changes) this.bumpDisplay(taskId);
       return result.changes > 0;
     }).immediate();

@@ -21,6 +21,7 @@ import { filesForReader } from "../session/file-contract.js";
 import { locallyUnsentPeerRequest } from "./read-retry.js";
 import { FinalizationDispatchError } from "../session/task-finalization.js";
 import { taskBindingForRequest } from "../tasks/task-resume.js";
+import { hasCommandIdentity } from "../session/command-identity.js";
 
 const TASK_REFRESH_WAIT_MS = 750;
 const TASK_REFRESH_TIMEOUT_MS = 5_000;
@@ -442,13 +443,15 @@ export class SessionFeed {
       ...(task?{observation:this.projector.observeTask(task.id,member.id)}:{}),
     });
     if(params.kind==="revision")return update();
-    if(params.kind==="subscribe"&&params.known_revision===(task?this.store.getTask(task.id).revision:this.store.memberRevision(member.id)))return update();
     const frozen=task?.state==="closed"?this.store.getTaskSnapshot(task.id,member.id):null;
     const cached=task?this.store.taskData.projection(task.id,member.id):this.store.getSnapshot(session.id,member.id);
     const currentRevision=task?this.store.getTask(task.id).revision:this.store.memberRevision(member.id);
-    const snapshot=validateSnapshot(frozen&&frozen.revision>=task!.revision?frozen.snapshot
-      :cached?.snapshot&&cached.revision===currentRevision?cached.snapshot
-      :await this.projector.materialize(session.id,member.id,task?.id,{
+    const compatible = (snapshot: Snapshot) => params.command_identity !== true || hasCommandIdentity(snapshot);
+    const reusable = frozen && frozen.revision >= currentRevision && compatible(frozen.snapshot) ? frozen.snapshot
+      : cached?.snapshot && cached.revision === currentRevision && compatible(cached.snapshot) ? cached.snapshot : null;
+    // A matching source revision does not make a pre-negotiation cached shape complete.
+    if(params.kind==="subscribe"&&params.known_revision===currentRevision&&(params.command_identity!==true||reusable))return update();
+    const snapshot=validateSnapshot(reusable ?? await this.projector.materialize(session.id,member.id,task?.id,{
         timeoutMs:Math.max(0,deadline-Date.now()),
         signal:signal?AbortSignal.any([signal,this.refreshController.signal]):this.refreshController.signal,
       })) as Snapshot;
@@ -532,6 +535,9 @@ export class SessionFeed {
       if(subscription.nodeId!==nodeId)continue;
       if(!this.store.findMember(subscription.sessionId,subscription.memberId)){this.subscriptions.delete(key);continue;}
       subscription.confirmedAt=0;
+      const cached=subscription.taskId?this.store.taskData.projection(subscription.taskId,subscription.memberId)
+        :this.store.getSnapshot(subscription.sessionId,subscription.memberId);
+      if(!cached?.snapshot||!hasCommandIdentity(cached.snapshot))subscription.lastRevision=-1;
       pending.push(this.refreshSubscription(key,subscription));
     }
     await Promise.all(pending);
@@ -569,7 +575,8 @@ export class SessionFeed {
     const existing=this.subscriptions.get(key);
     if(existing?.nodeId===nodeId)return existing;
     const cached=taskId?this.store.taskData.projection(taskId,memberId):this.store.getSnapshot(sessionId,memberId);
-    const subscription:RemoteSubscription={nodeId,sessionId,memberId,taskId,lastRevision:cached?.snapshot?cached.revision:-1,confirmedAt:0,generation:0};
+    const subscription:RemoteSubscription={nodeId,sessionId,memberId,taskId,
+      lastRevision:cached?.snapshot&&hasCommandIdentity(cached.snapshot)?cached.revision:-1,confirmedAt:0,generation:0};
     this.subscriptions.set(key,subscription);
     return subscription;
   }

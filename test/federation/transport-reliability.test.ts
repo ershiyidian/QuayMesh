@@ -57,12 +57,18 @@ test("真实限速链路中大正文传输期间小响应可独立完成", { tim
     client.on("error", () => upstream.destroy()); upstream.on("error", () => client.destroy());
     client.on("close", () => { sockets.delete(client); upstream.destroy(); });
     upstream.on("close", () => { sockets.delete(upstream); client.destroy(); });
+    let pacedAt: number | undefined, sentBytes = 0;
     const slower = new Transform({ transform(chunk: Buffer, _encoding, callback) {
       if (!throttled) { this.push(chunk); callback(); return; }
+      const startedAt = pacedAt ??= performance.now();
       void (async () => {
         for (let offset = 0; offset < chunk.length; offset += 8192) {
           if (this.destroyed) return;
-          this.push(chunk.subarray(offset, offset + 8192)); await delay(8);
+          const slice = chunk.subarray(offset, offset + 8192);
+          this.push(slice); sentBytes += slice.length;
+          // 按字节和单调时钟节流，避免 TCP 短尾片及定时器迟到累积。
+          const remaining = startedAt + sentBytes / 1024 - performance.now();
+          if (remaining > 0) await delay(remaining);
         }
       })().then(() => callback(), callback);
     } });

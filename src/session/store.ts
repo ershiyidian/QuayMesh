@@ -10,6 +10,7 @@ import { TaskMailboxStore, assertTaskMailboxReadyInTransaction, taskMailboxSnaps
 import { TaskBindingStore } from "../tasks/task-binding.js";
 import { assertTaskCompletionStatus } from "./task-completion.js";
 import { retryableAdmission } from "./outcome.js";
+import { upgradeCommandIdentity } from "./command-identity.js";
 import { aggregateReviewStates } from "./review-state.js";
 import {
   ExecutionState,
@@ -919,10 +920,13 @@ export class SessionStore {
     this.db.transaction(()=>{
       if (snapshot.taskId && !this.taskData.putProjection(snapshot.taskId, memberId, sourceRevision, snapshot, true)) return;
       this.reconcileRemoteCommandInvocations(sessionId, memberId, snapshot);
+      const previous = this.getSnapshot(sessionId, memberId);
+      const upgraded = previous.revision === sourceRevision && previous.snapshot
+        ? upgradeCommandIdentity(previous.snapshot, snapshot) : null;
       const now=new Date().toISOString();
-      const result=this.db.prepare(`UPDATE qm_session_members SET snapshot_revision=?,snapshot_json=?,snapshot_updated_at=?
-        WHERE id=? AND session_id=? AND (snapshot_revision<? OR (snapshot_revision=? AND snapshot_json IS NULL))`)
-        .run(sourceRevision,JSON.stringify(snapshot),now,memberId,sessionId,sourceRevision,sourceRevision);
+      this.db.prepare(`UPDATE qm_session_members SET snapshot_revision=?,snapshot_json=?,snapshot_updated_at=?
+        WHERE id=? AND session_id=? AND (snapshot_revision<? OR (snapshot_revision=? AND (snapshot_json IS NULL OR ?)))`)
+        .run(sourceRevision,JSON.stringify(upgraded ?? snapshot),now,memberId,sessionId,sourceRevision,sourceRevision,upgraded ? 1 : 0);
     }).immediate();
   }
 
