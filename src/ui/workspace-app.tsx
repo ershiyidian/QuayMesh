@@ -8,7 +8,7 @@ import type { Snapshot } from "../session/types.js";
 import {CARD_RESOURCES, WORKSPACE_APP_VERSION} from '../session/card-contract.js';
 import { createCardController, type CardController } from "./session-card/controller.js";
 import { snapshotFromSchema } from "./session-card/snapshot.js";
-import { createMcpSource, type SessionCardSource } from "./session-card/source.js";
+import { createMcpSource, toolResultData, type SessionCardSource } from "./session-card/source.js";
 import {
   applySnapshot,
   createCardState,
@@ -200,7 +200,7 @@ function bootstrapFromResult(result: unknown): Bootstrap | null {
   const record = asRecord(result);
   const meta = asRecord(record?._meta);
   const quaymesh = asRecord(meta?.quaymesh);
-  const structured = asRecord(record?.structuredContent);
+  const structured = toolResultData(result);
   for (const key of ["session_id", "task_id"] as const) {
     const metadataId = stringField(quaymesh?.[key]), resultId = stringField(structured?.[key]);
     if (metadataId && resultId && metadataId !== resultId) throw new Error("SESSION_CARD_BOOTSTRAP_IDENTITY_MISMATCH");

@@ -2,9 +2,9 @@ import type { Snapshot } from './types.js';
 import type { ExecutionObservation } from '../execution-observation.js';
 import { filesForReader } from './file-contract.js';
 
-export const WORKSPACE_APP_VERSION = 'task-card-v9';
-export const WORKSPACE_APP_URI = 'ui://quaymesh/task-card/v9.html';
-export const PREVIOUS_WORKSPACE_APP_URI = 'ui://quaymesh/task-card/v8.html';
+export const WORKSPACE_APP_VERSION = 'task-card-v10';
+export const WORKSPACE_APP_URI = 'ui://quaymesh/task-card/v10.html';
+export const PREVIOUS_WORKSPACE_APP_URI = 'ui://quaymesh/task-card/v9.html';
 
 // 历史聊天永久保存资源地址；这份表记录实际发布过的入口，不按版本号倒推。
 export const CARD_RESOURCES = [
@@ -14,7 +14,8 @@ export const CARD_RESOURCES = [
   {version:'task-card-v5', uri:'ui://quaymesh/task-card/v5.html'},
   {version:'task-card-v6', uri:'ui://quaymesh/task-card/v6.html'},
   {version:'task-card-v7', uri:'ui://quaymesh/task-card/v7.html'},
-  {version:'task-card-v8', uri:PREVIOUS_WORKSPACE_APP_URI},
+  {version:'task-card-v8', uri:'ui://quaymesh/task-card/v8.html'},
+  {version:'task-card-v9', uri:PREVIOUS_WORKSPACE_APP_URI},
   {version:WORKSPACE_APP_VERSION, uri:WORKSPACE_APP_URI},
 ] as const;
 export type CardVersion = typeof CARD_RESOURCES[number]['version'];
@@ -49,7 +50,7 @@ export function projectionForCard<T extends {snapshot?: Snapshot; observation?: 
 }
 
 function supportsStaleObservation(version?: string): boolean {
-  return version === 'task-card-v8' || version === WORKSPACE_APP_VERSION;
+  return version === 'task-card-v8' || version === 'task-card-v9' || version === WORKSPACE_APP_VERSION;
 }
 
 function withoutCommandIdentity(snapshot: Snapshot): Snapshot {

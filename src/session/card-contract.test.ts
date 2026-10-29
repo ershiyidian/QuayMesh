@@ -62,14 +62,14 @@ function freezeDeep<T>(value: T): T {
   return value;
 }
 
-test('new cards use v9 while every actually published historical resource stays registered', () => {
-  assert.equal(WORKSPACE_APP_VERSION, 'task-card-v9');
-  assert.equal(WORKSPACE_APP_URI, 'ui://quaymesh/task-card/v9.html');
-  assert.equal(PREVIOUS_WORKSPACE_APP_URI, 'ui://quaymesh/task-card/v8.html');
+test('new cards use v10 while every actually published historical resource stays registered', () => {
+  assert.equal(WORKSPACE_APP_VERSION, 'task-card-v10');
+  assert.equal(WORKSPACE_APP_URI, 'ui://quaymesh/task-card/v10.html');
+  assert.equal(PREVIOUS_WORKSPACE_APP_URI, 'ui://quaymesh/task-card/v9.html');
   assert.deepEqual(CARD_RESOURCES.map(item => item.version),
-    [1, 3, 4, 5, 6, 7, 8, 9].map(version => `task-card-v${version}`));
+    [1, 3, 4, 5, 6, 7, 8, 9, 10].map(version => `task-card-v${version}`));
   assert.equal(new Set(CARD_RESOURCES.map(item => item.uri)).size, CARD_RESOURCES.length);
-  for (const version of [1, 3, 4, 5, 6, 7, 8, 9]) {
+  for (const version of [1, 3, 4, 5, 6, 7, 8, 9, 10]) {
     assert.ok(CARD_RESOURCES.some(item => item.uri === `ui://quaymesh/task-card/v${version}.html`));
   }
 });
@@ -95,15 +95,30 @@ test('card serialization preserves the original evidence and persisted Snapshot 
   assert.equal(internal.runningCommand?.effect, 'started');
 });
 
-test('v8 and v9 retain the live and stale-observation fields already understood by v8', () => {
+test('v8, v9 and v10 retain the live and stale-observation fields already understood by v8', () => {
   const internal = fixture();
-  for (const version of ['task-card-v8', 'task-card-v9']) {
+  for (const version of ['task-card-v8', 'task-card-v9', 'task-card-v10']) {
     const view = snapshotForCard(internal, version);
     assert.deepEqual(view.executionObservation, internal.executionObservation);
     assert.deepEqual(view.live, internal.live);
     assert.deepEqual(view.finalization, internal.finalization);
     assert.equal(view.sourceTaskId, internal.sourceTaskId);
     assertPrivateIdentityAbsent(view);
+  }
+});
+
+test('v10 preserves the v9 wire shape with and without explicit file-time negotiation', () => {
+  const snapshot = fixture();
+  snapshot.files = [{ id: 'file-a', member_id: 'member-a', status: 'M', path: 'file.txt', from: null,
+    additions: 1, removals: 0, hash: 'hash-a', large: false, binary: false,
+    coverage: 'session_owned', revertible: false, recordedAt: 150 }];
+  const result = { unchanged: false, rev: snapshot.rev, snapshot,
+    observation: snapshot.executionObservation, live: snapshot.live };
+  for (const fileRecordedAt of [false, true]) {
+    assert.deepEqual(snapshotForCard(snapshot, 'task-card-v10', fileRecordedAt),
+      snapshotForCard(snapshot, 'task-card-v9', fileRecordedAt));
+    assert.deepEqual(projectionForCard(result, 'task-card-v10', fileRecordedAt),
+      projectionForCard(result, 'task-card-v9', fileRecordedAt));
   }
 });
 
@@ -134,7 +149,7 @@ test('qm_session projection envelopes use the same public boundary, including cu
   for (const version of [undefined, ...CARD_RESOURCES.map(item => item.version)]) {
     const reply = projectionForCard(result, version);
     assertPrivateIdentityAbsent(reply.snapshot);
-    if (version === 'task-card-v8' || version === 'task-card-v9') {
+    if (version === 'task-card-v8' || version === 'task-card-v9' || version === 'task-card-v10') {
       assert.deepEqual(reply.observation, result.observation);
       assert.deepEqual(reply.live, result.live);
     } else if (version === 'task-card-v6' || version === 'task-card-v7') {
@@ -152,11 +167,11 @@ test('qm_session projection envelopes use the same public boundary, including cu
 test('unchanged replies and absent command aliases preserve the documented shape', () => {
   const snapshot = fixture();
   const unchanged = { unchanged: true, rev: snapshot.rev, observation: snapshot.executionObservation, live: snapshot.live };
-  for (const version of ['task-card-v8', 'task-card-v9']) {
+  for (const version of ['task-card-v8', 'task-card-v9', 'task-card-v10']) {
     assert.deepEqual(projectionForCard(unchanged, version), unchanged);
   }
   const input = { ...snapshot, commands: [], currentCommand: null, runningCommand: undefined, lastCommand: null };
-  const view = snapshotForCard(input, 'task-card-v9');
+  const view = snapshotForCard(input, WORKSPACE_APP_VERSION);
   assert.deepEqual(view.commands, []);
   assert.equal(view.currentCommand, null);
   assert.equal(view.runningCommand, undefined);

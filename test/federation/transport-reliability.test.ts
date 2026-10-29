@@ -4,8 +4,13 @@ import { createServer as createH2Server, constants, type Http2Session } from "no
 import { createServer, connect, type Socket } from "node:net";
 import { Transform } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PeerTransport, PeerApplicationError, RpcRequestTimeoutError, type RpcHandler, type PeerProgressNotification } from "../../src/federation/transport.js";
 import type { FederationConfig } from "../../src/federation/types.js";
+import { ExecutionConflictError } from "../../src/execution-coordinator.js";
+import { errorEnvelope, errorFromEnvelope } from "../../src/session/outcome.js";
 
 function config(nodeId: string): FederationConfig {
   return { enabled: true, coordinatorId: "target", nodeId, nickname: nodeId, host: "127.0.0.1", port: 0,
@@ -117,6 +122,118 @@ test("跨节点错误保留安全恢复身份、effect 和 retryHint", async () 
       assert.ok(error instanceof PeerApplicationError); assert.equal(error.effect, "partial"); assert.equal(error.retryHint, "do_not_retry");
       assert.equal(error.details?.operation_id, "op_fixture"); assert.equal(error.details?.authorization, undefined); return true;
     });
+  } finally { await p.close(); }
+});
+
+test("资源冲突的实际错误和持久回执重放都保留占用身份，不透传私有标题", async t => {
+  const directory = await mkdtemp(join(tmpdir(), "qm-peer-conflict-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const secret = "private-title-command-and-credential";
+  const original = new ExecutionConflictError("claim_blocker", undefined, secret, {
+    type: "resource", requested: [
+      { kind: "tree", path: "C:\\Work\\project", access: "write" },
+      { kind: "file", path: "/srv/project/report.txt", access: "read" },
+      { kind: "named", key: "compiler:shared", access: "write" },
+    ], blockedResources: [{ kind: "named", key: "compiler:shared", access: "write" }],
+    operationId: "op_blocker", taskId: "task_blocker", title: secret,
+    acquiredAt: "2026-10-29T15:15:00.000Z", queued: false,
+  }, "not_started");
+  const envelope = errorEnvelope(original, { sideEffecting: true });
+  assert.equal((envelope.errorDetails as Record<string, unknown>).claim_id, "claim_blocker");
+  const saved = join(directory, "receipt.json");
+  await writeFile(saved, JSON.stringify(envelope));
+  const replay = errorFromEnvelope(JSON.parse(await readFile(saved, "utf8")), undefined, "op_rejected");
+  const p = await pair(method => { throw method === "original" ? original : replay; });
+  try {
+    for (const method of ["original", "replay"]) {
+      await assert.rejects(p.caller.links.get("target")!.call(method, {}), error => {
+        assert.ok(error instanceof PeerApplicationError);
+        assert.equal(error.code, "EXECUTION_CONFLICT");
+        assert.equal(error.effect, "not_started");
+        assert.equal(error.retryHint, method === "replay" ? "retry_later" : undefined);
+        const { title: _title, ...expected } = original.details;
+        assert.deepEqual(error.details, expected);
+        assert.equal(JSON.stringify({ message: error.message, details: error.details }).includes(secret), false);
+        assert.notEqual(error.details?.operationId, "op_rejected", "保留阻塞操作，不能换成被拒绝请求的操作");
+        return true;
+      });
+    }
+  } finally { await p.close(); }
+});
+
+test("冲突投射拒绝未知字段、错型与过大范围，保留明确的执行效果", async () => {
+  const secret = "must-not-cross-peer-boundary";
+  const safeResource = { kind: "named", key: "compile", access: "write" };
+  const cases: Record<string, Record<string, unknown>> = {
+    projected: { type: "future-policy-v2", requested: [{ ...safeResource, authorization: secret }],
+      blockedResources: [{ kind: "file", path: "/srv/work/report", access: "read", command: secret }],
+      operationId: null, taskId: null, acquiredAt: null, queued: true, title: secret, command: secret, authorization: secret,
+      operation_id: "op_rejected", owner_node_id: "worker", next_action: { tool: "workspace_context", authorization: secret,
+        arguments: { action: "status", operation_id: "op_rejected", workspace_id: "qm:worker:ws_fixture", command: secret } } },
+    invalid: { type: {}, requested: [safeResource, { kind: "shell", path: secret, access: "write" }],
+      blockedResources: [{ kind: "file", path: "relative/path", access: "read" }],
+      operationId: {}, taskId: [], acquiredAt: false, queued: "false", claim_id: {}, operation_id: { command: secret },
+      resources: [{ command: secret }], scope: { token: secret }, conflicts: { title: secret },
+      next_action: { tool: "exec_command", arguments: { cmd: secret } } },
+    oversized: { requested: Array.from({ length: 129 }, () => safeResource),
+      blockedResources: [{ kind: "named", key: "x".repeat(513), access: "write" }] },
+    byte_budget: { requested: Array.from({ length: 5 }, (_, index) => ({ kind: "tree", path: "/" + String(index).repeat(4000), access: "write" })),
+      blockedResources: [safeResource] },
+  };
+  const p = await pair(method => { throw Object.assign(new Error(secret), {
+    code: "EXECUTION_CONFLICT", claimId: "claim_blocker", effect: "partial", retryHint: "do_not_retry", details: cases[method],
+  }); });
+  try {
+    for (const name of Object.keys(cases)) {
+      await assert.rejects(p.caller.links.get("target")!.call(name, {}), error => {
+        assert.ok(error instanceof PeerApplicationError);
+        assert.equal(error.effect, "partial"); assert.equal(error.retryHint, "do_not_retry");
+        assert.equal(error.details?.claim_id, "claim_blocker");
+        assert.equal(JSON.stringify({ message: error.message, details: error.details }).includes(secret), false);
+        assert.ok(Buffer.byteLength(JSON.stringify(error.details)) <= 16 * 1024);
+        if (name === "projected") assert.deepEqual(error.details, {
+          claim_id: "claim_blocker", type: "future-policy-v2", requested: [safeResource],
+          blockedResources: [{ kind: "file", path: "/srv/work/report", access: "read" }],
+          operationId: null, taskId: null, acquiredAt: null, queued: true,
+          operation_id: "op_rejected", owner_node_id: "worker", next_action: { tool: "workspace_context",
+            arguments: { action: "status", operation_id: "op_rejected", workspace_id: "qm:worker:ws_fixture" } },
+        });
+        else if (name === "byte_budget") assert.deepEqual(error.details, { claim_id: "claim_blocker", blockedResources: [safeResource] });
+        else assert.deepEqual(error.details, { claim_id: "claim_blocker" });
+        return true;
+      });
+    }
+  } finally { await p.close(); }
+});
+
+test("旧 peer 的原始冲突帧也清除私有消息，普通错误消息保持原文", async () => {
+  const secret = "legacy-private-title-and-command";
+  const p = await pair(async (method, _value, peer, context) => {
+    const conflict = method === "conflict";
+    // Send the old peer's raw envelope, bypassing the new sender projection.
+    await p.target.links.get(peer)!.send({ id: context!.requestId, error: {
+      code: conflict ? "EXECUTION_CONFLICT" : "LEGACY_ERROR",
+      message: conflict ? secret : "original ordinary error",
+      effect: "unknown", retryHint: "query_original",
+      details: conflict ? { claim_id: "claim_legacy", title: secret } : { operation_id: "op_legacy" },
+    } });
+    return new Promise(resolve => context!.signal.addEventListener("abort", () => resolve(null), { once: true }));
+  });
+  try {
+    for (const method of ["conflict", "ordinary"]) {
+      await assert.rejects(p.caller.links.get("target")!.call(method, {}), error => {
+        assert.ok(error instanceof PeerApplicationError);
+        assert.equal(error.effect, "unknown"); assert.equal(error.retryHint, "query_original");
+        if (method === "conflict") {
+          assert.equal(error.message.includes(secret), false);
+          assert.deepEqual(error.details, { claim_id: "claim_legacy" });
+        } else {
+          assert.equal(error.message, "original ordinary error");
+          assert.deepEqual(error.details, { operation_id: "op_legacy" });
+        }
+        return true;
+      });
+    }
   } finally { await p.close(); }
 });
 

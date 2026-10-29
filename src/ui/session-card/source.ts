@@ -90,6 +90,19 @@ type ToolName =
   | "task_resume"
   | "qm_widget_stage";
 
+/** The MCP text mirror carries data, never the private entry-authority sideband. */
+export function toolResultData(value: unknown): Record<string, unknown> | undefined {
+  const record = (item: unknown): Record<string, unknown> | undefined =>
+    item !== null && typeof item === "object" && !Array.isArray(item) ? item as Record<string, unknown> : undefined;
+  const result = record(value);
+  if (!result) return;
+  if (Object.hasOwn(result, "structuredContent")) return record(result.structuredContent);
+  if (!Array.isArray(result.content)) return;
+  const texts = result.content.map(record).filter(item => item?.type === "text");
+  if (texts.length !== 1 || typeof texts[0]?.text !== "string") return;
+  try { return record(JSON.parse(texts[0].text)); } catch { return; }
+}
+
 export function createMcpSource(
   app: App,
   sessionId: string,
@@ -141,29 +154,30 @@ export function createMcpSource(
         { signal: controller.signal },
       );
       if (disposed || controller.signal.aborted) throw controller.signal.reason ?? new Error("SESSION_CARD_REQUEST_CANCELLED");
+      const data = toolResultData(result);
       if (result.isError) {
         const message = result.content
           .filter((item) => item.type === "text")
           .map((item) => item.text)
           .join("\n");
         const error=new Error(message || `${name} failed`) as Error & {retryAfterMs?:number;code?:string};
-        const retry=(result.structuredContent as {retry_after_ms?:number}|undefined)?.retry_after_ms;
+        const retry=data?.retry_after_ms;
         if(typeof retry==="number")error.retryAfterMs=retry;
-        const code=(result.structuredContent as {error_code?:unknown}|undefined)?.error_code;
+        const code=data?.error_code;
         error.code=typeof code==="string"?code:taskBindingErrorCode(error)||undefined;
         throw error;
       }
-      if (!result.structuredContent) {
-        throw new Error(`${name}: missing structuredContent`);
+      if (!data) {
+        throw new Error(`${name}: missing structuredContent or a single JSON text result`);
       }
       if (bindingRequest !== undefined) {
         const binding = name === "task_resume"
-          ? resumeBinding(result.structuredContent, taskId, sessionId)
+          ? resumeBinding(data, taskId, sessionId)
           : bindingFromMeta(result._meta, taskId);
         // A late poll or page cannot replace a newer resume/inspect response.
         if (bindingRequest === bindingGeneration) currentTaskBinding = binding;
       }
-      return result.structuredContent as T;
+      return data as T;
     } catch (error) {
       if (bindingRequest === bindingGeneration) currentTaskBinding = null;
       throw error;

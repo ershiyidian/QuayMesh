@@ -142,7 +142,7 @@ test("the existing timer keeps an open mailbox fresh after three initial snapsho
   assert.equal(f.state.taskBinding, null);
   const previous = messages;
   t.mock.timers.tick(5000); await settled();
-  assert.equal(messages, previous + 1, "the timer remains scheduled for the visible mailbox after the snapshot budget is exhausted");
+  assert.equal(messages, previous + 1, "the visible mailbox continues while the snapshot remains unconfirmed");
   assert.equal(snapshots, 3);
   assert.equal(f.state.messages.messages[0].sequence, messages);
   assert.equal(f.state.lastConfirmedAt, confirmation);
@@ -161,11 +161,13 @@ test("the existing timer keeps an open mailbox fresh after three initial snapsho
   f.state.tab = "messages"; await f.controller.handleIntent({ type: "tab_changed" });
   const reopened = messages;
   t.mock.timers.tick(10_000); await settled();
-  assert.equal(messages, reopened + 1, "reopening the tab reuses the same timer even when snapshot retries stopped");
+  assert.equal(messages, reopened + 1, "reopening the tab reuses the same timer during snapshot backoff");
+  const beforeHidden = snapshots;
+  assert.ok(beforeHidden > 3, "a visible Task continues bounded snapshot recovery after the initial failures");
   f.doc.hidden = true; f.doc.dispatchEvent(new Event("visibilitychange"));
   t.mock.timers.tick(60_000); await f.controller.pollOnce();
   assert.equal(messages, reopened + 1);
-  assert.equal(snapshots, 3, "visibility changes never reset the failed first-handshake budget");
+  assert.equal(snapshots, beforeHidden, "hidden cards stop snapshot requests as well as mailbox requests");
 });
 
 test("failed mailbox reads retain the last page and draft; later polls keep the explicitly selected history page", async t => {

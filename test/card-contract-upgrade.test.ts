@@ -27,12 +27,12 @@ test('旧卡片在新服务的启动和后续读取中保持可用，新卡片�
   const opened = await f.client.callTool({name: 'open_workspace', arguments: {path: f.project}, _meta: meta});
   assert.notEqual(opened.isError, true);
   assert.equal(oldReader.safeParse((opened._meta as any)?.quaymesh?.snapshot).success, true);
-  for (const version of ['task-card-v5', undefined, 'task-card-v4', 'task-card-v6', 'task-card-v7', WORKSPACE_APP_VERSION]) {
+  for (const version of ['task-card-v5', undefined, 'task-card-v4', 'task-card-v6', 'task-card-v7', 'task-card-v9', WORKSPACE_APP_VERSION]) {
     const result = await f.client.callTool({name: 'qm_session', arguments: {...identity, since_rev: -1,
       ...(version ? {resource_version: version} : {})}, _meta: meta});
     assert.notEqual(result.isError, true, JSON.stringify(result));
     const data = result.structuredContent as any;
-    if (version === WORKSPACE_APP_VERSION || version === 'task-card-v7') {
+    if (version === WORKSPACE_APP_VERSION || version === 'task-card-v9' || version === 'task-card-v7') {
       assert.ok(data.snapshot.executionObservation);
       assert.ok('sourceTaskId' in data.snapshot);
       assert.ok(data.live);
@@ -48,7 +48,7 @@ test('旧卡片在新服务的启动和后续读取中保持可用，新卡片�
   }
   const app = {getHostCapabilities: () => ({serverTools:{}}),
     callServerTool: (request: {name:string;arguments:Record<string,unknown>}) => f.client.callTool({...request,_meta:meta})} as unknown as App;
-  for (const historicalVersion of ['task-card-v1','task-card-v4','task-card-v6','task-card-v7'] as const) {
+  for (const historicalVersion of ['task-card-v1','task-card-v4','task-card-v6','task-card-v7','task-card-v9'] as const) {
     const source=createMcpSource(app,session_id,task_id,undefined,historicalVersion);
     try {
       const snapshot=await source.snapshot(-1);
@@ -72,14 +72,14 @@ test('旧输出协议的未变化回执同样不携带新增观察字段', () =>
 });
 
 test('资源 URI、握手版本、旧资源入口保持一致', async t => {
-  assert.equal(WORKSPACE_APP_VERSION, 'task-card-v8');
-  assert.equal(WORKSPACE_APP_URI, 'ui://quaymesh/task-card/v8.html');
+  assert.equal(WORKSPACE_APP_VERSION, 'task-card-v10');
+  assert.equal(WORKSPACE_APP_URI, 'ui://quaymesh/task-card/v10.html');
   const f = await createRealTestServer({git: false});
   t.after(() => f.dispose());
   const listing = await f.client.listTools();
   const start = listing.tools.find(tool => tool.name === 'start_session');
   assert.equal((start?._meta?.ui as any)?.resourceUri, WORKSPACE_APP_URI);
-  for (const uri of [WORKSPACE_APP_URI, 'ui://quaymesh/task-card/v5.html', 'ui://quaymesh/task-card/v7.html']) {
+  for (const uri of [WORKSPACE_APP_URI, 'ui://quaymesh/task-card/v5.html', 'ui://quaymesh/task-card/v7.html', 'ui://quaymesh/task-card/v9.html']) {
     const response = await f.client.readResource({uri});
     assert.equal(response.contents[0].uri, uri);
   }

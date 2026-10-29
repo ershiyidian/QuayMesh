@@ -87,15 +87,22 @@ export interface ExecutionTicket {
   cancel(): void;
 }
 
+interface ExecutionConflictDetails {
+  type: string; requested: ExecutionResource[]; blockedResources: ExecutionResource[];
+  operationId: string | null; taskId: string | null; title: string | null; acquiredAt: string | null; queued: boolean;
+}
+
 export class ExecutionConflictError extends Error {
   readonly code = "EXECUTION_CONFLICT";
+  readonly details: Partial<ExecutionConflictDetails> & { claim_id: string };
   constructor(readonly claimId: string, readonly agentId: string | undefined, reason: string,
-    readonly details?: { type: string; requested: ExecutionResource[]; blockedResources: ExecutionResource[];
-      operationId: string | null; taskId: string | null; title: string | null; acquiredAt: string | null; queued: boolean },
+    details?: ExecutionConflictDetails,
     // Only the admission boundary knows the protected action has not started.
     readonly effect?: "not_started") {
     super(`${reason}。${effect === "not_started" ? "操作尚未开始。" : ""}占用：${claimId}${details ? `；${JSON.stringify(details)}` : ""}`);
     this.name = "ExecutionConflictError";
+    // The claim identity must survive durable error envelopes and replay.
+    this.details = { ...details, claim_id: claimId };
   }
 }
 

@@ -155,7 +155,7 @@ export function createCardView(doc: Document, state: CardState, onIntent:CardInt
     let confirmation=confirmed,note="";
     if(state.connection==="unconfirmed"){
       confirmation=`数据未确认 · ${confirmed}`;
-      note="首次状态读取未确认，自动重试已暂停；重新打开卡片可重试。";
+      note="首次状态读取尚未确认，正在按间隔重试；收到新状态前保留上次显示。";
     }else if(state.connection==="error"){
       confirmation=`更新延迟 · ${confirmed}`;
       note="正在重新读取状态";

@@ -22,7 +22,7 @@ export interface CardController {
 
 const MAX_OUTPUT_BATCH=8;
 const MAX_PATCH_BYTES=4*1024*1024;
-const MAX_FIRST_SNAPSHOT_FAILURES=3;
+const FIRST_SNAPSHOT_UNCONFIRMED_AFTER=3;
 
 export function createCardController(state:CardState,renderer:CardView,source:SessionCardSource,doc:Document=document,
   pendingState:PendingMessageState=createPendingMessageState(()=>(doc.defaultView as (Window&{openai?:unknown})|null)?.openai)):CardController {
@@ -52,16 +52,13 @@ export function createCardController(state:CardState,renderer:CardView,source:Se
   const binding=createTaskResumeController(state,source,()=>{view.renderFooter();view.renderPanel();},
     ()=>{clearTimeout(timer);request?.abort("SESSION_CARD_BINDING_ACTION");messages.visibilityChanged();},()=>schedule());
 
-  const canReadSnapshot=()=>firstSnapshotRecorded||firstSnapshotFailures<MAX_FIRST_SNAPSHOT_FAILURES;
-
   function schedule():void {
     clearTimeout(timer);
     if(!visible()||!source.live||state.taskResume.busy)return;
     const interval=refreshDelay(state.snapshot,state.collapsed);
     if(interval===null&&firstSnapshotRecorded)return;
     const mailbox=messages.canRefresh();
-    if(!canReadSnapshot()&&(!mailbox||interval===null))return;
-    // Coordinator messages do not inherit a worker snapshot's retry delay or exhausted handshake budget.
+    // Coordinator messages do not inherit a worker snapshot's retry delay.
     timer=setTimeout(tick,mailbox?interval??5000:Math.max(interval??5000,retryAt-Date.now()));
   }
 
@@ -92,9 +89,9 @@ export function createCardController(state:CardState,renderer:CardView,source:Se
       if(!signal.aborted&&!stopped){
         if(state.taskResume.available&&applyTaskBinding(state,null))view.renderPanel();
         if(source.live&&!firstSnapshotRecorded)firstSnapshotFailures++;
-        const exhausted=!firstSnapshotRecorded&&firstSnapshotFailures>=MAX_FIRST_SNAPSHOT_FAILURES;
-        state.connection=exhausted?"unconfirmed":"error";
-        if(exhausted&&state.snapshot){
+        const unconfirmed=!firstSnapshotRecorded&&firstSnapshotFailures>=FIRST_SNAPSHOT_UNCONFIRMED_AFTER;
+        state.connection=unconfirmed?"unconfirmed":"error";
+        if(unconfirmed&&state.snapshot){
           state.snapshot={...state.snapshot,capabilities:{...state.snapshot.capabilities,continue:false,revert:false}};
           view.render();
         }
@@ -118,7 +115,7 @@ export function createCardController(state:CardState,renderer:CardView,source:Se
     clearTimeout(timer);
     const pending:Array<Promise<void>>=[];
     if(snapshotRead)pending.push(snapshotRead);
-    else if(canReadSnapshot()&&Date.now()>=retryAt)pending.push(readSnapshot());
+    else if(Date.now()>=retryAt)pending.push(readSnapshot());
     if(messages.canRefresh())pending.push(messages.poll());
     // Keep one timer ticking even when one resource is still pending. Each reader owns its single flight.
     schedule();

@@ -7,6 +7,7 @@ import { connect, createServer, createSecureServer, constants,
 import { Duplex, finished } from "node:stream";
 import { connect as tlsConnect } from "node:tls";
 import { isIP, type Socket } from "node:net";
+import { posix, win32 } from "node:path";
 import { connectSocket } from "../../node/network.mjs";
 import type { FederationConfig, PeerConfig } from "./types.js";
 
@@ -74,19 +75,68 @@ function progressNotification(value: unknown): PeerProgressNotification | undefi
     ...(typeof params.message === "string" ? { message: params.message.slice(0, 512) } : {}) } };
 }
 
+function executionConflictDetails(error: Record<string, unknown>, recovery: Record<string, unknown>): Record<string, unknown> {
+  const source = error.details && typeof error.details === "object" && !Array.isArray(error.details)
+    ? error.details as Record<string, unknown> : {};
+  const details: Record<string, unknown> = {};
+  const text = (value: unknown, maximum: number): value is string => typeof value === "string"
+    && value.length > 0 && value.length <= maximum && Buffer.byteLength(value) <= maximum && !/[\u0000-\u001f\u007f]/u.test(value);
+  const identity = (value: unknown): value is string => text(value, 256) && /^[A-Za-z0-9][A-Za-z0-9_.:%~-]*$/u.test(value);
+  // Keep the existing recovery identities, but do not forward opaque legacy
+  // resource containers or arbitrary next_action bodies for this typed error.
+  for (const [key, value] of Object.entries(recovery)) {
+    if (!["claim_id", "conflicts", "resources", "scope", "next_action"].includes(key) && identity(value)) details[key] = value;
+  }
+  const next = recovery.next_action as { tool?: unknown; arguments?: Record<string, unknown> } | undefined;
+  if (next?.tool === "workspace_context" && next.arguments?.action === "status"
+    && identity(next.arguments.operation_id) && identity(next.arguments.workspace_id)) details.next_action = {
+      tool: "workspace_context", arguments: { action: "status", operation_id: next.arguments.operation_id, workspace_id: next.arguments.workspace_id },
+    };
+  const claimId = error.claimId ?? source.claim_id;
+  if (identity(claimId)) details.claim_id = claimId;
+  if (text(source.type, 64) && /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/u.test(source.type)) details.type = source.type;
+  for (const key of ["operationId", "taskId"]) {
+    if (source[key] === null || identity(source[key])) details[key] = source[key];
+  }
+  if (source.acquiredAt === null || text(source.acquiredAt, 64) && Number.isFinite(Date.parse(source.acquiredAt))) details.acquiredAt = source.acquiredAt;
+  if (typeof source.queued === "boolean") details.queued = source.queued;
+  // Remote paths are opaque identities; never resolve them on this node.
+  // A malformed/oversized list is omitted as a whole, never presented as a partial scope.
+  for (const key of ["blockedResources", "requested"]) {
+    const values = source[key];
+    if (!Array.isArray(values) || values.length > 128) continue;
+    const resources: Record<string, unknown>[] = [];
+    for (const raw of values) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) break;
+      const resource = raw as Record<string, unknown>;
+      if (resource.access !== "read" && resource.access !== "write") break;
+      if (resource.kind === "named" && text(resource.key, 512)) resources.push({ kind: resource.kind, key: resource.key, access: resource.access });
+      else if ((resource.kind === "file" || resource.kind === "tree") && text(resource.path, 4096)
+        && (posix.isAbsolute(resource.path) || win32.isAbsolute(resource.path))) resources.push({ kind: resource.kind, path: resource.path, access: resource.access });
+      else break;
+    }
+    if (resources.length === values.length && Buffer.byteLength(JSON.stringify({ ...details, [key]: resources })) <= 16 * 1024) details[key] = resources;
+  }
+  return details;
+}
+
 function peerError(error: unknown): PeerErrorEnvelope {
   const value = error && typeof error === "object" ? error as Record<string, unknown> : {};
   const envelope: PeerErrorEnvelope = {
     message: (error instanceof Error ? error.message : String(error)).slice(0, 8192),
     code: typeof value.code === "string" ? value.code.slice(0, 128) : "NODE_OPERATION_FAILED",
   };
+  // ExecutionConflictError's local message embeds its full details, including a
+  // private task title. Cross-node recovery uses the typed projection below.
+  if (envelope.code === "EXECUTION_CONFLICT") envelope.message = "执行资源暂时不可用；占用身份见错误详情。";
   if (["not_started", "started", "completed", "partial", "unknown"].includes(String(value.effect))) envelope.effect = String(value.effect);
   if (["retry_later", "query_original", "do_not_retry", "fix_input", "retry_same_key"].includes(String(value.retryHint))) envelope.retryHint = String(value.retryHint);
-  if (value.details && typeof value.details === "object") {
+  if ((value.details && typeof value.details === "object") || envelope.code === "EXECUTION_CONFLICT") {
     // 只传递恢复和资源身份；绝不把任意异常对象、凭据或循环引用放入跨节点帧。
     const allowed = ["operation_id", "owner_node_id", "receipt_node_id", "task_id", "session_id", "member_id", "stage", "dispatch_state", "next_action", "leaseId", "conflicts", "resources", "scope", "claim_id"];
     try {
-      const details = Object.fromEntries(Object.entries(value.details).filter(([key]) => allowed.includes(key)));
+      const recovery = Object.fromEntries(Object.entries(value.details ?? {}).filter(([key]) => allowed.includes(key)));
+      const details = envelope.code === "EXECUTION_CONFLICT" ? executionConflictDetails(value, recovery) : recovery;
       const encoded = JSON.stringify(details);
       if (Buffer.byteLength(encoded) <= 16 * 1024) envelope.details = JSON.parse(encoded);
     } catch {}
@@ -231,7 +281,11 @@ export class PeerLink extends EventEmitter {
       const pending = this.pending.get(frame.id);
       if (!pending) return;
       clearTimeout(pending.timer); this.pending.delete(frame.id);
-      if (frame.error) pending.reject(new PeerApplicationError(this.peerId, frame.error.message, frame.error.code, peerError(frame.error)));
+      if (frame.error) {
+        const error = peerError(frame.error);
+        pending.reject(new PeerApplicationError(this.peerId,
+          error.code === "EXECUTION_CONFLICT" ? error.message : frame.error.message, frame.error.code, error));
+      }
       else pending.resolve(frame.result);
     }
   }

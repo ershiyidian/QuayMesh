@@ -181,12 +181,17 @@ test("展开命令显示开始、结束及耗时，文件显示证据时间而�
   await card.locator("#card").screenshot({ path: "releases/session-acceptance/browser/card-recorded-times-mobile.png" });
 });
 
-test("任务快照持续失败达到重试上限时，真实 Coordinator 消息仍自动刷新且不伪造任务确认", async ({ page }) => {
+test("任务快照首次多次失败时消息独立刷新，状态恢复后同一卡片取得真实快照", async ({ page }) => {
+  test.setTimeout(90_000);
   let snapshots = 0;
+  let offline = true;
+  const snapshotRequests: number[] = [];
   await page.route("**/api/tool", async route => {
     const input = route.request().postDataJSON();
     if (input.name !== "qm_session") { await route.continue(); return; }
     snapshots++;
+    snapshotRequests.push(Date.now());
+    if (!offline) { await route.continue(); return; }
     // Fault only the worker-dependent snapshot route. Mailbox requests still reach the real OAuth/SQLite fixture.
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ isError: true,
       content: [{ type: "text", text: "WORKER_OFFLINE: task snapshot unavailable" }],
@@ -221,8 +226,16 @@ test("任务快照持续失败达到重试上限时，真实 Coordinator 消息�
   await expect(card.locator("#task-binding-state")).toContainText("尚未确认");
   await expect(card.locator("#task-message-continue")).toBeHidden();
   await expect(draft).toHaveValue("快照离线时仍保留草稿");
-  expect(snapshots).toBe(3, "message polling must not reset the exhausted snapshot handshake budget");
+  for (let index = 3; index < snapshotRequests.length; index++) {
+    expect(snapshotRequests[index] - snapshotRequests[index - 1]).toBeGreaterThanOrEqual(index === 3 ? 19_000 : 29_000);
+  }
   expect(await page.evaluate(() => window.__quaymeshHost.followupMessages())).toEqual(followups);
+  offline = false;
+  await expect(card.locator("#prog")).not.toContainText("数据未确认", { timeout: 35_000 });
+  await expect(card.locator("#prog")).not.toContainText("更新延迟");
+  expect(snapshots).toBeGreaterThan(3);
+  await expect(draft).toHaveValue("快照离线时仍保留草稿");
+  await card.locator("#card").screenshot({ path: "releases/session-acceptance/browser/card-first-snapshot-recovered.png" });
 });
 
 test("模拟可选 widgetState 的 iframe 重挂载保留原发送键，真实 MCP 只保存一条消息", async ({ page }) => {

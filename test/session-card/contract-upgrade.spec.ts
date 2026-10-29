@@ -4,16 +4,17 @@ import { expect, test } from '@playwright/test';
 import { WORKSPACE_APP_VERSION } from '../../src/session/card-contract.js';
 
 for (const legacy of [
-  { env: 'QUAYMESH_TEST_LEGACY_CARD', sameVersion: false, name: '真实旧发行卡片' },
-  { env: 'QUAYMESH_TEST_LEGACY_V9_CARD', sameVersion: true, name: '真实缓存的同版本旧 v9 卡片' },
+  { env: 'QUAYMESH_TEST_LEGACY_CARD', version: undefined, name: '真实旧发行卡片' },
+  { env: 'QUAYMESH_TEST_LEGACY_V9_CARD', version: 'task-card-v9', name: '真实已发布的旧 v9 卡片' },
 ]) test(`${legacy.name}读取新服务，命令和文件差异均不发生格式拒收`, async ({page}) => {
   const legacyPath = process.env[legacy.env];
   test.skip(!legacyPath, '需要实际保留的旧发行卡片，不使用模拟压缩脚本');
   const html = await readFile(legacyPath!, 'utf8');
-  expect(html.includes(WORKSPACE_APP_VERSION),'必须使用指定版本的实际保留 HTML').toBe(legacy.sameVersion);
+  expect(html.includes(WORKSPACE_APP_VERSION),'必须使用升级前实际保留的 HTML').toBe(false);
   expect(html.includes('file_recorded_at'),'旧 HTML 尚不支持显式文件时间协商').toBe(false);
   const versions=[...new Set(html.match(/task-card-v\d+/g)??[])];
   expect(versions.length).toBeGreaterThan(0);
+  if (legacy.version) expect(versions).toContain(legacy.version);
   await test.info().attach('legacy-card-provenance',{contentType:'application/json',body:JSON.stringify({path:legacyPath,
     sha256:createHash('sha256').update(html).digest('hex'),versions})});
   await page.route('**/api/bootstrap', async route => {

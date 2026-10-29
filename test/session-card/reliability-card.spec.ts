@@ -13,6 +13,46 @@ for(const delivery of ["structured","delayed"]){
   });
 }
 
+test("仅保留完整 JSON text 的宿主仍从真实工具结果绑定并持续更新同一任务", async ({page}) => {
+  test.setTimeout(60_000);
+  const errors:string[]=[];
+  let snapshots=0;
+  page.on("pageerror",error=>errors.push(error.message));
+  await page.route("**/api/bootstrap",async route=>{
+    const response=await route.fetch(),data=await response.json();
+    // Simulate only the host projection; identities and content come from the real MCP result.
+    const {structuredContent:_body,_meta:_meta,...result}=data.openResult;
+    await route.fulfill({response,json:{...data,openResult:result}});
+  });
+  await page.route("**/api/tool",async route=>{
+    const input=route.request().postDataJSON();
+    if(!String(input.name).startsWith("qm_")){await route.continue();return;}
+    const response=await route.fetch(),result=await response.json();
+    if(input.name==="qm_session")snapshots++;
+    const {structuredContent:_body,...projected}=result;
+    await route.fulfill({response,json:projected});
+  });
+  await page.goto("/");await expect(page.locator("#status")).toHaveText("ready");
+  const card=page.frameLocator("#app-frame");
+  await expect(card.locator("#stats")).toContainText("命令");
+  await expect(card.locator("#ws")).not.toContainText("等待工作区");
+  const title=await card.locator("#title").textContent();
+  const marker="text-only-card-command-"+Date.now();
+  const result=await page.evaluate(command=>window.__quaymeshHost.runCommand(command),
+    process.platform==="win32"?"cmd /c echo "+marker:"printf '%s\\n' "+marker);
+  expect(result.isError,JSON.stringify(result)).not.toBe(true);
+  await card.locator("#toggle").click();await card.locator("#t-commands").click();
+  await expect(card.locator("#p-commands")).toContainText(marker,{timeout:25_000});
+  await expect(card.locator("#title")).toHaveText(title!);
+  expect(snapshots).toBeGreaterThan(1);
+  await expect(card.locator("#prog")).not.toContainText("数据未确认");
+  expect(errors).toEqual([]);
+  await card.locator("#card").screenshot({path:"releases/session-acceptance/browser/card-text-result-desktop.png"});
+  await page.setViewportSize({width:390,height:844});
+  expect(await card.locator("#card").evaluate(element=>element.scrollWidth-element.clientWidth)).toBeLessThan(2);
+  await card.locator("#card").screenshot({path:"releases/session-acceptance/browser/card-text-result-mobile.png"});
+});
+
 test("设计师卡片默认折叠、活动摘要、任务计时、窄屏和终态停轮询",async({page})=>{
   test.setTimeout(90000);await page.goto("/");await expect(page.locator("#status")).toHaveText("ready");
   const card=page.frameLocator("#app-frame"),root=card.locator("#card"),toggle=card.locator("#toggle");

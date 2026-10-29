@@ -44,12 +44,13 @@ The card shows the age of the last activity separately from its frozen duration.
 
 ## Historical card protocol compatibility
 
-The current resource is `ui://quaymesh/task-card/v7.html`. Published v1, v3, v4, v5, and v6 addresses remain registered because historical conversations retain those addresses.
+The current resource is `ui://quaymesh/task-card/v10.html`. Published v1 and v3–v9 addresses remain registered because historical conversations retain those addresses.
 
-The resource address and the renderer's protocol capability are separate. When a historical address serves the current renderer, that renderer declares `task-card-v7` on every `qm_session` request. The historical address remains available for widget diagnostics. It must not force current JavaScript to request a reduced historical payload.
+The resource address and the renderer's protocol capability are separate. When a historical address serves the current renderer, that renderer declares `task-card-v10` on every `qm_session` request. The historical address remains available for widget diagnostics. It must not force current JavaScript to request a reduced historical payload.
 
 | Actual reader capability | Snapshot / live reply |
 | --- | --- |
+| v8, v9, v10 | Full snapshot and live state, including stale observations and per-operation observation times |
 | v7 | Full snapshot, execution observation, lightweight live connectivity/execution state, typed finalization |
 | v6 | Execution observation and source task identity preserved; v7-only live/finalization fields omitted |
 | v1, v3, v4, v5, or unspecified | Historical strict snapshot shape; newer observation/live/finalization fields omitted |

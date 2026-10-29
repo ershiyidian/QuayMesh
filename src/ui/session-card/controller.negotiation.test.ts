@@ -51,13 +51,22 @@ test("a closed card retries a rejected first revision through its existing timer
   assert.equal(reads, 2, "a negotiated closed card returns to no network polling");
 });
 
-test("first-snapshot retries stop after three failures and do not turn bootstrap capabilities into confirmed actions", async t => {
+test("an unconfirmed first snapshot recovers after three failures without remounting or treating bootstrap actions as confirmed", async t => {
   t.mock.timers.enable({ apis: ["Date", "setTimeout", "setInterval"], now: Date.parse("2026-10-28T06:00:00Z") });
   const { snapshot, state, doc, view } = fixture();
-  state.snapshot = { ...snapshot, taskState: "active", capabilities: { ...snapshot.capabilities, continue: true, revert: true } };
+  state.snapshot = { ...snapshot, taskState: "active", taskResult: null, workspace: null, workspaces: [], files: [],
+    totals: { files: 0, commands: 0, agents: 0 },
+    capabilities: { ...snapshot.capabilities, continue: true, revert: true } };
+  const recovered = { ...state.snapshot, rev: snapshot.rev + 1, workspace: previewSnapshot.workspace,
+    workspaces: previewSnapshot.workspaces, files: previewSnapshot.files,
+    totals: { ...state.snapshot.totals, files: previewSnapshot.files.length } };
   const confirmed = state.lastConfirmedAt;
-  let reads = 0;
-  const source = { ...createPreviewSource(), live: true, async snapshot() { reads++; throw new Error("offline"); } };
+  let reads = 0, available = false;
+  const source = { ...createPreviewSource(), live: true, async snapshot() {
+    reads++;
+    if (!available) throw new Error("offline");
+    return recovered;
+  } };
   const controller = createCardController(state, view, source, doc as unknown as Document);
   t.after(() => controller.dispose());
   controller.start(); await controller.pollOnce();
@@ -68,9 +77,20 @@ test("first-snapshot retries stop after three failures and do not turn bootstrap
   assert.equal(state.snapshot!.rev, snapshot.rev);
   assert.equal(state.snapshot!.capabilities.continue, false);
   assert.equal(state.snapshot!.capabilities.revert, false);
-  t.mock.timers.tick(120_000); await controller.pollOnce();
+  t.mock.timers.tick(19_999); await controller.pollOnce();
+  assert.equal(reads, 3, "an unconfirmed card still respects the existing exponential backoff");
   doc.hidden = true; doc.dispatchEvent(new Event("visibilitychange"));
   doc.hidden = false; doc.dispatchEvent(new Event("visibilitychange"));
   await controller.pollOnce();
-  assert.equal(reads, 3, "visibility changes and elapsed time cannot reset the first-handshake budget");
+  assert.equal(reads, 3, "visibility changes cannot bypass the retry deadline");
+  available = true;
+  t.mock.timers.tick(1); await controller.pollOnce();
+  assert.equal(reads, 4);
+  assert.equal(state.connection, "live");
+  assert.equal(state.snapshot!.rev, recovered.rev);
+  assert.deepEqual(state.snapshot!.workspaces, recovered.workspaces);
+  assert.equal(state.snapshot!.totals.files, recovered.files.length);
+  assert.equal(state.snapshot!.capabilities.continue, true);
+  assert.equal(state.snapshot!.capabilities.revert, true);
+  assert.ok(state.lastConfirmedAt! > confirmed!);
 });
