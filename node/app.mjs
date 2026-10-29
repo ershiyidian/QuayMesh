@@ -1,9 +1,9 @@
 import http from "node:http";
-import { readFile, access, mkdir, rm } from "node:fs/promises";
+import { readFile, access, mkdir, rm, lstat } from "node:fs/promises";
 import { constants } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, isAbsolute } from "node:path";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadNodeConfig, validateNode, secret, hostUrl } from "./config.mjs";
 import { applySettingsPatch, loadSettingsAuthority, publicSettings } from "./settings.mjs";
 import { writeJson, atomicWrite, readOptionalJson } from "./files.mjs";
@@ -20,6 +20,31 @@ import { resumeAdmissionWithRetry } from "./maintenance-recovery.mjs";
 export const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const admissionExpectation=state=>state?.instance?{instance:state.instance,accepting:state.accepting,reason:state.reason,changedAt:state.changedAt}:undefined;
+
+export async function installationStartupBudget(root,transition,sourceCommit,readinessMs=30000) {
+  const ordinary={coreReadinessMs:readinessMs};
+  const snapshot=transition?.database;
+  if(transition?.phase!=="validating"||transition.sourceCommit!==sourceCommit||
+    !/^[a-f0-9]{40}$/.test(sourceCommit??"")||!/^[a-f0-9]{40}$/.test(transition.previousCommit??"")||
+    transition.previousCommit===sourceCommit||typeof transition.id!=="string"||!transition.id||
+    !Number.isSafeInteger(transition.ownerPid)||transition.ownerPid<1||
+    snapshot?.exists!==true||!Number.isSafeInteger(snapshot.version)||snapshot.version<0)return ordinary;
+  // Read the target's schema version without opening the live database: its
+  // migration may already hold the writer lock. Reinstalls and downgrades keep
+  // the ordinary startup deadline, even when a transition marker is present.
+  const {LATEST_DATABASE_VERSION}=await import(pathToFileURL(join(root,"dist","db","migrations.js")).href);
+  if(!Number.isSafeInteger(LATEST_DATABASE_VERSION)||LATEST_DATABASE_VERSION<1)
+    throw new Error("目标发行缺少有效的数据库结构版本");
+  if(snapshot.version>=LATEST_DATABASE_VERSION)return ordinary;
+  if(typeof snapshot.backup!=="string"||!isAbsolute(snapshot.backup))throw new Error("升级启动缺少已完成的数据库快照");
+  const saved=await lstat(snapshot.backup);
+  if(!saved.isFile()||!Number.isSafeInteger(saved.size)||saved.size<=0)throw new Error("升级启动需要有效的数据库快照文件");
+  // Derive a fixed, bounded allowance from the completed snapshot's actual
+  // size. Values supplied in configuration or transition JSON are not timers.
+  const coreReadinessMs=Math.max(readinessMs,Math.min(1800000,readinessMs+Math.ceil(saved.size/(4*1024*1024)*1000)));
+  return {coreReadinessMs,validationTimeoutMs:coreReadinessMs+60000+30000,
+    transitionId:transition.id,databaseBytes:saved.size,fromVersion:snapshot.version,toVersion:LATEST_DATABASE_VERSION};
+}
 
 export class QuayMeshNode {
   constructor(configuration, { root = packageRoot, intervalMs = 1000, readinessMs = 30000 } = {}) {
@@ -144,6 +169,7 @@ export class QuayMeshNode {
     this.token = this.generation.token;
     const {node,cluster} = this.config;
     this.installationTransition=await readOptionalJson(join(node.stateDir,"installation-transition.json"));
+    this.startupReadiness=await installationStartupBudget(this.root,this.installationTransition,this.release,this.readinessMs);
     if(this.installationTransition)this.maintenance=true;
     this.supervisor = new ComponentSupervisor({logDir:join(node.stateDir,"logs"),intervalMs:this.intervalMs});
     this.supervisor.define(this.generation.plans);
@@ -166,7 +192,8 @@ export class QuayMeshNode {
       if(this.installationTransition)this.relay?.setAccepting(false);
       await this.startAdmin();
       await this.supervisor.start();
-      await this.supervisor.waitReady(new Set(["core"]),this.readinessMs);
+      try { await this.supervisor.waitReady(new Set(["core"]),this.startupReadiness.coreReadinessMs); }
+      catch(error){throw new Error(`Core 启动未通过 ${this.startupReadiness.coreReadinessMs} ms 就绪预算：${error.message}`,{cause:error});}
       await this.confirmConfiguration(this.generation);
       this.membership = await new MembershipClient({node,cluster,token:this.token,release:this.release,
         status:() => ({components:this.supervisor.snapshot(),discovery:this.discovery}),
@@ -298,6 +325,7 @@ export class QuayMeshNode {
       maintenance:this.maintenance,maintenanceProtocol:2,relayActiveRequests:this.relay?.activeRequests??0,
       components:this.supervisor?.snapshot() || [],discovery:this.discovery,
       installationTransition:this.installationTransition??null,
+      startupReadiness:this.startupReadiness??null,
       activeCoreRelease:this.activeCoreRelease??null,
       membership:this.membership?.state || {connected:false,lastSuccessAt:null,error:null},
       error:errors.current.at(-1)?.message || null, errors, observedAt:Date.now()};

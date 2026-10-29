@@ -7,7 +7,7 @@ import { loadNodeConfig, defaultConfigDir, secret } from "./config.mjs";
 import { writeJson, atomicWrite, readOptionalJson } from "./files.mjs";
 import { requestJson } from "./network.mjs";
 import { restrictedEnvironment } from "./environment.mjs";
-import { packageRoot } from "./app.mjs";
+import { packageRoot, installationStartupBudget } from "./app.mjs";
 import { componentPlans } from "./compile.mjs";
 import { beginInstallationMaintenance, runMaintenanceProof } from "./maintenance-lease.mjs";
 
@@ -197,8 +197,13 @@ async function runningStatus(port) {
   catch (error) { if (error.code === "ECONNREFUSED") return null; throw error; }
 }
 export async function waitRunning(manifest,token,timeoutMs,{stableMs=60000,resume=true}={}) {
-  const deadline = performance.now()+timeoutMs;
   const release=manifest.directory?await readOptionalJson(join(manifest.directory,"release.json")):undefined;
+  if(manifest.directory&&manifest.stateDir&&release?.sourceCommit===manifest.sourceCommit){
+    const transition=await readOptionalJson(join(manifest.stateDir,"installation-transition.json"));
+    const startup=await installationStartupBudget(manifest.directory,transition,manifest.sourceCommit);
+    timeoutMs=Math.max(timeoutMs,startup.validationTimeoutMs??0);
+  }
+  const deadline = performance.now()+timeoutMs;
   const fingerprints=Boolean(release?.runtime||release?.nativeDependencies);
   const configuration=manifest.config?await loadNodeConfig(manifest.config):undefined;
   const requiredIds=new Set(configuration?componentPlans(configuration.node,configuration.cluster,configuration.env,{
@@ -241,7 +246,7 @@ export async function waitRunning(manifest,token,timeoutMs,{stableMs=60000,resum
         actual?.sqlitePackageVersion===expected?.version&&actual?.sqliteNativeSha256===expected?.sha256&&
         actual?.nodeSha256===release.runtime?.nodeSha256&&actual?.packageLockSha256===release.runtime?.packageLockSha256&&
         typeof actual?.sqliteNativeSha256==="string"&&/^[0-9a-f]{64}$/.test(actual.sqliteNativeSha256);
-      if(!coreIdentityMatches)lastFailure="Core 进程身份、Node 或 SQLite 实际指纹与发行清单不符";
+      if(!coreIdentityMatches&&!unready.length)lastFailure="Core 进程身份、Node 或 SQLite 实际指纹与发行清单不符";
     }
     if (state?.nodeId===manifest.nodeId && state.release===manifest.sourceCommit &&
       !unready.length && coreIdentityMatches) {
@@ -255,7 +260,7 @@ export async function waitRunning(manifest,token,timeoutMs,{stableMs=60000,resum
     }else{identity=undefined;stableSince=0;}
     await sleep(500);
   }
-  throw new Error(`新发行服务没有在规定时间内报告正确身份和就绪状态${lastFailure?`：${lastFailure}`:""}`);
+  throw new Error(`新发行服务没有在 ${timeoutMs} ms 内报告正确身份和就绪状态并连续稳定 ${stableMs} ms${lastFailure?`：${lastFailure}`:""}`);
 }
 
 export function databaseSnapshot(manifest,target,{stallTimeoutMs=60000,maxTimeoutMs=1800000,
