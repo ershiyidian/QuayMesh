@@ -24,18 +24,24 @@ import { readLocalActivity, permitted } from "./local.js";
 import { readLocalMetadata, readLocalPage, readLocalOverview, readLocalOverviewUsage, readLocalRunSummaries, readLocalSessionTitles, readLocalTaskIndex, readLocalUsage } from "./local-queries.js";
 import { readRunDetail, readFileDiff, readRunPatch, readCommandOutput, textPage } from "./detail.js";
 import type { Query } from "./query.js";
-import type { Run, SourceState } from "./types.js";
+import type { Run, SourceState, TaskMessageConfirmation } from "./types.js";
 import { WorkbenchError } from "./types.js";
+import { HANDOFF_FINALIZATION_CODE } from "../session/task-completion.js";
 import { WriteReceipts, writeEffect, type WriteReceipt, type VerifiedReceipt, type WriteEffect } from "./receipts.js";
 
 const id = z.string().min(1).max(2048);
 const key = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
 const revision = z.number().nonnegative();
 const text = (value: unknown): string => typeof value === "string" ? value : "";
+const taskMessageConfirmationSchema = z.object({ available: z.literal(true), taskId: id, ownerNodeId: id,
+  taskRevision: z.number().int().nonnegative(), taskState: z.enum(["active", "closed"]),
+  sequence: z.number().int().nonnegative(), pending: z.number().int().nonnegative(), observedAt: z.number() });
+
 const querySchema = z.object({
   fresh:z.enum(['0','1']).optional(),
   node: z.string().optional(), project: z.string().optional(), q: z.string().max(1000).optional(),
   session: z.string().optional(), root: z.string().optional(),
+  requestState: z.enum(["active", "closed"]).optional(),
   days: z.coerce.number().int().min(0).max(36500).optional().transform((value) => value === undefined ? undefined : String(value)),
   stage: z.string().max(300).optional(), status: z.string().optional(), sort: z.enum(["newest", "oldest", "tokens", "duration"]).optional(),
   cursor: z.string().max(8192).optional(),
@@ -73,7 +79,11 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
     const target = req.body?.id ?? req.body?.projectId ?? req.body?.previewId ?? "";
     return receipts.execute(`${scope}:${req.path}:${target}`, requestKey, req.path, req.body, () => fn(req));
   };
-  const localPost = (path: string, fn: (req: Request) => unknown | Promise<unknown>) => operations.post(`/api/workbench${path}`, safe(recorded("node", fn)));
+  const localPost = (path: string, fn: (req: Request) => unknown | Promise<unknown>, authorize?: (req: Request) => void) =>
+    operations.post(`/api/workbench${path}`, safe(req => {
+      authorize?.(req); // Replayed receipts still require the current authority and caller scope.
+      return recorded("node", fn)(req);
+    }));
   const get = (path: string, fn: (req: Request) => unknown | Promise<unknown>) => router.get(`/api/v4${path}`, safe(fn));
   const post = (path: string, fn: (req: Request) => unknown | Promise<unknown>) => router.post(`/api/v4${path}`, safe(recorded("console", async (req) => {
     feed.invalidate();
@@ -93,6 +103,42 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
     }
     return reply.body as T;
   };
+  const taskAuthority = (): string => {
+    // Standalone Owner consoles retain their local lifecycle. A configured mesh
+    // must never fall back from its fixed Coordinator to a Worker or mirror.
+    if (!config.federation?.enabled) return localId;
+    const coordinator = config.federation.coordinatorId;
+    if (!coordinator) throw new WorkbenchError('尚未配置任务权威节点，不能确认或结束任务',503,'task_authority_required','none');
+    return coordinator;
+  };
+  const consoleTask = (taskId: string) => {
+    if (taskAuthority() !== localId || config.federation?.enabled && !config.federation.capabilities.coordinator) {
+      throw new WorkbenchError('任务消息和结束操作必须由配置的 Coordinator 确认',503,'task_authority_required','none');
+    }
+    if (!session) throw new WorkbenchError('当前节点没有任务生命周期服务',503,'task_service_unavailable','none');
+    // Browser routes have Owner-token session + CSRF middleware; internal calls
+    // arrive through authenticated mesh RPC. Never accept an owner ID in the body.
+    const task = session.store.getTask(taskId), owner = session.store.getSession(task.session_id);
+    if (task.source_kind === 'federation_mirror') throw new WorkbenchError('镜像记录不能作为任务权威',409,'task_owner_mismatch','none');
+    const members = session.store.taskMemberIds(task.id).map(memberId => session.store.getMember(task.session_id,memberId));
+    if (members.some(member => member.node_id === localId && !permitted(config,member.root))) {
+      throw new WorkbenchError('任务不在允许访问的项目内',403,'task_scope','none');
+    }
+    return { task, owner };
+  };
+  const taskMessagesFor = async (taskId: string): Promise<TaskMessageConfirmation> => {
+    let authority: string | null = null;
+    try {
+      authority = taskAuthority();
+      const state = taskMessageConfirmationSchema.parse(await call(authority,`/workbench/tasks/${encodeURIComponent(taskId)}/messages-state`));
+      if (state.taskId !== taskId || state.ownerNodeId !== authority) throw new Error('任务消息状态与权威身份不一致');
+      return state;
+    } catch (error) {
+      return { available: false, taskId, ownerNodeId: authority, error: error instanceof Error ? error.message : String(error) };
+    }
+  };
+  const withTaskMessages = async (detail: RunDetail): Promise<RunDetail> => detail.run.taskId
+    ? { ...detail, taskMessages: await taskMessagesFor(detail.run.taskId) } : detail;
   const routeRun = (req: Request) => decode(text(req.params.id));
   const rawRunDetail = async (reference: string) => {
     const target = decode(reference);
@@ -119,7 +165,7 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
     return {task:detail.run,phases:[detail.run],complete:true,sources:[],missingNodes:[]};
   };
   const aggregateRunDetail=async(reference:string,fresh=false)=>{
-    if(!parseTaskReference(reference)&&!parseSessionReference(reference))return rawRunDetail(reference);
+    if(!parseTaskReference(reference)&&!parseSessionReference(reference))return withTaskMessages(await rawRunDetail(reference));
     const related=await taskPhases(reference,fresh);
     const observed=await mapConcurrent(related.task.phaseRefs??related.phases.map(phase=>phase.id),4,async phase=>{
       try{return {phase,detail:await rawRunDetail(phase)};}
@@ -136,7 +182,7 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
       ?{...source,online:true,state:'ready' as const,observedAt:Date.now(),stale:false,error:null}:source);
     const phases=observeSourceStates(related.phases.map(phase=>byPhase.get(phase.id)??phase),evidence);
     const task=feed.taskFromPhases(phases,related.lifecycle)??related.task;
-    return mergeTaskDetails(task,details,{complete:related.complete&&missing.length===0,sources,missing});
+    return withTaskMessages(mergeTaskDetails(task,details,{complete:related.complete&&missing.length===0,sources,missing}));
   };
   const search = (req: Request): Query => querySchema.parse(req.query);
   const queryString = (req: Request) => new URLSearchParams(Object.entries(search(req)).filter((pair): pair is [string, string] => pair[1] !== undefined)).toString();
@@ -178,16 +224,33 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
     return {items,total:saved.total+selected.length,bins,nextAfter:query.after!==undefined&&items.length?{after:items.at(-1)!.time,afterId:items.at(-1)!.id}:null};
   });
 
-  localPost('/tasks/finish',async req=>{
-    const input=z.object({taskId:id,expectedTaskRevision:revision,result:z.enum(['completed','failed','cancelled','handed_off']),summary:z.string().max(4000),requestKey:key}).parse(req.body);
-    if(!session)throw new WorkbenchError('当前节点没有任务生命周期服务',503,'task_service_unavailable','none');
-    const task=session.store.getTask(input.taskId),owner=session.store.getSession(task.session_id);
-    const members=session.store.taskMemberIds(task.id).map(memberId=>session.store.getMember(task.session_id,memberId));
-    if(members.some(member=>member.node_id===localId&&!permitted(config,member.root)))throw new WorkbenchError('任务不在允许访问的项目内',403,'task_scope','none');
-    const finished=await session.service.finishTask(owner.owner_id,task.id,input.result,input.summary,input.expectedTaskRevision);
-    actions.audit.record('task.finish',task.id,{state:task.state,result:task.result_status},{state:finished.state,result:finished.result_status},input.requestKey);
-    return {taskId:task.id,state:finished.state,result:finished.result_status,status:'completed',effect:'applied'};
+  localGet('/tasks/:id/messages-state',req=>{
+    const { task } = consoleTask(id.parse(req.params.id));
+    return { available: true as const, ownerNodeId: localId, observedAt: Date.now(), ...session!.store.taskMessageState(task.id) };
   });
+  localPost('/tasks/finish',async req=>{
+    const input=z.object({taskId:id,expectedTaskRevision:revision,messageSequence:z.number().int().nonnegative().optional(),
+      result:z.enum(['completed','failed','cancelled','handed_off']),summary:z.string().max(4000),requestKey:key}).parse(req.body);
+    const { task, owner } = consoleTask(input.taskId);
+    let finished;
+    try {
+      finished=await session!.service.finishTask(owner.owner_id,task.id,input.result,input.summary,input.expectedTaskRevision,input.messageSequence ?? 0);
+    } catch (error) {
+      const failure=error as { code?: unknown; effect?: unknown };
+      if (failure.effect==='not_started' && failure.code===HANDOFF_FINALIZATION_CODE) {
+        throw new WorkbenchError('交接不会结束工作目标。请用 checkpoint_task 保存进度，再在接收入口用 task_resume 恢复同一任务；目标保持开放。',409,HANDOFF_FINALIZATION_CODE,'none');
+      }
+      if (failure.effect==='not_started' && typeof failure.code==='string' && failure.code.startsWith('TASK_MAILBOX_')) {
+        throw new WorkbenchError(failure.code==='TASK_MAILBOX_INPUT_PENDING'
+          ? '仍有用户消息未由模型确认，请处理后重新打开结束确认'
+          : '任务消息已更新，请关闭确认框，刷新并核对消息后重新确认',409,failure.code,'none');
+      }
+      throw error;
+    }
+    actions.audit.record('task.finish',task.id,{state:task.state,result:task.result_status},
+      {state:finished.state,result:finished.result_status,messageSequence:input.messageSequence ?? 0},input.requestKey);
+    return {taskId:task.id,state:finished.state,result:finished.result_status,status:'completed',effect:'applied'};
+  },req=>{consoleTask(id.parse(req.body?.taskId));});
 
   localPost("/runs/review", (req) => {
     const input = z.object({ id, expectedRevision: revision, completeExecution: z.boolean().optional(), verdict: z.enum(["accept", "reject"]), note: z.string().max(4000), requestKey: key }).parse(req.body);
@@ -290,8 +353,10 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
       }finally{ledger.close();}
     }
     if(path.endsWith('/tasks/finish')&&session){
-      const task=session.store.getTask(String(input.taskId));
-      return {verified:task.state==='closed'&&task.result_status===input.result&&task.summary===input.summary,effect:'applied',response:{taskId:task.id,state:task.state,result:task.result_status,status:'completed',effect:'applied'}};
+      const {task}=consoleTask(String(input.taskId));
+      const intent=session.store.taskData.finalization(task.id);
+      return {verified:task.state==='closed'&&task.result_status===input.result&&task.summary===input.summary
+        &&intent?.mailbox_sequence===(input.messageSequence ?? 0),effect:'applied',response:{taskId:task.id,state:task.state,result:task.result_status,status:'completed',effect:'applied'}};
     }
     return {verified:false};
   });
@@ -314,7 +379,7 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
       const finish=path.match(/\/runs\/([^/]+)\/finish$/);
       if(finish){
         const related=await taskPhases(decodeURIComponent(finish[1]),true);
-        return related.lifecycle?forward(related.lifecycle.nodeId??localId,'/api/workbench/tasks/finish',''):{verified:false};
+        return related.task.taskId?forward(taskAuthority(),'/api/workbench/tasks/finish',''):{verified:false};
       }
       const settings=path.match(/\/nodes\/([^/]+)\/settings$/);
       if(settings)return forward(decodeURIComponent(settings[1]),'/api/workbench/settings','');
@@ -451,7 +516,8 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
 
   const outcomeError=(error:unknown)=>({ok:false,effect:writeEffect(error),error:error instanceof Error?error.message:String(error),code:error instanceof WorkbenchError?error.code:'operation_failed'});
   post('/runs/:id/finish',async req=>{
-    const input=z.object({expectedRevision:revision,result:z.enum(['completed','failed','cancelled','handed_off']),summary:z.string().max(4000),requestKey:key}).parse(req.body);
+    const input=z.object({expectedRevision:revision,expectedTaskRevision:revision.optional(),messageSequence:z.number().int().nonnegative().optional(),
+      result:z.enum(['completed','failed','cancelled','handed_off']),summary:z.string().max(4000),requestKey:key}).parse(req.body);
     const related=await taskPhases(text(req.params.id));
     if(related.task.revision!==input.expectedRevision)throw new WorkbenchError('任务已更新，请刷新后再次确认',409,'revision_conflict','none');
     if(!related.task.taskId)throw new WorkbenchError('此历史执行没有独立请求，请使用阶段验收',409,'task_identity_missing','none');
@@ -459,7 +525,9 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
     const lifecycle=owned.lifecycle;
     if(!lifecycle)throw new WorkbenchError('尚未取得请求所属节点',503,'task_owner_unavailable','none');
     if(!owned.complete)throw new WorkbenchError('任务相关节点尚未全部确认，请先核对缺失来源',409,'task_incomplete','none');
-    return call(lifecycle.nodeId??localId,'/workbench/tasks/finish',{taskId:lifecycle.id,expectedTaskRevision:lifecycle.revision,result:input.result,summary:input.summary,requestKey:input.requestKey});
+    return call(taskAuthority(),'/workbench/tasks/finish',{taskId:related.task.taskId,
+      expectedTaskRevision:input.expectedTaskRevision ?? lifecycle.revision,messageSequence:input.messageSequence ?? 0,
+      result:input.result,summary:input.summary,requestKey:input.requestKey});
   });
   const savePlan=(req:Request,plan:DispatchPlan)=>receipts.execute(`console-plan:${req.path}`,key.parse(req.body.requestKey),req.path,req.body,()=>plan);
   const dispatchPlan=async(plan:DispatchPlan)=>dispatchResponse(plan,await mapConcurrent(plan.targets,4,async target=>{
@@ -589,7 +657,7 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
   return { feed };
 }
 
-type RunDetail = Awaited<ReturnType<typeof readRunDetail>>;
+type RunDetail = Awaited<ReturnType<typeof readRunDetail>> & { taskMessages?: TaskMessageConfirmation };
 type RoutedTaskDetail = { phase: string; detail: RunDetail };
 
 const TASK_PART_PREFIX = "tqpart:";

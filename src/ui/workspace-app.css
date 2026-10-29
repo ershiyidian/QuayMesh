@@ -53,6 +53,8 @@
       background: light-dark(#f3f3f5, #0e0e10)
     }
 
+    [hidden] { display: none !important; }
+
     button {
       font: inherit;
       color: inherit;
@@ -127,6 +129,7 @@
       max-width: none
     }
 
+    .card[data-status=active],
     .card[data-status=running],
     .card[data-status=finalizing],
     .card[data-status=handed_off] {
@@ -282,7 +285,11 @@
 
     .prog {
       font-size: 11px;
-      color: var(--color-text-tertiary)
+      color: var(--color-text-tertiary);
+      max-width: 240px;
+      white-space: pre-line;
+      text-align: right;
+      overflow-wrap: anywhere
     }
 
     .ib {
@@ -294,6 +301,8 @@
       align-items: center;
       justify-content: center;
       gap: 4px;
+      flex-shrink: 0;
+      white-space: nowrap;
       color: var(--color-text-tertiary);
       font-size: 11px;
       transition: background-color 120ms var(--ease), color 120ms var(--ease)
@@ -346,7 +355,7 @@
       }
     }
 
-    .card:not([data-status=running]):not([data-status=stalled]) .bar {
+    .card:not([data-status=stalled]) .bar:not(.indet) {
       opacity: 0
     }
 
@@ -637,6 +646,143 @@
       color: var(--color-text-secondary)
     }
 
+    .row-times {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 2px 12px;
+      padding: 0 12px 6px 44px;
+      font-size: 11px;
+      color: var(--color-text-tertiary);
+    }
+
+    .row-time {
+      display: inline-flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .row-time time {
+      overflow-wrap: anywhere;
+    }
+
+    .message-panel {
+      padding: 12px;
+      max-height: none;
+    }
+
+    .message-help {
+      margin: 0 0 10px;
+      color: var(--color-text-secondary);
+      line-height: 1.6;
+      overflow-wrap: anywhere;
+    }
+
+    .message-toolbar, .message-compose-actions {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .message-toolbar {
+      margin-bottom: 10px;
+    }
+
+    .message-toolbar [role=status], #task-message-size {
+      font-size: 11px;
+      color: var(--color-text-tertiary);
+      overflow-wrap: anywhere;
+    }
+
+    .message-list {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      max-height: var(--panel-max);
+      overflow: auto;
+      scrollbar-width: thin;
+    }
+
+    .task-message, .task-message-pending {
+      padding: 10px;
+      margin-bottom: 10px;
+      border: 1px solid var(--color-border-secondary);
+      border-radius: 8px;
+    }
+
+    .task-message-assistant {
+      background: var(--color-background-secondary);
+    }
+
+    .task-message-header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 4px;
+    }
+
+    .task-message-header time, .task-message-status, .task-message-reply {
+      font-size: 11px;
+      color: var(--color-text-tertiary);
+    }
+
+    .task-message-body, .task-message-pending-body {
+      margin: 8px 0;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .task-message-reply {
+      display: block;
+      margin-top: 4px;
+    }
+
+    .message-form {
+      border-top: 1px solid var(--color-border-secondary);
+      padding-top: 10px;
+    }
+
+    .message-form label {
+      display: block;
+      margin-bottom: 6px;
+    }
+
+    .message-form textarea {
+      display: block;
+      width: 100%;
+      min-height: 72px;
+      resize: vertical;
+      padding: 8px;
+      font: inherit;
+      color: inherit;
+      background: var(--color-background-primary);
+      border: 1px solid var(--color-border-primary);
+      border-radius: 6px;
+    }
+
+    .message-form textarea[readonly] {
+      color: var(--color-text-secondary);
+    }
+
+    .message-compose-actions {
+      margin: 8px 0;
+    }
+
+    #task-message-size {
+      margin-right: auto;
+    }
+
+    .message-send {
+      background: var(--color-background-info);
+      color: var(--color-text-info);
+    }
+
+    .message-panel button:disabled {
+      opacity: .5;
+      cursor: default;
+    }
+
     @media (max-width:520px) {
       .hd {
         grid-template-columns: 16px minmax(0, 1fr);
@@ -656,7 +802,8 @@
 
       .hd-r {
         grid-column: 2;
-        min-width: 0
+        min-width: 0;
+        flex-wrap: wrap
       }
 
       .meta {
@@ -665,11 +812,13 @@
         align-items: baseline;
         gap: 0 8px;
         min-width: 0;
+        flex-basis: 100%;
         margin-right: auto
       }
 
       .prog {
-        overflow-wrap: anywhere
+        max-width: 100%;
+        text-align: left
       }
 
       .ws {
@@ -680,6 +829,27 @@
         gap: 4px;
         padding: 0 8px
       }
+    }
+
+    .task-binding {
+      padding: 10px;
+      border: 1px solid var(--color-border-primary);
+      border-radius: 8px;
+      margin: 8px 0 12px;
+      min-width: 0;
+      overflow-wrap: anywhere
+    }
+
+    .task-binding-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px
+    }
+
+    .task-binding-actions .ib {
+      white-space: nowrap;
+      flex-shrink: 0
     }
 
     @media (prefers-reduced-motion:reduce) {

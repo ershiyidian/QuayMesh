@@ -1,6 +1,18 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { taskView } from './task-view.js';
+import { taskView, taskLifecycleView } from './task-view.js';
+
+test('任务主状态取持久生命周期，后台状态变化不能结束开放任务', () => {
+  for (const execution of ['running', 'queued', 'idle', 'waiting', 'failed', 'unknown', 'stalled', 'completed']) {
+    const input = {requestState:'active', result:null, execution};
+    assert.deepEqual(taskLifecycleView(input), {status:'active', label:'任务进行中'});
+    assert.equal(taskView(input).requestEnded, false);
+  }
+  assert.equal(taskLifecycleView({requestState:'closed',result:'failed'})?.label,'未完成');
+  assert.equal(taskLifecycleView({requestState:'closed',result:'completed',finalizing:true})?.status,'completed');
+  assert.equal(taskLifecycleView({requestState:'active',finalizing:true,finalizationFailed:true})?.label,'交付确认失败');
+  assert.equal(taskLifecycleView({}),null,'旧记录缺少任务生命周期时保留执行状态回退');
+});
 
 test('其它成员过期时，新鲜运行和排队事实仍然有效', () => {
   const active = taskView({requestState: 'active', execution: 'idle', active: true, stale: true});

@@ -59,7 +59,9 @@ async function fixture(t: TestContext) {
   const forward = async (name: string, requestId: string, input: Record<string, unknown>, observe = false) => {
     const remoteInput = { ...input, workspace_id: `qm:worker:${workspace.id}` };
     const extra = { authInfo: { clientId: "transport", extra: { owner_id: "owner" } }, requestId, _meta: { "openai/session": "conversation" } };
-    const trusted = SessionFeed.prototype.trustedInvocation.call({ store: cloud.store } as unknown as SessionFeed, name, remoteInput, extra)!;
+    const trusted = await SessionFeed.prototype.trustedInvocation.call({ store: cloud.store, service: cloud.service } as unknown as SessionFeed,
+      name, remoteInput, extra);
+    assert.ok(trusted, "the Coordinator captures a trusted Task before recording or forwarding work");
     const options = { tool_name: name, kind: "patch" as const, label: name, affectsFiles: !observe };
     return cloud.recorder.recordForwarded({ ...options, input: remoteInput, workspace_id: remoteInput.workspace_id,
       identity: { owner_id: "owner", conversation_id: "conversation", transport_instance_id: "transport", request_id: requestId, task_id: trusted.task_id },

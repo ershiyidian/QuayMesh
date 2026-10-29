@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { aggregateTaskIndex, aggregateTasks, taskReference } from "./task-aggregation.js";
+import { aggregateTaskIndex, aggregateTasks, filterTaskIndex, taskReference } from "./task-aggregation.js";
 import type { TaskPhaseIndex } from "./local-queries.js";
 import type { Run } from "./types.js";
 
@@ -47,6 +47,18 @@ test("tasks aggregate across nodes by task_id and keep later user requests separ
 });
 
 const at = 1_800_000_000_000;
+
+test('进行中按任务生命周期筛选，包含无命令和失败试验，排除已交接的后台执行', () => {
+  const rows=aggregateTaskIndex([
+    {...phase('idle','open-idle','desktop'),requestState:'active',executionStatus:'waiting'},
+    {...phase('failed','open-failed','desktop'),requestState:'active',executionStatus:'failed'},
+    {...phase('running','handed','desktop'),requestState:'closed',resultStatus:'handed_off',executionStatus:'running'},
+  ],at);
+  assert.deepEqual(filterTaskIndex(rows,{requestState:'active',days:'7'},at).map(row=>row.taskId).sort(),['open-failed','open-idle']);
+  assert.deepEqual(filterTaskIndex(rows,{requestState:'closed',days:'0'},at).map(row=>row.taskId),['handed']);
+  assert.deepEqual(filterTaskIndex(rows,{stage:'running,stopping,queued',days:'0'},at).map(row=>row.taskId),['handed']);
+});
+
 const scenarios: Array<{name: string; values: Array<Partial<Run>>; expected: string}> = [
   {name: '新工作区十秒前完成命令，旧工作区闲置二十五分钟', values: [
     {executionStatus: 'waiting', lastActivityAt: at - 10_000},

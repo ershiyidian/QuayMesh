@@ -27,7 +27,19 @@ import { readRunCheckpoint, saveRunCheckpoint, type RunCheckpoint } from "./run-
 import type { SessionChangeCollector } from "./changes.js";
 import type { SessionProjector } from "./projection.js";
 import type { TaskFinalStatus } from "./task-data.js";
+import { admitTaskWorkInTransaction, finalizationBlocksNewWork, taskFinishingError, FinalizationDispatchError } from "./task-finalization.js";
+import { assertTaskCompletionStatus, type TaskCompletionStatus } from "./task-completion.js";
 import type { ExecutionCoordinator } from "../execution-coordinator.js";
+import type { TaskExecutionEntry, TaskStartIntent, TaskCreationClient } from "../tasks/task-binding.js";
+
+/** task_id 限定本次调用；访问任务时仍核对已认证 owner，不改变其他入口的选择。 */
+export interface TaskExecutionIdentity {
+  owner_id: string;
+  conversation_id?: string | null;
+  task_entry?: TaskExecutionEntry;
+  task_creation?: TaskCreationClient;
+  task_id?: string;
+}
 
 export interface TaskOwnerReceipt {
   taskId: string;
@@ -69,6 +81,8 @@ export interface OperationProgressResult {
 interface FinalizationFlight<T> {
   status: TaskFinalStatus;
   summary: string;
+  messageSequence: number;
+  revision?: number;
   ready: Promise<void>;
   work: Promise<T>;
 }
@@ -92,11 +106,11 @@ export class SessionService {
         this.finalizationCursor=intent;
         const task=this.store.getTask(intent.task_id);
         if(this.finalizing.has(task.id)||this.finalizingLocal.has(task.id))continue;
-        if(intent.status!=="handed_off"&&(this.localBackground(task.id).length||this.store.taskData.activeWork(task.id)))continue;
+        if(this.localBackground(task.id).length||this.store.taskData.activeWork(task.id))continue;
         const owner=this.store.getSession(task.session_id).owner_id;
         const flight=task.source_kind==="federation_mirror"
-          ? this.finishOwnedTask(owner,task.id,intent.status,intent.summary)
-          : this.finishTask(owner,task.id,intent.status,intent.summary);
+          ? this.finishOwnedTask(owner,task.id,intent.status,intent.summary,intent.finalization_revision)
+          : this.finishTask(owner,task.id,intent.status,intent.summary,undefined,intent.mailbox_sequence,intent.finalization_revision);
         observed.push(flight.catch(error=>{
           // finishTask 已保存精确失败信息，下一轮仅接续原意图，不重执行操作。
           console.error("QuayMesh 任务收尾仍待处理",task.id,error instanceof Error?error.message:String(error));
@@ -117,7 +131,6 @@ export class SessionService {
   private readonly finalizingLocal = new Map<string, FinalizationFlight<TaskOwnerReceipt>>();
   private readonly pendingRuns = new Map<string, Promise<string>>();
   private remoteFinalizer?: (task: TaskRecord, status: TaskFinalStatus, summary: string) => Promise<TaskOwnerReceipt[]>;
-  private remoteArchiver?: (task:TaskRecord)=>Promise<TaskOwnerReceipt[]>;
 
   constructor(
     private readonly store: SessionStore,
@@ -129,6 +142,7 @@ export class SessionService {
     private readonly recovery?: RecoveryService,
     private readonly nodeId = "local",
     private readonly execution?: ExecutionCoordinator,
+    private readonly bindingAuthority = true,
   ) {}
 
   start(
@@ -143,20 +157,68 @@ export class SessionService {
   }
 
   async startTask(
-    context: { owner_id: string; conversation_id?: string | null },
+    context: TaskExecutionIdentity,
     title: string,
     requestKey?: string,
     sourceTaskId?: string,
+    intent: TaskStartIntent = {},
   ): Promise<{ session: SessionRecord; task: TaskRecord }> {
-    if (sourceTaskId) this.store.requireSession(context.owner_id,this.store.getTask(sourceTaskId).session_id);
+    if (!context.task_entry && context.task_creation) {
+      this.requireBindingAuthority();
+      if (!requestKey) throw Object.assign(new Error("TASK_BINDING_REQUEST_KEY_REQUIRED"),
+        {code: "TASK_BINDING_REQUEST_KEY_REQUIRED", effect: "not_started"});
+      if (context.task_creation.principal.ownerId !== context.owner_id)
+        throw Object.assign(new Error("TASK_ACCESS_DENIED"), {code: "TASK_ACCESS_DENIED", effect: "not_started"});
+      const taskId = await this.store.taskBindings.startUnbound(context.task_creation, requestKey,
+        {title, sourceTaskId, ...intent}, () => {
+          if (sourceTaskId) this.store.requireSession(context.owner_id, this.store.getTask(sourceTaskId).session_id);
+          const session = this.start(context, title);
+          return this.store.createTask(session.id, title, requestKey, sourceTaskId).id;
+        });
+      const task = this.store.getTask(taskId);
+      return {session: this.store.requireSession(context.owner_id, task.session_id), task};
+    }
+    if (context.task_entry && !requestKey)
+      throw Object.assign(new Error("TASK_BINDING_REQUEST_KEY_REQUIRED"),
+        { code: "TASK_BINDING_REQUEST_KEY_REQUIRED", effect: "not_started" });
+    if (context.task_entry && requestKey) {
+      this.requireBindingAuthority();
+      this.requireEntryOwner(context);
+      const result = await this.store.taskBindings.start(context.task_entry, requestKey, { title, sourceTaskId, ...intent }, () => {
+        if (sourceTaskId) this.store.requireSession(context.owner_id, this.store.getTask(sourceTaskId).session_id);
+        // The old Session is only a storage adapter. The start receipt belongs to
+        // this authenticated entry, so another entry can use the same key safely.
+        const session = this.start(context, title);
+        return this.store.createTask(session.id, title, undefined, sourceTaskId).id;
+      }, () => {
+        const session = context.conversation_id
+          ? this.store.findByConversation(context.owner_id, context.conversation_id)
+          : null;
+        return session ? {
+          replayTaskId: this.store.taskForRequest(session.id, requestKey)?.id ?? null,
+          currentTaskId: this.store.currentTask(session.id)?.id ?? null,
+        } : null;
+      });
+      const task = this.store.getTask(result.taskId);
+      return { session: this.store.requireSession(context.owner_id, task.session_id), task };
+    }
+    // Preserve older hosts without a stable entry. Their legacy receipt scope is
+    // unchanged; a transport or owner ID must not masquerade as a binding version.
+    const existingSession = context.conversation_id
+      ? this.store.findByConversation(context.owner_id, context.conversation_id)
+      : null;
+    const saved = existingSession && requestKey ? this.store.taskForRequest(existingSession.id, requestKey) : null;
+    if (existingSession && saved) return { session: existingSession, task: saved };
+    if (intent.expectedBindingRevision !== undefined)
+      throw Object.assign(new Error("TASK_ENTRY_REQUIRED: A binding revision requires a stable authenticated entry."),
+        { code: "TASK_ENTRY_REQUIRED", effect: "not_started" });
+    if (sourceTaskId) this.store.requireSession(context.owner_id, this.store.getTask(sourceTaskId).session_id);
     let session = this.start(context, title);
     if (requestKey) {
       const saved=this.store.taskForRequest(session.id,requestKey);
       if (saved) return {session,task:saved};
     }
-    const previous = this.store.currentTask(session.id);
-    if (previous?.state === "active") await this.freezeTask(previous);
-
+    // A new independent goal changes the legacy entry selection, not other Tasks.
     const task = this.store.createTask(session.id, title, requestKey, sourceTaskId);
     session = this.store.getSession(session.id);
     return { session, task };
@@ -167,41 +229,124 @@ export class SessionService {
     return task ?? this.store.createTask(session.id, title);
   }
 
+  /** Pure lookup. Task identity is captured before asynchronous workspace work. */
+  selectedExecution(context: TaskExecutionIdentity): { session: SessionRecord; task: TaskRecord } | null {
+    this.requireEntryOwner(context);
+    const selectedId = context.task_id ?? (context.task_entry && this.bindingAuthority ? this.store.taskBindings.current(context.task_entry)?.taskId : null);
+    if (selectedId) {
+      const task = this.store.getTask(selectedId);
+      return { task, session: this.store.requireSession(context.owner_id, task.session_id) };
+    }
+    const session = context.conversation_id ? this.store.findByConversation(context.owner_id, context.conversation_id) : null;
+    const task = session ? this.store.currentTask(session.id) : null;
+    return session && task ? { session, task } : null;
+  }
+
+  async resolveExecution(context: TaskExecutionIdentity, title = "QuayMesh task"): Promise<{ session: SessionRecord; task: TaskRecord }> {
+    if (context.task_entry && !context.task_id) this.requireBindingAuthority();
+    const selected = this.selectedExecution(context);
+    if (context.task_id) return selected!;
+    if (context.task_entry) {
+      if (selected) {
+        const binding = await this.store.taskBindings.initializeLegacy(context.task_entry, selected.task.id);
+        const task = this.store.getTask(binding.taskId!);
+        return { task, session: this.store.requireSession(context.owner_id, task.session_id) };
+      }
+      const initialized = await this.store.taskBindings.initialize(context.task_entry, () => {
+        const session = this.start(context, title);
+        return this.ensureCurrentTask(session, title).id;
+      });
+      const task = this.store.getTask(initialized.taskId!);
+      return { task, session: this.store.requireSession(context.owner_id, task.session_id) };
+    }
+    if (selected) return selected;
+    // Compatibility for internal callers and hosts that have not established an
+    // entry. Explicit cross-entry resume itself always requires a stable entry.
+    const session = this.start(context, title);
+    return { session, task: this.ensureCurrentTask(session, title) };
+  }
+
+  private requireEntryOwner(context: TaskExecutionIdentity): void {
+    if (context.task_entry && context.task_entry.principal.ownerId !== context.owner_id) {
+      throw Object.assign(new Error("TASK_ACCESS_DENIED"), { code: "TASK_ACCESS_DENIED", effect: "not_started" });
+    }
+  }
+
+  private requireBindingAuthority(): void {
+    if (!this.bindingAuthority) throw Object.assign(new Error("TASK_BINDING_AUTHORITY_REQUIRED: Select or resume the Task through the configured Coordinator."),
+      { code: "TASK_BINDING_AUTHORITY_REQUIRED", effect: "not_started" });
+  }
+
+  async withTaskExecution<T>(context: TaskExecutionIdentity, title: string,
+    work: (captured: TaskExecutionIdentity & { task_id: string }, scope: { session: SessionRecord; task: TaskRecord }) => Promise<T>): Promise<T> {
+    const scope = await this.resolveExecution(context, title);
+    const captured = { ...context, task_id: scope.task.id };
+    const execute = async () => {
+      await this.store.writeAsync(() => this.store.taskData.admitWorkInTransaction(scope.task.id));
+      return work(captured, { session: scope.session, task: this.store.getTask(scope.task.id) });
+    };
+    return this.execution ? this.execution.withWork({ kind: "tool", taskId: scope.task.id }, execute) : execute();
+  }
+
   async adoptTask(sessionId: SessionId, taskId: string, title: string, createdAt?: string, sourceTaskId?: string): Promise<TaskRecord> {
     const existing=this.store.findTask(taskId);
-    if(existing) return existing;
+    if(existing) {
+      if(existing.session_id!==sessionId)throw Object.assign(new Error(`TASK_SESSION_MISMATCH: ${taskId}`),
+        {code:"TASK_SESSION_MISMATCH",effect:"not_started"});
+      return existing;
+    }
     return this.store.adoptRemoteTask(sessionId, taskId, title, createdAt, sourceTaskId);
   }
 
-  async finishTask(ownerId: string, taskId: string, status: "completed"|"failed"|"cancelled"|"handed_off", summary: string, expectedTaskRevision?: number): Promise<TaskRecord> {
-    this.store.requireSession(ownerId,this.store.getTask(taskId).session_id);
+  async finishTask(ownerId: string, taskId: string, status: TaskFinalStatus, summary: string,
+    expectedTaskRevision?: number, messageSequence = 0, expectedFinalizationRevision?: number): Promise<TaskRecord> {
+    const task = this.store.getTask(taskId);
+    this.store.requireSession(ownerId,task.session_id);
+    assertTaskCompletionStatus(status);
     return this.runFinalization(this.finalizing,taskId,status,summary,
-      ready=>this.completeTask(ownerId,taskId,status,summary,expectedTaskRevision,ready));
+      ready=>this.completeTask(ownerId,taskId,status,summary,expectedTaskRevision,ready,messageSequence,expectedFinalizationRevision),messageSequence);
   }
 
-  private runFinalization<T>(flights:Map<string,FinalizationFlight<T>>,taskId:string,status:TaskFinalStatus,summary:string,
-    finish:(ready:()=>void)=>Promise<T>):Promise<T> {
-    const pending=flights.get(taskId);
-    if(pending){
-      // 写锁期间 intent 可能尚未落盘，内存中的同一 flight 也要拒绝冲突请求。
-      if(pending.status!==status || pending.summary!==summary)throw new Error('TASK_FINALIZATION_CONFLICT');
+  private runFinalization<T>(
+    flights: Map<string, FinalizationFlight<T>>,
+    taskId: string,
+    status: TaskFinalStatus,
+    summary: string,
+    finish: (ready: (revision: number) => void) => Promise<T>,
+    messageSequence = 0
+  ): Promise<T> {
+    const pending = flights.get(taskId),
+      current = this.store.taskData.finalization(taskId);
+    if (pending && (
+      pending.revision === undefined
+      || current?.finalization_revision === pending.revision && current.recovery_state !== "superseded"
+    )) {
+      if (pending.status !== status || pending.summary !== summary || pending.messageSequence !== messageSequence)
+        throw new Error('TASK_FINALIZATION_CONFLICT');
       return pending.work;
     }
-    let markReady!:()=>void;
-    const ready=new Promise<void>(resolve=>{markReady=resolve;});
-    const run=()=>finish(markReady);
-    // 归档独立持有维护占用；工具先返回受理后仍由 service 收尾，不能计入自身 task 的 activeWork。
-    const work=Promise.resolve().then(()=>this.execution
-      ? this.execution.withWork({kind:"tool",allowWhilePaused:true,blocking:true},run) : run())
-      .finally(()=>flights.delete(taskId));
-    flights.set(taskId,{status,summary,ready,work});
+    let markReady!: () => void;
+    const ready = new Promise<void>(resolve => { markReady = resolve; });
+    let flight: FinalizationFlight<T>;
+    const run = () => finish(revision => {
+      flight.revision = revision;
+      markReady();
+    });
+    // Maintenance owns no Task execution lease: it must not count itself as active work.
+    const work = Promise.resolve().then(() => this.execution
+      ? this.execution.withWork({ kind: "tool", allowWhilePaused: true, blocking: true }, run) : run())
+      .finally(() => {
+        if (flights.get(taskId) === flight) flights.delete(taskId);
+      });
+    flight = { status, summary, messageSequence, ready, work };
+    flights.set(taskId, flight);
     return work;
   }
 
-  async finishTaskWithinBudget(ownerId: string, taskId: string, status: TaskFinalStatus, summary: string, waitMs=2000): Promise<
+  async finishTaskWithinBudget(ownerId: string, taskId: string, status: TaskFinalStatus, summary: string, waitMs=2000, messageSequence=0, expectedTaskRevision?: number): Promise<
     { task: TaskRecord; accepted: false } | { task: TaskRecord; accepted: true; pollAfterMs: number }
   > {
-    const work=this.finishTask(ownerId,taskId,status,summary);
+    const work=this.finishTask(ownerId,taskId,status,summary,expectedTaskRevision,messageSequence);
     const ready=this.finalizing.get(taskId)?.ready;
     // 持久 finalization 会记录后台错误，避免受理响应后的失败成为未处理拒绝。
     void work.catch(()=>{});
@@ -221,22 +366,30 @@ export class SessionService {
   setRemoteFinalizer(finalizer: (task: TaskRecord, status: TaskFinalStatus, summary: string) => Promise<TaskOwnerReceipt[]>): void {
     this.remoteFinalizer=finalizer;
   }
-  setRemoteArchiver(archiver:(task:TaskRecord)=>Promise<TaskOwnerReceipt[]>):void {this.remoteArchiver=archiver;}
 
   private localBackground(taskId: string): string[] {
     return this.ledger?this.store.runIdsForTask(taskId).filter(id=>this.ledger!.hasActiveChild(id)):[];
   }
 
-  private assertTaskIdle(taskId: string, status: TaskFinalStatus): void {
-    if(status!=="handed_off" && (this.localBackground(taskId).length || this.store.taskData.activeWork(taskId))) {
+  private assertTaskIdle(taskId: string): void {
+    if(this.localBackground(taskId).length || this.store.taskData.activeWork(taskId)) {
       throw new Error(`TASK_HAS_ACTIVE_EXECUTIONS: ${taskId}`);
     }
-    if(status!=="handed_off" && this.ledger && this.store.runIdsForTask(taskId).some(id=>this.ledger!.hasUnresolvedChild(id))) {
+    if(this.ledger && this.store.runIdsForTask(taskId).some(id=>this.ledger!.hasUnresolvedChild(id))) {
       throw new Error(`TASK_RECONCILIATION_REQUIRED: ${taskId}`);
     }
   }
 
-  private async completeTask(ownerId: string, taskId: string, status: TaskFinalStatus, summary: string, expectedTaskRevision?: number, ready?:()=>void): Promise<TaskRecord> {
+  private async completeTask(
+    ownerId: string,
+    taskId: string,
+    status: TaskCompletionStatus,
+    summary: string,
+    expectedTaskRevision?: number,
+    ready?: (revision: number) => void,
+    messageSequence = 0,
+    expectedFinalizationRevision?: number
+  ): Promise<TaskRecord> {
     const task=this.store.getTask(taskId);
     this.store.requireSession(ownerId,task.session_id);
     if(task.state==="closed"&&task.result_status) {
@@ -244,38 +397,59 @@ export class SessionService {
       if(task.summary!==summary)throw new Error('TASK_FINALIZATION_ALREADY_CONFIRMED');
       return task;
     }
-    await this.store.writeAsync(()=>this.store.taskData.requestFinalization(taskId,status,summary,expectedTaskRevision));
-    ready?.();
+    const intent = await this.store.writeAsync(() => this.store.taskData.requestFinalization(
+      taskId,
+      status,
+      summary,
+      expectedTaskRevision,
+      messageSequence,
+      { expectedFinalizationRevision }
+    ));
+    ready?.(intent.finalization_revision);
     try {
-      this.assertTaskIdle(taskId,status);
+      this.assertTaskIdle(taskId);
       const remote=this.store.taskMemberIds(taskId).map(id=>this.store.getMember(task.session_id,id)).filter(member=>member.node_id!==this.nodeId);
       if(remote.length&&!this.remoteFinalizer)throw new Error("TASK_REMOTE_FINALIZER_UNAVAILABLE");
+      if (remote.length)
+        await this.store.writeAsync(() => this.store.taskData.markFinalizationDispatched(taskId, intent.finalization_revision));
       const receipts=remote.length?await this.remoteFinalizer!(task,status,summary):[];
       for(const member of remote) {
         const receipt=receipts.find(value=>value.nodeId===member.node_id && value.taskId===taskId);
         const frozen=receipt?.snapshots.find(value=>value.memberId===member.id);
         if(!receipt||!frozen)throw new Error(`TASK_OWNER_RECEIPT_MISSING: ${member.node_id}:${member.id}`);
-        if(status!=="handed_off"&&(receipt.activeWork||receipt.backgroundRuns.length))throw new Error(`TASK_HAS_ACTIVE_EXECUTIONS: ${member.node_id}`);
-        await this.store.writeAsync(()=>this.store.putTaskSnapshot(taskId,member.id,frozen.revision,frozen.snapshot,frozen.files));
+        if(receipt.activeWork||receipt.backgroundRuns.length)throw new Error(`TASK_HAS_ACTIVE_EXECUTIONS: ${member.node_id}`);
+        await this.store.writeAsync(() => {
+          this.store.taskData.requireFinalization(taskId, intent.finalization_revision);
+          this.store.putTaskSnapshot(taskId, member.id, frozen.revision, frozen.snapshot, frozen.files);
+        });
       }
-      this.assertTaskIdle(taskId,status);
-      await this.captureTask(task,true);
-      await this.finishLocalRuns(taskId,status,summary);
-      return await this.store.writeAsync(()=>this.store.completeTaskFinalization(taskId,status,summary));
-    } catch(error) {
-      await this.store.writeAsync(()=>this.store.taskData.finishFinalization(taskId,error instanceof Error?error.message:String(error)));
+      this.assertTaskIdle(taskId);
+      this.store.taskData.requireFinalization(taskId, intent.finalization_revision);
+      await this.captureTask(task, true, intent.finalization_revision);
+      // Closing local runs is itself irreversible evidence; persist uncertainty before it.
+      await this.store.writeAsync(() => this.store.taskData.markFinalizationDispatched(taskId, intent.finalization_revision));
+      await this.finishLocalRuns(taskId, status, summary, intent.finalization_revision);
+      return await this.store.writeAsync(() => this.store.completeTaskFinalization(taskId, status, summary, intent.finalization_revision));
+    } catch (error) {
+      const safe = intent.recovery_state === "safe"
+        && error instanceof FinalizationDispatchError
+        && error.allNotSent;
+      await this.store.writeAsync(() => this.store.taskData.finishFinalization(
+        taskId,
+        error instanceof Error ? error.message : String(error),
+        intent.finalization_revision,
+        safe ? "safe" : undefined
+      ));
       throw error;
     }
   }
 
-  private async finishLocalRuns(taskId: string, status: TaskFinalStatus, summary: string): Promise<void> {
-    if (status === "handed_off") {
-      if(this.ledger)await runSqliteWrite(this.ledger.db,()=>this.ledger!.archiveTaskRuns(taskId));
-      return;
-    }
+  private async finishLocalRuns(taskId: string, status: TaskCompletionStatus, summary: string, revision: number): Promise<void> {
     if(this.ledger) {
+      const linkedStore = new SessionStore(this.ledger.db);
       for(const id of this.store.runIdsForTask(taskId)) {
-        await runSqliteWrite(this.ledger.db,()=>{
+        await runSqliteWrite(this.ledger.db, () => {
+          linkedStore.taskData.requireFinalization(taskId, revision);
           if(this.ledger!.run(id).status==="running")
             this.ledger!.finish(id,{status,acceptance:"not_applicable",summary,evidence:[]});
         });
@@ -283,46 +457,44 @@ export class SessionService {
     }
   }
 
-  async finishOwnedTask(ownerId: string, taskId: string, status: TaskFinalStatus, summary: string): Promise<TaskOwnerReceipt> {
+  async finishOwnedTask(ownerId: string, taskId: string, status: TaskFinalStatus, summary: string,
+    expectedFinalizationRevision?: number): Promise<TaskOwnerReceipt> {
     this.store.requireSession(ownerId,this.store.getTask(taskId).session_id);
+    assertTaskCompletionStatus(status);
     return this.runFinalization(this.finalizingLocal,taskId,status,summary,async ready=>{
       const task=this.store.getTask(taskId);
       this.store.requireSession(ownerId,task.session_id);
       if(task.state==='closed' && task.result_status && task.result_status!==status)throw new Error('TASK_ALREADY_FINISHED_WITH_DIFFERENT_RESULT');
       if(task.state==='closed' && task.result_status && task.summary!==summary)throw new Error('TASK_FINALIZATION_ALREADY_CONFIRMED');
       if(!(task.state==="closed"&&task.result_status)) {
-        await this.store.writeAsync(()=>this.store.taskData.requestFinalization(taskId,status,summary));
-        ready();
+        // A delegated request has already reached an owner; this Worker cannot retire it independently.
+        const intent = await this.store.writeAsync(() => this.store.taskData.requestFinalization(
+          taskId,
+          status,
+          summary,
+          undefined,
+          0,
+          { expectedFinalizationRevision, delegated: true }
+        ));
+        ready(intent.finalization_revision);
         try {
-          this.assertTaskIdle(taskId,status);
-          await this.captureTask(task,false);
-          this.assertTaskIdle(taskId,status);
-          await this.finishLocalRuns(taskId,status,summary);
-          await this.store.writeAsync(()=>this.store.completeTaskFinalization(taskId,status,summary));
-        } catch(error) {
-          await this.store.writeAsync(()=>this.store.taskData.finishFinalization(taskId,error instanceof Error?error.message:String(error)));
+          this.assertTaskIdle(taskId);
+          await this.captureTask(task, false, intent.finalization_revision);
+          this.assertTaskIdle(taskId);
+          await this.finishLocalRuns(taskId, status, summary, intent.finalization_revision);
+          await this.store.writeAsync(() => this.store.completeTaskFinalization(taskId, status, summary, intent.finalization_revision));
+        } catch (error) {
+          await this.store.writeAsync(() => this.store.taskData.finishFinalization(
+            taskId,
+            error instanceof Error ? error.message : String(error),
+            intent.finalization_revision
+          ));
           throw error;
         }
       }
       return {taskId,nodeId:this.nodeId,backgroundRuns:this.localBackground(taskId),activeWork:this.store.taskData.activeWork(taskId),
         snapshots:this.store.taskSnapshots(taskId).filter(value=>this.store.getMember(task.session_id,value.memberId).node_id===this.nodeId)};
     });
-  }
-
-  private async freezeTask(task: TaskRecord): Promise<void> {
-    let remoteError:string|null=null;
-    if(this.remoteArchiver) {
-      try {
-        const receipts=await this.remoteArchiver(task);
-        for(const receipt of receipts)for(const frozen of receipt.snapshots)
-          this.store.putTaskSnapshot(task.id,frozen.memberId,frozen.revision,frozen.snapshot,frozen.files);
-      } catch(error) {remoteError=error instanceof Error?error.message:String(error);}
-    }
-    await this.captureTask(task,true);
-    // 旧轮次不再接受下一步时，停止没有活跃子任务的 Console 计时。
-    this.ledger?.archiveTaskRuns(task.id);
-    if(remoteError)this.store.setTaskChangeSummary(task.id,"incomplete",`TASK_ARCHIVE_REMOTE_PENDING: ${remoteError}`);
-    this.store.archiveTask(task.id,"superseded");
   }
 
   async archiveOwnedTask(ownerId:string,taskId:string):Promise<TaskOwnerReceipt>{
@@ -336,7 +508,15 @@ export class SessionService {
       snapshots:this.store.taskSnapshots(taskId).filter(value=>this.store.getMember(task.session_id,value.memberId).node_id===this.nodeId)};
   }
 
-  private async captureTask(task: TaskRecord, includeRemote: boolean): Promise<void> {
+  private async captureTask(task: TaskRecord, includeRemote: boolean, finalizationRevision?: number): Promise<void> {
+    const assertCurrent = (store: SessionStore) => {
+      if (finalizationRevision !== undefined) store.taskData.requireFinalization(task.id, finalizationRevision);
+    };
+    const persist = <T>(write: () => T) => this.store.writeAsync(() => {
+      assertCurrent(this.store);
+      return write();
+    });
+    assertCurrent(this.store);
     const changeErrors:string[]=[];
     if (this.projections) {
       for (const memberId of this.store.taskMemberIds(task.id)) {
@@ -359,7 +539,7 @@ export class SessionService {
           ? stored
           : await this.projections.materialize(task.session_id, member.id, task.id);
         const files = this.store.fileSummaries(task.session_id, member.id, task.id);
-        await this.store.writeAsync(()=>this.store.putTaskSnapshot(task.id, member.id, snapshot.rev, snapshot, files));
+        await persist(() => this.store.putTaskSnapshot(task.id, member.id, snapshot.rev, snapshot, files));
         if (member.node_id === this.nodeId) {
           const paths = [...new Set([
             ...snapshot.instructions.map((item) => item.path),
@@ -371,27 +551,34 @@ export class SessionService {
               if (error.code === "ENOENT") return null;
               throw error;
             });
-            if (content !== null) await this.store.writeAsync(()=>this.store.putTaskContext(task.id, member.id, path, content));
+            if (content !== null) await persist(() => this.store.putTaskContext(task.id, member.id, path, content));
           }
         }
         if (this.ledger) {
           for (const runId of this.store.runIdsForMember(task.session_id, member.id, task.id)) {
             if (!readRunCheckpoint(this.ledger.db, runId)) {
-              await runSqliteWrite(this.ledger.db,()=>saveRunCheckpoint(this.ledger!.db, runId, { revision: snapshot.rev, snapshot, files }));
+              await runSqliteWrite(this.ledger.db, () => {
+                assertCurrent(new SessionStore(this.ledger!.db));
+                return saveRunCheckpoint(this.ledger!.db, runId, { revision: snapshot.rev, snapshot, files });
+              });
             }
           }
         }
       }
     }
-    await this.store.writeAsync(()=>this.store.setTaskChangeSummary(task.id,changeErrors.length?"incomplete":"complete",changeErrors.length?changeErrors.join(" | "):null));
+    await persist(() => this.store.setTaskChangeSummary(
+      task.id,
+      changeErrors.length ? "incomplete" : "complete",
+      changeErrors.length ? changeErrors.join(" | ") : null
+    ));
   }
 
   async open(
-    context: { owner_id: string; conversation_id?: string | null },
+    context: TaskExecutionIdentity,
     workspace: { id: WorkspaceId; node: string; root: string; mode: "checkout" | "worktree"; sourceRoot: string | null; metadata?: WorkspaceMetadata },
     title: string,
-  ): Promise<{ session: SessionRecord; member: SessionMember; bootstrap: Record<string, unknown> }> {
-    const session = this.start(context, title);
+  ): Promise<{ session: SessionRecord; task: TaskRecord; member: SessionMember; bootstrap: Record<string, unknown> }> {
+    const { session, task } = await this.resolveExecution(context, title);
 
     const member = this.store.addMember(
       session.id,
@@ -401,20 +588,20 @@ export class SessionService {
       workspace.mode,
       workspace.sourceRoot,
     );
-    const task = this.ensureCurrentTask(session, title);
     this.store.touchTaskMember(task.id, member.id);
 
     this.store.appendEvent({
       session_id: session.id,
+      task_id: task.id,
       member_id: member.id,
       type: "session_opened",
-      source_id: `open-${session.id}-${member.id}`,
+      source_id: `open-${task.id}-${member.id}`,
       timestamp: new Date().toISOString(),
       payload: { workspace_id: workspace.id, root: workspace.root, metadata: workspace.metadata },
     });
 
     if (this.projections?.schedule) {
-      this.projections.schedule(session.id, member.id);
+      this.projections.schedule(session.id, member.id, task.id);
     }
     this.scheduleRecovery(member.root);
 
@@ -425,18 +612,16 @@ export class SessionService {
       title: session.title,
     };
 
-    return { session, member, bootstrap };
+    return { session, task, member, bootstrap };
   }
 
   async attach(
-    context: { owner_id: string; conversation_id?: string | null },
+    context: TaskExecutionIdentity,
     sessionId: SessionId,
     workspace: { id: WorkspaceId; node: string; root: string; mode: "checkout" | "worktree"; sourceRoot: string | null; metadata?: WorkspaceMetadata },
   ): Promise<{ member: SessionMember }> {
-    const session = this.store.requireSession(context.owner_id, sessionId);
-    if (context.conversation_id && session.conversation_id && session.conversation_id !== context.conversation_id) {
-      throw new Error(`SESSION_SCOPE_MISMATCH: ${sessionId}`);
-    }
+    const { session, task } = await this.resolveExecution(context);
+    if (session.id !== sessionId) throw new Error(`TASK_SESSION_MISMATCH: ${task.id}`);
 
     const member = this.store.addMember(
       session.id,
@@ -446,45 +631,37 @@ export class SessionService {
       workspace.mode,
       workspace.sourceRoot,
     );
-    const task = this.ensureCurrentTask(session);
     this.store.touchTaskMember(task.id, member.id);
 
     this.store.appendEvent({
       session_id: session.id,
+      task_id: task.id,
       member_id: member.id,
       type: "session_opened",
-      source_id: `attach-${session.id}-${member.id}`,
+      source_id: `attach-${task.id}-${member.id}`,
       timestamp: new Date().toISOString(),
       payload: { workspace_id: workspace.id, root: workspace.root, mode: "attach", metadata: workspace.metadata },
     });
 
-    for (const existing of this.store.getMembers(session.id)) {
+    for (const existing of this.store.taskMemberIds(task.id).map(id => this.store.getMember(session.id, id))) {
       if (existing.node_id !== this.nodeId) continue;
       if (existing.id !== member.id) this.store.appendEvent({
-        session_id: session.id, member_id: existing.id, type: "session_opened",
-        source_id: `member-attached-${existing.id}-${member.id}`, timestamp: new Date().toISOString(),
+        session_id: session.id, task_id: task.id, member_id: existing.id, type: "session_opened",
+        source_id: `member-attached-${task.id}-${existing.id}-${member.id}`, timestamp: new Date().toISOString(),
         payload: { attached_member_id: member.id },
       });
-      this.refreshMember(session.id, existing.id);
+      this.refreshMember(session.id, existing.id, task.id);
     }
 
     return { member };
   }
 
   async resolveForWorkspace(
-    context: { owner_id: string; conversation_id?: string | null },
+    context: TaskExecutionIdentity,
     workspaceId: WorkspaceId,
-  ): Promise<{ session: SessionRecord; member: SessionMember }> {
+  ): Promise<{ session: SessionRecord; task: TaskRecord; member: SessionMember }> {
+    const { session, task } = await this.resolveExecution(context);
     const ws: Workspace = await this.workspaces.getWorkspace(workspaceId);
-
-    let session: SessionRecord | null = null;
-    if (context.conversation_id) {
-      session = this.store.findByConversation(context.owner_id, context.conversation_id);
-    }
-
-    if (!session) {
-      session = this.store.createSession(context.owner_id, context.conversation_id ?? null, ws.root);
-    }
 
     let members = this.store.getMembers(session.id);
     let member = members.find((m) => m.workspace_id === workspaceId);
@@ -499,9 +676,9 @@ export class SessionService {
       );
     }
 
-    this.store.touchTaskMember(this.ensureCurrentTask(session).id, member.id);
+    this.store.touchTaskMember(task.id, member.id);
 
-    return { session, member };
+    return { session, task, member };
   }
 
   async ensureRun(
@@ -529,10 +706,9 @@ export class SessionService {
         const currentMember = linkedStore.getMember(session.id, member.id);
         const currentTask = linkedStore.getTask(task.id);
         if (currentTask.session_id !== session.id || currentTask.state !== "active") throw new Error(`TASK_NOT_ACTIVE: ${task.id}`);
-        const finishing = linkedStore.taskData.finalization(task.id);
-        if (finishing && !finishing.error) throw new Error(`TASK_FINISHING: ${task.id}`);
+        admitTaskWorkInTransaction(ledger.db,task.id);
         if (operation.invocationId !== undefined || operation.operationId !== undefined) {
-          const attempt = operation.operationId ? linkedStore.findInvocationByOperation(session.owner_id, operation.operationId) : null;
+          const attempt = operation.operationId ? linkedStore.findInvocationSummaryByOperation(session.owner_id, operation.operationId) : null;
           if (!attempt || attempt.id !== operation.invocationId || attempt.task_id !== task.id
             || attempt.session_id !== session.id || attempt.member_id !== member.id) throw new Error("OPERATION_RETRY_SUPERSEDED");
         }
@@ -573,19 +749,19 @@ export class SessionService {
     context.task_id = task.id;
     if (task.session_id !== session.id || task.state !== "active") throw new Error(`TASK_NOT_ACTIVE: ${task.id}`);
     const finalization=this.store.taskData.finalization(task.id);
-    if(finalization && !finalization.error)throw new Error(`TASK_FINISHING: ${task.id}`);
+    if (finalizationBlocksNewWork(finalization)) throw taskFinishingError(task.id, finalization!);
     const runId = await this.ensureRun(session, member, {
       kind, label, invocationId: context.invocation_id, operationId: context.operation_id,
     }, task.id);
     const ledger = this.requireLedger();
-    const attempt = context.operation_id ? this.store.findInvocationByOperation(context.owner_id, context.operation_id) : null;
+    const attempt = context.operation_id ? this.store.findInvocationSummaryByOperation(context.owner_id, context.operation_id) : null;
     if (attempt && attempt.id !== context.invocation_id) throw new Error("OPERATION_RETRY_SUPERSEDED");
+    const linkedStore = new SessionStore(ledger.db);
     const operationId = await runSqliteWrite(ledger.db, () => {
-      if (this.store.getTask(task.id).state !== "active") throw new Error(`TASK_NOT_ACTIVE: ${task.id}`);
-      const finishing = this.store.taskData.finalization(task.id);
-      if (finishing && !finishing.error) throw new Error(`TASK_FINISHING: ${task.id}`);
-      const currentAttempt = context.operation_id ? this.store.findInvocationByOperation(context.owner_id, context.operation_id) : null;
+      admitTaskWorkInTransaction(ledger.db, task.id);
+      const currentAttempt = context.operation_id ? linkedStore.findInvocationSummaryByOperation(context.owner_id, context.operation_id) : null;
       if (currentAttempt && currentAttempt.id !== context.invocation_id) throw new Error("OPERATION_RETRY_SUPERSEDED");
+      linkedStore.touchTaskMember(task.id, member.id);
       return ledger.operation({
         id: context.operation_id,
         runId,
@@ -642,8 +818,18 @@ export class SessionService {
   async finishOperationById(operationId: string, result: OperationFinishResult, invocationId?: string): Promise<void> {
     const event = this.store.findOperationEvent(operationId);
     if (!event) throw new Error(`OPERATION_NOT_FOUND: ${operationId}`);
-    const invocation = this.store.findInvocationByOperationId(operationId);
+    const invocation = this.store.findInvocationSummaryByOperationId(operationId);
     if (invocationId && invocation?.id !== invocationId) return;
+    // Terminal callbacks may run after every entry has selected another Task.
+    // Only the accepted invocation/event/run link can identify their original work.
+    const linkedTaskId = this.store.taskIdForRun(event.session_id, event.member_id, String(event.payload.run_id ?? ""));
+    const taskIds = [event.task_id, invocation?.task_id, linkedTaskId].filter((value): value is string => Boolean(value));
+    const taskId = taskIds[0];
+    if (!taskId || taskIds.some(value => value !== taskId)
+      || invocation && (invocation.session_id !== event.session_id || invocation.member_id !== event.member_id)) {
+      throw new Error(`OPERATION_TASK_SCOPE_UNKNOWN: ${operationId}`);
+    }
+    this.store.taskData.requireScope(taskId, event.session_id, event.member_id);
     if (invocation) {
       await this.store.writeAsync(() => this.store.updateInvocation({
         ownerId: invocation.owner_id,
@@ -660,7 +846,7 @@ export class SessionService {
       operation_id: operationId,
       invocation_id: invocation?.id,
       session_id: event.session_id,
-      task_id: event.task_id ?? this.store.currentTask(event.session_id)?.id ?? "",
+      task_id: taskId,
       member_id: event.member_id,
       run_id: String(event.payload.run_id ?? ""),
       kind: String(event.payload.kind ?? "command"),
@@ -757,7 +943,7 @@ export class SessionService {
     });
     if (!appended) return;
     if (this.projections?.schedule) {
-      this.projections.schedule(ticket.session_id, ticket.member_id);
+      this.projections.schedule(ticket.session_id, ticket.member_id, ticket.task_id);
     }
   }
 
@@ -766,7 +952,7 @@ export class SessionService {
   }
 
   private supersededAttempt(ticket: OperationTicket): boolean {
-    const current = this.store.findInvocationByOperationId(ticket.operation_id);
+    const current = this.store.findInvocationSummaryByOperationId(ticket.operation_id);
     return Boolean(ticket.invocation_id && current && current.id !== ticket.invocation_id);
   }
 
@@ -774,7 +960,7 @@ export class SessionService {
     const sourceId = (event.source_id as string) || `agent-${Date.now()}-${randomUUID().slice(0, 6)}`;
     await this.store.appendEventAsync({
       session_id: sessionId,
-      task_id: taskId ?? this.store.currentTask(sessionId)?.id ?? null,
+      task_id: taskId ?? null,
       member_id: memberId,
       type: "agent_changed",
       source_id: sourceId,
@@ -783,7 +969,7 @@ export class SessionService {
     });
 
     if (this.projections?.schedule) {
-      this.projections.schedule(sessionId, memberId);
+      this.projections.schedule(sessionId, memberId, taskId);
     }
   }
 

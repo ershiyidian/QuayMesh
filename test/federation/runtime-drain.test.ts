@@ -11,7 +11,6 @@ import { TOOL_DEADLINE_META } from "../../src/tool-request-budget.js";
 
 async function runtimeFixture(t: test.TestContext, proxyPort = 1) {
   const root = await mkdtemp(join(tmpdir(), "qm-runtime-drain-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
   const config = federationConfigSchema.parse({ enabled: true, nodeId: "worker", coordinatorId: "worker",
     host: "127.0.0.1", capabilities: { worker: true, egress: true }, roots: [], peers: [], priority: 100,
     egress: { enabled: false, proxyUrl: `http://127.0.0.1:${proxyPort}` } });
@@ -22,7 +21,12 @@ async function runtimeFixture(t: test.TestContext, proxyPort = 1) {
     resolveProxy: async () => config.egress.proxyUrl, artifactStat: async () => ({ size: 0 }), artifactRead: async () => { throw new Error("unused"); },
     artifactWrite: async () => {} };
   const runtime = new FederationRuntime(config, "fixture-secret", hooks);
-  t.after(async () => { await runtime.close(); });
+  t.after(async () => {
+    // Construction starts release metadata writes even before start(). Await
+    // all runtime writers before deleting their directory; hooks run in order.
+    await runtime.close();
+    await rm(root, { recursive: true, force: true });
+  });
   return runtime;
 }
 

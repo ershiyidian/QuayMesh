@@ -11,6 +11,9 @@ const validDigest = value => typeof value === "string" && /^[a-f0-9]{64}$/.test(
 const subjectIdentities = rows => rows.map(({domain,id,generation,fingerprint}) => [domain,id,generation,fingerprint])
   .sort((a,b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]));
 const sameSubjects = (left, right) => JSON.stringify(subjectIdentities(left)) === JSON.stringify(subjectIdentities(right));
+const claimIdentities = rows => rows.map(({id,operationId,ownerId,ownerPid,processStart,generation,fingerprint}) =>
+  [id,operationId,ownerId,ownerPid,processStart,generation,fingerprint]).sort((a,b)=>a[0].localeCompare(b[0]));
+const sameClaims = (left,right) => JSON.stringify(claimIdentities(left)) === JSON.stringify(claimIdentities(right));
 
 export function runMaintenanceProof(manifest, request, timeoutMs = 10000) {
   return new Promise((resolveProof, reject) => {
@@ -53,11 +56,19 @@ function subjects(value) {
     throw new Error("Invalid physical quiescence subject identities.");
   return value;
 }
-function activeCounts(status) {
+function reviewedClaims(value=[]) {
+  if (!Array.isArray(value) || value.some(row => !row ||
+      [row.id,row.operationId,row.ownerId,row.processStart,row.generation].some(value=>typeof value!=="string"||!value) ||
+      !Number.isSafeInteger(row.ownerPid) || row.ownerPid<1 || !validDigest(row.fingerprint)) ||
+      new Set(value.map(row=>row.id)).size!==value.length)
+    throw new Error("Invalid reviewed command claim identities.");
+  return value;
+}
+function activeCounts(status,claims) {
   const names = ["claims","waiting","operations","executions","queuedOperations","queuedExecutions","activeWork","allRuntimeWork","persistedRuntimeWork"];
   if (!status || names.some(name => !Number.isSafeInteger(status[name]) || status[name] < 0))
     throw new Error("Maintenance activity counters are unavailable.");
-  return names.reduce((sum, name) => sum + status[name], 0);
+  return status.claims!==claims.length || names.some(name=>name!=="claims"&&status[name]>0);
 }
 
 export async function beginInstallationMaintenance(options) {
@@ -102,8 +113,11 @@ export async function acquireInstallationLease({ provider, manifest, manifestFil
     lease = await provider.acquire(context);
     if (lease?.version !== 1 || lease.attemptId !== attemptId || lease.pause?.reason !== `release-preflight:${attemptId}` ||
         !Number.isFinite(Date.parse(lease.pause?.changedAt))) throw new Error("External maintenance ownership does not match this attempt.");
-    census(lease.census); subjects(lease.subjects);
+    census(lease.census); subjects(lease.subjects); reviewedClaims(lease.claims);
     if (!sameSubjects(lease.subjects, baseline.subjects)) throw new Error("The reviewed historical subjects changed during acquisition.");
+    if (baseline.admission.claims!==(lease.claims??[]).length || !sameClaims(lease.claims??[],reviewedClaims(baseline.claims)) ||
+        (lease.claims??[]).some(claim=>!lease.subjects.some(subject=>subject.domain==="operation"&&subject.id===claim.operationId&&subject.generation===claim.generation)))
+      throw new Error("The complete command claim set was not reviewed or changed during acquisition.");
     receipt.lease = lease; receipt.phase = "acquired";
     await writeJson(context.receiptFile, receipt);
   } catch (error) {
@@ -127,7 +141,8 @@ export async function acquireInstallationLease({ provider, manifest, manifestFil
     const observed = census(check?.census);
     const snapshot = await proof(manifest, { action: "inspect", stateDir: manifest.stateDir,
       pids: [context.manager.pid,context.core.pid] });
-    if (activeCounts(snapshot.admission) || snapshot.admission.accepting || !sameSubjects(lease.subjects, snapshot.subjects))
+    if (activeCounts(snapshot.admission,lease.claims??[]) || snapshot.admission.accepting ||
+        !sameSubjects(lease.subjects, snapshot.subjects) || !sameClaims(lease.claims??[],reviewedClaims(snapshot.claims)))
       throw new Error(`Maintenance state changed at ${stage}.`);
     if (stage === "after_stop") {
       for (const expected of [context.manager,context.core]) {

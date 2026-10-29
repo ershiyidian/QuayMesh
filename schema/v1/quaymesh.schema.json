@@ -510,7 +510,7 @@
           "type": "boolean"
         },
         "maxFileBytes": {
-          "default": 104857600,
+          "default": 1073741824,
           "type": "integer",
           "exclusiveMinimum": 0,
           "maximum": 9007199254740991

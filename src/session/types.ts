@@ -136,11 +136,15 @@ export interface FileSummary {
   binary: boolean;
   coverage: "session_owned" | "workspace_observed" | "partial";
   revertible: boolean;
+  /** Time this file's changed evidence was recorded; absent/null when unproven. */
+  recordedAt?: number | null;
 }
 
 export interface CommandSummary {
   id: string;
   operation_id: OperationId;
+  invocation_id?: string | null;
+  effect?: OperationRecord["effect"] | null;
   member_id: string;
   cmd: string;
   agent: string;

@@ -130,6 +130,18 @@ async function testOpenAIFileAdapter(): Promise<void> {
   assert.deepEqual(await collect(generatedOpened.stream), bytes);
   assert.equal(requested.length, 2);
 
+  // ChatGPT 当前按地区和文件服务编号分配官方文件主机。
+  for (const host of ["sdmntprcentralus.oaiusercontent.com", "sdmntprsouthcentralus.oaiusercontent.com", "files01.oaiusercontent.com"]) {
+    const regional = await registry.open({ ...reference, download_url: `https://${host}/files/example?sig=secret` });
+    assert.deepEqual(await collect(regional.stream), bytes);
+    assert.equal(new URL(requested.at(-1)!).hostname, host);
+  }
+  const requestsBeforeRejectedHosts = requested.length;
+  for (const host of ["oaiusercontent.com.example.net", "fakeoaiusercontent.com", "sdmntprcentralus.oaiusercontent.com.example.net"]) {
+    await expectArtifactError(registry.open({ ...reference, download_url: `https://${host}/file` }), "unsafe_openai_file_reference");
+  }
+  assert.equal(requested.length, requestsBeforeRejectedHosts);
+
   const fallbackOpened = await registry.open({
     ...generatedReference,
     file_name: null,

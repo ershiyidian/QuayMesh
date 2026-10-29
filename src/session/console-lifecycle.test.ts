@@ -21,6 +21,15 @@ import {aggregateTaskIndex, aggregateTasks, fallbackTask, filterTaskIndex, taskO
 import {needsAttention, taskStage, withTaskLifecycle} from '../console-task-state.js';
 import {taskView} from '../task-view.js';
 import {cardPresentation} from '../ui/session-card/timing.js';
+import {taskPrincipalFromAuthInfo} from '../tasks/task-access.js';
+
+function assertActiveTaskCard(snapshot: Parameters<typeof cardPresentation>[0], expectedBackgroundLabel: string): void {
+  assert.equal(snapshot.taskState, 'active');
+  const {status, label, backgroundStatus, backgroundLabel} = cardPresentation(snapshot, Date.now());
+  assert.deepEqual({status, label, backgroundStatus, backgroundLabel}, {
+    status: 'active', label: '任务进行中', backgroundStatus: 'idle', backgroundLabel: expectedBackgroundLabel,
+  });
+}
 
 async function fixture(t: TestContext) {
   const directory=await mkdtemp(join(tmpdir(),'qm-console-lifecycle-'));
@@ -51,6 +60,25 @@ async function fixture(t: TestContext) {
   };
   t.after(async()=>{await service.close();agents.close();workspaceStore.close();ledger.close();await rm(directory,{recursive:true,force:true});});
   return {root,stateDir,config,ledger,store,service,session,member,task,agent,createRun,rows};
+}
+
+function confirmedOpenIntent(f: Awaited<ReturnType<typeof fixture>>, version: 'legacy' | 'current' = 'legacy') {
+  if (version === 'legacy') {
+    // The pre-fence writer could save confirmation separately from Task closure.
+    // These legacy columns acquire revision=0/recovery_state=NULL on migration.
+    f.ledger.db.prepare(`INSERT INTO qm_task_finalizations(task_id,status,summary,requested_at,completed_at,error,mailbox_sequence)
+      VALUES(?,'completed','finish',?,?,NULL,0)`).run(f.task.id, f.task.created_at, new Date().toISOString());
+  } else {
+    const intent = f.store.taskData.requestFinalization(f.task.id, 'completed', 'finish');
+    assert.equal(f.store.taskData.finishFinalization(f.task.id, undefined, intent.finalization_revision), true);
+  }
+  const intent = f.store.taskData.finalization(f.task.id)!;
+  assert.ok(intent.completed_at);
+  assert.equal(intent.error, null);
+  assert.equal(intent.finalization_revision, version === 'legacy' ? 0 : 1);
+  assert.equal(intent.recovery_state, version === 'legacy' ? null : 'safe');
+  assert.equal(f.store.getTask(f.task.id).state, 'active');
+  return intent;
 }
 
 test('明确 legacy 事件不会归入后续 Task，省略 Task 与显式历史 Task 保持各自语义',async t=>{
@@ -113,7 +141,7 @@ for(const status of ['failed','cancelled'] as const) test(`最后一个代理 ${
     f.store.taskData.putProjection(f.task.id,f.member.id,member.rev,{...member,execution_status:ExecutionState.idle});
     const aggregate=(await projector.readTask(f.task.id,-1)).snapshot!;
     assert.equal(aggregate.execution_status,expected,'同 revision 的旧投影也不能覆盖所属 Task/member 的执行结果');
-    assert.equal(cardPresentation(aggregate,Date.now()).label,status==='failed'?'未完成':'执行已中断');
+    assertActiveTaskCard(aggregate,status==='failed'?'最近执行失败':'后台执行已中断');
   } finally {await projector.close();}
 });
 
@@ -124,7 +152,8 @@ test('同一毫秒成功接续同一代理后，旧失败不把整个任务永�
   const first=f.ledger.beginExecution({runId:run.id,agentId:f.agent.id,provider:'codex'});
   f.ledger.endExecution(first,'failed');
   const failed=await projector.materialize(f.session.id,f.member.id,f.task.id);
-  assert.equal(cardPresentation(failed,Date.now()).status,'failed');
+  assert.equal(failed.execution_status,ExecutionState.failed);
+  assertActiveTaskCard(failed,'最近执行失败');
   const second=f.ledger.beginExecution({runId:run.id,agentId:f.agent.id,provider:'codex'});
   f.ledger.endExecution(second,'completed');
   const sameTime=new Date().toISOString();
@@ -135,7 +164,7 @@ test('同一毫秒成功接续同一代理后，旧失败不把整个任务永�
   assert.equal(f.rows({attention:'1'}).length,0);
   const continued=await projector.materialize(f.session.id,f.member.id,f.task.id);
   assert.equal(continued.execution_status,ExecutionState.idle);
-  assert.equal(cardPresentation(continued,Date.now()).label,'当前无后台执行');
+  assertActiveTaskCard(continued,'暂无后台执行');
   assert.equal((await projector.readTask(f.task.id,-1)).snapshot?.execution_status,ExecutionState.idle);
   assert.equal((await f.service.finishTask('owner',f.task.id,'completed','successful retry')).result_status,'completed');
 });
@@ -159,18 +188,20 @@ test('卡片按 Task/member 读取执行结果，其他成员和新请求不继�
   const projector=new SessionProjector(f.store,f.stateDir,null,undefined,'local');
   try {
     const aggregate=(await projector.readTask(f.task.id,-1)).snapshot!;
-    assert.equal(cardPresentation(aggregate,Date.now()).status,'failed');
+    assert.equal(aggregate.execution_status,ExecutionState.failed);
+    assertActiveTaskCard(aggregate,'最近执行失败');
     const otherCard=(await projector.readTask(f.task.id,-1,other.id)).snapshot!;
     assert.equal(otherCard.execution_status,ExecutionState.idle);
-    assert.equal(cardPresentation(otherCard,Date.now()).label,'当前无后台执行');
+    assertActiveTaskCard(otherCard,'暂无后台执行');
     const next=f.store.createTask(f.session.id,'下一请求');
     f.store.touchTaskMember(next.id,f.member.id);
     const nextCard=(await projector.readTask(next.id,-1,f.member.id)).snapshot!;
     assert.equal(f.store.getSession(f.session.id).execution_state,ExecutionState.failed);
     assert.equal(nextCard.execution_status,ExecutionState.idle);
-    assert.equal(cardPresentation(nextCard,Date.now()).label,'当前无后台执行');
+    assertActiveTaskCard(nextCard,'暂无后台执行');
     const historical=(await projector.materialize(f.session.id,f.member.id,f.task.id));
-    assert.equal(cardPresentation(historical,Date.now()).status,'failed');
+    assert.equal(historical.execution_status,ExecutionState.failed);
+    assertActiveTaskCard(historical,'最近执行失败');
   } finally {await projector.close();}
 });
 
@@ -200,13 +231,78 @@ test('交付终态写入失败时，最终确认原子回滚且可真实重试',
   assert.equal(f.rows()[0].execution,'completed');
 });
 
-test('旧版本已确认却未关闭的收尾记录仍进入恢复队列',async t=>{
-  const f=await fixture(t);
-  f.store.taskData.requestFinalization(f.task.id,'completed','finish');
-  f.store.taskData.finishFinalization(f.task.id);
-  assert.equal(f.store.taskData.pendingFinalizations()[0]?.task_id,f.task.id);
+for (const version of ['legacy', 'current'] as const) test(`${version} 已确认却未关闭的收尾在新围栏下重新核对，完成后不重开`, async t => {
+  const f = await fixture(t), run = f.createRun('confirmed-before-close');
+  const original = confirmedOpenIntent(f, version);
+  assert.equal(f.store.taskData.pendingFinalizations()[0]?.task_id, f.task.id);
+  assert.throws(() => f.store.taskData.requireFinalization(f.task.id, original.finalization_revision),
+    {code: 'TASK_FINALIZATION_SUPERSEDED'}, 'completed evidence never bypasses the normal callback fence');
   await f.service.retryFinalizations();
-  assert.equal(f.store.getTask(f.task.id).result_status,'completed');
+  const finished = f.store.getTask(f.task.id), confirmed = f.store.taskData.finalization(f.task.id)!;
+  assert.equal(finished.state, 'closed');
+  assert.equal(finished.result_status, original.status);
+  assert.equal(finished.summary, original.summary);
+  assert.equal(f.ledger.run(run.id).status, 'completed');
+  assert.ok(confirmed.completed_at);
+  assert.equal(confirmed.error, null);
+  assert.ok(confirmed.finalization_revision > original.finalization_revision);
+  assert.equal(confirmed.recovery_state, 'reconcile', 'an old confirmation cannot be reclassified as an unsent finish');
+  assert.equal(f.store.taskData.pendingFinalizations().some(intent => intent.task_id === f.task.id), false);
+  await f.service.retryFinalizations();
+  assert.deepEqual(f.store.taskData.requestFinalization(f.task.id, 'completed', 'finish', undefined, 0,
+    {expectedFinalizationRevision: confirmed.finalization_revision}), confirmed, 'closed replay does not advance the fence');
+  await assert.rejects(f.service.finishTask('owner', f.task.id, 'failed', 'finish'), /TASK_ALREADY_FINISHED_WITH_DIFFERENT_RESULT/);
+  await assert.rejects(f.service.finishTask('owner', f.task.id, 'completed', 'another result'), /TASK_FINALIZATION_ALREADY_CONFIRMED/);
+  assert.deepEqual(f.store.getTask(f.task.id), finished);
+  assert.deepEqual(f.store.taskData.finalization(f.task.id), confirmed);
+});
+
+test('已确认但开放的历史收尾只接受原意图与精确围栏，过期回调不能关闭任务', async t => {
+  const f = await fixture(t), original = confirmedOpenIntent(f), before = f.store.getTask(f.task.id);
+  await assert.rejects(f.service.finishTask('owner', f.task.id, 'completed', 'finish'), {code: 'TASK_FINALIZATION_SUPERSEDED'});
+  for (const [status, summary] of [['failed', 'finish'], ['completed', 'changed summary']] as const) {
+    await assert.rejects(f.service.finishTask('owner', f.task.id, status, summary, undefined, 0, original.finalization_revision),
+      /TASK_FINALIZATION_ALREADY_CONFIRMED/);
+    assert.deepEqual(f.store.getTask(f.task.id), before);
+    assert.deepEqual(f.store.taskData.finalization(f.task.id), original);
+  }
+  const admitted = await f.store.writeAsync(() => f.store.taskData.requestFinalization(f.task.id, 'completed', 'finish', undefined, 0,
+    {expectedFinalizationRevision: original.finalization_revision}));
+  assert.equal(admitted.finalization_revision, original.finalization_revision + 1);
+  assert.equal(admitted.completed_at, null);
+  assert.equal(admitted.recovery_state, 'reconcile');
+  const active = f.store.getTask(f.task.id);
+  await assert.rejects(f.service.finishTask('owner', f.task.id, 'completed', 'finish', undefined, 0, original.finalization_revision),
+    {code: 'TASK_FINALIZATION_SUPERSEDED'});
+  assert.throws(() => f.store.completeTaskFinalization(f.task.id, 'completed', 'finish', original.finalization_revision),
+    {code: 'TASK_FINALIZATION_SUPERSEDED'});
+  assert.equal(f.store.taskData.finishFinalization(f.task.id, 'late old callback', original.finalization_revision), false);
+  assert.deepEqual(f.store.getTask(f.task.id), active);
+  assert.deepEqual(f.store.taskData.finalization(f.task.id), admitted);
+});
+
+test('历史已确认收尾不能越过新到消息或改用新的邮箱截止序号自动关闭任务', async t => {
+  const f = await fixture(t), original = confirmedOpenIntent(f);
+  const scope = {principal: taskPrincipalFromAuthInfo({extra: {owner_id: 'owner'}}), taskId: f.task.id};
+  const message = await f.store.mailbox.enqueue(scope, {messageKey: 'arrived-after-confirmation', body: '继续之前先处理这条输入。'});
+  await assert.rejects(f.service.finishTask('owner', f.task.id, 'completed', 'finish', undefined, 0, original.finalization_revision),
+    {code: 'TASK_MAILBOX_CHANGED'});
+  await assert.rejects(f.service.finishTask('owner', f.task.id, 'completed', 'finish', undefined, message.message.sequence, original.finalization_revision),
+    {code: 'TASK_MAILBOX_INPUT_PENDING'});
+  const receiverId = await f.store.mailbox.bindReceiver(scope, {clientId: 'test-client', correlationId: 'recovery-entry'});
+  const delivery = await f.store.mailbox.claim(scope, {receiverId, requestKey: 'receive-new-input'});
+  assert.equal(delivery.status, 'offered');
+  if (delivery.status !== 'offered') throw new Error('expected the real pending message');
+  await f.store.mailbox.acknowledge(scope, {receiverId, deliveryId: delivery.deliveryId, messageIds: [message.message.id]});
+  const active = f.store.getTask(f.task.id);
+  await assert.rejects(f.service.finishTask('owner', f.task.id, 'completed', 'finish', undefined, message.message.sequence, original.finalization_revision),
+    /TASK_FINALIZATION_ALREADY_CONFIRMED/);
+  assert.equal(f.store.taskData.pendingFinalizations().some(intent => intent.task_id === f.task.id), false);
+  await f.service.retryFinalizations();
+  assert.equal(active.state, 'active');
+  assert.equal(active.result_status, null);
+  assert.deepEqual(f.store.getTask(f.task.id), active);
+  assert.deepEqual(f.store.taskData.finalization(f.task.id), original);
 });
 
 test('迟到的代理回调不能重启或改写已停止的执行',async t=>{

@@ -16,9 +16,22 @@ function removeQuiescenceMigration(db: Database.Database) {
   for (const { name } of db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'execution_quiescence_%'").all() as {name:string}[])
     db.exec(`DROP TRIGGER "${name}"`);
   db.exec(`DROP TABLE execution_quiescence;
+    DROP TABLE qm_task_creation_receipts;
     DROP INDEX console_operations_maintenance_status;
     DROP INDEX console_executions_maintenance_status;
-    DELETE FROM qm_schema_migrations WHERE version=9;`);
+    DROP TABLE qm_task_binding_requests;
+    DROP TABLE qm_task_bindings;
+    DROP TABLE qm_task_messages;
+    DROP TABLE qm_task_message_deliveries;
+    DROP TABLE qm_task_message_receivers;
+    ALTER TABLE qm_task_finalizations DROP COLUMN mailbox_sequence;
+    ALTER TABLE qm_task_finalizations DROP COLUMN recovery_state;
+    ALTER TABLE qm_task_finalizations DROP COLUMN finalization_revision;
+    ALTER TABLE qm_file_changes DROP COLUMN recorded_at;
+    ALTER TABLE qm_task_file_changes DROP COLUMN recorded_at;
+    ALTER TABLE qm_task_members DROP COLUMN context_inherited;
+    ALTER TABLE qm_invocations DROP COLUMN response_uses_result;
+    DELETE FROM qm_schema_migrations WHERE version>=9;`);
 }
 
 test("版本八增量升级只增加物理证据结构，不推断旧unknown已完成或已排空",()=>{
@@ -36,7 +49,7 @@ test("版本八增量升级只增加物理证据结构，不推断旧unknown已�
     assert.deepEqual(db.prepare("SELECT * FROM console_operations").all(),before);
     assert.equal(db.prepare("SELECT count(*) FROM execution_quiescence").pluck().get(),0);
     assert.equal(db.prepare("SELECT status FROM console_work_runs").pluck().get(),"reconciliation_required");
-    assert.equal(db.prepare("SELECT max(version) FROM qm_schema_migrations").pluck().get(),9);
+    assert.equal(db.prepare("SELECT max(version) FROM qm_schema_migrations").pluck().get(),LATEST_DATABASE_VERSION);
     assert.equal(db.pragma("integrity_check",{simple:true}),"ok");
   }finally{db.close();}
 });
@@ -48,7 +61,11 @@ test("初始数据库创建全部工作区、任务和认证表", () => {
     assert.deepEqual(db.prepare("SELECT version,name FROM qm_schema_migrations").all(),
       [{version:1,name:"quaymesh-initial"},{version:2,name:"quaymesh-runtime-ownership"},{version:3,name:"quaymesh-durable-results"},{version:4,name:"quaymesh-task-lifecycle"},
         {version:5,name:"quaymesh-execution-observation"},{version:6,name:"quaymesh-invocation-attempts"},{version:7,name:"quaymesh-console-audit"},
-        {version:8,name:"quaymesh-execution-owner"},{version:9,name:"quaymesh-execution-quiescence"}]);
+        {version:8,name:"quaymesh-execution-owner"},{version:9,name:"quaymesh-execution-quiescence"},
+        {version:10,name:"quaymesh-task-messages"},{version:11,name:"quaymesh-file-evidence-time"},
+        {version:12,name:"quaymesh-task-entry-bindings"},{version:13,name:"quaymesh-finalization-fence"},
+        {version:14,name:"quaymesh-task-member-index"},{version:15,name:"quaymesh-invocation-payload-sharing"},
+        {version:16,name:"quaymesh-task-creation-receipts"}]);
     for (const name of ["workspace_sessions","oauth_clients","console_work_runs","execution_claims",
       "local_agent_sessions","qm_sessions","qm_tasks","qm_task_members","qm_task_snapshots","qm_task_context",
       "qm_runtime_work","qm_runtime_admission","qm_transfers","qm_task_change_baselines","qm_task_file_changes","qm_task_finalizations",

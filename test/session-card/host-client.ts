@@ -10,6 +10,7 @@ interface Bootstrap {
   memberId: string;
   secondRoot: string;
   processWorker: string;
+  nodeExecutable: string;
   root: string;
 }
 
@@ -66,6 +67,7 @@ window.__quaymeshHost = {
   teardownFrame,
   mountFrame,
   processWorker: bootstrap.processWorker,
+  nodeExecutable: bootstrap.nodeExecutable,
   runCommand: (cmd: string, yieldTimeMs?: number) => requestTool("exec_command", {
     workspace_id: currentWorkspaceId,
     cmd,
@@ -84,7 +86,7 @@ async function mountFrame(): Promise<void> {
       serverResources: { listChanged: true },
       openLinks: {},
       logging: {},
-      message: {},
+      ...(new URLSearchParams(location.search).get("host_messages") === "off" ? {} : { message: {} }),
     },
     {
       hostContext: {
@@ -117,7 +119,7 @@ async function mountFrame(): Promise<void> {
     const response = await fetch("/api/tool", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name: params.name, arguments: params.arguments ?? {} }),
+      body: JSON.stringify(toolRequest(params.name, params.arguments ?? {})),
     });
     if (!response.ok) throw new Error(await response.text());
     return await response.json();
@@ -160,9 +162,15 @@ async function mountFrame(): Promise<void> {
 }
 
 async function teardownFrame(): Promise<void> {
-  if (bridge) {
-    await bridge.teardownResource({});
-    bridge = null;
+  const previous = bridge;
+  bridge = null;
+  if (previous) {
+    try {
+      await previous.teardownResource({});
+    } finally {
+      // Resource teardown releases the view; closing removes the host transport's listener.
+      await previous.close();
+    }
   }
   frame.srcdoc = "<!doctype html><meta charset=utf-8><title>torn down</title>";
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -191,7 +199,7 @@ async function attachRealWorkspace(): Promise<void> {
 
 async function requestTool(name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
   try {
-    const result = await fetchJson<Record<string, unknown>>("/api/tool", { name, arguments: args });
+    const result = await fetchJson<Record<string, unknown>>("/api/tool", toolRequest(name, args));
     appendLog(`${name}: ${JSON.stringify(result).slice(0, 500)}`);
     await reportClientState({ initialized: true, lastTool: name, lastError: null });
     return result;
@@ -222,6 +230,11 @@ async function fetchJson<T>(url: string, body?: unknown): Promise<T> {
   });
   if (!response.ok) throw new Error(`${url}: ${response.status} ${await response.text()}`);
   return await response.json() as T;
+}
+
+function toolRequest(name: string, args: Record<string, unknown>): Record<string, unknown> {
+  const entry = new URLSearchParams(location.search).get("entry");
+  return { name, arguments: args, ...(entry === null ? {} : { entry: entry === "unavailable" ? null : entry }) };
 }
 
 async function postJson(url: string, body: unknown): Promise<void> {
@@ -261,6 +274,7 @@ declare global {
       teardownFrame: () => Promise<void>;
       mountFrame: () => Promise<void>;
       processWorker: string;
+      nodeExecutable: string;
       runCommand: (cmd: string, yieldTimeMs?: number) => Promise<Record<string, unknown>>;
       runPatch: (patch: string) => Promise<Record<string, unknown>>;
     };

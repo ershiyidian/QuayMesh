@@ -171,10 +171,13 @@ export class WorkbenchFeed {
     const scoped = filterTaskIndex(allTasks,query,at).filter(contributes);
     let counts:Record<string,number>={all:scoped.length};
     for(const task of scoped){const state=taskStage(task.executionStatus,task.acceptanceStatus,task.phaseExecutionStatus);counts[state]=(counts[state]??0)+1;}
-    const navigation=filterTaskIndex(allTasks,{...query,stage:undefined,attention:undefined},at).filter(contributes);
-    counts.scopeAll=navigation.length;counts.scopeActive=0;counts.scopeWaiting=0;counts.scopeResults=0;counts.scopeAttention=0;
+    const navigation=filterTaskIndex(allTasks,{...query,requestState:undefined,stage:undefined,attention:undefined},at).filter(contributes);
+    counts.scopeAll=navigation.length;counts.scopeOpen=0;counts.scopeClosed=0;
+    counts.scopeActive=0;counts.scopeWaiting=0;counts.scopeResults=0;counts.scopeAttention=0;
     for(const task of navigation){
       const state=taskStage(task.executionStatus,task.acceptanceStatus);
+      if(task.requestState==='active')counts.scopeOpen++;
+      if(task.requestState==='closed')counts.scopeClosed++;
       if(activeExecution(task.executionStatus))counts.scopeActive++;
       if(['waiting','stalled','finalizing'].includes(state))counts.scopeWaiting++;
       if(['done','accepted','rejected','review','failed','ended','cancelled','handed_off'].includes(state))counts.scopeResults++;
@@ -439,7 +442,7 @@ export class WorkbenchFeed {
 
   private async usageContributors(query:Query) {
     const input:Query={...query,days:query.usageDays??'30',date:query.usageDate};
-    for(const name of ['cursor','limit','status','stage','execution','attention','changed','usageDate','usageDays','fresh'])delete input[name];
+    for(const name of ['cursor','limit','requestState','status','stage','execution','attention','changed','usageDate','usageDays','fresh'])delete input[name];
     const search=new URLSearchParams(Object.entries(input).filter((value):value is [string,string]=>value[1]!==undefined));
     const group=await this.collect('/workbench/usage?'+search,()=>readLocalUsage(this.config,input),input,30000,undefined,query.fresh==='1');
     return {runIds:new Set(group.values.flatMap(value=>value.runIds)),sources:group.sources,complete:group.complete};

@@ -1,4 +1,4 @@
-import { textPage } from "../bounded-reply.js";
+import { textPage, replyBytes, REPLY_BYTES } from "../bounded-reply.js";
 import type { SessionStore } from "./store.js";
 import type { InvocationContext } from "./types.js";
 
@@ -7,7 +7,7 @@ export function savedOperationStatus(store: SessionStore, context: Pick<Invocati
   workspaceId: string, operationId: string, options: {offset?:number;processHandle?:string|number;agentId?:string} = {}): Record<string,unknown> | undefined {
   const session=store.requireSession(context.owner_id,context.session_id);
   const member=store.getMember(session.id,context.member_id);
-  const saved=store.findInvocationByOperation(context.owner_id,operationId);
+  const saved=store.findInvocationResultByOperation(context.owner_id,operationId);
   if (!saved) return;
   if (saved.session_id!==session.id || saved.member_id!==member.id) throw new Error("WORKSPACE_SESSION_MISMATCH");
   const event=store.findOperationEvent(operationId);
@@ -53,4 +53,29 @@ export function savedOperationStatus(store: SessionStore, context: Pick<Invocati
 export function operationReceiptSummary(receipt: Record<string,unknown>): Record<string,unknown> {
   return Object.fromEntries(["operation_id","invocation_id","task_id","tool_name","operation_state","effect","created_at","finished_at","result_ready","result_ref"]
     .filter(key=>receipt[key]!==undefined).map(key=>[key,receipt[key]]));
+}
+
+// 批量观察保留每项身份和状态；超预算的正文通过原操作单独续读。
+export function operationStatusBatch(results: Record<string,unknown>[], partial: boolean,
+  workspaceId: string, taskId?: string): {results: Record<string,unknown>[]; partial: boolean} {
+  const batch = {results,partial};
+  if (replyBytes(batch) <= REPLY_BYTES - 512) return batch;
+  const deferred = results.map(row => {
+    const {result:_result,initial_receipt:_receipt,result_page:_resultPage,
+      initial_receipt_page:_receiptPage,error_page:_errorPage,...status} = row;
+    const selectedTaskId = typeof row.task_id === "string" ? row.task_id : taskId;
+    return {...status,details_deferred:true,next_action:{tool:"workspace_context",arguments:{
+      workspace_id:workspaceId,action:"status",operation_id:row.operation_id,
+      ...(selectedTaskId ? {task_id:selectedTaskId} : {}),
+    }}};
+  });
+  const bounded = {results:deferred,partial};
+  if (replyBytes(bounded) > REPLY_BYTES - 512) {
+    throw Object.assign(new Error("STATUS_METADATA_TOO_LARGE: Query these operations individually."), {
+      code:"STATUS_METADATA_TOO_LARGE",effect:"not_started",details:{operations:results.map(row =>
+        Object.fromEntries(["operation_id","invocation_id","task_id","operation_state","effect"]
+          .filter(key=>row[key]!==undefined).map(key=>[key,row[key]])))},
+    });
+  }
+  return bounded;
 }

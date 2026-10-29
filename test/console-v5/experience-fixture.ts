@@ -4,8 +4,9 @@ import {openDatabase} from '../../src/db/client.js';
 import {SessionChangeCollector} from '../../src/session/changes.js';
 import {SessionStore} from '../../src/session/store.js';
 import {canonicalWorkspaceRoot} from '../../src/roots.js';
+import {WorkLedger} from '../../src/work-ledger.js';
 
-export async function consoleExperienceFixture() {
+export async function consoleExperienceFixture(options: { historicalBackground?: boolean } = {}) {
   const server=await createRealTestServer({git:false,uiEnabled:true});
   try {
   const meta={'openai/session':'console-experience'};
@@ -17,13 +18,32 @@ export async function consoleExperienceFixture() {
   const old=await call('start_session',{title:'已经结束的调查',request_key:'experience-old'});
   const workspace=await call('open_workspace',{path:server.project});
   await call('read',{workspace_id:workspace.workspace_id,path:'README.md'});
-  const completed=await call('start_session',{title:'已经完成的改动',request_key:'experience-complete'});
+  const oldSelection=await call('task_resume',{action:'inspect',task_id:old.task_id});
+  const completed=await call('start_session',{title:'已经完成的改动',request_key:'experience-complete',new_goal:true,
+    expected_binding_revision:(oldSelection.binding as {binding_revision:number}).binding_revision});
   await call('read',{workspace_id:workspace.workspace_id,path:'README.md'});
   const second=await call('attach_workspace',{session_id:completed.session_id,path:server.secondRoot});
   const patch=await server.client.callTool({name:'apply_patch',arguments:{workspace_id:second.workspace_id,patch:'*** Begin Patch\n*** Add File: finished.txt\n+真实完成的文件内容\n*** End Patch'},_meta:meta});
   await waitForRecordedTool(server,{sessionId:String(completed.session_id),workspaceId:String(second.workspace_id),conversationId:meta['openai/session'],paths:['finished.txt']},patch);
+  let historicalBackgroundOperationId: string | undefined;
+  if(options.historicalBackground) {
+    const ledger=new WorkLedger(server.config.stateDir);
+    try {
+      const row=ledger.db.prepare('SELECT run_id FROM qm_run_links WHERE task_id=? ORDER BY rowid DESC LIMIT 1')
+        .get(completed.task_id) as {run_id:string}|undefined;
+      assert.ok(row);
+      // Create the historical operation while this Task can still accept work.
+      // Its completed receipt permits the normal finish below; a lifecycle
+      // fixture can later load an older, delayed observation of this same ID.
+      historicalBackgroundOperationId=ledger.operation({runId:row.run_id,requestKey:'console-lifecycle-delayed-running',
+        kind:'command',label:'历史任务结束后到达的后台执行回执',status:'running'});
+      ledger.endOperation(historicalBackgroundOperationId,'completed');
+    } finally {ledger.close();}
+  }
   await call('finish_task',{task_id:completed.task_id,status:'completed',summary:'文件已经写入'});
-  const waiting=await call('start_session',{title:'等待下一步的工作',request_key:'experience-wait'});
+  const completedSelection=await call('task_resume',{action:'inspect',task_id:completed.task_id});
+  const waiting=await call('start_session',{title:'等待下一步的工作',request_key:'experience-wait',new_goal:true,
+    expected_binding_revision:(completedSelection.binding as {binding_revision:number}).binding_revision});
   await call('read',{workspace_id:workspace.workspace_id,path:'README.md'});
   const db=openDatabase(server.config.stateDir);
   try {
@@ -42,7 +62,7 @@ export async function consoleExperienceFixture() {
     assert.equal(response.status,200,await response.clone().text());
     return await response.json() as any;
   };
-  return {server,call,get,cookie,auth,old,completed,waiting,workspace,second};
+  return {server,call,get,cookie,auth,old,completed,waiting,workspace,second,historicalBackgroundOperationId};
   } catch(error) {await server.dispose();throw error;}
 }
 

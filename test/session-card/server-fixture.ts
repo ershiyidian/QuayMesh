@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 import { createServer as createNetServer } from "node:net";
 import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
+import { Agent, fetch as undiciFetch } from "undici";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig, type ServerConfig } from "../../src/config.js";
@@ -18,8 +19,22 @@ import { WorkLedger } from "../../src/work-ledger.js";
 const execFileAsync = promisify(execFile);
 const ownerToken = "test-owner-token-that-is-long-enough";
 
+function createFixtureHttp() {
+  // Keep real HTTP keep-alive/SSE within one server generation. A same-endpoint
+  // restart must never inherit sockets from the server we just closed.
+  const dispatcher = new Agent();
+  // Agent and fetch must come from the same package: Node's bundled fetch can
+  // use a different Undici dispatcher ABI. Do not mix it with this public Agent.
+  const requestFetch: typeof undiciFetch = (input, init) => undiciFetch(input, { ...init, dispatcher });
+  // The SDK's DOM FetchLike and Undici's public fetch types describe separate
+  // Request/Response classes. This fixture and the SDK use URL/string inputs and
+  // standard response methods; keep their type adaptation at this one boundary.
+  return { fetch: requestFetch as unknown as typeof fetch, destroy: () => dispatcher.destroy() };
+}
+
 export interface RealTestServerOptions {
   diagnostics?: CreateServerOptions["diagnostics"];
+  incomingArtifactAdapters?: CreateServerOptions["incomingArtifactAdapters"];
   prefix?: string;
   uiEnabled?: boolean;
   git?: boolean;
@@ -28,6 +43,7 @@ export interface RealTestServerOptions {
   federation?: {
     nodeId: string;
     nickname: string;
+    exportSecondRoot?: boolean;
     capabilities: {
       coordinator: boolean;
       worker: boolean;
@@ -129,7 +145,11 @@ export async function createRealTestServer(options: RealTestServerOptions = {}):
           ingressPort: options.federation.ingressPort,
           tokenEnv: "QUAYMESH_CLUSTER_TOKEN",
           peers: options.federation.peers,
-          roots: [{ id: "main", nickname: options.federation.nickname, path: project, description: "session-card federation fixture", tags: ["test"], enabled: true }],
+          roots: [
+            { id: "main", nickname: options.federation.nickname, path: project, description: "session-card federation fixture", tags: ["test"], enabled: true },
+            ...(options.federation.exportSecondRoot ? [{ id: "second", nickname: "Second test workspace", path: secondRoot,
+              description: "session-card second workspace fixture", tags: ["test"], enabled: true }] : []),
+          ],
           heartbeatMs: 1000,
           rpcTimeoutMs: 5000,
           egress: { ...defaults.federation.egress, enabled: false },
@@ -148,15 +168,16 @@ export async function createRealTestServer(options: RealTestServerOptions = {}):
   const loaded = loadConfig(env);
   const config = options.configure ? await options.configure(loaded) : loaded;
 
-  let running = createServer(config, { incomingArtifactAdapters: [], diagnostics: options.diagnostics });
+  let running = createServer(config, { incomingArtifactAdapters: options.incomingArtifactAdapters ?? [], diagnostics: options.diagnostics });
   await running.ready;
   let httpServer = running.app.listen(httpPort, "127.0.0.1");
   let client = new Client({ name: "session-card-test-client", version: "1.0.0" });
+  let fixtureHttp = createFixtureHttp();
   let disposed = false;
   const dispose = async () => {
     if (disposed) return;
     disposed = true;
-    await client.close();
+    try { await client.close(); } finally { await fixtureHttp.destroy(); }
     httpServer.closeAllConnections();
     await new Promise<void>((resolve) => {
       httpServer.close(() => resolve());
@@ -170,31 +191,51 @@ export async function createRealTestServer(options: RealTestServerOptions = {}):
     const address = httpServer.address();
     assert.ok(address && typeof address === "object");
     const baseUrl = "http://127.0.0.1:" + address.port;
-    const accessToken = await issueAccessToken(baseUrl, config.publicBaseUrl, ownerToken);
+    const accessToken = await issueAccessToken(baseUrl, config.publicBaseUrl, ownerToken, fixtureHttp.fetch);
     const transport = new StreamableHTTPClientTransport(new URL("/mcp", baseUrl), {
+      fetch: fixtureHttp.fetch,
       requestInit: { headers: { authorization: "Bearer " + accessToken } },
     });
     await client.connect(transport);
     // 与宿主一致，先发现工具并注册输出校验器，再开始任何工具调用。
     await client.listTools();
     const fixture:RealTestServer={ root, project, secondRoot, config, baseUrl, accessToken, client, running, dispose,
-      restart:async(beforeStart)=>{
-        await client.close();
-        httpServer.closeAllConnections();
-        await new Promise<void>(resolve=>httpServer.close(()=>resolve()));
-        await running.close();
-        await beforeStart?.();
-        running=createServer(config,{incomingArtifactAdapters:[],diagnostics:options.diagnostics});
-        await running.ready;
-        httpServer=running.app.listen(httpPort,"127.0.0.1");
-        await new Promise<void>(resolve=>httpServer.once("listening",resolve));
-        client=new Client({name:"session-card-test-client",version:"1.0.0"});
-        await client.connect(new StreamableHTTPClientTransport(new URL("/mcp",baseUrl),{
-          requestInit:{headers:{authorization:"Bearer "+accessToken}},
-        }));
-        await client.listTools();
-        fixture.running=running;
-        fixture.client=client;
+      restart: async (beforeStart) => {
+        let stage = "client.close";
+        try {
+          await client.close();
+          stage = "dispatcher.destroy";
+          await fixtureHttp.destroy();
+          stage = "http.close";
+          httpServer.closeAllConnections();
+          await new Promise<void>(resolve => httpServer.close(() => resolve()));
+          stage = "core.close";
+          await running.close();
+          stage = "beforeStart";
+          await beforeStart?.();
+          stage = "core.ready";
+          running = createServer(config, { incomingArtifactAdapters: options.incomingArtifactAdapters ?? [], diagnostics: options.diagnostics });
+          await running.ready;
+          stage = "http.listen";
+          httpServer = running.app.listen(httpPort, "127.0.0.1");
+          await new Promise<void>((resolve, reject) => {
+            httpServer.once("error", reject);
+            httpServer.once("listening", resolve);
+          });
+          fixtureHttp = createFixtureHttp();
+          client = new Client({ name: "session-card-test-client", version: "1.0.0" });
+          stage = "mcp.connect";
+          await client.connect(new StreamableHTTPClientTransport(new URL("/mcp", baseUrl), {
+            fetch: fixtureHttp.fetch,
+            requestInit: { headers: { authorization: "Bearer " + accessToken } },
+          }));
+          stage = "mcp.listTools";
+          await client.listTools();
+          fixture.running = running;
+          fixture.client = client;
+        } catch (error) {
+          throw new Error(`Real test server restart failed at ${stage}`, { cause: error });
+        }
       },
     };
     return fixture;
@@ -204,12 +245,12 @@ export async function createRealTestServer(options: RealTestServerOptions = {}):
   }
 }
 
-async function issueAccessToken(localBaseUrl: string, publicBaseUrl: string, token: string): Promise<string> {
+async function issueAccessToken(localBaseUrl: string, publicBaseUrl: string, token: string, requestFetch: typeof fetch): Promise<string> {
   const redirectUri = "http://127.0.0.1/callback";
   const resource = new URL("/mcp", publicBaseUrl).href;
   const verifier = "session-card-test-verifier-0123456789";
   const challenge = createHash("sha256").update(verifier).digest("base64url");
-  const registration = await fetch(localBaseUrl + "/register", {
+  const registration = await requestFetch(localBaseUrl + "/register", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -224,7 +265,7 @@ async function issueAccessToken(localBaseUrl: string, publicBaseUrl: string, tok
   const client = await registration.json() as { client_id?: string };
   assert.ok(client.client_id);
 
-  const approval = await fetch(localBaseUrl + "/authorize", {
+  const approval = await requestFetch(localBaseUrl + "/authorize", {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -246,7 +287,7 @@ async function issueAccessToken(localBaseUrl: string, publicBaseUrl: string, tok
   const code = new URL(location).searchParams.get("code");
   assert.ok(code);
 
-  const exchange = await fetch(localBaseUrl + "/token", {
+  const exchange = await requestFetch(localBaseUrl + "/token", {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({

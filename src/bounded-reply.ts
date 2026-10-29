@@ -1,4 +1,5 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { toolResultBytes } from "./mcp-tool-result.js";
 
 export const REPLY_BYTES = 48 * 1024;
 // Native MCP image blocks are binary media; the 48 KiB limit only applies to text/JSON.
@@ -20,7 +21,7 @@ export function jsonReply<T extends Record<string, unknown>>(value: T, summary =
 export function compatibleToolReceipt(reply: CallToolResult): CallToolResult {
   const body = reply.structuredContent;
   const error = body?.error;
-  if (reply.isError && error && typeof error === 'object' && !Array.isArray(error)
+  if (reply.isError && !body?.error_code && error && typeof error === 'object' && !Array.isArray(error)
     && (error as Record<string, unknown>).code === 'EXECUTION_CONFLICT') {
     const {structuredContent: _structuredContent, ...response} = reply;
     return {...response, _meta:{...reply._meta, quaymesh:{...quaymeshMetadata(reply), error}}};
@@ -36,18 +37,27 @@ function quaymeshMetadata(reply: CallToolResult): Record<string, unknown> {
   const value = reply._meta?.quaymesh;
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
-export const replyBytes = (value: Record<string, unknown>) => Buffer.byteLength(JSON.stringify(jsonReply(value)),"utf8");
+export const replyBytes = (value: Record<string, unknown>) => toolResultBytes(jsonReply(value));
+
+export interface TextPage {
+  text: string;
+  offset: number;
+  nextOffset: number | null;
+  totalCodePoints: number;
+}
 
 // 返回偏移使用 Unicode 码点，避免把一个字符分成两半。
-export function textPage(text: string, offset = 0, budget = 12 * 1024) {
+export function textPage(text: string, offset = 0, budget = 12 * 1024,
+  measure: (page: TextPage) => number = page => Buffer.byteLength(JSON.stringify(page.text))) {
   const points = Array.from(text);
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > points.length) throw new Error("Invalid response offset.");
+  const page = (length: number): TextPage => ({ text: points.slice(offset, offset + length).join(""), offset,
+    nextOffset: offset + length < points.length ? offset + length : null, totalCodePoints: points.length });
   let low = 0, high = Math.min(points.length - offset,budget);
   while (low < high) {
     const n = Math.ceil((low+high)/2);
-    if (Buffer.byteLength(JSON.stringify(points.slice(offset,offset+n).join(""))) <= budget) low = n;
+    if (measure(page(n)) <= budget) low = n;
     else high = n-1;
   }
-  return {text:points.slice(offset,offset+low).join(""),offset,
-    nextOffset:offset+low<points.length ? offset+low : null,totalCodePoints:points.length};
+  return page(low);
 }

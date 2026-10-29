@@ -1,14 +1,10 @@
-import {
-  createBashTool,
-  createEditTool,
-  createReadTool,
-  createWriteTool,
-  type BashToolInput,
-  type EditToolInput,
-  type EditToolDetails,
-  type ReadToolInput,
-  type WriteToolInput,
-  type AgentToolResult,
+import type {
+  BashToolInput,
+  EditToolInput,
+  EditToolDetails,
+  ReadToolInput,
+  WriteToolInput,
+  AgentToolResult,
 } from "@earendil-works/pi-coding-agent";
 
 type McpContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
@@ -58,6 +54,7 @@ async function runTool<TInput, TDetails = unknown>(
 }
 
 export async function readFileTool(input: ReadToolInput, context: ToolContext): Promise<ToolResponse> {
+  const { createReadTool } = await import("@earendil-works/pi-coding-agent");
   const tool = createReadTool(context.cwd);
 
   return runTool((params) => tool.execute("read_file", params), {
@@ -68,6 +65,7 @@ export async function readFileTool(input: ReadToolInput, context: ToolContext): 
 }
 
 export async function writeFileTool(input: WriteToolInput, context: ToolContext): Promise<ToolResponse> {
+  const { createWriteTool } = await import("@earendil-works/pi-coding-agent");
   const tool = createWriteTool(context.cwd);
 
   return runTool((params) => tool.execute("write_file", params), {
@@ -77,6 +75,7 @@ export async function writeFileTool(input: WriteToolInput, context: ToolContext)
 }
 
 export async function editFileTool(input: EditToolInput, context: ToolContext): Promise<ToolResponse<EditToolDetails>> {
+  const { createEditTool } = await import("@earendil-works/pi-coding-agent");
   const tool = createEditTool(context.cwd);
 
   return runTool((params) => tool.execute("edit_file", params), {
@@ -86,6 +85,7 @@ export async function editFileTool(input: EditToolInput, context: ToolContext): 
 }
 
 export async function runShellTool(input: BashToolInput, context: ToolContext): Promise<ToolResponse> {
+  const { createBashTool } = await import("@earendil-works/pi-coding-agent");
   const tool = createBashTool(context.cwd);
   const timeout = input.timeout === undefined ? 30 : Math.min(input.timeout, 300);
 

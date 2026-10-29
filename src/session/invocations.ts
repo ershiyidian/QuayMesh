@@ -1,10 +1,11 @@
+import { finalizationBlocksNewWork } from "./task-finalization.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
 import { OperationState, type InvocationContext } from "./types.js";
-import type { SessionStore } from "./store.js";
-import { classifyError, errorEnvelope, errorFromEnvelope, retryableAdmission, type InvocationEffect } from "./outcome.js";
+import type { SessionStore, InvocationSummary } from "./store.js";
+import { classifyError, errorEnvelope, errorFromEnvelope, RecordedInvocationError, type InvocationEffect } from "./outcome.js";
 
 export const requestContextStorage = new AsyncLocalStorage<InvocationContext>();
 
@@ -62,13 +63,13 @@ export interface RecordedInvocation<T> {
 }
 
 // 原操作已返回，保存回执失败时保留原身份，禁止把数据库错误当成新的执行失败。
-export class InvocationPersistenceError extends Error {
+export class InvocationPersistenceError extends RecordedInvocationError {
   readonly code = "INVOCATION_PERSISTENCE_FAILED";
   readonly effect = "unknown";
   readonly details: { operation_id: string; stage: "result" };
 
   constructor(operationId: string, cause: unknown) {
-    super("INVOCATION_PERSISTENCE_FAILED: The operation returned, but its receipt could not be saved. Query the original operation before taking further action.", { cause });
+    super("INVOCATION_PERSISTENCE_FAILED: The operation returned, but its receipt could not be saved. Query the original operation before taking further action.", operationId, { cause });
     this.details = { operation_id: operationId, stage: "result" };
   }
 }
@@ -125,23 +126,24 @@ export async function executeRecorded<T>(
     ? Object.fromEntries(Object.entries(data).filter(([key]) =>
       !["workspace_id", "yield_time_ms", "max_output_tokens"].includes(key)))
     : input);
-  const sameRequest = store.findInvocation(context.owner_id, context.transport_instance_id, requestId);
+  const sameRequest = store.findInvocationSummary(context.owner_id, context.transport_instance_id, requestId);
   const existing = sameRequest ?? (operationKey
-    ? store.findKeyedInvocation(context.owner_id, context.session_id, context.member_id, operationKey) : null);
+    ? store.findKeyedInvocationSummary(context.owner_id, context.session_id, context.member_id, operationKey) : null);
   let retryOf: string | undefined;
   if (existing) {
+    assertReplayScope(store, existing, context);
     if (context.operation_id && existing.operation_id && context.operation_id !== existing.operation_id) {
       throw new Error("OPERATION_ID_MISMATCH");
     }
     context.operation_id = existing.operation_id ?? undefined;
-    if (existing.tool_name !== context.tool_name || existing.arguments_json !== argumentsJson) {
+    if (!store.invocationMatchesInput(existing.id,context.tool_name,argumentsJson)) {
       throw new Error("REQUEST_ID_REUSED");
     }
-    if (!sameRequest && operationKey && retryableAdmission(existing)) {
+    if (!sameRequest && operationKey && store.isRetryableInvocationAdmission(existing)) {
       const task = existing.task_id ? store.getTask(existing.task_id) : null;
       if (!task || task.state !== "active" || task.id !== context.task_id
         || existing.session_id !== context.session_id || existing.member_id !== context.member_id
-        || store.taskData.finalization(task.id)) throw Object.assign(
+        || finalizationBlocksNewWork(store.taskData.finalization(task.id))) throw Object.assign(
           new Error("OPERATION_RETRY_SCOPE_MISMATCH: Retry requires the original active task and workspace member."),
           {code: "OPERATION_RETRY_SCOPE_MISMATCH", details: {operation_id: existing.operation_id, task_id: existing.task_id}});
       retryOf = existing.id;
@@ -149,7 +151,7 @@ export async function executeRecorded<T>(
   }
 
   const reservation = await store.writeAsync(() => {
-    const prior = store.findInvocation(context.owner_id, context.transport_instance_id, requestId);
+    const prior = store.findInvocationSummary(context.owner_id, context.transport_instance_id, requestId);
     const row = store.reserveInvocation({
       id: context.invocation_id,
       ownerId: context.owner_id,
@@ -181,12 +183,8 @@ export async function executeRecorded<T>(
   try {
     await operation.beforeEffect?.();
   } catch (error) {
-    const cancelled = store.findInvocation(context.owner_id, context.transport_instance_id, requestId);
-    if (cancelled?.state === OperationState.cancelled && cancelled.result_json !== null) {
-      return { replay: true, result: JSON.parse(cancelled.result_json) as T,
-        invocation_id: cancelled.id, operation_id: cancelled.operation_id,
-        state: cancelled.state, effect: cancelled.effect, result_ref: cancelled.result_ref };
-    }
+    const cancelled = store.findInvocationSummary(context.owner_id, context.transport_instance_id, requestId);
+    if (cancelled?.state === OperationState.cancelled && cancelled.result_ready) return replayInvocation<T>(store, cancelled);
     const outcome = classifyError(error, {sideEffecting: operation.sideEffecting ?? false, effectStarted: false});
     const envelope = errorEnvelope(error, {sideEffecting: operation.sideEffecting ?? false, effectStarted: false});
     await store.writeAsync(() => store.updateInvocation({
@@ -199,14 +197,10 @@ export async function executeRecorded<T>(
       finished: true,
       responded: true,
     }));
-    throw errorFromEnvelope(envelope, error);
+    throw errorFromEnvelope(envelope, error, operationId);
   }
-  const cancelled = store.findInvocation(context.owner_id, context.transport_instance_id, requestId);
-  if (cancelled?.state === OperationState.cancelled && cancelled.result_json !== null) {
-    return { replay: true, result: JSON.parse(cancelled.result_json) as T,
-      invocation_id: cancelled.id, operation_id: cancelled.operation_id,
-      state: cancelled.state, effect: cancelled.effect, result_ref: cancelled.result_ref };
-  }
+  const cancelled = store.findInvocationSummary(context.owner_id, context.transport_instance_id, requestId);
+  if (cancelled?.state === OperationState.cancelled && cancelled.result_ready) return replayInvocation<T>(store, cancelled);
   const started = await store.writeAsync(() => store.updateInvocation({
     ownerId: context.owner_id,
     transportInstanceId: context.transport_instance_id,
@@ -217,7 +211,7 @@ export async function executeRecorded<T>(
   if (started.state === OperationState.cancelled) return replayInvocation<T>(store, started);
 
   return requestContextStorage.run(context, async () => {
-    const latest = store.findInvocation(context.owner_id, context.transport_instance_id, requestId);
+    const latest = store.findInvocationSummary(context.owner_id, context.transport_instance_id, requestId);
     if (latest?.state === OperationState.cancelled) return replayInvocation<T>(store, latest);
     let result: T;
     try {
@@ -239,7 +233,7 @@ export async function executeRecorded<T>(
       } catch (persistenceError) {
         throw new InvocationPersistenceError(operationId, persistenceError);
       }
-      throw errorFromEnvelope(envelope, error);
+      throw errorFromEnvelope(envelope, error, operationId);
     }
 
     // 只保存已经算出的结果；锁等待和保存失败都不会再次调用 invoke。
@@ -258,7 +252,7 @@ export async function executeRecorded<T>(
             : OperationState.succeeded);
       const effect = explicit?.effect ?? (running ? "started" : unknown ? "unknown" : isError ? "completed" : "completed");
       const saved = await store.writeAsync(() => {
-        const current = store.findInvocation(context.owner_id, context.transport_instance_id, requestId);
+        const current = store.findInvocationSummary(context.owner_id, context.transport_instance_id, requestId);
         if (running && current?.finished_at) {
           return store.updateInvocation({
             ownerId: context.owner_id,
@@ -266,6 +260,7 @@ export async function executeRecorded<T>(
             requestId,
             resultRef: resultRef ?? current.result_ref,
             result,
+            responded: true,
           });
         }
         return store.updateInvocation({
@@ -295,10 +290,28 @@ export async function executeRecorded<T>(
   });
 }
 
-async function replayInvocation<T>(store: SessionStore, existing: NonNullable<ReturnType<SessionStore["findInvocation"]>>): Promise<RecordedInvocation<T>> {
-  const saved = existing.result_json !== null ? existing
+/** A retry may use another external conversation, but never another Task or workspace member. */
+function assertReplayScope(store: SessionStore, existing: InvocationSummary, context: InvocationContext): void {
+  const member = existing.owner_id === context.owner_id
+    && existing.session_id === context.session_id && existing.member_id === context.member_id
+    && (existing.task_id ?? null) === (context.task_id ?? null)
+    ? store.findMember(context.session_id, context.member_id) : null;
+  if (!member || member.workspace_id !== context.workspace_id
+    || existing.node_id !== member.node_id || existing.workspace_root !== member.root) {
+    throw Object.assign(new Error("OPERATION_RETRY_SCOPE_MISMATCH: Use the original Task and workspace member to retrieve this operation."), {
+      code: "OPERATION_RETRY_SCOPE_MISMATCH", effect: "not_started", retryHint: "fix_input",
+      details: { operation_id: existing.operation_id, task_id: existing.task_id },
+    });
+  }
+}
+
+async function replayInvocation<T>(store: SessionStore, existing: InvocationSummary): Promise<RecordedInvocation<T>> {
+  const ready = existing.result_ready ? existing
     : await waitForInvocationResult(store, existing.owner_id, existing.transport_instance_id, existing.request_id) ?? existing;
-  return {replay: true, ...(saved.result_json !== null ? {result: JSON.parse(saved.result_json) as T} : {}),
+  const receipt = ready.result_ready
+    ? store.findInvocationResult(ready.owner_id,ready.transport_instance_id,ready.request_id) : null;
+  const saved = receipt ?? ready;
+  return {replay: true, ...(receipt?.result_json !== null && receipt?.result_json !== undefined ? {result: JSON.parse(receipt.result_json) as T} : {}),
     invocation_id: saved.id, operation_id: saved.operation_id, state: saved.state,
     effect: saved.effect, result_ref: saved.result_ref};
 }
@@ -308,12 +321,12 @@ async function waitForInvocationResult(
   ownerId: string,
   transportInstanceId: string,
   requestId: string,
-): Promise<ReturnType<SessionStore["findInvocation"]>> {
+): Promise<InvocationSummary | null> {
   const deadline = Date.now() + 15_000;
   for (;;) {
-    const current = store.findInvocation(ownerId, transportInstanceId, requestId);
+    const current = store.findInvocationSummary(ownerId, transportInstanceId, requestId);
     // 进程终态可能先于请求回执保存；重复请求等待实际回执，不能只看执行状态。
-    if (!current || current.result_json !== null) return current;
+    if (!current || current.result_ready) return current;
     if (Date.now() >= deadline) return current;
     await delay(50);
   }
@@ -324,7 +337,7 @@ export function inheritedEnvelope(context: InvocationContext): InvocationContext
 }
 
 export function lookupStatus(store: SessionStore, ownerId: string, operationId: string): InvocationStatus {
-  const invocation = store.findInvocationByOperation(ownerId, operationId);
+  const invocation = store.findInvocationSummaryByOperation(ownerId, operationId);
   if (!invocation) throw new Error("OPERATION_NOT_FOUND");
   return {
     operation_id: operationId,

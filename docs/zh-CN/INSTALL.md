@@ -112,6 +112,8 @@ sudo ./runtime/node bin/quaymesh.js install \
 
 使用 OpenAI 隧道发现服务时，在终端设置 `QUAYMESH_TUNNEL_ID` 和 `QUAYMESH_TUNNEL_API_KEY`，并为 `init-site` 增加 `--resource-url YOUR_TUNNEL_RESOURCE_URL`。发现节点连接同一个隧道资源和协调节点。
 
+同一个 Linux 账户同时运行协调节点和执行节点时，为它们分别配置配置目录、状态目录、端口、systemd 服务和发行目录（`--prefix`）。协调节点使用 `install --config /path/site/cloud.json --config-dir /path/coordinator-config --prefix /path/coordinator-releases/RELEASE --service-name quaymesh-coordinator.service`，执行节点可沿用 `quaymesh-node.service`。后续升级自动沿用各自安装记录中的服务名。
+
 ## 升级
 
 在新版安装包目录执行：
@@ -122,6 +124,8 @@ sudo ./runtime/node bin/quaymesh.js install \
 ```
 
 第一条命令准备新的版本目录，并返回 `manifestFile`。第二条命令在当前工作允许切换时更新服务。安装记录保留上一版本，便于恢复。
+
+升级时使用已安装的 `node.json`，使用其他配置文件则传入原来的 `--config-dir`；省略服务选项会继承记录中的用户／系统服务范围、运行账户和 unit 路径，显式改变这些身份会被拒绝。
 
 切换会暂停新工作，等待已受理的命令、Agent 回合、文件传输和出口连接结束。出口隧道持续占用到客户端关闭；一段时间没有流量不会授权切断模型连接。排空超时会保留当前服务。
 
@@ -135,7 +139,7 @@ sudo ./runtime/node bin/quaymesh.js install \
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\node\windows-activate.ps1 -PreparedManifest C:\path\returned\prepared.json
 ```
 
-命令返回 `resultPath`。Windows Task Scheduler 持有独立激活进程，旧 Host 进程组退出后安装器继续执行。任务验证准备记录与原生运行时，复核执行台账，再交由安装器完成准入、排空、备份和稳定就绪检查。结果和完整日志保留在 `stateDir/activations/`。预检受阻时保留待处理与未知记录，供后续核对。发行已提交后，末尾状态复核失败会保留当前服务。TUN 节点需要从已提升权限的会话注册任务。
+命令返回 `resultPath`。Windows Task Scheduler 持有独立激活进程，旧 Host 进程组退出后安装器继续执行。任务验证准备记录与原生运行时，再交由安装器完成准入、持久工作排空、备份和稳定就绪检查。安装器的物理静止检查认可有效执行证明，同时保留历史未知结果；活动工作或尚无物理证明的工作会阻挡切换，保留当前服务。结果和完整日志保留在 `stateDir/activations/`。发行已提交后，末尾状态复核失败会保留当前服务。TUN 节点需要从已提升权限的会话注册任务。
 
 新版发行清单记录 Node、依赖锁文件和验证时实际加载的 SQLite 原生模块的 SHA-256。激活在整个就绪窗口中核对运行 Core 的进程身份与这些指纹。同一发行重启时，`active-release.json` 保留原激活时间，并用 `startedAt` 单独记录本次进程启动。
 

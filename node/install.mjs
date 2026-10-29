@@ -1,6 +1,6 @@
 import { cp, mkdir, access, chmod, readFile, readdir, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { join, resolve, dirname } from "node:path";
+import { join, resolve, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { loadNodeConfig, defaultConfigDir, secret } from "./config.mjs";
@@ -73,14 +73,46 @@ export function systemdUnit({nodeExecutable,entrypoint,configFile,directory,serv
     "[Install]",`WantedBy=${user ? "default.target" : "multi-user.target"}`,""].join("\n");
 }
 
-export async function prepareInstallation(file, {root=packageRoot,prefix,user=true,serviceUser,
-  configDir,platform=process.platform} = {}) {
-  if (!["linux","win32"].includes(platform)) throw new Error(`安装器尚不支持 ${platform}`);
+export function installationServiceName(manifest, requested) {
+  const current = manifest?.unitFile ? basename(manifest.unitFile) : undefined;
+  const name = requested ?? current ?? "quaymesh-node.service";
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.@-]*\.service$/.test(name)) throw new Error("需要有效的 systemd .service 名称");
+  if (current && requested && current !== requested) throw new Error("升级需要沿用已安装节点的服务名称");
+  return name;
+}
+
+export function installationServiceIdentity(installed, {user,serviceUser,serviceName,platform=process.platform} = {}) {
+  if (serviceName && platform !== "linux") throw new Error("服务名称只适用于 Linux systemd 安装");
+  if (installed && (user !== undefined && user !== (installed.user ?? true)
+    || serviceUser !== undefined && (serviceUser || null) !== (installed.serviceUser ?? null)))
+    throw new Error("升级需要沿用已安装节点的服务范围和运行账户");
+  user ??= installed?.user ?? true;
+  serviceUser ??= installed?.serviceUser ?? null;
   if (user && serviceUser) throw new Error("专用服务用户需要 --system");
+  if (serviceUser && platform !== "linux") throw new Error("专用系统用户安装适用于 Linux");
+  const name = platform === "linux" ? installationServiceName(installed, serviceName) : null;
+  const unitFile = platform === "linux" ? installed?.unitFile
+    ?? join(user ? join(homedir(),".config","systemd","user") : "/etc/systemd/system", name) : null;
+  return {user,serviceUser:serviceUser || null,unitFile};
+}
+
+export async function prepareInstallation(file, {root=packageRoot,prefix,user,serviceUser,
+  serviceName,configDir,platform=process.platform} = {}) {
+  if (!["linux","win32"].includes(platform)) throw new Error(`安装器尚不支持 ${platform}`);
   const loaded = await loadNodeConfig(file);
+  if (!configDir) {
+    const sourceInstallation = await readOptionalJson(join(dirname(loaded.configFile),"installation.json"));
+    if (sourceInstallation?.config === loaded.configFile) configDir = dirname(loaded.configFile);
+  }
   configDir ||= serviceUser ? join("/etc/quaymesh",loaded.node.id) : defaultConfigDir();
+  const configFile=join(resolve(configDir),"node.json");
+  const existingNode=await readOptionalJson(configFile);
+  if(existingNode&&existingNode.id!==loaded.node.id)throw new Error("已有持久节点配置属于其他节点，拒绝覆盖");
+  const installed=await readOptionalJson(join(resolve(configDir),"installation.json"));
+  if(installed&&installed.nodeId!==loaded.node.id)throw new Error("已有安装记录属于其他节点，拒绝覆盖");
+  const service = installationServiceIdentity(installed,{user,serviceUser,serviceName,platform});
+  ({user,serviceUser}=service);
   if (serviceUser) {
-    if (platform !== "linux") throw new Error("专用系统用户安装适用于 Linux");
     await run("id",[serviceUser]);
     if (loaded.node.stateDir === "/root" || loaded.node.stateDir.startsWith("/root/")) {
       throw new Error("专用用户需要可访问的 stateDir，例如 /var/lib/quaymesh");
@@ -96,9 +128,6 @@ export async function prepareInstallation(file, {root=packageRoot,prefix,user=tr
   const existing = await readdir(target).catch(error => { if(error.code === "ENOENT") return []; throw error; });
   if (existing.length) throw new Error(`发行目录已存在，不能覆盖：${target}`);
   const stage = join(resolve(configDir),"installations",randomUUID());
-  const configFile=join(resolve(configDir),"node.json");
-  const existingNode=await readOptionalJson(configFile);
-  if(existingNode&&existingNode.id!==loaded.node.id)throw new Error("已有持久节点配置属于其他节点，拒绝覆盖");
   const effective=existingNode?await loadNodeConfig(configFile):loaded;
   let prepared = false;
   await mkdir(target,{recursive:true});
@@ -122,14 +151,13 @@ export async function prepareInstallation(file, {root=packageRoot,prefix,user=tr
     const stagedConfig = join(stage,"node.json");
     await writeJson(stagedConfig,savedNode);
     await loadNodeConfig(stagedConfig);
-    const unitFile = platform === "linux" ? join(user ? join(homedir(),".config","systemd","user") : "/etc/systemd/system","quaymesh-node.service") : null;
     const manifest = {version:1,nodeId:loaded.node.id,directory:target,config:configFile,stagedConfig,
       configDir:resolve(configDir),stateDir:effective.node.stateDir,adminPort:effective.node.adminPort,
       nodeExecutable:executable,entrypoint:join(target,"bin","quaymesh.js"),
-      sourceCommit:release.sourceCommit,platform,user,serviceUser:serviceUser || null,unitFile,
+      sourceCommit:release.sourceCommit,platform,...service,
       settingsRevisionAtPrepare:savedNode.settingsRevision??1,
       desktopUi:effective.node.capabilities.desktopUi,preparedAt:new Date().toISOString()};
-    if (platform === "linux") await atomicWrite(join(stage,"quaymesh-node.service"),systemdUnit({...manifest,configFile}),0o644);
+    if (platform === "linux") await atomicWrite(join(stage,installationServiceName(manifest)),systemdUnit({...manifest,configFile}),0o644);
     const manifestFile = join(stage,"prepared.json");
     await writeJson(manifestFile,manifest); prepared = true;
     return {...manifest,manifestFile};
@@ -149,7 +177,7 @@ async function registeredService(manifest,start) {
       }
     }
     await run("systemctl",[...(manifest.user?["--user"]:[]),"daemon-reload"]);
-    if (start) await run("systemctl",[...(manifest.user?["--user"]:[]),"enable","--now","quaymesh-node.service"]);
+    if (start) await run("systemctl",[...(manifest.user?["--user"]:[]),"enable","--now",installationServiceName(manifest)]);
   } else {
     await run("powershell.exe",["-NoProfile","-ExecutionPolicy","Bypass","-File",join(manifest.directory,"node","windows-install.ps1"),
       "-NodeExecutable",manifest.nodeExecutable,"-EntryPoint",manifest.entrypoint,
@@ -158,7 +186,7 @@ async function registeredService(manifest,start) {
   }
 }
 async function stopService(manifest) {
-  if (manifest.platform === "linux") await run("systemctl",[...(manifest.user?["--user"]:[]),"stop","quaymesh-node.service"]);
+  if (manifest.platform === "linux") await run("systemctl",[...(manifest.user?["--user"]:[]),"stop",installationServiceName(manifest)]);
   else {
     if (manifest.desktopUi) await run(join(manifest.directory,"components","windows-x64","QuayMesh.Host.exe"),["--exit"]);
     await run("powershell.exe",["-NoProfile","-ExecutionPolicy","Bypass","-File",join(manifest.directory,"node","windows-stop.ps1")]);
@@ -304,9 +332,10 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
       const result=await runMaintenanceProof(manifest,{action:"record",stateDir:manifest.stateDir,
         attemptId:externalLease.context.attemptId,targetCommit:manifest.sourceCommit,core,
         previousProcesses:[externalLease.context.manager,externalLease.context.core],subjects:externalLease.lease.subjects,
+        claims:externalLease.lease.claims,
         receipt:{id:externalLease.context.attemptId,verifiedAt:new Date().toISOString(),
           evidence:{version:1,boundary:"reviewed_installation_stop_domain",context:externalLease.context,
-            pause:externalLease.lease.pause,stages:externalLease.receipt.stages}}});
+            pause:externalLease.lease.pause,stages:externalLease.receipt.stages,claims:externalLease.lease.claims}}});
       if(!result.admission.quiescent||result.admission.accepting)throw new Error("历史物理证据写入后新Core仍未排空或暂停所有权丢失");
     }
     await writeJson(recordFile,{...manifest,activatedAt:new Date().toISOString(),pid:status.components.find(value=>value.id==="core")?.pid});

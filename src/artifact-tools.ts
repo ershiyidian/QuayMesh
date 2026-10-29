@@ -22,6 +22,7 @@ import {
   describeIncomingArtifactValue,
   IncomingArtifactAdapterRegistry,
   type IncomingArtifactAdapter,
+  type OpenedIncomingArtifact,
 } from "./incoming-artifacts.js";
 import { logEvent } from "./logger.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
@@ -168,39 +169,12 @@ export async function downloadIncomingArtifact({
   path: string;
   publishEntry?: typeof defaultPublishEntry;
 }): Promise<DownloadIncomingArtifactResult> {
-  if (!isArtifactDownloadSupportedPlatform()) {
-    throw new ArtifactError(
-      "artifact_platform_unsupported",
-      "Native file download requires secure platform filesystem primitives.",
-    );
-  }
-  if (!Number.isSafeInteger(maxFileBytes) || maxFileBytes < 1) {
-    throw new ArtifactError(
-      "artifact_limit_invalid",
-      "Artifact file-size limit must be a positive integer.",
-    );
-  }
-  if (!workspaceId) {
-    throw new ArtifactError(
-      "artifact_workspace_invalid",
-      "A selected workspace is required for native file download.",
-    );
-  }
-
-  const destination = normalizeArtifactDestination(path);
-  const opened = await registry.open(file);
+  const { destination, opened } = await prepareArtifactDownload(registry, workspaceId, maxFileBytes, file, path);
   let destinationDirectory: ArtifactDestinationDirectory | undefined;
   let partialName: string | undefined;
   let artifactFile: ArtifactFile | undefined;
 
   try {
-    if (opened.size !== undefined && opened.size > maxFileBytes) {
-      throw new ArtifactError(
-        "artifact_file_too_large",
-        "Native file exceeds the configured per-file limit.",
-      );
-    }
-
     destinationDirectory = await prepareArtifactDestinationDirectory(
       workspaceRoot,
       destination.parentParts,
@@ -272,6 +246,50 @@ export async function downloadIncomingArtifact({
     await artifactFile?.close().catch(() => undefined);
     if (partialName) await destinationDirectory?.unlink(partialName).catch(() => undefined);
     await destinationDirectory?.close().catch(() => undefined);
+  }
+}
+
+/** Only this phase is known not to have created directories or written files. */
+async function prepareArtifactDownload(
+  registry: IncomingArtifactAdapterRegistry,
+  workspaceId: string,
+  maxFileBytes: number,
+  file: unknown,
+  path: string,
+) {
+  let opened: OpenedIncomingArtifact | undefined;
+  try {
+    if (!isArtifactDownloadSupportedPlatform()) {
+      throw new ArtifactError(
+        "artifact_platform_unsupported",
+        "Native file download requires secure platform filesystem primitives.",
+      );
+    }
+    if (!Number.isSafeInteger(maxFileBytes) || maxFileBytes < 1) {
+      throw new ArtifactError(
+        "artifact_limit_invalid",
+        "Artifact file-size limit must be a positive integer.",
+      );
+    }
+    if (!workspaceId) {
+      throw new ArtifactError(
+        "artifact_workspace_invalid",
+        "A selected workspace is required for native file download.",
+      );
+    }
+
+    const destination = normalizeArtifactDestination(path);
+    opened = await registry.open(file);
+    if (opened.size !== undefined && opened.size > maxFileBytes) {
+      throw new ArtifactError("artifact_file_too_large", "Native file exceeds the configured per-file limit.");
+    }
+    return { destination, opened };
+  } catch (error) {
+    opened?.stream.destroy();
+    const failure = error instanceof Error ? error : new Error(String(error), { cause: error });
+    // An adapter may supply stronger evidence. Never overwrite its explicit phase.
+    if (!("effect" in failure)) Object.assign(failure, { effect: "not_started" });
+    throw failure;
   }
 }
 

@@ -76,7 +76,7 @@ test("操作内嵌套请求仅复用已持有的包含范围，不能借用同�
   assert.equal(f.a.inspect(f.project).length,1);owner.release();
 });
 
-test("多资源申请原子完成，排队只影响实际冲突范围且维护不等待未启动的请求",async t=>{
+test("多资源申请原子完成，排队只影响冲突范围且维护保留已受理请求直到完成或取消",async t=>{
   const f=await fixture(t),one=join(f.project,"one.txt"),two=join(f.project,"two.txt");
   const writer=f.a.acquire({workspaceRoot:f.project,kind:"mutation",scopes:[file(one)]});
   assert.throws(()=>f.b.acquire({workspaceRoot:f.project,kind:"mutation",scopes:[file(two),file(one)]}),ExecutionConflictError);
@@ -86,10 +86,17 @@ test("多资源申请原子完成，排队只影响实际冲突范围且维护�
   f.a.acquire({workspaceRoot:f.project,kind:"mutation",scopes:[file(two)]}).release();
   assert.throws(()=>f.a.acquire({workspaceRoot:f.project,kind:"read",scopes:[file(one,"read")]}),ExecutionConflictError);
   writer.release();f.a.pause();
-  assert.equal(f.a.admissionStatus().waiting,1);assert.equal(f.a.admissionStatus().idle,true);
+  const paused=f.a.admissionStatus();
+  assert.equal(paused.claims,0);assert.equal(paused.activeWork,0);
+  assert.equal(paused.waiting,1);assert.equal(paused.idle,false,"accepted queue entries still protect work from maintenance restart");
   assert.throws(()=>queued.tryAcquire(),/暂不接受/);f.a.resume();
-  const granted=queued.tryAcquire();assert.ok(granted);granted.release();
+  const granted=queued.tryAcquire();assert.ok(granted);
+  assert.equal(f.a.admissionStatus().waiting,0);assert.equal(f.a.admissionStatus().claims,1);
+  assert.equal(f.a.admissionStatus().idle,false);granted.release();
   assert.equal(f.a.admissionStatus().idle,true);
+  const cancelled=f.b.enqueue({workspaceRoot:f.project,kind:"mutation",scopes:[file(one)]},5000);
+  f.a.pause();assert.equal(f.a.admissionStatus().idle,false);
+  cancelled.cancel();assert.equal(f.a.admissionStatus().waiting,0);assert.equal(f.a.admissionStatus().idle,true);
 });
 
 test("聚合目录自动声明父树范围，Git工作树与显式子范围仍保持独立",async t=>{

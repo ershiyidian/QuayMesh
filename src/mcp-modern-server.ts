@@ -1,4 +1,5 @@
 import { toolDeadline, TOOL_DEADLINE_META } from "./tool-request-budget.js";
+import { toolResultForTextClients } from "./mcp-tool-result.js";
 import * as z from "zod/v4";
 import {
   McpServer,
@@ -129,7 +130,7 @@ export function createModernMcpServerAdapter(
       async (input, context) => {
         const extra=legacyToolHandlerExtra(context);
         extra._meta={...recordValue(extra._meta),[TOOL_DEADLINE_META]:toolDeadline(name,input,extra._meta)};
-        return handler(input,extra);
+        return toolResultForTextClients(await handler(input,extra));
       },
     )) as LegacyMcpServer["registerTool"],
     registerResource: ((...args: unknown[]) => {

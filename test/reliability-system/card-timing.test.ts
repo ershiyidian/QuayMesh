@@ -38,7 +38,8 @@ test("CD01/CD04：完成命令和完成Task在一小时后仍使用固定结束�
 test("CD02/CD06：无后台的一小时静默显示明确提示，卡片查询时间不冒充模型活动",()=>{
   const silent=snapshot({lastModelToolAt:NOW-3_600_000,lastActivityAt:NOW-3_600_000,lastExecutionActivityAt:NOW-3_600_000,serverNow:NOW+3_600_000,observedAt:NOW+3_600_000});
   const view=cardPresentation(silent,NOW);
-  assert.equal(view.status,"stalled");assert.equal(view.label,"10 分钟没有新的执行记录");
+  assert.equal(view.status,"active");assert.equal(view.label,"任务进行中");
+  assert.equal(view.backgroundLabel,"长时间无新执行记录");
   assert.equal(view.modelActivityAgeMs,3_600_000);
 });
 
@@ -47,7 +48,7 @@ test("CD03：后台运行和无输出只显示事实，不自动判定失败或�
   const active=snapshot({status:"running",execution_status:ExecutionState.active,commands:[running],runningCommand:running,currentCommand:running,
     lastModelToolAt:NOW-30*60_000,lastExecutionActivityAt:NOW-20*60_000,lastOutputAt:NOW-18*60_000});
   const view=cardPresentation(active,NOW);
-  assert.equal(view.status,"running");assert.equal(view.commandClockDynamic,true);
+  assert.equal(view.status,"active");assert.equal(view.backgroundStatus,"running");assert.equal(view.commandClockDynamic,true);
   assert.equal(view.outputAgeMs,18*60_000);
 });
 
@@ -65,8 +66,10 @@ test("CD05：交接固定本轮时长，后台时长继续；归档空结果不�
 });
 
 test("CD07：静默阈值边界明确",()=>{
-  assert.equal(cardPresentation(snapshot({lastModelToolAt:NOW-DEFAULT_SILENCE_WARNING_MS+1,lastActivityAt:null,lastExecutionActivityAt:null}),NOW).status,"idle");
-  assert.equal(cardPresentation(snapshot({lastModelToolAt:NOW-DEFAULT_SILENCE_WARNING_MS,lastActivityAt:null,lastExecutionActivityAt:null}),NOW).status,"stalled");
+  const before=cardPresentation(snapshot({lastModelToolAt:NOW-DEFAULT_SILENCE_WARNING_MS+1,lastActivityAt:null,lastExecutionActivityAt:null}),NOW);
+  const after=cardPresentation(snapshot({lastModelToolAt:NOW-DEFAULT_SILENCE_WARNING_MS,lastActivityAt:null,lastExecutionActivityAt:null}),NOW);
+  assert.equal(before.status,"active");assert.equal(after.status,"active");
+  assert.equal(before.backgroundLabel,"暂无后台执行");assert.equal(after.backgroundLabel,"长时间无新执行记录");
 });
 
 test("CD08：明确交付结果优先于临时节点离线/历史执行错误",()=>{

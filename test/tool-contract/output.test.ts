@@ -60,15 +60,26 @@ test("TC09/RC06：相同key的非空stdin只发送一次",{timeout:60000},async 
 });
 
 test("BT12/16：一个结果范围过期不会遮蔽其他输出",{timeout:60000},async t=>{
-  const f=await fixture(t);
-  const large=await f.execute("process.stdout.write('x'.repeat(4*1024*1024+1024));",{yield_time_ms:2000});
-  assert.equal(large.output_truncated,true);assert.ok(large.retained_from>0);
+  const f=await fixture(t),largeBytes=4*1024*1024+1024;
+  const large=await f.execute(`process.stdout.write('x'.repeat(${largeBytes}));`,{yield_time_ms:2000});
+  // The first receipt may precede output retention. Observe the real terminal
+  // operation before reading its retained boundary, independently of yield time.
+  await until(async()=>{
+    const status=await f.call("workspace_context",{...f.scope,action:"status",operation_id:large.operation_id});
+    if(["accepted","queued","running"].includes(status.operation_state))return false;
+    assert.equal(status.operation_state,"succeeded",JSON.stringify(status));
+    return true;
+  });
+  const retained=await f.call("read_output",{...f.scope,operation_id:large.operation_id,cursor:largeBytes});
+  assert.equal(retained.process_done,true);assert.equal(retained.total_bytes,largeBytes);assert.ok(retained.retained_from>0);
   const small=await f.execute("console.log('small-result');",{yield_time_ms:2000});
+  await until(async()=>(await f.call("read_output",{...f.scope,operation_id:small.operation_id,cursor:0})).process_done);
   const response=await f.raw("read_output",{...f.scope,outputs:[{operation_id:large.operation_id,cursor:0},{operation_id:small.operation_id,cursor:0}],limit_bytes:32768});
+  assert.notEqual(response.isError,true,JSON.stringify(response));
   assert.ok(Buffer.byteLength(JSON.stringify(response))<=REPLY_BYTES);
   const result=response.structuredContent as any;
   assert.equal(result.partial,true);assert.match(result.outputs[0].error,/OUTPUT_RANGE_EXPIRED/);
-  assert.equal(result.outputs[1].result,"small-result\n");
+  assert.equal(result.outputs[1].result,"small-result\n");assert.equal(result.outputs[1].done,true);
 });
 
 test("输出JSON转义后仍遵守总预算，批量裁剪游标可完整重建",{timeout:60000},async t=>{

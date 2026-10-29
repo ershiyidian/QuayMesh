@@ -16,7 +16,7 @@ async function fixture(){
 }
 
 test("OP08：明确未启动、部分效果和远端未知使用不同 effect",()=>{
-  const conflict=new ExecutionConflictError("claim",undefined,"冲突");
+  const conflict=new ExecutionConflictError("claim",undefined,"冲突",undefined,"not_started");
   assert.deepEqual(classifyError(conflict,{sideEffecting:true,effectStarted:true}).effect,"not_started");
   const partial=classifyError(new Error("local write failed"),{sideEffecting:true,effectStarted:true});
   assert.equal(partial.effect,"partial");assert.equal(partial.retryHint,"do_not_retry");

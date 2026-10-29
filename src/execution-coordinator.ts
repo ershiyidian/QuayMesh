@@ -91,8 +91,10 @@ export class ExecutionConflictError extends Error {
   readonly code = "EXECUTION_CONFLICT";
   constructor(readonly claimId: string, readonly agentId: string | undefined, reason: string,
     readonly details?: { type: string; requested: ExecutionResource[]; blockedResources: ExecutionResource[];
-      operationId: string | null; taskId: string | null; title: string | null; acquiredAt: string | null; queued: boolean }) {
-    super(`${reason}。操作尚未开始。占用：${claimId}${details ? `；${JSON.stringify(details)}` : ""}`);
+      operationId: string | null; taskId: string | null; title: string | null; acquiredAt: string | null; queued: boolean },
+    // Only the admission boundary knows the protected action has not started.
+    readonly effect?: "not_started") {
+    super(`${reason}。${effect === "not_started" ? "操作尚未开始。" : ""}占用：${claimId}${details ? `；${JSON.stringify(details)}` : ""}`);
     this.name = "ExecutionConflictError";
   }
 }
@@ -411,7 +413,7 @@ export class ExecutionCoordinator {
           type:blockedResources.length ? "resource" : blocker.thread_key && blocker.thread_key===candidate.thread_key ? "thread" : blocker.agent_id && blocker.agent_id===candidate.agent_id ? "agent" : "capacity",
           requested,blockedResources,operationId:blocker.operation_id,taskId:blocker.task_id,title:blocker.title,
           acquiredAt:blocker.acquired_at ?? null,queued:"sequence" in blocker,
-        });
+        }, "not_started");
       }
       return this.insert(candidate);
     }).immediate();
@@ -424,7 +426,7 @@ export class ExecutionCoordinator {
       this.assertAccepting();
       this.database.sqlite.prepare("delete from execution_waiters where expires_at_ms <= ?").run(Date.now());
       const count = (this.database.sqlite.prepare("select count(*) as n from execution_waiters").get() as { n: number }).n;
-      if (count >= 64) throw new ExecutionConflictError("queue", undefined, "Local queue capacity reached; no provider invoked");
+      if (count >= 64) throw new ExecutionConflictError("queue", undefined, "Local queue capacity reached; no provider invoked", undefined, "not_started");
       this.database.sqlite.prepare(`insert into execution_waiters
         (id, owner_id, owner_pid, kind, checkout_root, agent_id, thread_key, access_mode, resources, expires_at_ms,scopes_json,operation_id,task_id,title)
         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)

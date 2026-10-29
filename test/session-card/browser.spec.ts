@@ -19,18 +19,26 @@ function workspaceId(boot:any):string{
 
 test("designer card structure, one iframe and multi-workspace context",async({page})=>{
   const frame=await openCard(page);
-  for(const id of ["#t-changes","#t-commands","#t-agents","#t-context"])await expect(frame.locator(id)).toBeVisible();
+  for(const id of ["#t-changes","#t-commands","#t-agents","#t-context","#t-messages"])await expect(frame.locator(id)).toBeVisible();
   await expect(page.locator("iframe")).toHaveCount(1);
   await expect(frame.locator("#title")).not.toBeEmpty();
   await page.screenshot({path:OUT+"/desktop-initial.png",fullPage:true});
   await page.setViewportSize({width:480,height:900});
   await page.screenshot({path:OUT+"/narrow-initial.png",fullPage:true});
   await page.setViewportSize({width:980,height:900});
+  const catalog=await page.evaluate(()=>window.__quaymeshHost.requestTool("workspace_catalog",{}));
+  expect(catalog.isError,JSON.stringify(catalog)).not.toBe(true);
+  expect((catalog.structuredContent as {workspaces:Array<{root_id:string}>}).workspaces.map(root=>root.root_id).sort())
+    .toEqual(["card-coordinator/main","card-coordinator/second"]);
+  const attachment = page.waitForResponse(response => response.url().endsWith("/api/tool")
+    && response.request().postDataJSON()?.name === "attach_workspace");
   await page.getByRole("button",{name:"Attach real workspace"}).click();
+  const attached = await (await attachment).json();
+  expect(attached.isError,JSON.stringify(attached)).not.toBe(true);
   await expect.poll(async()=>(await(await page.request.get("/api/state")).json()).lastTool,POLL).toBe("attach_workspace");
   await frame.locator("#t-context").click();
-  await expect(frame.locator("#p-context")).toContainText("desktop",POLL);
-  await expect(frame.locator("#p-context")).toContainText("second",POLL);
+  await expect(frame.locator("#p-context")).toContainText(attached.structuredContent.node_id,POLL);
+  await expect(frame.locator("#p-context")).toContainText(attached.structuredContent.root,POLL);
   await expect(frame.locator("#p-context")).toContainText("project",POLL);
 });
 
@@ -77,8 +85,8 @@ test("agent empty state and keyboard tabs",async({page})=>{
   await expect(frame.locator("#p-agents")).toContainText("没有子代理",POLL);
   await frame.locator("#t-changes").focus();
   await frame.locator("#t-changes").press("ArrowRight");await expect(frame.locator("#t-commands")).toHaveAttribute("aria-selected","true");
-  await frame.locator("#t-commands").press("End");await expect(frame.locator("#t-context")).toHaveAttribute("aria-selected","true");
-  await frame.locator("#t-context").press("Home");await expect(frame.locator("#t-changes")).toHaveAttribute("aria-selected","true");
+  await frame.locator("#t-commands").press("End");await expect(frame.locator("#t-messages")).toHaveAttribute("aria-selected","true");
+  await frame.locator("#t-messages").press("Home");await expect(frame.locator("#t-changes")).toHaveAttribute("aria-selected","true");
 });
 
 test("disconnect error, reconnect and teardown keep the background operation",async({page})=>{

@@ -3,11 +3,15 @@ import { createHash } from 'node:crypto';
 import { expect, test } from '@playwright/test';
 import { WORKSPACE_APP_VERSION } from '../../src/session/card-contract.js';
 
-test('真实旧发行卡片读取新服务，启动和后续命令均不发生格式拒收', async ({page}) => {
-  const legacyPath = process.env.QUAYMESH_TEST_LEGACY_CARD;
+for (const legacy of [
+  { env: 'QUAYMESH_TEST_LEGACY_CARD', sameVersion: false, name: '真实旧发行卡片' },
+  { env: 'QUAYMESH_TEST_LEGACY_V9_CARD', sameVersion: true, name: '真实缓存的同版本旧 v9 卡片' },
+]) test(`${legacy.name}读取新服务，命令和文件差异均不发生格式拒收`, async ({page}) => {
+  const legacyPath = process.env[legacy.env];
   test.skip(!legacyPath, '需要实际保留的旧发行卡片，不使用模拟压缩脚本');
   const html = await readFile(legacyPath!, 'utf8');
-  expect(html.includes(WORKSPACE_APP_VERSION),'必须使用实际保留、早于当前渲染器的发行包').toBe(false);
+  expect(html.includes(WORKSPACE_APP_VERSION),'必须使用指定版本的实际保留 HTML').toBe(legacy.sameVersion);
+  expect(html.includes('file_recorded_at'),'旧 HTML 尚不支持显式文件时间协商').toBe(false);
   const versions=[...new Set(html.match(/task-card-v\d+/g)??[])];
   expect(versions.length).toBeGreaterThan(0);
   await test.info().attach('legacy-card-provenance',{contentType:'application/json',body:JSON.stringify({path:legacyPath,
@@ -30,6 +34,18 @@ test('真实旧发行卡片读取新服务，启动和后续命令均不发生�
   await card.locator('#toggle').click();
   await card.locator('#t-commands').click();
   await expect(card.locator('#p-commands')).toContainText(marker, {timeout: 25000});
+  const file = `legacy-diff-${Date.now()}.txt`;
+  const patch = ['*** Begin Patch', `*** Add File: ${file}`, '+legacy diff evidence', '*** End Patch'].join('\n');
+  const changed = await page.evaluate(text => window.__quaymeshHost.runPatch(text), patch);
+  expect(changed.isError, JSON.stringify(changed)).not.toBe(true);
+  await card.locator('#t-changes').click();
+  const row = card.locator('[data-x^="f:"]', {hasText: file}).first();
+  await expect(row).toBeVisible({timeout: 25000});
+  if (await row.getAttribute('aria-expanded') !== 'true') await row.click();
+  // The old renderer displays the addition marker in its diff gutter, separately
+  // from the line text. Assert the rendered evidence without coupling it to that markup.
+  await expect(card.locator('#p-changes')).toContainText('legacy diff evidence', {timeout: 25000});
+  await expect(row).toHaveAttribute('aria-expanded', 'true');
   await expect(card.locator('#title')).not.toContainText('unrecognized_keys');
   expect(errors).toEqual([]);
 });

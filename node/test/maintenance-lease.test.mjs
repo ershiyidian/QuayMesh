@@ -27,11 +27,11 @@ async function serve(t,handle){
   return server.address().port;
 }
 
-async function leaseFixture(t){
+async function leaseFixture(t,claims=[]){
   const root=await directory(t),requests=[];
   const subject={domain:"operation",id:"legacy",generation:"old-attempt",fingerprint:"f".repeat(64)};
-  const state={admission:{...zeroActivity,accepting:true,reason:null,changedAt:"2026-10-23T00:00:00.000Z"},
-    subjects:[subject],processes:[{pid:1001,start:"manager-generation",alive:true},{pid:1002,start:"core-generation",alive:true}]};
+  const state={admission:{...zeroActivity,claims:claims.length,accepting:true,reason:null,changedAt:"2026-10-23T00:00:00.000Z"},
+    subjects:[subject],claims:structuredClone(claims),processes:[{pid:1001,start:"manager-generation",alive:true},{pid:1002,start:"core-generation",alive:true}]};
   const running={nodeId:"fixture",release:"old-commit",components:[{id:"core",pid:1002,startedAt:1,restarts:0}]};
   const port=await serve(t,(req,body)=>{
     requests.push({path:req.url,body});
@@ -55,7 +55,8 @@ async function leaseFixture(t){
       // The same identity with Python sort_keys ordering and harmless extras
       // must remain valid; object serialization order is not an identity.
       return {version:1,attemptId:context.attemptId,pause:{reason:pause.reason,changedAt:pause.changedAt},
-        census:freshCensus(),subjects:[{fingerprint:subject.fingerprint,generation:subject.generation,id:subject.id,domain:subject.domain,note:"reviewed"}]};
+        census:freshCensus(),subjects:[{fingerprint:subject.fingerprint,generation:subject.generation,id:subject.id,domain:subject.domain,note:"reviewed"}],
+        ...(claims.length?{claims:structuredClone(claims)}:{})};
     },
     async assertHeld(){return {census:freshCensus()};},
     async release(){released++;await requestJson(`http://127.0.0.1:${port}/internal/quaymesh/admission`,{
@@ -101,6 +102,69 @@ test("备份后暂停归属、进程代次或原始runtime工作变化均在stop
   fixture.state.admission.persistedRuntimeWork=0;
   fixture.provider.assertHeld=async()=>({census:{digest:"c".repeat(64),observedAt:"2026-01-01T00:00:00Z"}});
   await assert.rejects(lease.assertHeld("before_stop"),/missing or stale/);
+  await lease.release({outcome:"aborted-before-stop",transition:null,activeStatus:fixture.running});
+});
+
+const oldClaim={id:"old-claim",operationId:"legacy",ownerId:"old-coordinator",ownerPid:900,
+  processStart:"old-process-start",generation:"old-attempt",fingerprint:"a".repeat(64)};
+
+test("显式review的完整command claim集合贯穿四阶段，原始claim计数始终保留",async t=>{
+  const fixture=await leaseFixture(t,[oldClaim]),acquire=fixture.provider.acquire;
+  fixture.provider.acquire=async context=>({...await acquire(context),claims:[{
+    fingerprint:oldClaim.fingerprint,generation:oldClaim.generation,processStart:oldClaim.processStart,
+    ownerPid:oldClaim.ownerPid,ownerId:oldClaim.ownerId,operationId:oldClaim.operationId,id:oldClaim.id,note:"reviewed physical domain",
+  }]});
+  const lease=await beginInstallationMaintenance(fixture.options);
+  for(const stage of ["before_backup","after_backup","before_stop"]){
+    await lease.assertHeld(stage);assert.equal(fixture.state.admission.claims,1);
+  }
+  fixture.state.processes=fixture.state.processes.map(value=>({...value,alive:false,start:null}));
+  fixture.state.admission.reason="service stopping";
+  await lease.assertHeld("after_stop");
+  assert.equal(fixture.state.admission.claims,1,"the lease never deletes or discounts the saved claim");
+  assert.deepEqual(fixture.state.claims,[oldClaim]);
+  const saved=JSON.parse(await readFile(lease.context.receiptFile,"utf8"));
+  assert.equal(saved.lease.claims[0].fingerprint,oldClaim.fingerprint);assert.equal(saved.stages.length,4);
+  await lease.release({outcome:"aborted-before-stop",transition:null,activeStatus:fixture.running});
+});
+
+test("未显式声明、非完整候选集合或operation代次不匹配的claim拒绝acquire",async t=>{
+  for(const mode of ["not-opted-in","unsupported","wrong-generation"]){
+    const fixture=await leaseFixture(t,[oldClaim]),acquire=fixture.provider.acquire;
+    if(mode==="unsupported")fixture.state.claims=[];
+    fixture.provider.acquire=async context=>{
+      const value=await acquire(context);
+      if(mode==="not-opted-in")delete value.claims;
+      if(mode==="wrong-generation"){
+        value.claims[0].generation="another-attempt";
+        fixture.state.claims[0].generation="another-attempt";
+      }
+      return value;
+    };
+    await assert.rejects(beginInstallationMaintenance(fixture.options),error=>
+      /acquisition is unconfirmed/.test(error.message)&&/complete command claim set/.test(error.cause?.message));
+    assert.equal(fixture.released(),1,"only the owned pause is compensated; claim rows are untouched");
+    assert.equal(fixture.state.admission.claims,1);
+  }
+});
+
+test("同数量claim的任一身份或完整指纹变化、额外claim和runtime工作均阻挡stop",async t=>{
+  const fixture=await leaseFixture(t,[oldClaim]),lease=await beginInstallationMaintenance(fixture.options);
+  await lease.assertHeld("before_backup");
+  for(const [key,value] of Object.entries({id:"replacement",operationId:"other-operation",ownerId:"other-owner",ownerPid:901,
+    processStart:"reused-pid",generation:"next-attempt",fingerprint:"b".repeat(64)})){
+    fixture.state.claims=[{...oldClaim,[key]:value}];
+    await assert.rejects(lease.assertHeld("after_backup"),/Maintenance state changed/);
+  }
+  fixture.state.claims=[oldClaim,{...oldClaim,id:"extra"}];fixture.state.admission.claims=2;
+  await assert.rejects(lease.assertHeld("before_stop"),/Maintenance state changed/);
+  fixture.state.claims=[oldClaim];fixture.state.admission.claims=1;
+  for(const name of ["waiting","operations","executions","queuedOperations","queuedExecutions","activeWork","allRuntimeWork","persistedRuntimeWork"]){
+    fixture.state.admission[name]=1;
+    await assert.rejects(lease.assertHeld("before_stop"),/Maintenance state changed/);
+    fixture.state.admission[name]=0;
+  }
+  assert.deepEqual(lease.receipt.stages.map(value=>value.stage),["before_backup"]);
   await lease.release({outcome:"aborted-before-stop",transition:null,activeStatus:fixture.running});
 });
 

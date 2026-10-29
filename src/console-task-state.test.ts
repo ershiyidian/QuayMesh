@@ -1,10 +1,22 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { executionTimeEnd, taskTimeEnd, withTaskLifecycle } from './console-task-state.js';
-import { elapsed } from './ui/console-v5/presentation.js';
+import { elapsed, lifecycleBadges } from './ui/console-v5/presentation.js';
 import type { Run } from './console-workbench/types.js';
 
 const now = 1_800_000_000_000;
+
+test('控制台开放任务的主徽章稳定，失败和过期执行分别作为附加事实', () => {
+  for (const executionStatus of ['waiting','running','failed','unknown','stalled']) {
+    const html=lifecycleBadges({requestState:'active',resultStatus:null,executionStatus,acceptanceStatus:'not_required'},
+      {stale:executionStatus==='unknown',observedAt:now-60_000});
+    assert.match(html,/^<span class="state active">[^]*任务进行中<\/span>/);
+    if(executionStatus==='failed')assert.match(html,/最近执行失败/);
+    if(executionStatus==='unknown')assert.match(html,/后台执行结果待核对/);
+  }
+  const handed=lifecycleBadges({requestState:'closed',resultStatus:'handed_off',executionStatus:'running',acceptanceStatus:'not_required'});
+  assert.match(handed,/已交接/);assert.match(handed,/后台仍在执行/);
+});
 
 test('任务起点取真实创建时间，阶段开始时间不会改变总耗时', () => {
   const value = {taskId: 'task', executionStatus: 'waiting', acceptanceStatus: 'not_required',
@@ -42,10 +54,10 @@ test('控制台总耗时随开放任务更新，交付结束后后台执行不�
   const run = {requestState: 'active', executionStatus: 'waiting', startedAt: now - 60_000, finishedAt: null,
     lastActivityAt: now - 50_000, observedAt: now - 40_000, stale: true} as Run;
   const open = elapsed(run);
-  assert.match(open, /title="本轮耗时"/);
+  assert.match(open, /title="任务历时：从创建起计算，包含等待和节点离线时间"/);
   assert.match(open, /data-elapsed=/);
   assert.match(open, /data-observed="0"/);
   const closed = elapsed({...run, requestState: 'closed', executionStatus: 'running', finishedAt: now - 10_000});
-  assert.match(closed, /title="本轮耗时"/);
+  assert.match(closed, /title="任务历时：从创建起计算，包含等待和节点离线时间"/);
   assert.doesNotMatch(closed, /data-elapsed=/);
 });

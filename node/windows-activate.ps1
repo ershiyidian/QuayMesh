@@ -92,14 +92,10 @@ try {
     Start-Sleep -Seconds 3
     & $runtime (Join-Path $releaseRoot 'node\verify-installed.mjs')
     if ($LASTEXITCODE -ne 0) { throw '发行包、Node 或 SQLite 原生依赖验证失败，保持当前服务。' }
-    $preflightText = & $runtime (Join-Path $releaseRoot 'node\cutover-preflight.mjs') $prepared.stateDir
-    $preflightExit = $LASTEXITCODE
-    $outcome.preflight = ($preflightText -join '') | ConvertFrom-Json
-    if ($preflightExit -ne 0) {
-        $outcome.status = 'blocked'
-        throw '节点仍有执行、等待、出口流或待核对记录，保持当前服务。'
-    }
     Save-Result $outcome
+    # Use the installer's authoritative quiescence decision, including valid
+    # physical proofs for historical unknown receipts. Active or unproven work
+    # still blocks activation. No independent SQL gate runs before this drain.
     # activateInstallation freezes admission, checks the drain, backs up the
     # SQLite database, then requires one unchanged ready Core for 60 seconds.
     # Schema migration failures retain recovery_required instead of starting
@@ -114,7 +110,7 @@ try {
     $outcome.status = 'completed'
     $outcome.core = @($status.components | Where-Object { $_.id -eq 'core' })
 } catch {
-    if ($outcome.status -ne 'blocked') { $outcome.status = if ($committed) { 'verification_required' } else { 'failed' } }
+    $outcome.status = if ($committed) { 'verification_required' } else { 'failed' }
     $outcome.error = $_.Exception.Message
     $transitionPath = Join-Path $prepared.stateDir 'installation-transition.json'
     if (Test-Path -LiteralPath $transitionPath) {

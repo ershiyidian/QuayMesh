@@ -29,7 +29,9 @@ test("PR01/03/04/05/06/11/15/16：真实并行、资源冲突和跨Task归属",{
   const stale=await f.raw("apply_patch",{...f.scope,patch:"*** Begin Patch\n*** Update File: plain.txt\n@@\n-old\n+new\n*** End Patch",expected_content:{"plain.txt":"earlier\n"}});
   assert.equal(stale.isError,true);assert.equal(await readFile(join(f.project,"plain.txt"),"utf8"),"old\n");
   await Promise.all(Array.from({length:8},(_,index)=>f.call("checkpoint_task",{...f.scope,goal:`并发记录 ${index}`,decisions:["真实测试"],next_action:"等待命令"})));
-  const next=await f.call("start_session",{title:"后续请求",request_key:"new-task",source_task_id:f.task.task_id});
+  const selected=await f.call("task_resume",{action:"inspect",task_id:f.task.task_id});
+  const next=await f.call("start_session",{title:"独立后续目标",request_key:"new-task",source_task_id:f.task.task_id,
+    new_goal:true,expected_binding_revision:selected.binding.binding_revision});
   assert.notEqual(next.task_id,f.task.task_id);
   await writeFile(gate,"finish");
   for(const start of starts)await until(async()=>(await f.call("read_output",{...f.scope,operation_id:start.operation_id})).process_done);

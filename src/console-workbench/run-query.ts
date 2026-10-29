@@ -131,6 +131,7 @@ export function runQuery(ledger: WorkLedger, nodeId: string, projectIds: string[
   }
   if (query.root) condition("root=?", query.root);
   if (query.session) condition("session_id=?", query.session);
+  if (query.requestState) condition("task_state=?", query.requestState);
   if (query.changed) condition("changed=1");
   if (query.execution) condition("execution=?", query.execution);
   if (query.stage) {
@@ -147,7 +148,7 @@ export function runQuery(ledger: WorkLedger, nodeId: string, projectIds: string[
     if (query.finishedDay) condition("workbench_day(finished_ms)=?", query.finishedDay);
   }
   const days = Number(query.days ?? 7);
-  if (days) condition("(started_ms>=? OR execution IN ('running','queued','stopping','waiting','stalled','finalizing','unknown') OR finalizing=1 OR (execution='interrupted_recoverable' AND (unresolved=1 OR failed_child=1)))", at - days * 86400000);
+  if (days) condition("(started_ms>=? OR task_state='active' OR execution IN ('running','queued','stopping','waiting','stalled','finalizing','unknown') OR finalizing=1 OR (execution='interrupted_recoverable' AND (unresolved=1 OR failed_child=1)))", at - days * 86400000);
   const filter = where.length ? where.join(" AND ") : "1";
   const scope = `${sql}, scoped AS (SELECT * FROM states WHERE ${filter})`;
   const values = [...ordered, ...filters];

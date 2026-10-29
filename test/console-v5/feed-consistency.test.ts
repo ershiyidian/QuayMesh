@@ -77,6 +77,11 @@ test('navigation groups use request execution facts while review remains an inde
   const open=await f.feed.runs({node:'a',days:'0',stage:'waiting,stalled,finalizing'});
   assert.deepEqual(open.items.map(run=>run.taskId),['reviewable']);assert.equal(open.counts.review,1);
   assert.equal(open.counts.scopeAll,3);assert.equal(open.counts.scopeActive,1);assert.equal(open.counts.scopeWaiting,1);assert.equal(open.counts.scopeResults,1);
+  assert.equal(open.counts.scopeOpen,2);assert.equal(open.counts.scopeClosed,1);
+  const activeTasks=await f.feed.runs({node:'a',days:'0',requestState:'active'});
+  assert.deepEqual(activeTasks.items.map(run=>run.taskId).sort(),['busy','reviewable']);
+  assert.equal(activeTasks.counts.scopeAll,3);assert.equal(activeTasks.counts.scopeClosed,1);
+  assert.deepEqual((await f.feed.runs({node:'a',days:'0',requestState:'closed'})).items.map(run=>run.taskId),['finished']);
   assert.deepEqual((await f.feed.overview('UTC')).waiting.map(run=>run.taskId),['reviewable']);
 });
 

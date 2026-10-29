@@ -2,7 +2,7 @@ import { icon } from './icons.js';
 import { fmt, compact, duration, fullTime, ago, smartTime, validTime } from './format.js';
 import type { Run, ChangeCapture, SourceState } from './contracts.js';
 import { taskStage, taskStages, executionTimeEnd, taskTimeEnd } from '../../console-task-state.js';
-import { taskDelivery } from '../../task-view.js';
+import { taskLifecycleView } from '../../task-view.js';
 
 export const esc = (v: unknown): string => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 
@@ -31,20 +31,28 @@ export function acceptanceBadge(run: Pick<Run, 'executionStatus' | 'phaseExecuti
 
 export function lifecycleBadges(run: Pick<Run, 'requestState'|'resultStatus'|'executionStatus'|'phaseExecutionStatus'|'acceptanceStatus'|'finalization'>,
   observation?: {stale: boolean; observedAt: number | null}): string {
-  const delivery=taskDelivery(run.requestState,run.resultStatus),state=stage(run);
-  const primary=delivery ? `<span class="state ${delivery.status==='completed'?'done':esc(delivery.status)}">${icon(delivery.status==='completed'?'done':delivery.status==='ended'?'archive':delivery.status,14)}${esc(delivery.label)}</span>`
+  const lifecycle=taskLifecycleView({requestState:run.requestState,result:run.resultStatus,
+    finalizing:Boolean(run.finalization),finalizationFailed:run.finalization?.status==='failed'});
+  const ended=run.requestState==='closed',state=stage(run);
+  const tone=lifecycle?.status==='completed'?'done':lifecycle?.status==='finalizing'&&run.finalization?.status==='failed'?'failed':lifecycle?.status ?? state;
+  const symbol=lifecycle?.status==='active'?'tasks':lifecycle?.status==='ended'?'archive':tone;
+  const primary=lifecycle ? `<span class="state ${esc(tone)}">${icon(symbol,14)}${esc(lifecycle.label)}</span>`
     : run.finalization?.status==='failed'&&state==='finalizing' ? `<span class="state failed">${icon('failed',14)}交付确认失败</span>` : status(state);
   const result=[primary];
-  if(!delivery&&run.finalization&&state!=='finalizing')result.push(badge(run.finalization.status==='failed'?'交付确认失败':'交付确认中','warn'));
-  if(delivery){
-    const background:Record<string,string>={running:'后台仍在执行',stopping:'后台正在停止',queued:'后台正在准备',unknown:'后台执行结果待核对',interrupted_recoverable:'后台执行已中断'};
-    if(background[run.executionStatus])result.push(badge(background[run.executionStatus],['unknown','interrupted_recoverable'].includes(run.executionStatus)?'warn':''));
+  if(!lifecycle&&run.finalization&&state!=='finalizing')result.push(badge(run.finalization.status==='failed'?'交付确认失败':'交付确认中','warn'));
+  if(lifecycle){
+    const background:Record<string,string>=ended
+      ? {running:'后台仍在执行',stopping:'后台正在停止',queued:'后台正在准备',unknown:'后台执行结果待核对',interrupted_recoverable:'后台执行已中断'}
+      : {running:'后台执行中',stopping:'后台正在停止',queued:'后台正在准备',waiting:'当前无后台执行',idle:'当前无后台执行',
+        stalled:'长时间无新执行记录',unknown:'后台执行结果待核对',interrupted_recoverable:'后台执行已中断',
+        failed:'最近执行失败',cancelled:'最近执行已停止',completed:'本阶段执行已结束',ended:'本阶段执行已结束',handed_off:'执行阶段已交接'};
+    if(background[run.executionStatus])result.push(badge(background[run.executionStatus],['failed','unknown','stalled','interrupted_recoverable'].includes(run.executionStatus)?'warn':''));
   }
   if(observation?.stale)result.push(`<span class="badge warn" title="${esc('最后确认：'+fullTime(observation.observedAt))}">上次确认</span>`);
-  if(!delivery&&run.phaseExecutionStatus==='completed'&&run.executionStatus!=='completed')result.push(badge('执行阶段已结束'));
+  if(!ended&&run.phaseExecutionStatus==='completed'&&run.executionStatus!=='completed')result.push(badge('执行阶段已结束'));
   const acceptance=acceptanceBadge(run);
   if(acceptance)result.push(acceptance);
-  else if(delivery&&['review','accepted','rejected'].includes(state))result.push(badge(stages[state],state==='accepted'?'good':'warn'));
+  else if(lifecycle&&['review','accepted','rejected'].includes(state))result.push(badge(stages[state],state==='accepted'?'good':'warn'));
   return result.join(' ');
 }
 
@@ -107,10 +115,10 @@ export function executionObservationForRun(run:Run,sources:readonly Pick<SourceS
 }
 
 export function elapsed(r: Run, observation?: { stale: boolean; observedAt: number | null }) {
-  if (r.requestState === 'active') return `<span class="num elapsed" title="本轮耗时" data-elapsed="${r.startedAt}" data-observed="0">${duration(Date.now() - r.startedAt)}</span>`;
+  if (r.requestState === 'active') return `<span class="num elapsed" title="任务历时：从创建起计算，包含等待和节点离线时间" data-elapsed="${r.startedAt}" data-observed="0">${duration(Date.now() - r.startedAt)}</span>`;
   if (r.requestState === 'closed') {
     const end = taskTimeEnd(r);
-    return `<span class="num" title="本轮耗时">${duration(end === null ? null : end - r.startedAt)}</span>`;
+    return `<span class="num" title="任务历时：从创建起计算，包含等待和节点离线时间">${duration(end === null ? null : end - r.startedAt)}</span>`;
   }
   const active = ['running', 'stopping'].includes(r.executionStatus);
   const at = observation ? observation.observedAt : r.observedAt ?? null;

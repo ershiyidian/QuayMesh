@@ -13,8 +13,10 @@ import { sampleHealth } from "./health.js";
 import { mapConcurrent } from "../concurrency.js";
 import type { FederationConfig, NodeManifest, NodeView, JsonRecord, ConsoleReply, ToolHandler } from "./types.js";
 import type { SessionFeed } from "./session-feed.js";
+import { sessionToolRoute } from "./tool-routing.js";
 import { safeForwardedContext } from "../request-meta.js";
-import type { TrustedInvocationEnvelope } from "./session-types.js";
+import { retainLocalTaskClient } from "../tasks/task-binding.js";
+import { assertTaskBindingEnvelope, type TrustedInvocationEnvelope } from "./session-types.js";
 import { ExecutionCoordinator, type RuntimeWorkLease } from "../execution-coordinator.js";
 import { isReadOnlyObservation, observesAcceptedWork } from "../tool-admission.js";
 import { TransferStore, type TransferRequest, type TransferView } from "./transfer-store.js";
@@ -27,7 +29,7 @@ import { jsonReply } from "../bounded-reply.js";
 import { currentInvocation } from "../session/invocations.js";
 import { errorCode, toolErrorResult } from "../session/outcome.js";
 import { WorkspaceAccessError } from "../workspaces.js";
-import { dispatchPeerRequest, isTransientPeerFailure, isIdempotentPeerRequest } from "./read-retry.js";
+import { dispatchPeerRequest, isTransientPeerFailure, isIdempotentPeerRequest, isCancellableToolObservation } from "./read-retry.js";
 import { dispatchConsoleRequest } from "./console-request.js";
 
 export interface ArtifactWriteLifecycle {
@@ -204,6 +206,7 @@ export class FederationRuntime extends EventEmitter {
     return this.sessionFeed?.routeNodeFor(input);
   }
   routeNode(name: string, input: JsonRecord): string {
+    if (sessionToolRoute(name) === "task") return this.localId;
     if (name === 'read_diagnostics') return typeof input.node_id === 'string' ? input.node_id : this.localId;
     if (name === "open_workspace" && typeof input.root_id === "string") {
       return selectRoot(this.nodes(), input.root_id).node.id;
@@ -215,9 +218,9 @@ export class FederationRuntime extends EventEmitter {
       const handle = parseWorkspaceHandle(input.workspace_id);
       if (handle) return handle.node;
     }
-    return this.sessionRouteFor(input) ?? this.localId;
+    return sessionToolRoute(name) === "member" ? this.sessionRouteFor(input) ?? this.localId : this.localId;
   }
-  trustedInvocation(name: string, input: JsonRecord, extra: JsonRecord): TrustedInvocationEnvelope | undefined {
+  async trustedInvocation(name: string, input: JsonRecord, extra: JsonRecord): Promise<TrustedInvocationEnvelope | undefined> {
     return this.sessionFeed?.trustedInvocation(name, input, extra);
   }
   nodes(): NodeView[] {
@@ -317,10 +320,17 @@ export class FederationRuntime extends EventEmitter {
   }
   private async receive(method: string, params: any, peer: string, signal?: AbortSignal,
     notify?: (notification: PeerProgressNotification) => void | Promise<void>): Promise<unknown> {
+    const bound = method === "tool" ? params.extra?.trustedInvocation : method === "artifact.copy" ? params.context : undefined;
+    assertTaskBindingEnvelope(bound);
+    if (bound?.task_binding_version === 1 && peer !== this.localId
+      && (!this.config.coordinatorId || peer !== this.config.coordinatorId)) {
+      throw Object.assign(new Error("TASK_BINDING_COORDINATOR_REQUIRED"), { code: "TASK_BINDING_COORDINATOR_REQUIRED", effect: "not_started" });
+    }
     switch (method) {
       case "hello": this.remember(params.manifest, peer); return { manifest: this.makeManifest() };
       case "manifest": this.remember(params, peer); this.notePeerSuccess(peer); this.emit("change"); return null;
       case "tool": return this.invokeLocal(params.name, params.input, { ...(params.extra ?? {}), signal, sendNotification: notify });
+      case "session.binding-capabilities": return { node_id: this.localId, task_binding: this.sessionFeed ? 1 : 0 };
       case "session.feed": {
         if (!this.sessionFeed) throw new Error("SESSION_FEED_UNAVAILABLE");
         return this.sessionFeed.handleRequest(params, peer, signal);
@@ -365,6 +375,43 @@ export class FederationRuntime extends EventEmitter {
     }
   }
   private readonly peerHealth = new Map<string, { lastSuccessAt?: number; lastError?: string; consecutiveFailures: number }>();
+  private readonly bindingPeers = new WeakMap<PeerLink, Promise<void>>();
+
+  private bindingUnavailable(nodeId: string, cause?: unknown): Error {
+    return Object.assign(new NodeUnavailableError(nodeId,
+      "NODE_UNAVAILABLE: Task binding negotiation did not complete before dispatch. No work was sent; retry later with the same operation key."), {
+      cause, effect: "not_started", retryHint: "retry_later",
+      details: { phase: "task_binding_negotiation", dispatch_state: "not_sent", ...(cause ? { cause_code: errorCode(cause) } : {}) },
+    });
+  }
+
+  /** Negotiate on the actual connection that will receive the work, never from a stale directory entry. */
+  private taskBindingPeer(link: PeerLink, timeout: number): Promise<void> {
+    const saved = this.bindingPeers.get(link);
+    if (saved) return saved;
+    const probe = link.call<{ node_id: string; task_binding: number }>("session.binding-capabilities", {}, Math.min(timeout, 2000))
+      .then(result => {
+        if (!result || typeof result !== "object" || result.node_id !== link.peerId) throw new PeerApplicationError(link.peerId, "Task binding capability identity mismatch.",
+          "TASK_BINDING_CAPABILITY_INVALID", { message: "Capability identity mismatch; no work was sent.", effect: "not_started", retryHint: "fix_input" });
+        if (result.task_binding !== 1) {
+          throw new PeerApplicationError(link.peerId, "The Worker does not support explicit Task bindings.", "TASK_BINDING_PEER_UPGRADE_REQUIRED",
+            { message: "The Worker does not support explicit Task bindings.", effect: "not_started", retryHint: "fix_input" });
+        }
+      }).catch(error => {
+        this.bindingPeers.delete(link);
+        if (error instanceof PeerApplicationError && error.code === "TASK_BINDING_CAPABILITY_INVALID") throw error;
+        if (error instanceof PeerApplicationError && (error.code === "TASK_BINDING_PEER_UPGRADE_REQUIRED"
+          || error.code === "METHOD_NOT_FOUND" || error.code === "RPC_METHOD_NOT_FOUND"
+          // Published legacy peers did not assign a code to unknown methods.
+          || error.message === "未知节点方法 session.binding-capabilities")) {
+          throw new PeerApplicationError(link.peerId, `TASK_BINDING_PEER_UPGRADE_REQUIRED: ${link.peerId} must support Task binding before resumed work is sent.`,
+            "TASK_BINDING_PEER_UPGRADE_REQUIRED", { message: "Task binding negotiation rejected; no work was sent.", effect: "not_started", retryHint: "fix_input" });
+        }
+        throw this.bindingUnavailable(link.peerId, error);
+      });
+    this.bindingPeers.set(link, probe);
+    return probe;
+  }
   private notePeerSuccess(node: string): void {
     this.peerHealth.set(node, { lastSuccessAt: Date.now(), consecutiveFailures: 0 });
   }
@@ -377,7 +424,13 @@ export class FederationRuntime extends EventEmitter {
     onProgress?: (notification: PeerProgressNotification) => void | Promise<void>, signal?: AbortSignal) {
     const link = this.transport.links.get(node);
     if (!link) return undefined;
-    return { get connected() { return link.connected; }, call: (timeout: number) => {
+    return { get connected() { return link.connected; }, call: async (timeout: number) => {
+      const started = performance.now();
+      const invocation = method === "tool" ? (params as { extra?: { trustedInvocation?: TrustedInvocationEnvelope } }).extra?.trustedInvocation
+        : method === "artifact.copy" ? (params as { context?: TrustedInvocationEnvelope }).context : undefined;
+      if (invocation?.task_binding_version === 1) await this.taskBindingPeer(link, timeout);
+      const remaining = timeout - (performance.now() - started);
+      if (remaining <= 0) throw this.bindingUnavailable(node);
       let request = params;
       if (method === "tool" && isIdempotentPeerRequest(method, params)) {
         const input = params as { extra?: JsonRecord };
@@ -386,9 +439,9 @@ export class FederationRuntime extends EventEmitter {
         const declared = Number(meta?.[TOOL_DEADLINE_META]);
         // 每次只读尝试共享调用者期限，同时不得在该次 RPC 超时后继续堆积远端观察。
         request = { ...input, extra: { ...extra, _meta: { ...meta,
-          [TOOL_DEADLINE_META]: Math.min(Number.isFinite(declared) ? declared : Infinity, Date.now() + timeout) } } };
+          [TOOL_DEADLINE_META]: Math.min(Number.isFinite(declared) ? declared : Infinity, Date.now() + remaining) } } };
       }
-      return link.call<T>(method, request, timeout, onProgress, signal);
+      return link.call<T>(method, request, remaining, onProgress, signal);
     }, close: () => link.close() };
   }
   async request<T = unknown>(node: string, method: string, params: unknown, timeoutMs?: number,
@@ -422,11 +475,8 @@ export class FederationRuntime extends EventEmitter {
   private async invokeAcceptedTool(name: string, input: JsonRecord, extra: JsonRecord): Promise<unknown> {
     const deadlineAt=toolDeadline(name,input,extra._meta);
     remainingToolTime(deadlineAt);
-    // Workspace registration may be replay-safe but still commits durable
-    // membership/baseline state. Only observation work follows client aborts.
-    const cancellable = name !== "open_workspace" && name !== "attach_workspace"
-      && isIdempotentPeerRequest("tool", { name, input });
-    if (!cancellable) {
+    // Accepted durable work outlives the transport that returned its receipt.
+    if (!isCancellableToolObservation(name, input)) {
       const { signal: _transportSignal, ...durableExtra } = extra;
       return this.invokeToolBody(name, input, durableExtra, deadlineAt);
     }
@@ -532,20 +582,18 @@ export class FederationRuntime extends EventEmitter {
       const selected = selectRoot(this.nodes(), input.root_id); node = selected.node.id; args.root_id = selected.root.id;
     } else if (name === "attach_workspace" && typeof input.root_id === "string") {
       const selected = selectRoot(this.nodes(), input.root_id); node = selected.node.id; args.root_id = selected.root.id;
-    } else if (name.startsWith("qm_")) {
+    } else if (sessionToolRoute(name) === "member") {
       const detail = await this.sessionFeed?.fetchDetail(name, input, extra);
       if (detail !== undefined) return detail;
-      if (name !== "qm_session") {
-        const routedNode = this.sessionRouteFor(input);
-        if (routedNode) node = routedNode;
-      }
-    } else if (typeof input.workspace_id === "string") {
+      const routedNode = this.sessionRouteFor(input);
+      if (routedNode) node = routedNode;
+    } else if (sessionToolRoute(name) !== "task" && typeof input.workspace_id === "string") {
       const handle = parseWorkspaceHandle(input.workspace_id);
       if (handle) { node = handle.node; args.workspace_id = handle.local; }
     }
     // Credentials and transport callbacks never become RPC arguments.
     const trusted = extra.trustedInvocation as TrustedInvocationEnvelope | undefined
-      ?? this.trustedInvocation(name, input, extra);
+      ?? await this.trustedInvocation(name, input, extra);
     const attempt = currentInvocation();
     const trustedInvocation = trusted && attempt?.tool_name === name && attempt.owner_id === trusted.owner_id
       && String(attempt.request_id) === trusted.request_id
@@ -561,24 +609,46 @@ export class FederationRuntime extends EventEmitter {
       requestId: identity.request_id,
       sessionId: identity.transport_session_id,
       ...(trustedInvocation ? { trustedInvocation } : {}),
-      ...(identity.owner_id ? { authInfo: { clientId: identity.client_id, extra: {
+      ...(identity.owner_id ? { authInfo: retainLocalTaskClient(node === this.localId ? extra.authInfo as {clientId?: string; extra?: Record<string, unknown>} : undefined,
+        { clientId: identity.client_id as string | undefined, extra: {
         owner_id: identity.owner_id, transport_instance_id: identity.transport_instance_id,
-      } } } : {}) };
+      } }) } : {}) };
     let progress = 0;
     const onProgress = progressToken !== undefined && typeof extra.sendNotification === "function"
       ? (notification: PeerProgressNotification) => (extra.sendNotification as (notification: PeerProgressNotification) => Promise<void>)({
         method: "notifications/progress", params: { progressToken, progress: progress++,
           ...(notification.params.message ? { message: notification.params.message } : {}) },
       }) : undefined;
-    const signal = extra.signal instanceof AbortSignal ? extra.signal : undefined;
+    // A stateless MCP response can close while the recorder still owns this RPC.
+    // Propagate caller cancellation only for observations; durable work keeps its
+    // original operation identity and bounded RPC deadline until its result is saved.
+    const signal = isCancellableToolObservation(name, args) && extra.signal instanceof AbortSignal
+      ? extra.signal : undefined;
     const query=()=>this.request(node, "tool", { name, input: args, extra: context }, remainingToolTime(deadlineAt), onProgress, signal);
-    const result = name==="workspace_context" && this.sessionFeed
-      ? await this.sessionFeed.recoverOperationStatus(input,trustedInvocation,node,query)
-      : await query();
-    if ((result as JsonRecord | null)?.isError !== true) {
-      await this.sessionFeed?.afterRemoteResult(name, args, result, node, trustedInvocation);
+    const dispatch = async () => {
+      const result = name==="workspace_context" && this.sessionFeed
+        ? await this.sessionFeed.recoverOperationStatus(input,trustedInvocation,node,query)
+        : await query();
+      if ((result as JsonRecord | null)?.isError !== true) {
+        await this.sessionFeed?.afterRemoteResult(name, args, result, node, trustedInvocation);
+        if (node !== this.localId && this.sessionFeed && trustedInvocation?.task_id
+          && (name === "open_workspace" || name === "attach_workspace")) {
+          return this.sessionFeed.workspaceResultForEntry(result, extra, trustedInvocation.task_id);
+        }
+      }
+      return result;
+    };
+    if (node !== this.localId && this.sessionFeed && trustedInvocation?.task_id
+      && (name === "open_workspace" || name === "attach_workspace")) {
+      // The first remote member does not exist at the authority until its reply.
+      // Keep the captured Task busy through that reply and validate it before
+      // dispatch, so finalization cannot close or remirror it during first open.
+      return this.execution.withWork({ kind: "tool", taskId: trustedInvocation.task_id }, async () => {
+        await this.sessionFeed!.admitTaskWork(trustedInvocation);
+        return dispatch();
+      });
     }
-    return result;
+    return dispatch();
   }
   private async openGatewayStream(service: "ingress" | "egress"): Promise<Duplex> {
     const node = service === "ingress"
@@ -659,30 +729,74 @@ export class FederationRuntime extends EventEmitter {
     if (!source || !destination) throw new Error("请从 open_workspace 获取源和目标 workspace_id");
     const requestKey=typeof input.request_key==="string"?input.request_key:undefined;
     if(!requestKey || requestKey.length>128)throw new Error("COPY_REQUEST_KEY_REQUIRED");
-    const context=extra ? this.trustedInvocation("copy_artifact",{workspace_id:input.destination_workspace_id},extra) : undefined;
+    const context=extra ? await this.trustedInvocation("copy_artifact",{workspace_id:input.destination_workspace_id},extra) : undefined;
     if(extra && !context)throw new Error("COPY_TASK_CONTEXT_REQUIRED");
     const request = { sourceNode: source.node, sourceWorkspace: source.local,
       sourcePath: input.source_path, destinationWorkspace: destination.local, destinationPath: input.destination_path,
       overwrite: input.overwrite === true, requestKey, context };
     if (context) {
-      try { await this.sessionFeed?.recordTaskWork(context); }
-      catch (admissionError) {
-        const code = errorCode(admissionError);
-        if (code !== "TASK_NOT_ACTIVE" && code !== "TASK_FINISHING") throw admissionError;
-        // 结束任务只查询原回执；旧节点不支持查询时也绝不回退为启动复制。
-        let saved: TransferView | null;
-        try { saved = await this.request<TransferView | null>(destination.node, "artifact.lookup", request); }
-        catch (lookupError) {
-          if (errorCode(lookupError) === "COPY_REQUEST_KEY_REUSED") throw Object.assign(lookupError as Error, { effect: "not_started" });
-          throw Object.assign(new Error("COPY_RECEIPT_LOOKUP_FAILED: 未发送新的复制请求；原回执暂时无法查询，请检查目标节点连接和版本。", { cause: lookupError }),
-            { code: "COPY_RECEIPT_LOOKUP_FAILED", effect: "not_started", details: { task_id: context.task_id, owner_node_id: destination.node,
-              admission_error: code, lookup_error: errorCode(lookupError) } });
-        }
-        if (saved) return saved;
-        throw admissionError;
+      // A saved copy key is a receipt replay, not a new decision to continue the
+      // Task. Resolve it before safe-intent retirement, just like executeRecorded.
+      let saved: TransferView | null;
+      try {
+        saved = await this.request<TransferView | null>(destination.node, "artifact.lookup", request);
+      } catch (error) {
+        if (errorCode(error) === "COPY_REQUEST_KEY_REUSED")
+          throw Object.assign(error as Error, { effect: "not_started" });
+        throw Object.assign(
+          new Error("COPY_RECEIPT_LOOKUP_FAILED: No new copy was sent; check the original key and destination before retrying.", { cause: error }),
+          {
+            code: "COPY_RECEIPT_LOOKUP_FAILED",
+            effect: "not_started",
+            details: {
+              task_id: context.task_id,
+              owner_node_id: destination.node,
+              lookup_error: errorCode(error)
+            }
+          }
+        );
       }
+      if (saved) return saved;
     }
-    return this.request(destination.node, "artifact.copy", request);
+    const dispatch = async () => {
+      if (context) {
+        try {
+          await this.sessionFeed?.recordTaskWork(context);
+        } catch (admissionError) {
+          const code = errorCode(admissionError);
+          if (code !== "TASK_NOT_ACTIVE" && code !== "TASK_FINISHING") throw admissionError;
+          // 结束任务只查询原回执；旧节点不支持查询时也绝不回退为启动复制。
+          let saved: TransferView | null;
+          try {
+            saved = await this.request<TransferView | null>(destination.node, "artifact.lookup", request);
+          } catch (lookupError) {
+            if (errorCode(lookupError) === "COPY_REQUEST_KEY_REUSED")
+              throw Object.assign(lookupError as Error, { effect: "not_started" });
+            throw Object.assign(
+              new Error("COPY_RECEIPT_LOOKUP_FAILED: 未发送新的复制请求；原回执暂时无法查询，请检查目标节点连接和版本。", { cause: lookupError }),
+              {
+                code: "COPY_RECEIPT_LOOKUP_FAILED",
+                effect: "not_started",
+                details: {
+                  task_id: context.task_id,
+                  owner_node_id: destination.node,
+                  admission_error: code,
+                  lookup_error: errorCode(lookupError)
+                }
+              }
+            );
+          }
+          if (saved) return saved;
+          throw admissionError;
+        }
+      }
+      return this.request(destination.node, "artifact.copy", request);
+    };
+    // Cover authority admission through the owner receipt. The Worker separately
+    // owns its accepted transfer lease until the copy itself reaches a terminal state.
+    return context?.task_id
+      ? this.execution.withWork({ kind: "transfer", taskId: context.task_id }, dispatch)
+      : dispatch();
   }
   private async startCopy(input: JsonRecord): Promise<TransferView> {
     if(this.stopped || !this.config.capabilities.worker)throw new Error("WORKER_CAPABILITY_UNAVAILABLE");

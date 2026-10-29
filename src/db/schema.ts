@@ -332,6 +332,9 @@ export const quaymeshInvocations = sqliteTable(
     effect: text("effect").notNull(),
     resultRef: text("result_ref"),
     resultJson: text("result_json"),
+    responseAt: text("response_at"),
+    responseJson: text("response_json"),
+    responseUsesResult: integer("response_uses_result").notNull().default(0),
     createdAt: text("created_at").notNull(),
     finishedAt: text("finished_at"),
   },
@@ -421,6 +424,7 @@ export const quaymeshFileChanges = sqliteTable(
     revertible: integer("revertible").notNull().default(0),
     patchRef: text("patch_ref").notNull(),
     createdAt: text("created_at").notNull(),
+    recordedAt: integer("recorded_at"),
   },
   (table) => [
     primaryKey({ columns: [table.sessionId, table.memberId, table.versionRef, table.fileId] }),

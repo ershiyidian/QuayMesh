@@ -152,7 +152,8 @@ test("真实双节点 HTTP：查询不恢复已清理工作树，授权的显式
 
   for (const [meta, expected] of [
     [otherMeta, "WORKSPACE_SESSION_MISMATCH"],
-    [originalMeta, "SESSION_SCOPE_MISMATCH"],
+    // The selected Task rejects a foreign canonical Session before the Worker restore RPC.
+    [originalMeta, "TASK_SESSION_MISMATCH"],
   ] as const) {
     const refused = await raw("attach_workspace", { workspace_id, session_id: otherTask.session_id }, meta);
     assert.equal(refused.isError, true, JSON.stringify(refused));
@@ -185,7 +186,9 @@ test("真实双节点 HTTP：查询不恢复已清理工作树，授权的显式
 
   // 新任务只在入口创建并完成，worker 没见过它；恢复前不能把它首次镜像为 active。
   await call("finish_task", { task_id: task.task_id, status: "completed", summary: "原工作树任务已完成" });
-  const closedTask = await call("start_session", { title: "未访问 worker 的任务", request_key: randomUUID() });
+  const selection = await call("task_resume", { action: "inspect", task_id: task.task_id });
+  const closedTask = await call("start_session", { title: "未访问 worker 的任务", request_key: randomUUID(),
+    new_goal: true, expected_binding_revision: selection.binding.binding_revision });
   const finished = await call("finish_task", { task_id: closedTask.task_id, status: "completed", summary: "入口任务完成" });
   assert.equal(finished.state, "closed");
   const prunedAgain = await cleanupManagedWorktrees({ store,

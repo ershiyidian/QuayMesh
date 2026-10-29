@@ -1,7 +1,10 @@
-import { activityAgeText, cardPresentation, commandTiming, durationText, hasBackground, type CardStatus } from "./timing.js";
+import { activityAgeText, cardPresentation, commandTiming, durationText, hasBackground, isFinal, taskActivityAt, type CardPresentation, type CardStatus } from "./timing.js";
 import type { AgentSummary, CommandSummary, FileSummary, InstructionSummary, Snapshot } from "../../session/types.js";
 import { safeConsoleUrl } from "../console/validation.js";
+import { fullTime, timeZone, validTime } from "../console-v5/format.js";
 import { escapeCode, parseFilePatch } from "./diff.js";
+import { renderTaskMessagePanel } from "./message-panel.js";
+import { canContinueTask } from "./task-binding.js";
 import {
   applyCommandOutput, appendPage, applySnapshot, diffCacheKey, resetAfterRevert,
   selectedAgents, selectedCommands, selectedFiles, selectedInstructions,
@@ -17,8 +20,15 @@ export type CardIntent=
   |{type:"revert";expectedRev:number}
   |{type:"open_link";url:string}
   |{type:"display_mode";mode:"inline"|"fullscreen"}
+  |{type:"task_messages";beforeSequence?:number|null}
+  |{type:"send_task_message"}
+  |{type:"inspect_task_binding"}
+  |{type:"resume_task"}
+  |{type:"request_host_resume"}
+  |{type:"tab_changed"}
   |{type:"continue_session";agentId?:string};
 export type CardIntentHandler=(intent:CardIntent)=>Promise<unknown>;
+export type CardContinuationResult={sent:true}|{sent:false;reason:"busy"};
 
 export interface CardView {
   render(): void;
@@ -62,9 +72,24 @@ export function createCardView(doc: Document, state: CardState, onIntent:CardInt
     if(next===undefined)return;
     event.preventDefault();
     const button=list[(next+list.length)%list.length];
-    if(button){state.tab=(button.dataset.tab??"changes") as CardTab;render();button.focus();}
+    if(button){state.tab=(button.dataset.tab??"changes") as CardTab;render();button.focus();void onIntent({type:"tab_changed"}).catch(error=>note(errorMessage(error)));}
+  };
+  const input=(event:Event)=>{
+    const target=event.target;
+    if(target instanceof Element&&target.id==="task-message-draft"){
+      state.messages.draft=(target as HTMLTextAreaElement).value;
+      state.messages.sendNotice=null;
+      renderPanel();
+    }
+  };
+  const submit=(event:Event)=>{
+    if(event.target instanceof Element&&event.target.id==="task-message-form"){
+      event.preventDefault();void onIntent({type:"send_task_message"}).catch(error=>note(errorMessage(error)));
+    }
   };
   card.addEventListener("click",click);
+  card.addEventListener("input",input);
+  card.addEventListener("submit",submit);
   header.addEventListener("click",headerClick);
   tabs.addEventListener("keydown",keydown);
 
@@ -90,10 +115,10 @@ export function createCardView(doc: Document, state: CardState, onIntent:CardInt
     const statusElement=required<HTMLElement>(doc,"#stIc");
     if(statusElement.dataset.status!==presentation.status){statusElement.innerHTML=statusIcon(presentation.status);statusElement.dataset.status=presentation.status;}
     setText(required<HTMLElement>(doc,"#title"),snapshot.title);
-    required<HTMLElement>(doc,"#title").title=snapshot.sourceTaskId?`接续任务 ${snapshot.sourceTaskId}`:snapshot.title;
+    required<HTMLElement>(doc,"#title").title=snapshot.sourceTaskId?`来源任务 ${snapshot.sourceTaskId}`:snapshot.title;
     const workspace=snapshot.workspaces[0];
     const ws=required<HTMLElement>(doc,"#ws");
-    setText(ws,workspace?`${snapshot.sourceTaskId?"接续 · ":""}${workspace.node_id}/${shortPath(workspace.root)}`:"等待工作区");
+    setText(ws,workspace?`${snapshot.sourceTaskId?"来源 · ":""}${workspace.node_id}/${shortPath(workspace.root)}`:"等待工作区");
     ws.title=snapshot.workspaces.map(item=>`${item.node_id}: ${item.root}`).join("\n");
     const running=snapshot.runningCommand??snapshot.commands.find(command=>command.status==="run"||command.status==="queued")??null;
     const lastCommand=snapshot.lastCommand??snapshot.currentCommand??null;
@@ -101,6 +126,8 @@ export function createCardView(doc: Document, state: CardState, onIntent:CardInt
     const label=running?.cmd??lastCommand?.cmd??snapshot.lastOperation?.label??presentation.label;
     activity.className=`act${running?" mono":""}${["stalled","failed","unavailable","finalizing","archived"].includes(presentation.status)?" tone":""}`;
     if(snapshot.taskState==='closed')
+      setText(activity,`${presentation.label}${presentation.backgroundLabel?` · ${presentation.backgroundLabel}`:''}`);
+    else if(presentation.status==='active')
       setText(activity,`${presentation.label}${presentation.backgroundLabel?` · ${presentation.backgroundLabel}`:''}`);
     else if(presentation.status==='idle'||presentation.status==='stalled'||presentation.status==='unavailable')
       setText(activity,presentation.label);
@@ -112,32 +139,46 @@ export function createCardView(doc: Document, state: CardState, onIntent:CardInt
     const stats=required<HTMLElement>(doc,"#stats"),statsMarkup=`<span class="nf">${snapshot.totals.files} 文件</span><span>${snapshot.totals.commands} 命令</span>${snapshot.totals.agents?`<span>${snapshot.totals.agents} 代理</span>`:""}<span class="add mono">+${adds??"?"}</span><span class="del mono">−${dels??"?"}</span>`;
     if(stats.innerHTML!==statsMarkup)stats.innerHTML=statsMarkup;
     const clock=required<HTMLElement>(doc,"#clock");
-    setText(clock,presentation.taskElapsedMs===null?"耗时未确认":`${presentation.taskClockLabel} ${durationText(Math.floor(presentation.taskElapsedMs/1000)*1000)}`);
-    clock.title=presentation.taskClockLabel;
+    setText(clock,presentation.taskElapsedMs===null?`${presentation.taskClockLabel}未确认`:`${presentation.taskClockLabel} ${durationText(Math.floor(presentation.taskElapsedMs/1000)*1000)}`);
+    clock.title=snapshot.taskId ? '任务历时：从创建起计算，包含等待和节点离线时间' : '记录历时：从历史记录创建起计算';
     clock.dataset.dynamic=String(presentation.taskClockDynamic);
-    const prog=required<HTMLElement>(doc,"#prog");
-    setText(prog,`最近活动 ${activityAgeText(presentation.activityAgeMs)}`);
     const bar=required<HTMLElement>(doc,"#bar");
     bar.classList.toggle("indet",presentation.commandClockDynamic);
     bar.style.setProperty("--p",snapshot.taskResult||snapshot.closureReason?"1":"0");
-    if(state.connection==="error"){
-      prog.textContent=`更新延迟 · 上次确认 ${activityAgeText(now-presentation.confirmedAt)}`;
-      prog.title=`正在重新读取状态；上次确认 ${new Date(presentation.confirmedAt).toLocaleString()}`;
+    renderRecency(snapshot,presentation,now);
+  }
+
+  function renderRecency(snapshot:Snapshot,presentation:CardPresentation,now:number):void {
+    const prog=required<HTMLElement>(doc,"#prog"),activityAt=taskActivityAt(snapshot);
+    const recent=activityAt===null?"暂无任务活动":`最近活动 ${activityAgeText(Math.max(0,now-activityAt))}`;
+    const confirmed=`上次确认 ${activityAgeText(Math.max(0,now-presentation.confirmedAt))}`;
+    let confirmation=confirmed,note="";
+    if(state.connection==="unconfirmed"){
+      confirmation=`数据未确认 · ${confirmed}`;
+      note="首次状态读取未确认，自动重试已暂停；重新打开卡片可重试。";
+    }else if(state.connection==="error"){
+      confirmation=`更新延迟 · ${confirmed}`;
+      note="正在重新读取状态";
     }else if(presentation.observationStale){
-      prog.textContent=`${presentation.status==='running'?'部分状态待更新 · ':''}上次确认 ${activityAgeText(now-presentation.confirmedAt)}`;
-      prog.title=new Date(presentation.confirmedAt).toLocaleString();
+      confirmation=`${presentation.backgroundStatus==='running'?'部分状态待更新 · ':''}${confirmed}`;
     }else if(snapshot.host_status==='disconnected'){
-      prog.textContent=['running','queued'].includes(presentation.backgroundStatus)?'节点连接异常 · 仍有后台执行'
+      const connection=['running','queued'].includes(presentation.backgroundStatus)?'节点连接异常 · 仍有后台执行'
         :snapshot.taskState==='closed'&&snapshot.taskResult?'节点暂不可达 · 交付结果已保存':'节点暂不可达';
-      prog.title='';
+      confirmation=`${connection} · ${confirmed}`;
     }else if(snapshot.taskState!=='closed'&&snapshot.finalization&&presentation.status==='running'){
-      prog.textContent=snapshot.finalization.state==='failed'?'交付确认失败':'交付确认中';
-      prog.title=snapshot.finalization.error??'';
-    }else prog.title='';
+      confirmation=`${snapshot.finalization.state==='failed'?'交付确认失败':'交付确认中'} · ${confirmed}`;
+      note=snapshot.finalization.error??'';
+    }
+    setText(prog,`${recent}\n${confirmation}`);
+    prog.title=[activityAt===null?"暂无任务活动":`最近活动 ${new Date(activityAt).toLocaleString()}`,
+      `上次确认 ${new Date(presentation.confirmedAt).toLocaleString()}`,note].filter(Boolean).join("\n");
   }
 
   function renderActions(snapshot:Snapshot):void {
     const box=required<HTMLElement>(doc,"#acts"),parts:string[]=[];
+    if(state.taskResume.available&&snapshot.taskState!=="closed"&&!canContinueTask(state))
+      parts.push(`<button class="ib" data-act="binding-open" aria-label="查看任务关联并恢复"${state.busy?" disabled":""}>${state.taskResume.requiresInspection?"检查关联":"恢复任务"}</button>`);
+    if(snapshot.taskId)parts.push('<button class="ib" data-act="messages-open" aria-label="与 GPT 对话">对话</button>');
     if(snapshot.totals.files>0)parts.push(`<button class="ib" data-act="copy-patch" aria-label="复制补丁" title="复制补丁">${icon("copy")}</button>`);
     const url=safeConsoleUrl(snapshot.consoleUrl??undefined);
     if(url)parts.push(`<button class="ib" data-act="review" data-url="${esc(url)}" aria-label="打开完整详情" title="打开完整详情">${icon("max")}</button>`);
@@ -163,6 +204,7 @@ export function createCardView(doc: Document, state: CardState, onIntent:CardInt
   function renderPanel():void {
     if(state.collapsed||!state.inViewport||doc.hidden||!state.snapshot)return;
     const panel=required<HTMLElement>(doc,`#p-${state.tab}`);
+    if(state.tab==="messages"){renderTaskMessagePanel(panel,state);return;}
     const markup=panelMarkup();
     if(panel.innerHTML!==markup){panel.innerHTML=markup;panel.classList.remove("enter");void panel.offsetWidth;panel.classList.add("enter");}
   }
@@ -187,7 +229,8 @@ export function createCardView(doc: Document, state: CardState, onIntent:CardInt
         else if(cached.error)body=`<div class="code"><div class="x">${esc(cached.error)}</div></div>`;
         else body=`<div class="code">${(cached.rows??[]).map(row=>`<div class="${row.kind==="add"?"a":row.kind==="delete"?"d":row.kind==="header"?"h":""}">${esc(row.text)||" "}</div>`).join("")||'<div class="x">无文本差异</div>'}</div>`;
       }
-      return `<div class="grp"><button class="row" data-x="${key}" aria-expanded="${open}">${icon("chev","chev")}<span class="fs ${file.status}">${file.status}</span><span class="path" title="${esc(file.path)}"><span class="dir">${esc(path.slice(0,split))}</span>${esc(path.slice(split))}</span><span class="num"><span class="add">+${file.additions??"?"}</span> <span class="del">−${file.removals??"?"}</span></span></button>${body}</div>`;
+      const recorded=validTime(file.recordedAt)?recordTime("记录",file.recordedAt):'<span class="row-time">时间未记录</span>';
+      return `<div class="grp"><button class="row" data-x="${key}" aria-expanded="${open}">${icon("chev","chev")}<span class="fs ${file.status}">${file.status}</span><span class="path" title="${esc(file.path)}"><span class="dir">${esc(path.slice(0,split))}</span>${esc(path.slice(split))}</span><span class="num"><span class="add">+${file.additions??"?"}</span> <span class="del">−${file.removals??"?"}</span></span></button><div class="row-times">${recorded}</div>${body}</div>`;
     }).join("")+more;
   }
 
@@ -200,7 +243,8 @@ export function createCardView(doc: Document, state: CardState, onIntent:CardInt
       const timing=commandTiming(state.snapshot!,command,cardNow(state));
       const duration=commandDurationLabel(command,timing);
       const displayedStatus=command.status==='run'&&!timing.dynamic?'unknown':command.status;
-      return `<div class="grp"><button class="row" data-x="${key}" aria-expanded="${open}" ${command.status==="queued"?"disabled":""}>${icon("chev","chev")}<span class="cs ${statusClass(displayedStatus)}">${commandIcon(displayedStatus)}</span><span class="path" title="${esc(command.cmd)}">${esc(command.cmd)}</span><time class="num" data-command-id="${esc(command.id)}">${duration}</time></button>${body}</div>`;
+      const timestamps=`<div class="row-times">${recordTime("开始",command.startedAt)}${recordTime("结束",command.endedAt,command.status==="run"||command.status==="queued"?"未结束":"未知")}</div>`;
+      return `<div class="grp"><button class="row" data-x="${key}" aria-expanded="${open}" ${command.status==="queued"?"disabled":""}>${icon("chev","chev")}<span class="cs ${statusClass(displayedStatus)}">${commandIcon(displayedStatus)}</span><span class="path" title="${esc(command.cmd)}">${esc(command.cmd)}</span><time class="num" data-command-id="${esc(command.id)}">${duration}</time></button>${timestamps}${body}</div>`;
     }).join("")+more;
   }
 
@@ -212,7 +256,7 @@ export function createCardView(doc: Document, state: CardState, onIntent:CardInt
 
   function contextMarkup():string {
     const snapshot=state.snapshot;if(!snapshot)return"";
-    const rows:Array<[string,string]>=[["Session",snapshot.sessionId],["Task",snapshot.taskId??""],["状态",cardPresentation(snapshot,cardNow(state)).label]];
+    const rows:Array<[string,string]>=[["任务",snapshot.taskId??""],["状态",cardPresentation(snapshot,cardNow(state)).label]];
     for(const workspace of snapshot.workspaces)rows.push([workspace.node_id,workspace.root]);
     let html=rows.map(([key,value])=>kv(key,value)).join("");
     const instructions=selectedInstructions(state);
@@ -229,12 +273,29 @@ export function createCardView(doc: Document, state: CardState, onIntent:CardInt
 
   async function handleAction(action:string,button:HTMLElement):Promise<void>{
     if(action==="toggle"){await toggleCard();return;}
-    if(action==="tab"){state.tab=(button.dataset.tab??"changes") as CardTab;render();return;}
+    if(action==="tab"){state.tab=(button.dataset.tab??"changes") as CardTab;render();await onIntent({type:"tab_changed"});return;}
+    if(action==="messages-open"||action==="binding-open"){
+      state.tab="messages";
+      if(state.collapsed)await toggleCard();else render();
+      await onIntent({type:"tab_changed"});
+      if(action==="binding-open")doc.querySelector<HTMLButtonElement>(".task-binding button:not([hidden]):not(:disabled)")?.focus();
+      else required<HTMLTextAreaElement>(doc,"#task-message-draft").focus();
+      return;
+    }
+    if(action==="binding-inspect"){await onIntent({type:"inspect_task_binding"});return;}
+    if(action==="binding-resume"){await onIntent({type:"resume_task"});return;}
+    if(action==="binding-host"){await onIntent({type:"request_host_resume"});return;}
+    if(action==="messages-refresh"){await onIntent({type:"task_messages"});return;}
+    if(action==="messages-older"){const before=state.messages.nextBeforeSequence;if(before!==null)await onIntent({type:"task_messages",beforeSequence:before});return;}
+    if(action==="messages-latest"){await onIntent({type:"task_messages",beforeSequence:null});return;}
     if(action==="copy-patch"){const text=await onIntent({type:"copy_patch"});note(await copyText(String(text??""))?`已复制补丁 · ${(String(text??"").length/1024).toFixed(1)} KB`:"宿主拒绝访问剪贴板");return;}
     if(action==="review"){const url=safeConsoleUrl(button.dataset.url??state.snapshot?.consoleUrl??undefined);if(url)await onIntent({type:"open_link",url});return;}
     if(action==="revert"){await revert();return;}
     if(action==="more"){await onIntent({type:"load_more",kind:button.dataset.kind as "files"|"commands"|"agents"});return;}
-    if(action==="continue-session"){await onIntent({type:"continue_session",agentId:button.dataset.id});note("已发送继续请求");}
+    if(action==="continue-session"){
+      const result=await onIntent({type:"continue_session",agentId:button.dataset.id}) as CardContinuationResult|undefined;
+      if(result?.sent===true)note("已发送继续请求");
+    }
   }
 
   async function toggleDetail(key:string):Promise<void>{
@@ -265,8 +326,12 @@ export function createCardView(doc: Document, state: CardState, onIntent:CardInt
 
   function fillTimers():void{
     const snapshot=state.snapshot;if(!snapshot)return;
-    renderSummary(snapshot);
     const now=cardNow(state);
+    if(isFinal(snapshot,now)){
+      renderRecency(snapshot,cardPresentation(snapshot,now),now);
+      return;
+    }
+    renderSummary(snapshot);
     const commands=new Map(selectedCommands(state).map(command=>[command.id,command]));
     for(const timer of doc.querySelectorAll<HTMLElement>("[data-command-id]")){
       const command=commands.get(timer.dataset.commandId??'');if(!command)continue;
@@ -287,6 +352,7 @@ export function createCardView(doc: Document, state: CardState, onIntent:CardInt
   }
   function dispose():void{
     card.removeEventListener("click",click);header.removeEventListener("click",headerClick);tabs.removeEventListener("keydown",keydown);
+    card.removeEventListener("input",input);card.removeEventListener("submit",submit);
     clearTimeout(noteTimer);clearTimeout(revertTimer);
   }
   return{render,renderPanel,renderFooter,fillTimers,dispose};
@@ -314,6 +380,12 @@ function $$<T extends Element>(selector:string,root:ParentNode):T[]{return[...ro
 function esc(value:unknown):string{return escapeCode(String(value??""));}
 function errorMessage(error:unknown):string{return error instanceof Error?error.message:String(error);}
 function cardNow(state:CardState):number{const candidate=Date.now()+state.clockOffsetMs;state.lastNowMs=Math.max(state.lastNowMs,candidate);return state.lastNowMs;}
+const deviceTimeZone=Intl.DateTimeFormat().resolvedOptions().timeZone;
+function recordTime(label:string,value:number|null|undefined,missing="未知"):string{
+  if(!validTime(value))return `<span class="row-time">${esc(label)} ${esc(missing)}</span>`;
+  const text=fullTime(value),title=`${text} · ${timeZone()??deviceTimeZone}`;
+  return `<span class="row-time">${esc(label)} <time datetime="${new Date(value).toISOString()}" title="${esc(title)}">${esc(text)}</time></span>`;
+}
 
 function setText(element:HTMLElement,value:string):void{if(element.textContent!==value)element.textContent=value;}
 

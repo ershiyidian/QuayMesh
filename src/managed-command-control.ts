@@ -13,7 +13,7 @@ export async function cancelManagedCommand(input: {
   if (["completed", "failed", "cancelled"].includes(recorded.status)) {
     return { operation_id: operationId, state: recorded.status, cancel_requested: false };
   }
-  const saved = runtime.store.findInvocationByOperation(ownerId, operationId);
+  const saved = runtime.store.findInvocationSummaryByOperation(ownerId, operationId);
   if (!saved) throw Object.assign(new Error("命令缺少对应的调用身份，请核对原操作"), { code: "COMMAND_IDENTITY_UNKNOWN", effect: "unknown" });
   if (saved.effect === "not_started" && !active) {
     const result = jsonReply({ operation_id: operationId, result: "命令在启动前已取消。", running: false,

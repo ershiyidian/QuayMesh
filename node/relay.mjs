@@ -1,6 +1,6 @@
 import http from "node:http";
 import https from "node:https";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createAgent } from "./network.mjs";
 
 const HOP_HEADERS = new Set(["connection","keep-alive","proxy-authenticate","proxy-authorization","te","trailer","transfer-encoding","upgrade"]);
@@ -14,6 +14,65 @@ const CONSOLE_REQUEST_HEADERS = ["accept","content-type","cookie","origin","refe
 const CONSOLE_RESPONSE_HEADERS = ["content-type","content-length","cache-control","etag","last-modified","set-cookie","location","content-disposition","content-security-policy","x-content-type-options","referrer-policy"];
 const CONSOLE_RECOVERY_SCRIPT = 'const reconnect=()=>location.reload();document.getElementById("reconnect").addEventListener("click",reconnect);setTimeout(reconnect,5000);';
 const CONSOLE_RECOVERY_SCRIPT_HASH = createHash("sha256").update(CONSOLE_RECOVERY_SCRIPT).digest("base64");
+const RELAY_ERROR_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ECONNABORTED", "ETIMEDOUT", "EPIPE", "ENOTFOUND", "EAI_AGAIN", "ERR_STREAM_PREMATURE_CLOSE", "MCP_RESPONSE_TIMEOUT"]);
+
+// Observe body bytes, never retain them. Local finish is not a tunnel/host acknowledgement.
+function traceRelayExchange(req, res, origin, record) {
+  const context = { relayTraceId: randomUUID(), upstreamOrigin: origin.origin };
+  const started = performance.now(), hash = createHash("sha256");
+  let done = false, upstreamRequestCreated = false, reply, responseBytes = 0;
+  let headersMs = null, firstByteMs = null, failurePhase, errorCode;
+  const emit = (event, fields = {}) => {
+    try {
+      const pending = record(event, { ts: new Date().toISOString(), ...context, ...fields });
+      if (pending && typeof pending.then === "function") Promise.resolve(pending).catch(() => {});
+    } catch { /* Diagnostics must not change transport behavior. */ }
+  };
+  const failure = (phase, error) => {
+    if (done) return;
+    failurePhase ??= phase;
+    if (errorCode === undefined && error) errorCode = RELAY_ERROR_CODES.has(error.code) ? error.code : "other";
+  };
+  const capture = chunk => {
+    if (done) return;
+    if (firstByteMs === null && chunk.length) firstByteMs = Math.round(performance.now() - started);
+    responseBytes += chunk.length; hash.update(chunk);
+  };
+  const aborted = () => failure("request_aborted");
+  const finish = () => {
+    if (done) return;
+    done = true;
+    reply?.off("data", capture);
+    req.off("aborted", aborted);
+    res.off("finish", finish); res.off("close", finish);
+    const contentType = String(reply?.headers["content-type"] ?? "").split(";", 1)[0].trim().toLowerCase();
+    const encoding = reply?.headers["content-encoding"] ?? "identity";
+    emit("mcp_relay_finished", {
+      upstreamRequestCreated, httpStatus: res.statusCode, upstreamStatus: reply?.statusCode ?? null,
+      durationMs: Math.round(performance.now() - started), upstreamHeadersMs: headersMs, firstResponseByteMs: firstByteMs,
+      upstreamBodyBytes: responseBytes, upstreamBodySha256: hash.digest("hex"),
+      upstreamComplete: reply?.complete ?? null, upstreamReadableEnded: reply?.readableEnded ?? null,
+      upstreamAborted: reply?.aborted ?? null, downstreamFinished: res.writableFinished,
+      downstreamDestroyed: res.destroyed, requestAborted: req.aborted,
+      phase: failurePhase ?? (!upstreamRequestCreated ? "local_admission" : res.writableFinished ? "completed" : "downstream_closed"),
+      ...(errorCode === undefined ? {} : { errorCode }),
+      responseFormat: contentType === "text/event-stream" ? "sse" : contentType === "application/json" ? "json" : "other",
+      contentEncoding: ["identity", "gzip", "br", "deflate"].includes(encoding) ? encoding : "other",
+      hostAcknowledgment: "unknown",
+    });
+  };
+  req.once("aborted", aborted);
+  res.once("finish", finish); res.once("close", finish);
+  emit("mcp_relay_started");
+  return {
+    id: context.relayTraceId, failure,
+    requestCreated() { upstreamRequestCreated = true; },
+    response(value) {
+      reply = value; headersMs = Math.round(performance.now() - started);
+      if (!done) reply.on("data", capture);
+    },
+  };
+}
 
 function forwardedHeaders(headers) {
   const excluded = new Set(HOP_HEADERS);
@@ -47,10 +106,11 @@ function readBody(req) {
 }
 
 export class McpRelay {
-  constructor({ origin, host = "127.0.0.1", port = 17676, socksUrl, onError = () => {}, onSuccess = () => {}, consoleRpc, mcpResponseTimeoutMs = 125000 }) {
+  constructor({ origin, host = "127.0.0.1", port = 17676, socksUrl, onError = () => {}, onSuccess = () => {}, onExchange = () => {}, consoleRpc, mcpResponseTimeoutMs = 125000 }) {
     this.origin = new URL(origin);
     this.host = host; this.port = port; this.onError = onError;
     this.onSuccess = onSuccess; this.accepting = true; this.activeRequests = 0;
+    this.onExchange = onExchange;
     this.mcpResponseTimeoutMs = mcpResponseTimeoutMs;
     this.agent = createAgent(this.origin, { socksUrl });
     this.requests = new Set();
@@ -63,6 +123,8 @@ export class McpRelay {
 
   async route(req, res) {
     const pathname = new URL(req.url,"http://relay.local").pathname;
+    const trace = req.method === "POST" && ["/mcp", "/mcp/"].includes(pathname)
+      ? traceRelayExchange(req, res, this.origin, this.onExchange) : null;
     const health = req.method === "GET" && ["/readyz","/healthz"].includes(pathname);
     const discoveryMetadata = req.method === "GET" && DISCOVERY_METADATA_PATHS.has(pathname);
     if (!this.accepting && !health && !discoveryMetadata) {
@@ -96,7 +158,7 @@ export class McpRelay {
       await this.serveConsole(req, res, parsed);
       return;
     }
-    this.forward(req, res, parsed);
+    this.forward(req, res, parsed, trace);
   }
 
   // 页面、资源和 API 统一由 Coordinator 提供，避免本机旧页面配上新版接口。
@@ -157,31 +219,36 @@ export class McpRelay {
     res.writeHead(error.status || 503, { "content-type": "application/json", "retry-after": "2" }).end(JSON.stringify({ error: "coordinator_unavailable",message:error.message }));
   }
 
-  forward(req, res, parsed) {
+  forward(req, res, parsed, trace) {
     const startedAt=Date.now();
     const boundedMcp=req.method==="POST"&&["/mcp","/mcp/"].includes(parsed.pathname);
     const target = new URL(`${parsed.pathname}${parsed.search}`, this.origin);
     const headers = forwardedHeaders(req.headers);
     headers.host = this.origin.host;
+    // Replace caller-supplied correlation, independently of every business/auth identity.
+    if (trace) headers["x-quaymesh-relay-trace"] = trace.id;
     const client = target.protocol === "https:" ? https : http;
     const upstream = client.request(target, { method: req.method, headers, agent: this.agent }, (reply) => {
       clearTimeout(headerTimer);
       if (res.destroyed) { reply.destroy(); return; }
+      trace?.response(reply);
       res.writeHead(reply.statusCode || 502, forwardedHeaders(reply.headers));
       res.flushHeaders();
       // 已有响应头不代表最终结果已送达；上游半途断开要同步终止下游，
       // 不能留下一个永远等待 SSE 终止消息的 ChatGPT 请求。
       const interrupted = () => {
+        trace?.failure("upstream_incomplete");
         if (!res.writableFinished && !res.destroyed) res.destroy(new Error("Coordinator 响应流提前结束"));
       };
       reply.once("aborted", interrupted);
       reply.once("close", () => { if (!reply.complete) interrupted(); });
-      reply.once("error", error => { if (!res.destroyed) res.destroy(error); });
+      reply.once("error", error => { trace?.failure("upstream_response", error); if (!res.destroyed) res.destroy(error); });
       reply.pipe(res);
       if ((reply.statusCode || 502) < 500) res.once("finish", () => {
         if (reply.complete && !reply.aborted) this.onSuccess(`relay:${parsed.pathname}`);
       });
     });
+    trace?.requestCreated();
     this.requests.add(upstream);
     // 最终结果期限不随 SSE 心跳延长，GET 订阅流仍按连接生命周期管理。
     let responseTimer;
@@ -205,11 +272,15 @@ export class McpRelay {
     }
     res.once("finish",()=>clearTimeout(responseTimer));
     res.once("close",()=>clearTimeout(responseTimer));
-    const headerTimer = setTimeout(() => upstream.destroy(new Error("Coordinator 响应头超时")), ["/mcp", "/mcp/"].includes(parsed.pathname) ? 125000 : 30000);
+    const headerTimer = setTimeout(() => {
+      trace?.failure("header_timeout");
+      upstream.destroy(new Error("Coordinator 响应头超时"));
+    }, ["/mcp", "/mcp/"].includes(parsed.pathname) ? 125000 : 30000);
     headerTimer.unref();
     upstream.once("close", () => { clearTimeout(headerTimer); clearTimeout(responseTimer); this.requests.delete(upstream); });
     upstream.once("error", (error) => {
       clearTimeout(headerTimer);
+      trace?.failure(error.code === "MCP_RESPONSE_TIMEOUT" ? "final_result_timeout" : "upstream_request", error);
       if (res.destroyed || req.aborted) return;
       this.fail(req,res,error);
     });

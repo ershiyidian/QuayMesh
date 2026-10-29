@@ -6,28 +6,30 @@ import {openDatabase} from "../../src/db/client.js";
 import {validateSnapshot} from "../../src/session/schema.js";
 import {callOpen,createRealTestServer,structured} from "../session-card/server-fixture.js";
 
-test("TK01/TK02：新请求归档旧Task，不伪造交付结果；显式结束固定真实结果",{timeout:60000},async t=>{
+test("TK01/TK02：新独立目标保留旧Task；显式结束仅固定所选目标的真实结果",{timeout:60000},async t=>{
   const server=await createRealTestServer({git:false,uiEnabled:true});t.after(()=>server.dispose());
   const conversation="task-archive-lifecycle",meta={"openai/session":conversation};
   const first=structured(await server.client.callTool({name:"start_session",arguments:{title:"第一轮",request_key:"first"},_meta:meta}));
   const opened=structured(await callOpen(server.client,server.project,conversation));
-  const second=structured(await server.client.callTool({name:"start_session",arguments:{title:"第二轮",request_key:"second"},_meta:meta}));
+  const selected=structured(await server.client.callTool({name:"task_resume",arguments:{action:"inspect",task_id:first.task_id},_meta:meta}));
+  const second=structured(await server.client.callTool({name:"start_session",arguments:{title:"第二轮",request_key:"second",
+    new_goal:true,expected_binding_revision:(selected.binding as {binding_revision:number}).binding_revision},_meta:meta}));
   assert.notEqual(first.task_id,second.task_id);
 
   const db=openDatabase(server.config.stateDir);
   try {
-    const archived=db.sqlite.prepare(`SELECT state,result_status,closure_reason,archived_at,delivery_ended_at,source_kind
+    const previous=db.sqlite.prepare(`SELECT state,result_status,closure_reason,archived_at,delivery_ended_at,source_kind
       FROM qm_tasks WHERE id=?`).get(first.task_id) as Record<string,unknown>;
-    assert.equal(archived.state,"closed");assert.equal(archived.result_status,null);
-    assert.equal(archived.closure_reason,"superseded");assert.equal(typeof archived.archived_at,"string");
-    assert.equal(archived.delivery_ended_at,null);assert.equal(archived.source_kind,"user_request");
+    assert.equal(previous.state,"active");assert.equal(previous.result_status,null);
+    assert.equal(previous.closure_reason,null);assert.equal(previous.archived_at,null);
+    assert.equal(previous.delivery_ended_at,null);assert.equal(previous.source_kind,"user_request");
   } finally {db.close();}
 
   const oldSnapshot=validateSnapshot(structured(await server.client.callTool({name:"qm_session",arguments:{
     session_id:opened.session_id,task_id:first.task_id,member_id:opened.member_id,since_rev:-1}})).snapshot);
-  assert.equal(oldSnapshot.closureReason,"superseded");assert.equal(oldSnapshot.taskResult,null);
+  assert.equal(oldSnapshot.taskState,"active");assert.equal(oldSnapshot.closureReason,null);assert.equal(oldSnapshot.taskResult,null);
   assert.equal(oldSnapshot.deliveryEndedAt,null);assert.equal(oldSnapshot.endedAt,null);assert.equal(oldSnapshot.status,"idle");
-  assert.ok(oldSnapshot.notices.some(value=>value.includes("已归档")));
+  assert.ok(!oldSnapshot.notices.some(value=>value.includes("已归档")));
 
   const finished=structured(await server.client.callTool({name:"finish_task",arguments:{task_id:second.task_id,status:"completed",summary:"第二轮完成"},_meta:meta}));
   assert.equal(finished.result_status,"completed");
@@ -35,6 +37,10 @@ test("TK01/TK02：新请求归档旧Task，不伪造交付结果；显式结束�
     session_id:opened.session_id,task_id:second.task_id,member_id:opened.member_id,since_rev:-1}})).snapshot);
   assert.equal(finalSnapshot.closureReason,"explicit");assert.equal(finalSnapshot.taskResult,"completed");
   assert.equal(finalSnapshot.status,"done");assert.ok(finalSnapshot.deliveryEndedAt);assert.equal(finalSnapshot.endedAt,finalSnapshot.deliveryEndedAt);
+  const unchanged=validateSnapshot(structured(await server.client.callTool({name:"qm_session",arguments:{
+    session_id:opened.session_id,task_id:first.task_id,member_id:opened.member_id,since_rev:-1}})).snapshot);
+  assert.equal(unchanged.taskState,"active");assert.equal(unchanged.taskResult,null);
+  assert.equal(unchanged.archivedAt,null);assert.equal(unchanged.deliveryEndedAt,null);
 });
 
 test("TK03/R34：辅助变化摘要失败不吞掉已确认交付结果",{timeout:60000},async t=>{

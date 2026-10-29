@@ -108,6 +108,8 @@ Install the coordinator first, followed by the workers:
 
 Additional nodes use distinct IDs and network addresses. The files under `examples/` illustrate Linux and Windows worker settings. A custom inventory passed to `init-site --inventory` can generate all node configurations together.
 
+When a Linux account runs both a coordinator and a worker, give them separate configuration directories, state directories, ports, systemd services, and release directories (`--prefix`). For the coordinator, use `install --config /path/site/cloud.json --config-dir /path/coordinator-config --prefix /path/coordinator-releases/RELEASE --service-name quaymesh-coordinator.service`. The worker can keep `quaymesh-node.service`. Upgrades reuse the service name saved in each installation record.
+
 `mesh.mode: "no-tun"` uses a local SOCKS5 connection to the virtual network. `mesh.mode: "tun"` uses a system network adapter. Set `mesh.enabled: false` when an existing network supplies the configured node addresses.
 
 For OpenAI tunnel discovery, set `QUAYMESH_TUNNEL_ID` and `QUAYMESH_TUNNEL_API_KEY` in your shell and add `--resource-url YOUR_TUNNEL_RESOURCE_URL` to `init-site`. Discovery nodes use the same tunnel resource and coordinator.
@@ -123,6 +125,8 @@ From the new package:
 
 The first command creates a versioned installation and returns `manifestFile`. The second switches the service when its current work allows it. The installation record retains the previous version for recovery.
 
+Use the installed `node.json`, or pass its original `--config-dir` when using another configuration file; omitted service options inherit the recorded user/system scope, service account, and unit path, while explicit changes to that identity are rejected.
+
 Activation pauses admission and waits for accepted commands, agent turns, transfers, and open egress tunnels to close. A tunnel remains active until its client closes it; an idle period does not authorize terminating a model connection. If drain times out, the current service remains running.
 
 The prepared release is verified with its own Node runtime and installed SQLite dependency, including 500 native close/garbage-collection cycles. Activation takes a consistent SQLite backup, records `installation-transition.json`, and requires the same Core process to remain ready for 60 seconds before resuming work. A manager restart preserves this pause. `status` shows an unfinished transition so it can be recovered deliberately.
@@ -135,7 +139,7 @@ When initiating a Windows upgrade from a QuayMesh command, prepare the release f
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\node\windows-activate.ps1 -PreparedManifest C:\path\returned\prepared.json
 ```
 
-The command returns a `resultPath`. Windows Task Scheduler owns the activation process, so closing the old Host's process group does not kill the installer. The task verifies the prepared identity and native runtime, checks the execution ledger, and delegates admission, drain, backup, and stable readiness to the installer. Its result and transcript remain under `stateDir/activations/`. A blocked preflight preserves pending and unknown records for investigation. A committed release remains running if a later status check fails. Use an elevated session to register the task for a TUN node.
+The command returns a `resultPath`. Windows Task Scheduler owns the activation process, so closing the old Host's process group does not kill the installer. The task verifies the prepared identity and native runtime, then delegates admission, durable-work drain, backup, and stable readiness to the installer. The installer's physical-quiescence check recognizes valid execution proofs while preserving unresolved historical results; active or unproven work keeps the current service running. Its result and transcript remain under `stateDir/activations/`. A committed release remains running if a later status check fails. Use an elevated session to register the task for a TUN node.
 
 New release manifests contain SHA-256 hashes of Node, the dependency lock file, and the SQLite addon actually loaded during verification. Activation compares them with the running Core's process-bound identity for the full readiness window. `active-release.json` retains the original activation time when the same release restarts and records the current process's `startedAt` separately.
 

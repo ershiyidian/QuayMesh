@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { ExecutionState, ReviewState, HostState } from "./types.js";
 import { aggregateReviewStates } from './review-state.js';
 import { taskView } from '../task-view.js';
+import { taskContinuationEligibility } from "./task-continuation.js";
 import type {
   AgentSummary,
   CommandSummary,
@@ -98,7 +99,7 @@ export class SessionProjector {
 
   private finalizationView(task: TaskRecord): Snapshot['finalization'] {
     const value = this.store.taskData.finalization(task.id);
-    if (!value || value.completed_at && task.state === 'closed') return null;
+    if (!value || value.recovery_state==='superseded' || value.completed_at && task.state === 'closed') return null;
     return {state: value.error ? 'failed' : 'pending', requestedAt: Date.parse(value.requested_at), error: value.error};
   }
 
@@ -175,7 +176,7 @@ export class SessionProjector {
       taskState:task?.state,
       taskResult:task?.result_status,
       lastOperation,
-      lastActivityAt:maxTime([activity.lastModelToolAt,activity.lastExecutionActivityAt,activity.lastOutputAt]),
+      lastActivityAt:activity.lastActivityAt,
       lastModelToolAt:activity.lastModelToolAt,
       lastExecutionActivityAt:activity.lastExecutionActivityAt,
       lastOutputAt:activity.lastOutputAt,
@@ -225,7 +226,7 @@ export class SessionProjector {
       capabilities: {
         refresh: true,
         revert: revert.allowed && revert.revision === memberRevisionBefore,
-        continue: agents.some((agent) => agent.result_available || agent.state === "working" || agent.state === "queued"),
+        continue: taskContinuationEligibility(task, task?.id, task ? this.store.taskData.finalization(task.id) : null).allowed,
         open_file: files.length > 0,
       },
       notices,
@@ -306,11 +307,12 @@ export class SessionProjector {
       ||agents.some(agent=>agent.state==="working"||agent.state==="queued");
     const runningCommand=commands.find(command=>command.status==="run"||command.status==="queued")??null;
     const lastCommand=[...commands].sort((a,b)=>(b.endedAt??b.startedAt??0)-(a.endedAt??a.startedAt??0))[0]??null;
+    const lastActivityAt=maxTime(snapshots.map(snapshot=>snapshot.lastActivityAt));
     const lastModelToolAt=maxTime(snapshots.map(snapshot=>snapshot.lastModelToolAt));
     const lastExecutionActivityAt=maxTime(snapshots.map(snapshot=>snapshot.lastExecutionActivityAt));
     const lastOutputAt=maxTime(snapshots.map(snapshot=>snapshot.lastOutputAt));
     const finalization=this.store.taskData.finalization(task.id);
-    const finalizing=Boolean(finalization&&(!finalization.completed_at||task.state==='active'));
+    const finalizing=Boolean(finalization&&finalization.recovery_state!=='superseded'&&(!finalization.completed_at||task.state==='active'));
     if(finalizing)notices.push(finalization!.error?`任务结束尚未确认：${finalization!.error}`:"正在确认各节点的任务结果");
     const reviewStates=snapshots.map(snapshot=>snapshot.review_status);
     if(snapshots.length<selectedMemberIds.length)reviewStates.push(ReviewState.unknown);
@@ -335,7 +337,7 @@ export class SessionProjector {
       taskResult:task.result_status,
       finalization:this.finalizationView(task),
       lastOperation,
-      lastActivityAt:maxTime([lastModelToolAt,lastExecutionActivityAt,lastOutputAt]),
+      lastActivityAt:maxTime([lastActivityAt,lastModelToolAt,lastExecutionActivityAt,lastOutputAt]),
       lastModelToolAt,
       lastExecutionActivityAt,
       lastOutputAt,
@@ -375,7 +377,7 @@ export class SessionProjector {
       capabilities: {
         refresh: task.state === "active" || active || finalizing,
         revert: task.state === "active" && snapshots.length === 1 && Boolean(snapshots[0]?.capabilities.revert),
-        continue: task.state === "active" && agents.some((agent) => agent.result_available || agent.state === "working" || agent.state === "queued"),
+        continue: taskContinuationEligibility(task, task.id, finalization).allowed,
         open_file: files.length > 0,
       },
       notices: [...new Set(notices)],
@@ -441,7 +443,7 @@ export class SessionProjector {
       capabilities: {
         refresh: true,
         revert: false,
-        continue: agents.some((agent) => agent.result_available || agent.state === "working" || agent.state === "queued"),
+        continue: false,
         open_file: files.length > 0,
       },
       notices,
@@ -507,6 +509,9 @@ export class SessionProjector {
       records.set(operationId, {
         id: operationId,
         operation_id: operationId,
+        invocation_id: typeof event.payload.invocation_id === "string" ? event.payload.invocation_id : null,
+        effect: ["not_started", "started", "partial", "completed", "unknown"].includes(String(event.payload.effect))
+          ? event.payload.effect as CommandSummary["effect"] : null,
         member_id: memberId,
         cmd: String(event.payload.label ?? event.payload.kind ?? existing?.cmd ?? "command"),
         agent: String(event.payload.agent ?? event.payload.agent_id ?? existing?.agent ?? "host"),

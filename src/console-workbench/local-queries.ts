@@ -79,8 +79,9 @@ export function readLocalTaskIndex(config: ServerConfig, at = Date.now()): { ite
   try {
     const own = scope(config, ledger);
     const base = runQuery(ledger, own.node, own.projects, { days: "0" }, at, { counts: false });
+    // Keep every phase for exact cross-node grouping; summary bodies belong to detail reads.
     const rows = ledger.db.prepare(`${base.sql} SELECT id,reference,session_id,task_id,title,project_id,project_name,root,execution,acceptance,status,task_result,
-      started_ms,finished_ms,last_activity_at,tokens,changed,unresolved,failed_child,summary,latest,task_state,
+      started_ms,finished_ms,last_activity_at,tokens,changed,unresolved,failed_child,latest,task_state,
       finalizing,finalization_requested_at,finalization_error FROM selected ORDER BY started_ms DESC,reference`)
       .all(...base.params) as Array<Record<string, unknown>>;
     return { items: rows.map((row) => ({
@@ -122,10 +123,8 @@ export function readLocalSessionTitles(config: ServerConfig): { items: SessionTi
       id:string; session_id:string; source_task_id:string|null; title:string; state:string; result_status:string|null; revision:number;
       created_at:string; finished_at:string|null; delivery_ended_at:string|null; last_activity_at:string; requested_at:string|null; completed_at:string|null; error:string|null;
     }>;
-    const members = ledger.db.prepare(`WITH membership AS (
-      SELECT task_id,member_id FROM qm_task_members UNION SELECT task_id,member_id FROM qm_events WHERE task_id IS NOT NULL
-    ) SELECT tm.task_id,m.id member_id,m.node_id,m.root,p.id project_id,p.name
-      FROM membership tm JOIN qm_session_members m ON m.id=tm.member_id
+    const members = ledger.db.prepare(`SELECT tm.task_id,m.id member_id,m.node_id,m.root,p.id project_id,p.name
+      FROM qm_task_members tm JOIN qm_session_members m ON m.id=tm.member_id
       LEFT JOIN console_projects p ON p.root=m.root`).all() as Array<{
         task_id:string; member_id:string; node_id:string; root:string; project_id:string|null; name:string|null;
       }>;

@@ -141,6 +141,8 @@ test("a fast terminal callback cannot be overwritten by the earlier running tool
   assert.equal(saved.state, OperationState.succeeded);
   assert.ok(saved.finished_at);
   assert.match(saved.result_json ?? "", /finished before the handler returned/);
+  assert.ok(saved.response_at, "A completed process must still record its first tool receipt");
+  assert.equal(saved.response_json, saved.result_json);
 });
 
 for (const precedingStatus of [undefined, OperationState.running]) {

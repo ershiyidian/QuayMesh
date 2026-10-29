@@ -1,4 +1,5 @@
 import { registerCheckpointTool } from "./session/checkpoints.js";
+import { HANDOFF_FINALIZATION_CODE } from "./session/task-completion.js";
 import { CARD_RESOURCES, type CardVersion, snapshotForCard } from './session/card-contract.js';
 import { registerOperationTools } from "./tool-surfaces/operations.js";
 import { createFederation } from "./federation/integration.js";
@@ -10,7 +11,10 @@ import { randomUUID, createHash } from "node:crypto";
 import { ConflictingToolAliasError, normalizeCachedToolCall } from "./mcp-cached-arguments.js";
 import { workspaceOutputSchema } from "./workspace-bootstrap.js";
 import {currentInvocation} from "./session/invocations.js";
-import { textPage, REPLY_BYTES, IMAGE_BYTES, jsonReply, compatibleToolReceipt } from "./bounded-reply.js";
+import { registerTaskMessageTools, withTaskMessageNotice } from "./messaging/task-messages.js";
+import { registerTaskResumeTool, taskBindingForRequest } from "./tasks/task-resume.js";
+import { textPage, REPLY_BYTES, IMAGE_BYTES, jsonReply, compatibleToolReceipt, type TextPage } from "./bounded-reply.js";
+import { toolResultBytes } from "./mcp-tool-result.js";
 import { argumentFingerprint } from "./mcp-request-diagnostics.js";
 import { ensureDesktopProject } from "./codex-projects.js";
 import { WorkLedger as ProjectWorkLedger } from "./work-ledger.js";
@@ -74,11 +78,12 @@ import { LocalAgentStore } from "./local-agent-store.js";
 import { createSessionRuntime, type SessionRuntime } from "./session/runtime.js";
 import { buildHostPrompt } from "./session/prompts.js";
 import { OperationState, type Snapshot } from "./session/types.js";
-import { classifyToolResultError, errorCode, toolErrorResult } from "./session/outcome.js";
+import { classifyToolResultError, errorCode, recordedToolErrorResult, toolErrorResult } from "./session/outcome.js";
 import { registerWorkspaceContextTool } from "./tool-surfaces/workspace-context.js";
 import { createProjectConsoleRouter } from "./project-console-router.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { conversationScopeIdFromRequestMeta, sessionRequestIdentity } from "./request-meta.js";
+import { withLocallyAuthenticatedTaskClient } from "./tasks/task-binding.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { createRuntimeControlServer, type RuntimeControlRequest } from "./runtime-control.js";
 import { ServerDiagnostics, diagnosticError, httpDiagnosticRequestId } from "./server-diagnostics.js";
@@ -318,13 +323,15 @@ function registerMcpSurface(
     ? withTrackedToolHandlers(server, trackToolActivity)
     : server;
   const modelTarget = sessionRuntime
-    ? withSessionToolRecording(registrationTarget, sessionRuntime, workspaces)
+    ? withSessionToolRecording(registrationTarget, sessionRuntime, workspaces, config)
     : registrationTarget;
   const toolSurface = getToolSurface(config.toolMode);
 
   if (sessionRuntime) {
     sessionRuntime.registerAppTools(registrationTarget as unknown as Parameters<SessionRuntime["registerAppTools"]>[0]);
     registerReadDiagnostics(registrationTarget, config);
+    registerTaskMessageTools(registrationTarget as unknown as Parameters<typeof registerTaskMessageTools>[0], { config, mailbox: sessionRuntime.store.mailbox });
+    registerTaskResumeTool(registrationTarget as unknown as Parameters<typeof registerTaskResumeTool>[0], { config, store: sessionRuntime.store });
   }
 
   if (config.uiEnabled) {
@@ -367,12 +374,14 @@ function registerMcpSurface(
   registerToolOrApp(
     "start_session",
     {
-      title: "Start QuayMesh session",
-      description: "Start one task card per user request; reuse request_key when retrying. The returned workspaces list contains only workspaces ALREADY ATTACHED to the new task and is normally empty. To discover available worker machines and exported root_id values, call workspace_catalog with NO query, then open_workspace with a returned root_id. Cloud is a Coordinator, not a file execution worker.",
+      title: "Start a QuayMesh task",
+      description: "Create a Task for a new independent goal; reuse request_key and input on retry. If this entry already has a Task, a new goal requires new_goal:true and its observed binding revision; follow-ups reuse or resume the existing Task. Returned workspaces are usually empty; discover roots with workspace_catalog, then open_workspace.",
       inputSchema: {
         title: z.string().min(1).max(200).describe("Task title."),
         request_key: z.string().min(1).max(128).describe("Stable request key; reuse for retries."),
-        source_task_id: z.string().min(1).optional().describe("Previous task to continue."),
+        source_task_id: z.string().min(1).optional().describe("Source task recorded on a newly created Task."),
+        new_goal: z.literal(true).optional().describe("Explicitly create an independent goal; follow-ups reuse the current Task."),
+        expected_binding_revision: z.number().int().nonnegative().optional().describe("Current entry revision from task_resume inspect or the selection conflict."),
       },
       outputSchema: {
         session_id: z.string(),
@@ -383,27 +392,45 @@ function registerMcpSurface(
       ...workspaceAppDescriptorMeta(config),
       annotations: { readOnlyHint:false, destructiveHint:false, idempotentHint:true, openWorldHint:false },
     },
-    async ({ title, request_key, source_task_id }, extra) => {
+    async ({ title, request_key, source_task_id, new_goal, expected_binding_revision }, extra) => {
       if (!sessionRuntime) throw new Error("SESSION_RUNTIME_UNAVAILABLE");
       const identity = sessionRequestIdentity(extra);
-      const { session, task } = await sessionRuntime.service.startTask(
-        { owner_id: identity.owner_id, conversation_id: identity.conversation_id },
-        title,
-        request_key,
-        source_task_id,
-      );
+      let started: Awaited<ReturnType<SessionRuntime["service"]["startTask"]>>;
+      try {
+        if (!identity.task_entry && !identity.task_creation)
+          throw Object.assign(new Error("TASK_CREATION_IDENTITY_REQUIRED: Create the Task through an authenticated Coordinator endpoint, then pass task_id on workspace calls."),
+            {code: "TASK_CREATION_IDENTITY_REQUIRED", effect: "not_started"});
+        started = await sessionRuntime.service.startTask(
+          identity,
+          title,
+          request_key,
+          source_task_id,
+          { newGoal: new_goal, expectedBindingRevision: expected_binding_revision },
+        );
+      } catch (error) {
+        if (error && typeof error === "object" && "effect" in error && error.effect === "not_started")
+          return toolErrorResult(error);
+        throw error;
+      }
+      const { session, task } = started;
       const projection = await sessionRuntime.projector.readTask(task.id, -1);
+      const binding = taskBindingForRequest(sessionRuntime.store, extra, task.id, config);
       return {
-        content: [{ type: "text", text: "QuayMesh task " + task.id + " started in session " + session.id + ": " + task.title
+        content: [{ type: "text", text: "QuayMesh Task " + task.id + ": " + task.title
           + "\n" + taskConsoleUrl(config,task.id)
-          + "\nTask workspaces are initially empty until a worker root is opened. Call workspace_catalog({}) to discover exported roots, then open_workspace({root_id:\"desktop/main\"}) or another listed root." }],
+          + (binding.can_continue ? "\nThis entry selects this Task. Reuse attached workspace handles; discover and open roots if the list is empty."
+            : !binding.entry_available ? `\n${binding.reason}`
+              : binding.can_resume ? "\nThis reply does not switch the entry back from newer work. Inspect and explicitly resume this Task before continuing it."
+                : "\nThis Task cannot accept new work. Its history remains available; this reply does not reopen it.") }],
         _meta: {
           quaymesh: {
             session_id: session.id,
             task_id: task.id,
+            task_binding: binding,
             snapshot_ref: "task:" + task.id,
-            snapshot: projection.snapshot ? snapshotForCard(projection.snapshot) : undefined,
-            capabilities: { refresh: true, revert: false, continue: false, open_file: false },
+            snapshot: projection.snapshot ? snapshotForCard({ ...projection.snapshot,
+              capabilities: { ...projection.snapshot.capabilities, continue: binding.can_continue } }) : undefined,
+            capabilities: { refresh: true, revert: false, continue: binding.can_continue, open_file: false },
           },
         },
         structuredContent: {
@@ -425,25 +452,35 @@ function registerMcpSurface(
   );
 
   modelTarget.registerTool("finish_task",{
-    title:"完成本轮任务",
-    description:"在本轮最终回复前保存结果。后台执行仍在运行时使用 handed_off。",
+    title:"结束工作目标",
+    description:"仅目标完成或明确终止时保存最终结果；命令结束、进度回复和换对话都不关闭目标。交接先 checkpoint_task 保存进度，再在接收入口 task_resume 同一 Task。旧 handed_off 请求会被明确拒绝，Task 保持开放。",
     inputSchema:{
       task_id:z.string().min(1),
-      status:z.enum(["completed","failed","cancelled","handed_off"]),
+      status:z.enum(["completed","failed","cancelled","handed_off"]).describe("completed: goal achieved; failed/cancelled: goal explicitly ended. Legacy handed_off is rejected; use checkpoint_task and task_resume to keep the same Task open."),
       summary:z.string().min(1).max(4000),
+      message_sequence:z.number().int().nonnegative().optional().describe("Latest mailbox.sequence returned by task_messages; required when this Task has messages."),
+      expected_task_revision:z.number().int().nonnegative().optional().describe("task_revision from task_resume inspect; required for a new explicit finish after resumed work superseded an earlier finish."),
     },
     outputSchema:{task_id:z.string(),state:z.enum(["closed","finalizing"]),result_status:z.string().nullable(),
       accepted:z.boolean().optional(),poll_after_ms:z.number().optional(),
-      next_action:z.object({tool:z.literal("finish_task"),arguments:z.object({task_id:z.string(),status:z.string(),summary:z.string()})}).optional()},
+      next_action:z.object({tool:z.literal("finish_task"),arguments:z.object({task_id:z.string(),status:z.string(),summary:z.string(),message_sequence:z.number().int().nonnegative().optional(),expected_task_revision:z.number().int().nonnegative().optional()})}).optional()},
     annotations:{readOnlyHint:false,destructiveHint:true,idempotentHint:true,openWorldHint:false},
-  },async({task_id,status,summary},extra)=>{
+  },async({task_id,status,summary,message_sequence,expected_task_revision},extra)=>{
     if(!sessionRuntime)throw new Error("SESSION_RUNTIME_UNAVAILABLE");
     const owner=sessionRequestIdentity(extra).owner_id;
-    const finished=await sessionRuntime.service.finishTaskWithinBudget(owner,task_id,status,summary);
+    const finished=await sessionRuntime.service.finishTaskWithinBudget(owner,task_id,status,summary,2000,message_sequence ?? 0,expected_task_revision).catch(error=>{
+      // This specific guard rejects before persisting an intent. Other failures
+      // may have already changed finalization state and retain their original path.
+      const precondition=error && typeof error==="object" && "effect" in error && error.effect==="not_started"
+        && ["TASK_REVISION_REQUIRED","TASK_REVISION_CONFLICT"].includes(errorCode(error));
+      if(!precondition && (status!=="handed_off" || errorCode(error)!==HANDOFF_FINALIZATION_CODE))throw error;
+      return toolErrorResult(error);
+    });
+    if("isError" in finished)return finished;
     const task=finished.task;
     if(finished.accepted)return {content:[{type:"text",text:"结束请求已保存，正在确认并归档各节点证据。卡片会在归档完成后更新。"}],
       structuredContent:{task_id,state:"finalizing",result_status:null,accepted:true,poll_after_ms:finished.pollAfterMs,
-        next_action:{tool:"finish_task",arguments:{task_id,status,summary}}}};
+        next_action:{tool:"finish_task",arguments:{task_id,status,summary,message_sequence:message_sequence ?? 0}}}};
     return {content:[{type:"text",text:summary+'\n'+task_id+'\n'+taskConsoleUrl(config,task_id)}],structuredContent:{task_id,state:task.state,result_status:task.result_status}};
   });
 
@@ -477,6 +514,7 @@ function registerMcpSurface(
     async ({ path, mode, base_ref, create_directory }, extra) => {
       const { _meta } = extra;
       const requestIdentity = sessionRuntime ? sessionRequestIdentity(extra) : undefined;
+      const executeOpen = async (capturedIdentity = requestIdentity, workspaceReuseScope?: string) => {
       const startedAt = performance.now();
       const baseRef = base_ref;
       const createDirectory = create_directory;
@@ -488,7 +526,7 @@ function registerMcpSurface(
         includeBootstrapContext,
       } = await workspaces.openWorkspace(
         { path, mode, baseRef, createDirectory },
-        { conversationScopeId: conversationScopeIdFromRequestMeta(_meta) },
+        { conversationScopeId: workspaceReuseScope ?? conversationScopeIdFromRequestMeta(_meta) },
       );
       const projectLedger = new ProjectWorkLedger(config.stateDir);
       let quaymeshProjectId: string;
@@ -542,10 +580,7 @@ function registerMcpSurface(
       let currentTaskId: string | undefined;
       const sessionOpen = sessionRuntime
         ? await sessionRuntime.service.open(
-            {
-              owner_id: requestIdentity!.owner_id,
-              conversation_id: requestIdentity!.conversation_id,
-            },
+            capturedIdentity!,
             {
               id: workspace.id,
               node: config.federation?.nodeId ?? "local",
@@ -558,9 +593,10 @@ function registerMcpSurface(
           )
         : undefined;
       if (sessionOpen) {
-        currentTaskId = sessionRuntime!.store.currentTask(sessionOpen.session.id)?.id;
+        currentTaskId = sessionOpen.task.id;
         sessionRuntime!.context.registerDiscovered({
           sessionId: sessionOpen.session.id,
+          taskId: currentTaskId,
           memberId: sessionOpen.member.id,
           workspace,
           loadedAgentsFiles: agentsFiles,
@@ -568,6 +604,7 @@ function registerMcpSurface(
         });
         initialSnapshot = await sessionRuntime!.projector.materialize(sessionOpen.session.id, sessionOpen.member.id, currentTaskId);
       }
+      const binding = sessionOpen ? taskBindingForRequest(sessionRuntime!.store, extra, sessionOpen.task.id, config) : undefined;
       const resultContent: ToolContent[] = [{type:"text",text:workspaceReused?"Workspace reused.":"Workspace opened."}];
       logToolCall(config, {
         tool: "open_workspace",
@@ -587,11 +624,13 @@ function registerMcpSurface(
                   ...(currentTaskId ? { task_id: currentTaskId } : {}),
                   member_id: sessionOpen.member.id,
                   workspace_id: workspace.id,
+                  task_binding: binding,
                   snapshot_ref: currentTaskId
                     ? `task:${currentTaskId}:member:${sessionOpen.member.id}`
                     : `session:${sessionOpen.session.id}:member:${sessionOpen.member.id}`,
-                  snapshot: initialSnapshot ? snapshotForCard(initialSnapshot) : undefined,
-                  capabilities: { refresh: true, revert: true, continue: true, open_file: true },
+                  snapshot: initialSnapshot ? snapshotForCard({ ...initialSnapshot,
+                    capabilities: { ...initialSnapshot.capabilities, continue: binding?.can_continue === true } }) : undefined,
+                  capabilities: { refresh: true, revert: true, continue: binding?.can_continue === true, open_file: true },
                 },
               }
             : {}),
@@ -634,6 +673,11 @@ function registerMcpSurface(
           }:{}),
         },
       };
+      };
+      return sessionRuntime && requestIdentity
+        ? sessionRuntime.service.withTaskExecution(requestIdentity, path, (captured, scope) => executeOpen(
+          { ...requestIdentity, task_id: captured.task_id }, scope.session.conversation_id ?? scope.task.id))
+        : executeOpen();
     },
   );
 
@@ -642,7 +686,7 @@ function registerMcpSurface(
     {
       title: "Attach another workspace",
       description:
-        "Open an additional project in the same conversation with path, or restore a pruned workspace with its existing workspace_id. Restoring retains its session, directory, and saved tracked changes.",
+        "Attach a project to the selected Task, or restore a pruned workspace with its existing workspace_id. Restoring retains its Task, directory, and saved tracked changes.",
       inputSchema: {
         create_directory: z.boolean().optional().describe("Create the directory when absent."),
         path: z.string().min(1).optional().describe("Project path; omit when restoring workspace_id."),
@@ -665,32 +709,27 @@ function registerMcpSurface(
           throw new Error("INVALID_ARGUMENT: workspace_id restores the original workspace; omit mode, base_ref, and create_directory.");
         }
         const identity = sessionRequestIdentity(extra);
-        const session = session_id
-          ? sessionRuntime.store.requireSession(identity.owner_id, session_id)
-          : identity.conversation_id
-            ? sessionRuntime.store.findByConversation(identity.owner_id, identity.conversation_id)
-            : null;
-        if (!session) throw new Error("SESSION_REQUIRED: call open_workspace first or pass session_id.");
-        if (identity.conversation_id && session.conversation_id && session.conversation_id !== identity.conversation_id) {
-          throw new Error(`SESSION_SCOPE_MISMATCH: ${session.id}`);
-        }
+        const selected = sessionRuntime.service.selectedExecution(identity);
+        if (!selected) throw Object.assign(new Error("TASK_EXECUTION_BINDING_REQUIRED: Select or resume a Task before attaching a workspace."),
+          { code: "TASK_EXECUTION_BINDING_REQUIRED", effect: "not_started" });
+        return await sessionRuntime.service.withTaskExecution({ ...identity, task_id: selected.task.id }, path ?? "QuayMesh task", async (captured, { session, task }) => {
+        if (session_id && session_id !== session.id) throw new Error(`TASK_SESSION_MISMATCH: ${task.id}`);
         const nodeId = config.federation?.nodeId ?? "local";
         if (workspace_id !== undefined && !session.members.some(member => member.node_id === nodeId && member.workspace_id === workspace_id)) {
           throw new Error(`WORKSPACE_SESSION_MISMATCH: ${workspace_id} is not a member of session ${session.id}.`);
         }
-        const task = sessionRuntime.store.currentTask(session.id);
-        if (!task || task.state !== "active") throw new Error(`TASK_NOT_ACTIVE: start a task in session ${session.id} before attaching a workspace.`);
-
         // 身份、原成员和任务先验证，再允许创建目录、运行 Git 或恢复修改。
         effectStarted = true;
         const opened = workspace_id !== undefined
           ? await workspaces.restoreWorkspace(workspace_id)
           : await workspaces.openWorkspace(
             { path: path!, mode, baseRef: base_ref, createDirectory: create_directory },
-            { conversationScopeId: identity.conversation_id ?? undefined },
+            // Reuse the Task's existing workspace namespace across external
+            // entries; the legacy value is only an internal storage adapter key.
+            { conversationScopeId: session.conversation_id ?? task.id },
           );
         const attached = await sessionRuntime.service.attach(
-          { owner_id: identity.owner_id, conversation_id: identity.conversation_id },
+          captured,
           session.id,
           {
             id: opened.workspace.id,
@@ -702,12 +741,13 @@ function registerMcpSurface(
           },
         );
         sessionRuntime.context.registerDiscovered({
-          sessionId: session.id, memberId: attached.member.id, workspace: opened.workspace,
+          sessionId: session.id, taskId: task.id, memberId: attached.member.id, workspace: opened.workspace,
           loadedAgentsFiles: opened.agentsFiles, availableAgentsFiles: opened.availableAgentsFiles,
         });
         return {
           content:[{type:"text",text:"Workspace attached."}],
-          _meta:{quaymesh:{session_id:session.id,task_id:task.id,member_id:attached.member.id,workspace_id:opened.workspace.id}},
+          _meta:{quaymesh:{session_id:session.id,task_id:task.id,member_id:attached.member.id,workspace_id:opened.workspace.id,
+            task_binding:taskBindingForRequest(sessionRuntime.store,extra,task.id,config)}},
           structuredContent:{
             workspace_id:opened.workspace.id,root:opened.workspace.root,node_id:nodeId,
             session_id:session.id,task_id:task.id,mode:opened.workspace.mode,
@@ -718,6 +758,7 @@ function registerMcpSurface(
             }:{}),
           },
         };
+        });
       } catch (error) {
         return toolErrorResult(error, { sideEffecting: effectStarted });
       }
@@ -805,19 +846,22 @@ function registerMcpSurface(
       }
 
       const original = contentText(response.content);
-      const page = textPage(original, responseOffset, REPLY_BYTES - 4096);
-      const result = { ...response,
-        content: response.content.map((block) => block.type === "text" ? { type: "text" as const, text: `已读取 ${input.path}，正文见 result。` } : block),
+      const resultHash = createHash("sha256").update(original).digest("hex");
+      // 按完整回包选择页长，计入文本客户端所需的结构化结果镜像。
+      const reply = (page: TextPage) => ({
+        content: [{ type: "text" as const, text: `已读取 ${input.path}，正文见 result。` }],
         _meta:{quaymesh:{argument_fingerprint:argumentFingerprint({action:"read",...input})}},
         structuredContent: {result:page.text,operation_id:currentInvocation()?.operation_id,
-          result_sha256: createHash("sha256").update(original).digest("hex"), response_page: {
+          result_sha256: resultHash, response_page: {
             offset: page.offset,
             next_offset: page.nextOffset,
             total_code_points: page.totalCodePoints,
-          }} };
-      if (Buffer.byteLength(JSON.stringify(result)) > REPLY_BYTES) return {
-        content: [{ type: "text" as const, text: "Non-text read exceeds response budget; select a smaller artifact." }],
-        structuredContent: { result: "Non-text read exceeds response budget; select a smaller artifact." }, isError: true };
+          }} });
+      const page = textPage(original, responseOffset, REPLY_BYTES - 512, value => toolResultBytes(reply(value)));
+      const result = reply(page);
+      if (toolResultBytes(result) > REPLY_BYTES) return {
+        content: [{ type: "text" as const, text: "Read response metadata exceeds response budget." }],
+        structuredContent: { result: "Read response metadata exceeds response budget." }, isError: true };
       return result;
     },
   );
@@ -886,6 +930,7 @@ const SESSION_RECORDED_TOOLS = new Set([
   "write",
   "edit",
   "apply_patch",
+  "download_artifact",
   "bash",
   "exec_command",
   "write_stdin",
@@ -933,13 +978,14 @@ function withSessionToolRecording(
   server: McpRegistrationTarget,
   runtime: SessionRuntime,
   workspaces: WorkspaceRegistry,
+  config: ServerConfig,
 ): McpRegistrationTarget {
   return {
     registerTool: ((name: string, definition: Record<string, unknown>, handler: (input: any, extra: any) => any) => {
       if (!SESSION_RECORDED_TOOLS.has(name)) {
         return (server.registerTool as any)(name, definition, handler);
       }
-      if (["exec_command","bash","apply_patch","write","edit","write_stdin","cancel_command"].includes(name)) {
+      if (["exec_command","bash","apply_patch","write","edit","download_artifact","write_stdin","cancel_command"].includes(name)) {
         const key = z.string().min(1).max(128).optional()
           .describe("Retry key for one intended change.");
         const shape = definition.inputSchema as any;
@@ -951,22 +997,30 @@ function withSessionToolRecording(
         const identity = sessionRequestIdentity(extra);
         const operationKind = name === "bash" || name === "exec_command"
           ? "command"
-          : name === "write" || name === "edit" || name === "apply_patch"
+          : name === "write" || name === "edit" || name === "apply_patch" || name === "download_artifact"
             ? "patch"
             : name === "workspace_context" && input?.action === "search"
               ? "search"
               : SUBAGENT_OPERATION_TOOLS.has(name)
                 ? "agent_control"
                 : "read";
-        const affectsFiles = ["write", "edit", "apply_patch", "bash", "exec_command"].includes(name)
+        const affectsFiles = ["write", "edit", "apply_patch", "download_artifact", "bash", "exec_command"].includes(name)
           || (["spawn_agent", "followup_agent"].includes(name) && input.read_only !== true);
-        const writePaths = name === "write" || name === "edit"
+        const writePaths = name === "write" || name === "edit" || name === "download_artifact"
           ? (typeof input.path === "string" ? [input.path] : [])
           : name === "apply_patch" && typeof input.patch === "string"
             ? parseMutationPaths(input.patch).flatMap((action) => action.kind === "update" && action.moveTo ? [action.path, action.moveTo] : [action.path])
             : [];
         let writeEvidence: WriteEvidence[] = [];
         let knownWritePaths: string[] = [];
+        // Signed attachment URLs can contain credentials. Persist a comparison
+        // digest for exact retries, while only the live handler sees the URL.
+        let recordedInput = input;
+        if (name === "download_artifact" && input.file && typeof input.file === "object") {
+          const { download_url, ...file } = input.file;
+          recordedInput = { ...input, file: { ...file,
+            download_url_sha256: createHash("sha256").update(String(download_url)).digest("hex") } };
+        }
         const record = forwarded ? runtime.recorder.recordForwarded.bind(runtime.recorder) : runtime.recorder.record.bind(runtime.recorder);
         return record({
           identity,
@@ -976,13 +1030,13 @@ function withSessionToolRecording(
           label: name === "spawn_agent" && typeof input?.name === "string" ? input.name
             : name === "exec_command" ? String(input.cmd)
               : name === "bash" ? String(input.command ?? input.cmd ?? name) : name,
-          input,
+          input: recordedInput,
           affectsFiles,
           ...(["exec_command", "bash", "apply_patch", "write", "edit", "write_stdin"].includes(name) ? {
             replyWaitMs: name === "exec_command" || name === "bash"
               ? Math.max(1000, Math.min(5000, Number(input.yield_time_ms ?? 2000) + 1000)) : 2000,
             pendingResult: (context: import("./session/types.js").InvocationContext) => {
-              const saved = runtime.store.findInvocationByOperation(context.owner_id, context.operation_id!);
+              const saved = runtime.store.findInvocationResultByOperation(context.owner_id, context.operation_id!);
               const envelope = saved?.result_json ? JSON.parse(saved.result_json) : null;
               if (envelope?.kind === "result") return envelope.value;
               const message = "操作已接收，准备或执行仍在继续。请按 operation_id 查询状态，无需重新提交。";
@@ -1002,6 +1056,8 @@ function withSessionToolRecording(
             writeEvidence = await runtime.changes.prepareWrite(member, writePaths, cwd, context.task_id);
             knownWritePaths = writePaths.map(path => relative(member.root, resolveSessionPath(cwd, path)));
           },
+          afterReply: (result, context, operationId) => withTaskMessageNotice(config, runtime.store.mailbox, context,
+            recordedToolErrorResult(result, operationId, {sideEffecting: affectsFiles, forwarded})),
           afterResult: async (_result, context) => {
             if (writeEvidence.length) await runtime.changes.recordWrite(
               runtime.store.getMember(context.session_id, context.member_id), writeEvidence, context.task_id);
@@ -1381,12 +1437,12 @@ export function createServer(
     // 无状态 HTTP 请求每次使用独立的传输身份。客户端可以重复使用 JSON-RPC 序号，
     // 不能把同一对话里的不同调用当成同一次调用的重试。客户端提供 MCP 会话标识时，
     // 才使用该会话身份做跨请求去重。
-    req.auth = { ...req.auth, extra: {
+    req.auth = withLocallyAuthenticatedTaskClient({ ...req.auth, extra: {
       ...req.auth.extra,
       transport_instance_id: typeof req.headers["mcp-session-id"] === "string"
         ? req.headers["mcp-session-id"]
         : `http:${requestId ?? randomUUID()}`,
-    } };
+    } });
     logEvent(config.logging, "debug", "mcp_request", {
       requestId,
       method: req.method,

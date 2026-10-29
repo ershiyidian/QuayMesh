@@ -9,7 +9,7 @@ import { jsonReply, replyBytes, REPLY_BYTES } from "../bounded-reply.js";
 import { currentInvocation } from "../session/invocations.js";
 import type { InvocationContext } from "../session/types.js";
 import { currentOperationEvents } from "../session/activity.js";
-import { savedOperationStatus } from "../session/operation-status.js";
+import { savedOperationStatus, operationStatusBatch } from "../session/operation-status.js";
 import { observationBudget, observeWithSignal } from "../observation-budget.js";
 
 const id = z.string().min(1).max(256);
@@ -41,7 +41,7 @@ export const workspaceContextInputSchema = z.object({
     recovery:["session_id","task_id","cursor","limit"],
   };
   const error=(message:string,path:string)=>context.addIssue({code:"custom",path:[path],message});
-  for(const key of Object.keys(input))if(!["workspace_id","action",...allowed[input.action]!].includes(key))error("参数不适用于当前 action",key);
+  for(const key of Object.keys(input))if(!["workspace_id","task_id","action",...allowed[input.action]!].includes(key))error("参数不适用于当前 action",key);
   if(input.action==="capture"&&!input.files&&!input.result_ref)error("capture 需要 files 或 result_ref","files");
   if(input.action==="search"&&!input.result_ref&&!input.query&&!input.queries)error("search 需要 query 或 queries","queries");
   if(input.query&&input.queries)error("query 与 queries 只能选择一项","query");
@@ -55,7 +55,7 @@ export const workspaceContextInputSchema = z.object({
 export function registerWorkspaceContextTool({ server, config, workspaces, processSessions, sessionRuntime }: ToolRegistrationContext): void {
   server.registerTool("workspace_context", {
     title: "Inspect workspace",
-    description: "Batch file ranges or literal searches. Continue with result_ref and cursor. status/recovery inspect saved work.",
+    description: "Batch file ranges or literal searches. Reuse result_ref: page via cursor=next_cursor, then file_offset=scope.next_file_offset. status/recovery inspect saved work.",
     inputSchema: workspaceContextInputSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, async (rawInput, extra) => {
@@ -76,7 +76,7 @@ export function registerWorkspaceContextTool({ server, config, workspaces, proce
           try{return {operation_id,...await statusReply(sessionRuntime,processSessions,workspace,operation_id,input.limit)};}
           catch(error){return {operation_id,error:error instanceof Error?error.message:String(error)};}
         });
-        return jsonReply({results,partial:results.some(result=>"error" in result)});
+        return jsonReply(operationStatusBatch(results,results.some(result=>"error" in result),input.workspace_id,input.task_id));
       }
       return jsonReply(await statusReply(sessionRuntime, processSessions, workspace, input.operation_id, input.limit, input.offset));
     }
@@ -115,6 +115,7 @@ export function registerWorkspaceContextTool({ server, config, workspaces, proce
         while (replyBytes(value) > REPLY_BYTES && page.length > 1) {
           page.pop(); value.nextOffset = offset + page.length;
         }
+        if (replyBytes(value) > REPLY_BYTES) throw new Error("CONTEXT_PAGE_TOO_LARGE");
         return value;
       }
       return contextPage({server,workspaces,processSessions,sessionRuntime,config},liveWorkspace,{...input,action:input.action as "capture"|"search"},budget.signal);

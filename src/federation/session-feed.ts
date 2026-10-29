@@ -1,6 +1,7 @@
 import { executionObservationSchema } from "../session/schema.js";
 import { createHash } from "node:crypto";
 import { sessionRequestIdentity } from "../request-meta.js";
+import { sessionToolRoute } from "./tool-routing.js";
 import type { SessionProjector } from "../session/projection.js";
 import type { SessionService, TaskOwnerReceipt } from "../session/service.js";
 import type { SessionStore } from "../session/store.js";
@@ -10,15 +11,34 @@ import type { FederationRuntime } from "./runtime.js";
 import type { PeerLink } from "./transport.js";
 import type { JsonRecord } from "./types.js";
 import { parseWorkspaceHandle } from "./routing.js";
-import type { SessionFeedRequest, SessionFeedUpdate, TrustedInvocationEnvelope } from "./session-types.js";
+import { assertTaskBindingEnvelope, type SessionFeedRequest, type SessionFeedUpdate, type TrustedInvocationEnvelope } from "./session-types.js";
+import { canonicalWorkspaceRoot } from "../roots.js";
 import { isReadOnlyObservation } from "../tool-admission.js";
 import { jsonReply } from "../bounded-reply.js";
 import { errorCode } from "../session/outcome.js";
-import { savedOperationStatus, operationReceiptSummary } from "../session/operation-status.js";
+import { savedOperationStatus, operationReceiptSummary, operationStatusBatch } from "../session/operation-status.js";
 import { EXECUTION_OBSERVATION_TTL_MS } from "../execution-observation.js";
+import { filesForReader } from "../session/file-contract.js";
+import { locallyUnsentPeerRequest } from "./read-retry.js";
+import { FinalizationDispatchError } from "../session/task-finalization.js";
+import { taskBindingForRequest } from "../tasks/task-resume.js";
 
 const TASK_REFRESH_WAIT_MS = 750;
 const TASK_REFRESH_TIMEOUT_MS = 5_000;
+type SnapshotReader = Pick<SessionFeedRequest, "command_identity" | "file_recorded_at">;
+
+function observedOperationIds(name: string, input: JsonRecord): string[] {
+  if (!isReadOnlyObservation(name, input)) return [];
+  if (name !== "read_output" && name !== "write_stdin" && !(name === "workspace_context" && input.action === "status")) return [];
+  if (typeof input.operation_id === "string") return [input.operation_id];
+  if (name === "write_stdin" && typeof input.session_id === "string") return [input.session_id];
+  if (name === "workspace_context" && Array.isArray(input.operation_ids))
+    return input.operation_ids.filter((value): value is string => typeof value === "string");
+  if (name === "read_output" && Array.isArray(input.outputs)) return input.outputs.flatMap(value =>
+    value && typeof value === "object" && typeof (value as JsonRecord).operation_id === "string"
+      ? [String((value as JsonRecord).operation_id)] : []);
+  return [];
+}
 
 interface RemoteSubscription {
   nodeId: string;
@@ -37,7 +57,7 @@ export class SessionFeed {
   private readonly snapshots = new Map<string, Promise<SessionFeedUpdate>>();
   private readonly refreshController = new AbortController();
   private readonly pendingPublishes = new Map<string, NodeJS.Timeout>();
-  private readonly subscribers = new Map<string, Set<string>>();
+  private readonly subscribers = new Map<string, Map<string, SnapshotReader>>();
   private readonly disposeStore: () => void;
   private readonly disposeSettlements: Array<() => void> = [];
   private closed = false;
@@ -68,26 +88,24 @@ export class SessionFeed {
       const session=store.getSession(task.session_id);
       const members=store.taskMemberIds(task.id).map(id=>store.getMember(session.id,id)).filter(member=>member.node_id!==runtime.localId);
       const nodes=[...new Set(members.map(member=>member.node_id))];
-      return Promise.all(nodes.map(async nodeId => {
+      const results = await Promise.allSettled(nodes.map(async nodeId => {
         const member=members.find(candidate=>candidate.node_id===nodeId)!;
         const receipt=await runtime.request<TaskOwnerReceipt>(nodeId,"session.feed",{
           kind:"finalize",session_id:session.id,member_id:member.id,task_id:task.id,
-          owner_id:session.owner_id,status,summary,
+          owner_id:session.owner_id,status,summary,command_identity:true,file_recorded_at:true,
         } satisfies SessionFeedRequest);
         if(receipt.taskId!==task.id || receipt.nodeId!==nodeId || !Array.isArray(receipt.snapshots))throw new Error("TASK_OWNER_RECEIPT_INVALID");
         return receipt;
       }));
-    });
-    service.setRemoteArchiver(async task=>{
-      const session=store.getSession(task.session_id);
-      const members=store.taskMemberIds(task.id).map(id=>store.getMember(session.id,id)).filter(member=>member.node_id!==runtime.localId);
-      const nodes=[...new Set(members.map(member=>member.node_id))];
-      return Promise.all(nodes.map(async nodeId=>{
-        const member=members.find(candidate=>candidate.node_id===nodeId)!;
-        return runtime.request<TaskOwnerReceipt>(nodeId,"session.feed",{
-          kind:"archive",session_id:session.id,member_id:member.id,task_id:task.id,owner_id:session.owner_id,
-        } satisfies SessionFeedRequest);
-      }));
+      const failed = results.filter((value): value is PromiseRejectedResult => value.status === "rejected");
+      if (failed.length) {
+        // Wait for the whole fan-out. A local offline error on one node cannot
+        // erase another owner's successful/unknown finalization side effects.
+        const allNotSent = failed.length === results.length
+          && failed.every(value => locallyUnsentPeerRequest(value.reason));
+        throw new FinalizationDispatchError(failed.map(value => value.reason), allNotSent);
+      }
+      return results.map(value => (value as PromiseFulfilledResult<TaskOwnerReceipt>).value);
     });
   }
 
@@ -111,12 +129,15 @@ export class SessionFeed {
       {offset:typeof input.offset==="number"?input.offset:0})]));
     let reply:unknown, failure:unknown;
     try {reply=await queryOwner();} catch(error) {failure=error;}
-    if (![...receipts.values()].some(Boolean)) {
-      if (failure) throw failure;
-      return reply;
-    }
     const envelope=reply&&typeof reply==="object"?reply as JsonRecord:{};
     const body=envelope.structuredContent&&typeof envelope.structuredContent==="object"?envelope.structuredContent as JsonRecord:{};
+    if (![...receipts.values()].some(Boolean)) {
+      if (failure) throw failure;
+      // 旧 Worker 不认识新的回包预算，入口仍按最终文本/JSON 结果计费。
+      if (Array.isArray(input.operation_ids) && Array.isArray(body.results) && envelope.isError !== true)
+        return {...envelope,...jsonReply(operationStatusBatch(body.results as JsonRecord[],body.partial===true,workspaceId,identity.task_id))};
+      return reply;
+    }
     const join=(operationId:string,owner:JsonRecord|undefined):JsonRecord=>{
       const receipt=receipts.get(operationId);
       const rows=Array.isArray(owner?.operations)?owner.operations as JsonRecord[]:[];
@@ -132,65 +153,89 @@ export class SessionFeed {
     if (typeof input.operation_id==="string") return jsonReply(join(input.operation_id,body));
     const remoteRows=Array.isArray(body.results)?body.results as JsonRecord[]:[];
     const results=ids.map(id=>join(id,remoteRows.find(row=>row.operation_id===id)));
-    return jsonReply({results,partial:results.some(row=>row.owner_lookup!=="found")});
+    return jsonReply(operationStatusBatch(results,results.some(row=>row.owner_lookup!=="found"),workspaceId,identity.task_id));
   }
 
-  trustedInvocation(name: string, input: JsonRecord, extra: JsonRecord): TrustedInvocationEnvelope | undefined {
+  async trustedInvocation(name: string, input: JsonRecord, extra: JsonRecord): Promise<TrustedInvocationEnvelope | undefined> {
+    // App Task controls and member detail reads authorize their explicit scope in
+    // their own handlers. They must not borrow the model's selected execution Task.
+    if (sessionToolRoute(name) !== "none") return undefined;
     const auth = extra.authInfo as { extra?: Record<string, unknown> } | undefined;
     const ownerId = auth?.extra?.owner_id;
     if (typeof ownerId !== "string" || ownerId.length === 0) return undefined;
-    const conversation = conversationId(extra);
     const identity = sessionRequestIdentity(extra);
-    const current = typeof input.session_id === "string"
-      ? this.store.requireSession(ownerId, input.session_id)
-      : conversation ? this.store.findByConversation(ownerId, conversation) : null;
-    if (name === "attach_workspace" && current && conversation && current.conversation_id && current.conversation_id !== conversation) {
-      throw Object.assign(new Error(`SESSION_SCOPE_MISMATCH: ${current.id}`), { code: "SESSION_SCOPE_MISMATCH", effect: "not_started" });
+    const observing = isReadOnlyObservation(name, input);
+    // Explicit observations may use their durable original operation. This does
+    // not change the entry binding or authorize new work in that operation's Task.
+    const operation = observedOperationIds(name, input).map(id => this.store.findInvocationSummaryByOperation(ownerId, id))
+      .find(saved => saved?.task_id);
+    const historicalTaskId = observing && typeof input.task_id === "string" ? input.task_id : operation?.task_id ?? undefined;
+    const captured = historicalTaskId ? { ...identity, task_id: historicalTaskId } : identity;
+    const existing = this.service.selectedExecution(captured);
+    const selected = name === "open_workspace" || !observing && !captured.task_id && existing
+      ? await this.service.resolveExecution(captured, "QuayMesh task") : existing;
+    if (!selected) return undefined;
+    const { session, task } = selected;
+    if (name !== "write_stdin" && typeof input.session_id === "string" && input.session_id !== session.id) {
+      throw Object.assign(new Error(`TASK_SESSION_MISMATCH: ${task.id}`), { code: "TASK_SESSION_MISMATCH", effect: "not_started" });
     }
     const handle = typeof input.workspace_id === "string" ? parseWorkspaceHandle(input.workspace_id) : undefined;
-    const found = current?.members.find((candidate) => candidate.id === input.member_id
+    const member = session.members.find(candidate => candidate.id === input.member_id
       || (candidate.workspace_id === (handle?.local ?? input.workspace_id) && (!handle || candidate.node_id === handle.node)));
-    const member = found && current ? { sessionId: current.id, member: found } : undefined;
-    const sessionId = typeof input.session_id === "string"
-      ? input.session_id
-      : member?.sessionId
-        ?? (conversation ? this.store.findByConversation(ownerId, conversation)?.id : undefined);
-    const memberId = typeof input.member_id === "string" ? input.member_id : member?.member.id;
-    if (!sessionId && name !== "open_workspace") return undefined;
-    if (!memberId && name !== "open_workspace" && name !== "attach_workspace") return undefined;
-    const requestedTaskId=typeof input.task_id==="string"?input.task_id:identity.task_id;
-    const task = sessionId ? requestedTaskId ? this.store.getTask(requestedTaskId) : this.store.currentTask(sessionId) : null;
-    // 首次镜像会创建 active 任务，入口须先拒绝已经结束的任务，避免恢复时重新激活。
-    if (name === "attach_workspace" && (!task || task.state !== "active")) {
-      throw Object.assign(new Error(`TASK_NOT_ACTIVE: start a task in session ${sessionId} before attaching a workspace.`),
-        { code: "TASK_NOT_ACTIVE", effect: "not_started" });
+    if (!member && name !== "open_workspace" && name !== "attach_workspace") return undefined;
+    if (name === "attach_workspace" && task.state !== "active") {
+      throw Object.assign(new Error(`TASK_NOT_ACTIVE: ${task.id}`), { code: "TASK_NOT_ACTIVE", effect: "not_started" });
     }
+    const independentBinding = session.conversation_id !== identity.conversation_id || this.store.currentTask(session.id)?.id !== task.id;
     return {
       invocation_id: invocationId(ownerId, identity.transport_instance_id, String(identity.request_id), name),
-      owner_id: ownerId,
-      conversation_id: conversation,
-      transport_instance_id: identity.transport_instance_id,
-      request_id: String(identity.request_id),
-      ...(sessionId ? { session_id: sessionId } : {}),
-      ...(current?.title ? { session_title: current.title } : {}),
-      ...(task ? { task_id: task.id, task_title: task.title, task_created_at: task.created_at, ...(task.source_task_id ? {task_source_id:task.source_task_id} : {}) } : {}),
-      ...(memberId ? { member_id: memberId } : {}),
-      ...(typeof input.workspace_id === "string" || member?.member.workspace_id
-        ? { workspace_id: typeof input.workspace_id === "string" ? input.workspace_id : member!.member.workspace_id }
-        : {}),
+      owner_id: ownerId, conversation_id: identity.conversation_id,
+      transport_instance_id: identity.transport_instance_id, request_id: String(identity.request_id),
+      session_id: session.id, session_title: session.title,
+      task_id: task.id, task_title: task.title, task_created_at: task.created_at,
+      ...(task.source_task_id ? { task_source_id: task.source_task_id } : {}),
+      ...(independentBinding ? { task_binding_version: 1 as const, canonical_conversation_id: session.conversation_id } : {}),
+      ...(member ? { member_id: member.id } : {}),
+      ...(typeof input.workspace_id === "string" || member?.workspace_id
+        ? { workspace_id: typeof input.workspace_id === "string" ? input.workspace_id : member!.workspace_id } : {}),
       actor: "model",
     };
   }
 
   async prepareLocalTool(name: string, input: JsonRecord, envelope: TrustedInvocationEnvelope | undefined): Promise<TrustedInvocationEnvelope | undefined> {
     if (!envelope) return;
-    const sessionId = typeof input.session_id === "string" ? input.session_id : envelope.session_id;
+    assertTaskBindingEnvelope(envelope);
+    // Explicit historical observations can recover their original scope from
+    // the execution owner's receipt even if the Coordinator predates that receipt.
+    // This neither selects a Task nor authorizes new work under the old operation.
+    const ownerId = envelope.owner_id;
+    const operation = observedOperationIds(name, input).map(id => this.store.findInvocationSummaryByOperation(ownerId, id))
+      .find(saved => saved?.task_id);
+    if (operation?.task_id) {
+      const task = this.store.getTask(operation.task_id), session = this.store.requireSession(envelope.owner_id, operation.session_id);
+      const member = this.store.getMember(session.id, operation.member_id);
+      const workspace = typeof input.workspace_id === "string" ? input.workspace_id : envelope.workspace_id;
+      const handle = workspace ? parseWorkspaceHandle(workspace) : undefined;
+      if (task.session_id !== session.id || member.node_id !== this.runtime.localId
+        || handle && handle.node !== this.runtime.localId || !workspace || member.workspace_id !== (handle?.local ?? workspace))
+        throw Object.assign(new Error("WORKSPACE_SESSION_MISMATCH"), { code: "WORKSPACE_SESSION_MISMATCH", effect: "not_started" });
+      envelope = { ...envelope, session_id: session.id, task_id: task.id, task_title: task.title, task_created_at: task.created_at,
+        task_source_id: task.source_task_id ?? undefined, member_id: member.id, task_binding_version: 1,
+        canonical_conversation_id: session.conversation_id };
+    }
+    const sessionId = name !== "write_stdin" && typeof input.session_id === "string" ? input.session_id : envelope.session_id;
     if (!sessionId) return envelope;
+    if (envelope.session_id && envelope.session_id !== sessionId) throw Object.assign(new Error("SESSION_SCOPE_MISMATCH"),
+      { code: "SESSION_SCOPE_MISMATCH", effect: "not_started" });
+    const existingTask = envelope.task_id ? this.store.findTask(envelope.task_id) : null;
+    if (existingTask && existingTask.session_id !== sessionId) throw Object.assign(new Error("TASK_SESSION_MISMATCH"),
+      { code: "TASK_SESSION_MISMATCH", effect: "not_started" });
+    if (existingTask) this.store.requireSession(envelope.owner_id, existingTask.session_id);
     if (isReadOnlyObservation(name, input)) {
       // 观察只使用已有归属，不能同步标题、补建远端会话或推进当前 Task。
       if (envelope.session_id && envelope.session_id !== sessionId) throw new Error("SESSION_SCOPE_MISMATCH");
       const session = this.store.requireSession(envelope.owner_id, sessionId);
-      if (envelope.conversation_id && session.conversation_id && envelope.conversation_id !== session.conversation_id)
+      if (envelope.task_binding_version !== 1 && envelope.conversation_id && session.conversation_id && envelope.conversation_id !== session.conversation_id)
         throw new Error("SESSION_SCOPE_MISMATCH");
       const workspaceId = typeof input.workspace_id === "string" ? input.workspace_id : envelope.workspace_id;
       // qm_session 在入口读成员投影；原 handler 的 requireSession/readTask.requireScope
@@ -202,11 +247,17 @@ export class SessionFeed {
         if (member.node_id !== this.runtime.localId || handle && handle.node !== this.runtime.localId
           || member.workspace_id !== (handle?.local ?? workspaceId)) throw new Error("WORKSPACE_SESSION_MISMATCH");
       }
-      const claimedTask = envelope.task_id ? this.store.findTask(envelope.task_id) : null;
+      const claimedTask = existingTask;
       if (claimedTask && claimedTask.session_id !== sessionId) throw new Error("TASK_SESSION_MISMATCH");
-      // 新入口 Task 可能尚未镜像；旧操作由 handler 按持久身份核对，不为观察创建新 Task。
-      const task = typeof input.task_id === "string" ? this.store.getTask(input.task_id)
-        : claimedTask ?? this.store.currentTask(sessionId);
+      if (envelope.task_binding_version === 1 && typeof input.task_id === "string" && input.task_id !== envelope.task_id)
+        throw Object.assign(new Error("TASK_SCOPE_MISMATCH"), { code: "TASK_SCOPE_MISMATCH", effect: "not_started" });
+      // An explicit captured Task with no mirror has no local history. Never
+      // substitute another Task or create mirror rows as a side effect of reading.
+      const task = typeof input.task_id === "string" ? this.store.findTask(input.task_id)
+        : envelope.task_id ? claimedTask : this.store.currentTask(sessionId);
+      if (!task && (envelope.task_id || typeof input.task_id === "string")) throw Object.assign(
+        new Error("TASK_REMOTE_HISTORY_UNAVAILABLE: This Worker has no records for the requested Task; the Task selection was not changed."),
+        { code: "TASK_REMOTE_HISTORY_UNAVAILABLE", effect: "not_started", retryHint: "fix_input" });
       if (!task) throw new Error("TASK_NOT_FOUND");
       if (task.session_id !== sessionId) throw new Error("TASK_SESSION_MISMATCH");
       return {...envelope, task_id: task.id, task_title: task.title, task_created_at: task.created_at,
@@ -215,35 +266,41 @@ export class SessionFeed {
     this.store.adoptRemoteSession({
       id: sessionId,
       ownerId: envelope.owner_id,
-      conversationId: envelope.conversation_id,
+      conversationId: envelope.task_binding_version === 1 ? envelope.canonical_conversation_id ?? null : envelope.conversation_id,
       title: envelope.session_title ?? "Federated session",
     });
+    this.store.requireSession(envelope.owner_id, sessionId);
     if (envelope.task_id) {
       await this.service.adoptTask(sessionId, envelope.task_id, envelope.task_title ?? envelope.session_title ?? "QuayMesh task", envelope.task_created_at, envelope.task_source_id);
     }
     return envelope;
   }
 
-  assertTaskAcceptsWork(envelope: TrustedInvocationEnvelope): void {
+  private requireTaskWorkScope(envelope: TrustedInvocationEnvelope): void {
     const task = envelope.task_id ? this.store.getTask(envelope.task_id) : null;
     if (task && task.session_id !== envelope.session_id) throw Object.assign(new Error(`TASK_SESSION_MISMATCH: ${task.id}`),
       { code: "TASK_SESSION_MISMATCH", effect: "not_started" });
     if (envelope.session_id) this.store.requireSession(envelope.owner_id, envelope.session_id);
     if (!task || task.state !== "active") throw Object.assign(new Error(`TASK_NOT_ACTIVE: ${envelope.task_id ?? "missing"}`),
       { code: "TASK_NOT_ACTIVE", effect: "not_started" });
-    const finalization = this.store.taskData.finalization(task.id);
-    if (finalization && !finalization.error) throw Object.assign(new Error(`TASK_FINISHING: ${task.id}`),
-      { code: "TASK_FINISHING", effect: "not_started" });
+  }
+
+  async admitTaskWork(envelope: TrustedInvocationEnvelope): Promise<void> {
+    await this.store.writeAsync(()=>{
+      this.requireTaskWorkScope(envelope);
+      this.store.taskData.admitWorkInTransaction(envelope.task_id!);
+    });
   }
 
   async recordTaskWork(envelope: TrustedInvocationEnvelope): Promise<void> {
-    this.assertTaskAcceptsWork(envelope);
+    this.requireTaskWorkScope(envelope);
     if (!envelope.task_id || !envelope.member_id) throw Object.assign(new Error("TASK_MEMBER_REQUIRED"),
       { code: "TASK_MEMBER_REQUIRED", effect: "not_started" });
     const taskId = envelope.task_id, memberId = envelope.member_id;
     await this.store.writeAsync(() => {
       // 等待写锁时任务可能已结束；先复核，再登记目标节点以参与任务收尾。
-      this.assertTaskAcceptsWork(envelope);
+      this.requireTaskWorkScope(envelope);
+      this.store.taskData.admitWorkInTransaction(taskId);
       this.store.touchTaskMember(taskId, memberId);
     });
   }
@@ -267,25 +324,49 @@ export class SessionFeed {
       }
       return;
     }
-    const structured = result && typeof result === "object" && !Array.isArray(result)
-      ? (result as JsonRecord).structuredContent as JsonRecord | undefined
-      : undefined;
-    if (!structured) return;
+    const mismatch = (message: string) => Object.assign(new Error(`TASK_REMOTE_SCOPE_MISMATCH: ${message}`),
+      { code: "TASK_REMOTE_SCOPE_MISMATCH", effect: "unknown", retryHint: "query_original",
+        details: { task_id: envelope.task_id, session_id: envelope.session_id, owner_node_id: nodeId } });
+    const raw = result && typeof result === "object" && !Array.isArray(result) ? (result as JsonRecord).structuredContent : undefined;
+    const structured = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as JsonRecord : undefined;
+    if (!structured) {
+      if (envelope.task_binding_version === 1) throw mismatch("The Worker omitted the captured Task and workspace identity.");
+      return;
+    }
     const sessionId = typeof structured.session_id === "string" ? structured.session_id : envelope.session_id;
+    if (envelope.session_id && sessionId !== envelope.session_id
+      || envelope.task_id && typeof structured.task_id === "string" && structured.task_id !== envelope.task_id
+      || envelope.task_binding_version === 1 && (structured.task_id !== envelope.task_id || structured.session_id !== envelope.session_id
+        || structured.node_id !== nodeId || typeof structured.workspace_id !== "string")) {
+      // The Worker may already have performed workspace side effects. Preserve
+      // the expected identity and report uncertainty; never adopt another Task.
+      throw mismatch("The Worker returned a different Task or canonical storage identity.");
+    }
     const metadata=(result as JsonRecord)._meta as JsonRecord|undefined;
     const identity=metadata?.quaymesh as JsonRecord|undefined;
     const memberId=typeof structured.member_id==="string"?structured.member_id:typeof identity?.member_id==="string"?identity.member_id:undefined;
     const workspaceId = typeof structured.workspace_id === "string" ? structured.workspace_id : envelope.workspace_id;
     const root = typeof structured.root === "string" ? structured.root : "";
     if (name === "open_workspace" || name === "attach_workspace") {
-      if (!sessionId || !memberId || !workspaceId || !root) throw new Error("SESSION_FEED_RESULT_ID_INVALID");
+      if (!sessionId || !memberId || !workspaceId || !root) {
+        if (envelope.task_binding_version === 1) throw mismatch("The Worker omitted the workspace member identity.");
+        throw new Error("SESSION_FEED_RESULT_ID_INVALID");
+      }
     } else if (!sessionId || !memberId || !workspaceId || !root) return;
     const mode = structured.mode === "worktree" ? "worktree" : "checkout";
-    const localWorkspaceId = parseWorkspaceHandle(workspaceId)?.local ?? workspaceId;
+    const handle = parseWorkspaceHandle(workspaceId), localWorkspaceId = handle?.local ?? workspaceId;
+    const expected = envelope.workspace_id ? parseWorkspaceHandle(envelope.workspace_id) : undefined;
+    const existingMember = this.store.findMember(sessionId, memberId);
+    if (handle && handle.node !== nodeId || envelope.member_id && envelope.member_id !== memberId
+      || envelope.workspace_id && localWorkspaceId !== (expected?.local ?? envelope.workspace_id)
+      || existingMember && (existingMember.node_id !== nodeId || existingMember.workspace_id !== localWorkspaceId
+        || canonicalWorkspaceRoot(existingMember.root) !== canonicalWorkspaceRoot(root))) {
+      throw mismatch("The Worker returned a different workspace member.");
+    }
     this.store.adoptRemoteSession({
       id: sessionId,
       ownerId: envelope.owner_id,
-      conversationId: envelope.conversation_id,
+      conversationId: envelope.task_binding_version === 1 ? envelope.canonical_conversation_id ?? null : envelope.conversation_id,
       title: envelope.session_title ?? "Federated session",
     });
     if (envelope.task_id) {
@@ -308,6 +389,19 @@ export class SessionFeed {
     void input;
   }
 
+  /** Worker snapshots carry Task state; only the authority can describe this caller's live entry binding. */
+  workspaceResultForEntry(result: unknown, extra: JsonRecord, taskId: string): unknown {
+    if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+    const reply = result as JsonRecord, metadata = reply._meta as JsonRecord | undefined;
+    const existing = metadata?.quaymesh as JsonRecord | undefined;
+    const binding = taskBindingForRequest(this.store, extra, taskId, { federation: this.runtime.config });
+    const snapshot = existing?.snapshot as Snapshot | undefined;
+    return { ...reply, _meta: { ...metadata, quaymesh: { ...existing, task_binding: binding,
+      ...(snapshot ? { snapshot: { ...snapshot, capabilities: { ...snapshot.capabilities, continue: binding.can_continue } } } : {}),
+      ...(existing?.capabilities ? { capabilities: { ...(existing.capabilities as JsonRecord), continue: binding.can_continue } } : {}),
+    } } };
+  }
+
   async handleRequest(params: SessionFeedRequest, peerId: string, signal?: AbortSignal): Promise<unknown> {
     const deadline=Date.now()+TASK_REFRESH_TIMEOUT_MS;
     signal?.throwIfAborted();
@@ -320,12 +414,14 @@ export class SessionFeed {
     if(params.kind==="finalize"){
       if(!task || params.owner_id!==session.owner_id || !params.status || typeof params.summary!=="string")throw new Error("TASK_FINALIZATION_INVALID");
       if(this.runtime.config.coordinatorId && peerId!==this.runtime.config.coordinatorId)throw new Error("COORDINATOR_REQUIRED");
-      return this.service.finishOwnedTask(session.owner_id,task.id,params.status,params.summary);
+      const receipt = await this.service.finishOwnedTask(session.owner_id,task.id,params.status,params.summary);
+      return taskReceiptForPeer(receipt, params);
     }
     if(params.kind==="archive"){
       if(!task||params.owner_id!==session.owner_id)throw new Error("TASK_ARCHIVE_INVALID");
       if(this.runtime.config.coordinatorId&&peerId!==this.runtime.config.coordinatorId)throw new Error("COORDINATOR_REQUIRED");
-      return this.service.archiveOwnedTask(session.owner_id,task.id);
+      const receipt = await this.service.archiveOwnedTask(session.owner_id,task.id);
+      return taskReceiptForPeer(receipt, params);
     }
     const key=subscriptionKey(session.id,member.id,task?.id);
     if(params.kind==="unsubscribe"){
@@ -334,7 +430,9 @@ export class SessionFeed {
       return null;
     }
     if(params.kind==="subscribe"){
-      const peers=this.subscribers.get(key)??new Set<string>();peers.add(peerId);this.subscribers.set(key,peers);
+      const peers=this.subscribers.get(key)??new Map<string,SnapshotReader>();
+      peers.set(peerId,{command_identity:params.command_identity===true,file_recorded_at:params.file_recorded_at===true});
+      this.subscribers.set(key,peers);
     }
     const update=(snapshot?:Snapshot,revision=snapshot?.rev??(task?this.store.getTask(task.id).revision:this.store.memberRevision(member.id))):SessionFeedUpdate=>({
       owner_id:session.owner_id,node_id:this.runtime.localId,session_id:session.id,member_id:member.id,
@@ -353,7 +451,8 @@ export class SessionFeed {
         timeoutMs:Math.max(0,deadline-Date.now()),
         signal:signal?AbortSignal.any([signal,this.refreshController.signal]):this.refreshController.signal,
       })) as Snapshot;
-    return update(params.kind==="subscribe"?compactSnapshot(snapshot):snapshot,snapshot.rev);
+    const selected = snapshotForPeer(snapshot, params);
+    return update(params.kind==="subscribe"?compactSnapshot(selected):selected,snapshot.rev);
   }
 
   async receiveUpdate(value: unknown, peerId: string, deadline=Date.now()+TASK_REFRESH_TIMEOUT_MS): Promise<void> {
@@ -438,16 +537,7 @@ export class SessionFeed {
   }
 
   async fetchDetail(toolName: string, input: JsonRecord, extra: JsonRecord): Promise<unknown | undefined> {
-    if (![
-      "qm_file_diff",
-      "qm_command_output",
-      "qm_command_outputs",
-      "qm_instruction",
-      "qm_patch",
-      "qm_revert",
-      "qm_file_url",
-      "qm_session_continue",
-    ].includes(toolName)) return undefined;
+    if (sessionToolRoute(toolName) !== "member") return undefined;
     const member = this.memberForTool(toolName, input);
     if (!member) return detailUnavailable("member_not_found", null, null, null);
     if (member.member.node_id === this.runtime.localId) return undefined;
@@ -518,7 +608,7 @@ export class SessionFeed {
     const deadline=Date.now()+TASK_REFRESH_TIMEOUT_MS;
     const pending=this.runtime.request<SessionFeedUpdate>(subscription.nodeId,"session.feed",{
       kind:"subscribe",session_id:subscription.sessionId,member_id:subscription.memberId,
-      known_revision:subscription.lastRevision,...(subscription.taskId?{task_id:subscription.taskId}:{}),
+      known_revision:subscription.lastRevision,command_identity:true,file_recorded_at:true,...(subscription.taskId?{task_id:subscription.taskId}:{}),
     } satisfies SessionFeedRequest,TASK_REFRESH_TIMEOUT_MS,undefined,this.refreshController.signal)
       .then(update=>this.receiveUpdate(update,subscription.nodeId,deadline))
       .catch(async error=>{
@@ -541,7 +631,7 @@ export class SessionFeed {
     }
     const pending=this.runtime.request<SessionFeedUpdate>(subscription.nodeId,"session.feed",{
       kind:"snapshot",session_id:subscription.sessionId,member_id:subscription.memberId,
-      ...(subscription.taskId?{task_id:subscription.taskId}:{}),known_revision:subscription.lastRevision,
+      ...(subscription.taskId?{task_id:subscription.taskId}:{}),known_revision:subscription.lastRevision,command_identity:true,file_recorded_at:true,
     } satisfies SessionFeedRequest,remaining,undefined,this.refreshController.signal)
       .finally(()=>{if(this.snapshots.get(key)===pending)this.snapshots.delete(key);});
     this.snapshots.set(key,pending);
@@ -575,7 +665,7 @@ export class SessionFeed {
       if(task.state==='closed'&&!observation.activeOperationIds.length&&!observation.preparingOperationIds.length&&!observation.staleOperationIds.length)continue;
       const update:SessionFeedUpdate={owner_id:session.owner_id,node_id:this.runtime.localId,session_id:sessionId,member_id:memberId,
         task_id:taskId,revision:task.revision,observed_at:new Date(observation.observedAt).toISOString(),observation};
-      for(const peer of peers)this.runtime.transport.links.get(peer)?.notify('session.feed.update',update);
+      for(const peer of peers.keys())this.runtime.transport.links.get(peer)?.notify('session.feed.update',update);
     }
   }
 
@@ -595,9 +685,11 @@ export class SessionFeed {
       const update:SessionFeedUpdate={
         owner_id:session.owner_id,node_id:this.runtime.localId,session_id:sessionId,member_id:memberId,
         ...(taskId?{task_id:taskId}:{}),revision:sourceRevision,observed_at:new Date().toISOString(),
-        ...(snapshot&&compactSnapshot(snapshot)?{snapshot}:{})
       };
-      for(const peerId of peers)this.runtime.transport.links.get(peerId)?.notify("session.feed.update",update);
+      for(const [peerId,reader] of peers){
+        const selected=snapshot?compactSnapshot(snapshotForPeer(snapshot,reader)):undefined;
+        this.runtime.transport.links.get(peerId)?.notify("session.feed.update",{...update,...(selected?{snapshot:selected}:{})});
+      }
     },0);
     timer.unref?.();this.pendingPublishes.set(key,timer);
     void revision;
@@ -723,6 +815,26 @@ function conversationId(extra: JsonRecord): string | null {
 
 function compactSnapshot(snapshot: Snapshot): Snapshot | undefined {
   return Buffer.byteLength(JSON.stringify(snapshot)) <= 64 * 1024 ? snapshot : undefined;
+}
+
+function snapshotForPeer(snapshot: Snapshot, reader: SnapshotReader): Snapshot {
+  const compatible = { ...snapshot, files: filesForReader(snapshot.files, reader.file_recorded_at === true) };
+  if (reader.command_identity === true) return compatible;
+  const legacyCommand = ({invocation_id: _invocation, effect: _effect, ...command}: Snapshot["commands"][number]) => command;
+  return {
+    ...compatible,
+    commands: snapshot.commands.map(legacyCommand),
+    ...(snapshot.currentCommand ? {currentCommand: legacyCommand(snapshot.currentCommand)} : {}),
+    ...(snapshot.runningCommand ? {runningCommand: legacyCommand(snapshot.runningCommand)} : {}),
+    ...(snapshot.lastCommand ? {lastCommand: legacyCommand(snapshot.lastCommand)} : {}),
+  };
+}
+
+function taskReceiptForPeer(receipt: TaskOwnerReceipt, reader: SnapshotReader): TaskOwnerReceipt {
+  return {...receipt,
+    snapshots: receipt.snapshots.map(value => ({...value, snapshot: snapshotForPeer(value.snapshot, reader),
+      files: filesForReader(value.files, reader.file_recorded_at === true)})),
+  };
 }
 
 function detailUnavailable(

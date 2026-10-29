@@ -9,7 +9,7 @@ The session card, global Console, project Console, and conversation task summari
 | Closed, completed | Completed | Background execution or unconfirmed receipts remain visible |
 | Closed, failed | Not completed | The original result stays fixed |
 | Closed, cancelled | Stopped | Any remaining background evidence is shown separately |
-| Closed, handed off | Handed off | Confirmed background execution may continue |
+| Historical closed, handed off | Handed off | Preserved legacy result; confirmed background execution may continue |
 | Closed, no confirmed result | Ended / archived; delivery unconfirmed | Never presented as completed |
 | Open, fresh active operation | Executing | Last output age and operation duration |
 | Open, fresh preparation | Preparing | Preparation is distinct from a command that has started |
@@ -55,6 +55,12 @@ The resource address and the renderer's protocol capability are separate. When a
 | v1, v3, v4, v5, or unspecified | Historical strict snapshot shape; newer observation/live/finalization fields omitted |
 
 Stored snapshots retain the full data. Compatibility conversion happens at the response boundary, so an old cached reader remains usable without discarding evidence needed by a current reader. Current display parsing tolerates unknown additive fields while continuing to reject malformed known fields.
+
+## Goal completion and handoff
+
+A Task stays open across progress replies, command completion, and conversation changes. Only an achieved or explicitly ended goal needs `finish_task`. New `handed_off` finalization requests return `TASK_HANDOFF_NOT_TERMINAL` with `effect: not_started`; they create no finalization intent, archive no runs, and cancel no accepted command. Save progress with `checkpoint_task`, then inspect and resume the same Task in the receiving entry with `task_resume` and its binding revision.
+
+Startup preserves confirmed closed history. It marks only unconfirmed legacy `handed_off` intents on open Tasks as rejected, retains their summary and previous error, and excludes them from automatic finalization. This clears their finalization block without selecting another Task, changing a binding revision, or acknowledging messages. A later explicit completed/failed/cancelled request still checks active execution, the exact mailbox sequence, unread input, and the final confirmation transaction. See the [Task guide](TASKS.md#finish-a-goal-deliberately).
 
 ## Host event and diagnosis boundaries
 

@@ -50,6 +50,7 @@ test("BT09/10/TC05：多查询行去重、目录枚举续读和具体对象schem
   }
   const page=await f.call("workspace_context",{...f.scope,action:"search",directory:"src",patterns:["*.ts"],queries:["alpha","beta"],context_lines:1,max_files:1});
   assert.equal(page.entries.length,1);assert.equal(page.scope.next_file_offset,1);
+  assert.equal(page.next_cursor,null);assert.equal(page.complete,false);
   assert.deepEqual(page.entries[0].lines.map((line:any)=>[line.line,line.matches]),[[1,[0]],[2,[1]],[3,[0,1]]]);
   await writeFile(join(f.project,"src","aa.ts"),"late-added\n");
   const next=await f.call("workspace_context",{...f.scope,action:"search",result_ref:page.result_ref,file_offset:1});
@@ -62,14 +63,14 @@ test("大目录按页枚举，共用结果的并发续页不重复或遗漏文�
   const paths=Array.from({length:310},(_,index)=>`source/file-${String(index).padStart(4,"0")}.txt`);
   const f=await fixture(t,{git:false,files:Object.fromEntries(paths.map(path=>[path,"needle\n"]))});
   const first=await f.call("workspace_context",{...f.scope,action:"search",directory:"source",patterns:["*.txt"],query:"needle",max_files:25});
-  assert.equal(first.scope.enumeration_complete,false);assert.equal(first.scope.total_files,null);
+  assert.equal(first.scope.enumeration_complete,false);assert.equal(first.scope.total_files,null);assert.equal(first.complete,false);
   assert.ok(first.scope.enumerated_files<paths.length,"首页无需枚举完整目录");
   const pages=await Promise.all(Array.from({length:12},(_,index)=>f.call("workspace_context",{
     ...f.scope,action:"search",result_ref:first.result_ref,file_offset:(index+1)*25})));
   const all=[first,...pages].flatMap(page=>page.entries.map((entry:any)=>entry.path));
   assert.equal(new Set(all).size,paths.length);assert.deepEqual([...all].sort(),paths);
   assert.equal(pages.at(-1)!.scope.enumeration_complete,true);
-  assert.equal(pages.at(-1)!.scope.next_file_offset,null);
+  assert.equal(pages.at(-1)!.scope.next_file_offset,null);assert.equal(pages.at(-1)!.complete,true);
   const listing=await f.call("workspace_context",{...f.scope,action:"list",directory:"source"});
   assert.equal(listing.total,null);assert.equal(listing.enumeration_complete,false);
   assert.equal(listing.entries.length,100);

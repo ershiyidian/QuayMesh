@@ -80,7 +80,7 @@ test("real commands feed the card, and attaching a root refreshes metadata and i
   assert.equal(validateSnapshot(second.snapshot).workspace.root, canonicalExecutionRoot(server.secondRoot));
 });
 
-test("one conversation keeps one session while each user request gets a fixed task card", { timeout: 30_000 }, async (t) => {
+test("explicit independent goals retain separate task cards within the compatible storage session", { timeout: 30_000 }, async (t) => {
   const server = await createRealTestServer({ uiEnabled: true });
   t.after(() => server.dispose());
   await writeFile(join(server.project, "AGENTS.md"), "task one rules\n");
@@ -125,8 +125,12 @@ test("one conversation keeps one session while each user request gets a fixed ta
   }));
   assert.equal(firstFinish.result_status, "completed");
 
+  const firstSelection = structured(await server.client.callTool({
+    name: "task_resume", arguments: { action: "inspect", task_id: firstTaskId }, _meta: meta,
+  }));
   const secondStart = structured(await server.client.callTool({
-    name: "start_session", arguments: { request_key: "request-2-6914", title: "第二轮任务" }, _meta: meta,
+    name: "start_session", arguments: { request_key: "request-2-6914", title: "第二个独立目标", new_goal: true,
+      expected_binding_revision: (firstSelection.binding as { binding_revision: number }).binding_revision }, _meta: meta,
   }));
   assert.equal(secondStart.session_id, firstStart.session_id);
   assert.notEqual(secondStart.task_id, firstStart.task_id);

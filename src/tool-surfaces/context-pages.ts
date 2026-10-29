@@ -233,7 +233,10 @@ function packPage(data:Capture,resultRef:string,from:Position,operationId?:strin
     if(next.selectionIndex===from.selectionIndex&&next.startLine===from.startLine&&next.lineOffset===from.lineOffset)throw new Error("CONTEXT_PAGE_CANNOT_PROGRESS");
     value.next_cursor=Buffer.from(JSON.stringify({...next,ref:resultRef})).toString("base64url");
   }
-  value.complete=next===null;
+  // Exhausting this reply does not exhaust a directory search's remaining files.
+  const scopeComplete = data.scope.selection !== "directory"
+    || (data.scope.enumeration_complete === true && data.scope.next_file_offset === null);
+  value.complete = next === null && scopeComplete;
   if(replyBytes(value)>REPLY_BYTES)throw new Error("CONTEXT_PAGE_TOO_LARGE");
   return value;
 }

@@ -31,6 +31,7 @@ export function filterRuns(runs: Run[], query: Query, now = Date.now()): Run[] {
   return runs.filter((run) => (!query.node || run.nodeId === query.node)
     && (!query.project || run.projectId === query.project)
     && (!query.session || run.sessionId === query.session)
+    && (!query.requestState || run.requestState === query.requestState)
     && (!query.root || run.root === query.root)
     && (!query.changed || run.diff !== null)
     && (!query.execution || run.executionStatus === query.execution)
@@ -39,7 +40,7 @@ export function filterRuns(runs: Run[], query: Query, now = Date.now()): Run[] {
     && (!query.finishedDay || run.finishedAt !== null && dayAt(run.finishedAt, zone) === query.finishedDay)
     && (!query.attention || needsAttention(run))
     && (!search || [run.title, run.localId, run.id, run.projectName, run.nodeId].some((value) => value.toLocaleLowerCase().includes(search)))
-    && (!days || run.startedAt >= now - days * 86_400_000 || active(run)
+    && (!days || run.startedAt >= now - days * 86_400_000 || run.requestState === 'active' || active(run)
       || run.executionStatus==='waiting' || needsAttention(run)));
 }
 

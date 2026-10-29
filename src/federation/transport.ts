@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { connect, createServer, createSecureServer, constants,
   type ClientHttp2Session, type Http2Server, type Http2SecureServer,
   type ServerHttp2Stream, type ClientHttp2Stream, type Http2Session } from "node:http2";
-import { Duplex } from "node:stream";
+import { Duplex, finished } from "node:stream";
 import { connect as tlsConnect } from "node:tls";
 import { isIP, type Socket } from "node:net";
 import { connectSocket } from "../../node/network.mjs";
@@ -595,9 +595,24 @@ export class PeerTransport extends EventEmitter {
   }
 }
 
-/** pipe() supplies byte-level backpressure; errors close both ends, without replay. */
+/** pipe() supplies backpressure and half-close; only orderly closes drain queued output. */
 export function bridge(left: Duplex, right: Duplex): void {
+  const closePeer = (source: Duplex, destination: Duplex): void => {
+    // HTTP/2 CANCEL can mark both halves finished without emitting an error.
+    const reset = "rstCode" in source && typeof source.rstCode === "number" && source.rstCode !== 0;
+    if (source.readableEnded && source.writableFinished && !source.errored && !reset
+      && !destination.writableFinished && !destination.destroyed) {
+      // pipe() has already ended this writable. Its source may close before the
+      // final bytes leave an HTTP/2 flow-control queue. Do not discard that tail.
+      const cleanup = finished(destination, { readable: false }, () => {
+        cleanup();
+        destination.destroy();
+      });
+      return;
+    }
+    destination.destroy();
+  };
   left.on("error", () => right.destroy()); right.on("error", () => left.destroy());
-  left.on("close", () => right.destroy()); right.on("close", () => left.destroy());
+  left.on("close", () => closePeer(left, right)); right.on("close", () => closePeer(right, left));
   left.pipe(right); right.pipe(left);
 }

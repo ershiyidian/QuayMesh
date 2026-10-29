@@ -86,7 +86,7 @@ test("SDK 客户端发现输出 schema 后接受真实 ENOENT 错误并成功重
   const found = await client.callTool({ name: "read_fixture", arguments: { name: "example.txt" } });
   assert.notEqual(found.isError, true);
   assert.deepEqual(found.structuredContent, { result: contents });
-  assert.deepEqual(found.content, [{ type: "text", text: contents }]);
+  assert.deepEqual(found.content, [{ type: "text", text: JSON.stringify({ result: contents }) }]);
   assert.equal(reads, 2);
   assert.deepEqual(handlerErrors, []);
   assert.deepEqual(transportErrors, []);

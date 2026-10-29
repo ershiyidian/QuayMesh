@@ -59,6 +59,27 @@ test("已核验历史不能掩盖活动claim、未分发队列和持久runtime w
   assert.equal(readMaintenanceStatus(db).quiescent,false);
 });
 
+test("旧版非阻塞标记的存活出口仍阻挡维护，关闭后保留历史未知结果与物理证明",t=>{
+  const {db,receipt}=fixture(t);
+  recordExecutionQuiescence(db,unresolvedSubjects(db),receipt);
+  const history=db.prepare("SELECT * FROM console_operations").all();
+  db.prepare(`INSERT INTO qm_runtime_work(id,owner_id,owner_pid,kind,blocking,started_at)
+    VALUES('legacy-egress','owner',?,'egress',0,'2026-10-23'),
+      ('observation','owner',?,'observe',0,'2026-10-23')`).run(process.pid,process.pid);
+  const original=db.prepare("SELECT * FROM qm_runtime_work ORDER BY id").all();
+  const active=readMaintenanceStatus(db);
+  assert.equal(active.quiescent,false);assert.equal(active.idle,false);
+  assert.equal(active.activeWork,1);assert.equal(active.nonBlockingWork,1);assert.equal(active.persistedRuntimeWork,2);
+  assert.deepEqual(active.work,[{kind:"egress",count:1}]);
+  assert.equal(active.physicalUnknown,0);assert.equal(active.reconciliationPending,true);
+  assert.deepEqual(db.prepare("SELECT * FROM qm_runtime_work ORDER BY id").all(),original,"observation does not rewrite the legacy flag");
+  db.prepare("DELETE FROM qm_runtime_work WHERE id='legacy-egress'").run();
+  const drained=readMaintenanceStatus(db);
+  assert.equal(drained.quiescent,true);assert.equal(drained.activeWork,0);assert.equal(drained.nonBlockingWork,1);
+  assert.equal(drained.reconciliationPending,true);assert.equal(drained.reconciledPhysicalBoundaries,1);
+  assert.deepEqual(db.prepare("SELECT * FROM console_operations").all(),history);
+});
+
 test("批量历史指纹变化时整个物理收据事务拒绝，readonly查询不修改历史或写收据",t=>{
   const {db,add,receipt}=fixture(t);add("other");const subjects=unresolvedSubjects(db);
   db.prepare("UPDATE console_operations SET evidence='[]' WHERE id='other'").run();

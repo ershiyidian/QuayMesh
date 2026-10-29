@@ -1,9 +1,9 @@
 import { mergeExecutionObservations } from "../../execution-observation.js";
 import type { CommandSummary, Snapshot } from "../../session/types.js";
-import { taskDelivery, taskView, TASK_SILENCE_MS } from "../../task-view.js";
+import { taskDelivery, taskLifecycleView, taskView, TASK_SILENCE_MS } from "../../task-view.js";
 
 export const DEFAULT_SILENCE_WARNING_MS = TASK_SILENCE_MS;
-export type CardStatus = "running" | "stalled" | "failed" | "success" | "cancelled" | "handed_off" | "finalizing" | "archived" | "idle" | "unavailable";
+export type CardStatus = "active" | "running" | "stalled" | "failed" | "success" | "cancelled" | "handed_off" | "finalizing" | "archived" | "idle" | "unavailable";
 export type BackgroundStatus = "running" | "queued" | "unconfirmed" | "idle";
 
 export interface CardPresentation {
@@ -53,6 +53,19 @@ export function deliveryEnd(snapshot: Snapshot): number | null {
   return null;
 }
 
+/** Latest recorded task work; transport refresh times deliberately stay separate. */
+export function taskActivityAt(snapshot: Pick<Snapshot, "lastActivityAt" | "lastModelToolAt"
+  | "lastExecutionActivityAt" | "lastOutputAt" | "lastOperation" | "lastCommand"
+  | "runningCommand" | "currentCommand">): number | null {
+  const times = [snapshot.lastActivityAt, snapshot.lastModelToolAt,
+    snapshot.lastExecutionActivityAt, snapshot.lastOutputAt,
+    snapshot.lastOperation?.startedAt, snapshot.lastOperation?.endedAt,
+    ...[snapshot.lastCommand, snapshot.runningCommand, snapshot.currentCommand]
+      .flatMap(command => command ? [command.startedAt, command.endedAt] : []),
+  ].filter(finiteTime);
+  return times.length ? Math.max(...times) : null;
+}
+
 export function lastProgressAt(snapshot: Snapshot): number {
   return Math.max(snapshot.startedAt, ...[snapshot.lastModelToolAt, snapshot.lastActivityAt,
     snapshot.lastExecutionActivityAt, snapshot.lastOutputAt, snapshot.lastOperation?.endedAt,
@@ -97,8 +110,8 @@ export function commandTiming(snapshot: Snapshot, command: CommandSummary | null
   return {elapsedMs: confirmedAt === null ? null : nonNegative(Math.min(now, confirmedAt) - command.startedAt), dynamic: false, confirmed: false};
 }
 
-export function modelActivityAt(snapshot: Snapshot): number | null {
-  return snapshot.lastModelToolAt ?? snapshot.lastActivityAt ?? null;
+export function modelActivityAt(snapshot: Pick<Snapshot, "lastModelToolAt" | "lastActivityAt">): number | null {
+  return snapshot.lastModelToolAt === undefined ? snapshot.lastActivityAt ?? null : snapshot.lastModelToolAt;
 }
 
 export function cardPresentation(snapshot: Snapshot, now: number, silenceWarningMs = DEFAULT_SILENCE_WARNING_MS): CardPresentation {
@@ -112,7 +125,10 @@ export function cardPresentation(snapshot: Snapshot, now: number, silenceWarning
     : observation.staleOperationIds.length || observationStale ? 'unconfirmed' : 'idle';
   const backgroundLabel = backgroundStatus === 'running' ? `后台仍在执行${observation.staleOperationIds.length?' · 另有命令结果待核对':''}`
     : backgroundStatus === 'queued' ? `后台正在准备${observation.staleOperationIds.length?' · 另有命令结果待核对':''}`
-    : backgroundStatus === 'unconfirmed' ? observation.staleOperationIds.length ? '后台命令结果待核对' : '后台状态待更新' : null;
+    : backgroundStatus === 'unconfirmed' ? observation.staleOperationIds.length ? '后台命令结果待核对' : '后台状态待更新'
+    : snapshot.taskState === 'active' ? shared.status === 'failed' ? '最近执行失败'
+      : shared.status === 'interrupted_recoverable' ? '后台执行已中断'
+      : shared.status === 'stalled' ? '长时间无新执行记录' : '暂无后台执行' : null;
   let status: CardStatus, label: string;
   // 本轮交付和后台命令各有自己的状态，失联回执不改写已保存的交付结果。
   const delivery = taskDelivery(snapshot.taskState, snapshot.taskResult);
@@ -120,6 +136,11 @@ export function cardPresentation(snapshot: Snapshot, now: number, silenceWarning
     status = delivery.status === 'completed' ? 'success' : delivery.status === 'ended' ? 'archived' : delivery.status as CardStatus;
     label = delivery.status === 'ended' && (snapshot.closureReason === 'superseded' || snapshot.closureReason === 'legacy_archive')
       ? '已归档 · 交付未确认' : delivery.label;
+  } else if (snapshot.taskState === 'active') {
+    const lifecycle=taskLifecycleView({requestState:snapshot.taskState,result:snapshot.taskResult,
+      finalizing:finalizationPending(snapshot),finalizationFailed:snapshot.finalization?.state==='failed'})!;
+    status=lifecycle.status==='finalizing'?'finalizing':'active';
+    label=lifecycle.label;
   } else if (shared.status === 'running' || shared.status === 'queued' || shared.status === 'stopping') {
     status = 'running'; label = shared.status === 'queued' ? '准备执行' : shared.status === 'stopping' ? '正在停止' : '执行中';
   } else if (shared.status === 'unknown') {
@@ -138,7 +159,7 @@ export function cardPresentation(snapshot: Snapshot, now: number, silenceWarning
   const taskClockDynamic = deliveryEnd(snapshot) === null && snapshot.taskState !== 'closed'
     && snapshot.closureReason !== 'superseded' && snapshot.closureReason !== 'legacy_archive';
   return {status, label, backgroundStatus, backgroundLabel,
-    taskElapsedMs: taskElapsedMs(snapshot, now), taskClockLabel: '本轮耗时',
+    taskElapsedMs: taskElapsedMs(snapshot, now), taskClockLabel: snapshot.taskId ? '任务历时' : '记录历时',
     commandElapsedMs: timing.elapsedMs, taskClockDynamic, commandClockDynamic: timing.dynamic,
     modelActivityAgeMs: age(now, modelAt), executionActivityAgeMs: age(now, executionAt),
     observationStale, confirmedAt: observation.observedAt,
@@ -161,7 +182,8 @@ export function refreshDelay(snapshot: Snapshot | null, collapsed = false): numb
 }
 
 export function needsLocalTimer(snapshot: Snapshot | null): boolean {
-  return Boolean(snapshot && !isFinal(snapshot));
+  // Relative activity/confirmation ages still advance after task duration stops.
+  return snapshot !== null;
 }
 
 export function durationText(milliseconds: number): string {

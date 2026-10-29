@@ -1,3 +1,5 @@
+import { taskContinuationEligibility } from "./task-continuation.js";
+import { taskBindingForRequest } from "../tasks/task-resume.js";
 import { executionObservationSchema, snapshotLiveStateSchema } from "./schema.js";
 import { projectionForCard } from './card-contract.js';
 import { errorCode } from './outcome.js';
@@ -6,10 +8,8 @@ import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ServerConfig } from "../config.js";
 import { jsonReply } from "../bounded-reply.js";
-import { workspaceHandle } from "../federation/routing.js";
+import { parseWorkspaceHandle, workspaceHandle } from "../federation/routing.js";
 import {
-  ExecutionState,
-  HostState,
   type AgentSummary,
   type FileSummary,
   type SessionId,
@@ -35,6 +35,7 @@ export interface SessionAppToolDependencies {
 }
 
 interface AppCallContext {
+  _meta?: unknown;
   authInfo?: {
     clientId?: string;
     extra?: Record<string, unknown>;
@@ -157,7 +158,7 @@ export function registerSessionAppTools(
         const task = dependencies.store.getTask(input.task_id);
         if (task.session_id !== input.session_id) throw new Error(`TASK_SESSION_MISMATCH: ${input.task_id}`);
         dependencies.store.requireSession(ownerId, input.session_id);
-        const result=projectionForCard(await dependencies.projector.readTask(input.task_id, input.since_rev, input.member_id, input.cursor), input.resource_version);
+        const result=projectionForCard(await dependencies.projector.readTask(input.task_id, input.since_rev, input.member_id, input.cursor), input.resource_version, input.file_recorded_at);
         if(input.mount_id&&input.resource_version){
           try {
             // 附带挂载诊断不能让读取等待写锁；独立阶段上报仍按原接口确认落盘。
@@ -174,15 +175,20 @@ export function registerSessionAppTools(
             if(code!=="SQLITE_BUSY"&&!code.startsWith("SQLITE_BUSY_"))throw error;
           }
         }
-        return jsonReply({...result});
+        const binding = taskBindingForRequest(dependencies.store, extra as AppCallContext, task.id, dependencies.config);
+        const scoped = result.snapshot ? { ...result, snapshot: { ...result.snapshot,
+          capabilities: { ...result.snapshot.capabilities, continue: binding.can_continue } } } : result;
+        // Entry authority is live request state, not a persisted Task property.
+        // It must also be returned on unchanged snapshots.
+        return { ...jsonReply({ ...scoped }), _meta: { quaymesh: { task_binding: binding } } };
       }
       if (!input.member_id) {
         const session = authorizedSessionRecord(ownerId, input.session_id);
-        return jsonReply({...projectionForCard(await dependencies.projector.readSession(session.id, input.since_rev, input.cursor), input.resource_version)});
+        return jsonReply({...projectionForCard(await dependencies.projector.readSession(session.id, input.since_rev, input.cursor), input.resource_version, input.file_recorded_at)});
       }
       const authorized = authorizedSession(ownerId, input.session_id);
       const member = memberForRequest(authorized, input.member_id);
-      return jsonReply({...projectionForCard(await dependencies.projector.read(authorized.session.id, member.id, input.since_rev, input.cursor), input.resource_version)});
+      return jsonReply({...projectionForCard(await dependencies.projector.read(authorized.session.id, member.id, input.since_rev, input.cursor), input.resource_version, input.file_recorded_at)});
     },
   );
 
@@ -475,12 +481,13 @@ export function registerSessionAppTools(
     server,
     "qm_session_continue",
     {
-      title: "Prepare continuation message",
-      description: "Builds a short continuation message for the user. It does not start model inference.",
+      title: "Prepare task continuation message",
+      description: "Builds a continuation message for the exact active task shown in the card. It does not create a task or start model inference.",
       inputSchema: appSchemas.continue,
       outputSchema: z.object({
         message: z.string(),
         session_id: z.string(),
+        task_id: z.string(),
         agent_id: z.string().optional(),
         result_ref: z.string().optional(),
       }),
@@ -489,22 +496,46 @@ export function registerSessionAppTools(
     },
     async (input, extra) => {
       const ownerId = owner(extra as AppCallContext);
-      bindTask(ownerId, input);
-      const authorized = authorizedSession(ownerId, input.session_id);
-      const member = memberForRequest(authorized, input.member_id);
-      const agent = continuationAgent(dependencies.store, authorized.session.id, member.id, input.agent_id);
-      const pendingHostContinuation = authorized.session.execution_state === ExecutionState.active
-        && authorized.session.host_state === HostState.disconnected;
-      if (!agent && !pendingHostContinuation) {
-        throw new Error("NO_CONTINUATION_RESULT");
+      const session = authorizedSessionRecord(ownerId, input.session_id);
+      const task = dependencies.store.getTask(input.task_id);
+      if (task.session_id !== session.id) throw new Error(`TASK_SESSION_MISMATCH: ${task.id}`);
+      const binding = taskBindingForRequest(dependencies.store, extra as AppCallContext, task.id, dependencies.config);
+      const continuation = taskContinuationEligibility(task, binding.can_continue ? task.id : null,
+        dependencies.store.taskData.finalization(task.id));
+      if (!continuation.allowed) {
+        const reason = continuation.code === "TASK_NOT_ACTIVE" ? "任务已经结束；当前入口不能重新开启任务。"
+          : continuation.code === "TASK_FINISHING" ? "任务正在完成确认；请等待结果或处理失败后重试。"
+            : "当前执行入口已关联其他任务；先恢复明确的任务绑定。";
+        throw Object.assign(new Error(`${continuation.code}: ${reason}`), { code: continuation.code, effect: "not_started" });
+      }
+      const taskMembers = new Set(dependencies.store.taskMemberIds(task.id));
+      let member = input.member_id ? session.members.find(item => item.id === input.member_id) : undefined;
+      if (input.member_id && (!member || !taskMembers.has(member.id))) throw new Error("MEMBER_NOT_IN_TASK");
+      let agent: AgentSummary | null;
+      if (input.agent_id) {
+        agent = continuationAgent(dependencies.store, task.id, member?.id, input.agent_id);
+        if (!agent) throw new Error("AGENT_RESULT_NOT_FOUND_IN_TASK");
+        const agentMemberId = agent.member_id;
+        member ??= session.members.find(item => item.id === agentMemberId);
+        if (!member || !taskMembers.has(member.id)) throw new Error("MEMBER_NOT_IN_TASK");
+      } else {
+        member ??= session.members.find(item => item.id === session.selected_member_id && taskMembers.has(item.id))
+          ?? session.members.find(item => taskMembers.has(item.id));
+        agent = member ? continuationAgent(dependencies.store, task.id, member.id) : null;
       }
       const resultRef = agent?.result_ref ?? undefined;
-      const parts = [`继续处理会话 ${authorized.session.id}`];
+      const parts = [`继续处理同一任务 ${task.id}，复用原 task_id 和工作区句柄`];
+      parts.push(`先调用 task_resume(${JSON.stringify({ action: "inspect", task_id: task.id })}) 确认当前模型入口；若尚未选中该任务，按所见 binding_revision 和稳定 request_key 显式 resume 后再工作`);
+      if (member) parts.push(`然后调用 workspace_context(${JSON.stringify({
+        workspace_id: parseWorkspaceHandle(member.workspace_id) || !dependencies.config?.federation?.enabled
+          ? member.workspace_id : workspaceHandle(member.node_id, member.workspace_id), action: "recovery", task_id: task.id,
+      })}) 读取原任务的检查点与执行状态`);
       if (agent?.id) parts.push(`代理 ${agent.id}`);
       if (resultRef) parts.push(`先读取结果 ${resultRef}`);
       return jsonReply({
         message: `${parts.join("；")}。`,
-        session_id: authorized.session.id,
+        session_id: session.id,
+        task_id: task.id,
         ...(agent?.id ? { agent_id: agent.id } : {}),
         ...(resultRef ? { result_ref: resultRef } : {}),
       });
@@ -514,15 +545,22 @@ export function registerSessionAppTools(
 
 function continuationAgent(
   store: SessionStore,
-  sessionId: string,
-  memberId: string,
+  taskId: string,
+  memberId: string | undefined,
   agentId?: string,
 ): AgentSummary | null {
-  const events = store.eventsForSession(sessionId).filter((event) => event.type === "agent_changed" && event.member_id === memberId);
-  const candidates = events
-    .map((event) => agentFromEvent(event))
-    .filter((agent): agent is AgentSummary => agent !== null)
-    .filter((agent) => agent.result_available);
+  const latest = new Map<string, AgentSummary>();
+  for (const event of store.eventsForTask(taskId)) {
+    if (event.type !== "agent_changed" || memberId !== undefined && event.member_id !== memberId) continue;
+    const agent = agentFromEvent(event);
+    if (!agent) continue;
+    const key = JSON.stringify([agent.member_id, agent.id]);
+    latest.delete(key);
+    latest.set(key, agent);
+  }
+  const matches = [...latest.values()].filter(agent => !agentId || agent.id === agentId);
+  if (agentId && memberId === undefined && matches.length > 1) throw new Error("AGENT_MEMBER_REQUIRED");
+  const candidates = matches.filter(agent => agent.result_available);
   if (agentId) return candidates.find((agent) => agent.id === agentId) ?? null;
   return candidates.at(-1) ?? null;
 }
@@ -552,7 +590,7 @@ function agentFromEvent(event: {
     startedAt: Date.parse(event.timestamp),
     endedAt: null,
     steps: null,
-    result_available: resultRef !== null,
+    result_available: event.payload.result_available !== false && resultRef !== null,
     result_ref: resultRef,
   };
 }

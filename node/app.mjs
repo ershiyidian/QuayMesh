@@ -129,6 +129,7 @@ export class QuayMeshNode {
       port:cluster.discovery.localPort,
       socksUrl:node.mesh.enabled && node.mesh.mode === "no-tun" ? `socks5://127.0.0.1:${node.mesh.socksPort}` : undefined,
       onError:error => this.errors.fail(error.source || "relay",error), onSuccess:source => this.errors.recover(source),
+      onExchange:(event,fields) => console.info(JSON.stringify({event,nodeId:node.id,...fields})),
       consoleRpc:request => requestJson(`http://127.0.0.1:${node.corePort}/internal/quaymesh/console`, {
         method:"POST", token:this.token, timeoutMs:30000, signal:request.signal,
         body:{nodeId:cluster.coordinator.id,request:{...request,signal:undefined}},

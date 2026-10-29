@@ -1,3 +1,5 @@
+import { taskExecutionEntryFromAuthInfo, taskCreationClientFromAuthInfo, type TaskExecutionEntry, type TaskCreationClient } from "./tasks/task-binding.js";
+
 function metadataString(
   meta: unknown,
   key: string,
@@ -32,6 +34,8 @@ export interface SessionRequestIdentity {
   invocation_id?: string;
   operation_id?: string;
   task_id?: string;
+  task_entry?: TaskExecutionEntry;
+  task_creation?: TaskCreationClient;
 }
 
 export interface SessionRequestIdentityInput {
@@ -42,6 +46,7 @@ export interface SessionRequestIdentityInput {
   sessionId?: string;
   requestId?: string | number;
   _meta?: unknown;
+  requestedTaskId?: unknown;
   trustedInvocation?: {
     invocation_id?: string;
     operation_id?: string;
@@ -82,14 +87,25 @@ export function sessionRequestIdentity(
     throw new Error("MISSING_REQUEST_ID");
   }
 
+  const conversationId = conversationScopeIdFromRequestMeta(input._meta) ?? input.trustedInvocation?.conversation_id ?? null;
+  const requestedTaskId = input.requestedTaskId;
+  if (requestedTaskId !== undefined && (typeof requestedTaskId !== "string" || requestedTaskId.length === 0))
+    throw Object.assign(new Error("TASK_ACCESS_INVALID_ID"), {code: "TASK_ACCESS_INVALID_ID", effect: "not_started"});
+  if (requestedTaskId && input.trustedInvocation?.task_id && requestedTaskId !== input.trustedInvocation.task_id)
+    throw Object.assign(new Error("TASK_SCOPE_MISMATCH"), {code: "TASK_SCOPE_MISMATCH", effect: "not_started"});
+  const taskId = input.trustedInvocation?.task_id ?? requestedTaskId;
+  const taskCreation = taskCreationClientFromAuthInfo(authInfo);
   return {
     owner_id: ownerId,
-    conversation_id: conversationScopeIdFromRequestMeta(input._meta) ?? input.trustedInvocation?.conversation_id ?? null,
+    conversation_id: conversationId,
     transport_instance_id: transportInstanceId,
     request_id: requestId,
     ...(input.trustedInvocation?.invocation_id ? { invocation_id: input.trustedInvocation.invocation_id } : {}),
     ...(input.trustedInvocation?.operation_id ? { operation_id: input.trustedInvocation.operation_id } : {}),
-    ...(input.trustedInvocation?.task_id ? { task_id: input.trustedInvocation.task_id } : {}),
+    ...(taskId ? { task_id: taskId } : {}),
+    ...(taskCreation ? {task_creation: taskCreation} : {}),
+    ...(authInfo.clientId && conversationId ? { task_entry: taskExecutionEntryFromAuthInfo({ ...authInfo,
+      extra: { ...authInfo.extra, owner_id: ownerId } }, conversationId) } : {}),
   };
 }
 

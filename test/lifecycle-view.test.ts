@@ -47,27 +47,28 @@ for(const result of ["completed","failed","cancelled"] as const){
 
 test("本轮耗时按请求起点持续计算，静默提示只描述执行活动",()=>{
   const view=cardPresentation(snapshot({lastModelToolAt:now-3_600_000,lastActivityAt:now-3_600_000}),now);
-  assert.equal(view.status,"stalled");assert.equal(view.taskClockDynamic,true);assert.equal(view.taskElapsedMs,3_600_000);
-  assert.equal(view.taskClockLabel,'本轮耗时');
+  assert.equal(view.status,"active");assert.equal(view.backgroundLabel,'长时间无新执行记录');assert.equal(view.taskClockDynamic,true);assert.equal(view.taskElapsedMs,3_600_000);
+  assert.equal(view.taskClockLabel,'任务历时');
 });
 
 test("三十分钟无输出的真实活跃执行仍显示运行",()=>{
   const value=snapshot({commands:[command],runningCommand:command,lastModelToolAt:now-1_800_000,
     executionObservation:{observedAt:now,activeOperationIds:["op"],preparingOperationIds:[],staleOperationIds:[]}});
-  const view=cardPresentation(value,now);assert.equal(view.status,"running");assert.equal(view.commandElapsedMs,1_800_000);
+  const view=cardPresentation(value,now);assert.equal(view.status,"active");assert.equal(view.backgroundStatus,"running");assert.equal(view.commandElapsedMs,1_800_000);
   assert.equal(view.commandClockDynamic,true);
 });
 
 test("同一快照失去活性观察后显示待确认，不把时间当成进展",()=>{
   const value=snapshot({commands:[command],runningCommand:command,executionObservation:{observedAt:now-31_000,
     activeOperationIds:["op"],preparingOperationIds:[],staleOperationIds:[]}});
-  const view=cardPresentation(value,now);assert.equal(view.status,"unavailable");assert.equal(view.commandClockDynamic,false);
+  const view=cardPresentation(value,now);assert.equal(view.status,"active");assert.equal(view.backgroundStatus,"unconfirmed");assert.equal(view.commandClockDynamic,false);
   assert.equal(view.commandElapsedMs,1_769_000);assert.equal(view.taskClockDynamic,true);
   assert.equal(cardPresentation(value,now+60_000).commandElapsedMs,1_769_000);
 });
 
 test("明确中断不会因一分钟前的工具活动又显示等待下一步",()=>{
-  assert.equal(cardPresentation(snapshot({execution_status:ExecutionState.interrupted}),now).label,"执行已中断");
+  const view=cardPresentation(snapshot({execution_status:ExecutionState.interrupted}),now);
+  assert.equal(view.label,"任务进行中");assert.equal(view.backgroundLabel,"后台执行已中断");
 });
 
 test("不同来源的观察分别过期，新鲜来源可确认相同操作",()=>{
@@ -102,10 +103,10 @@ test('单个节点离线不遮蔽其他节点的新鲜执行，未知回执仍�
   const value=snapshot({host_status:HostState.disconnected,commands:[command],runningCommand:command,
     executionObservation:{observedAt:now,activeOperationIds:['op'],preparingOperationIds:[],staleOperationIds:['offline-op']}});
   const active=cardPresentation(value,now);
-  assert.equal(active.status,'running');assert.equal(active.commandClockDynamic,true);
+  assert.equal(active.status,'active');assert.equal(active.backgroundStatus,'running');assert.equal(active.commandClockDynamic,true);
   assert.equal(active.backgroundLabel,'后台仍在执行 · 另有命令结果待核对');
   const expired=cardPresentation(value,now+31_000);
-  assert.equal(expired.status,'unavailable');assert.equal(expired.commandClockDynamic,false);
+  assert.equal(expired.status,'active');assert.equal(expired.backgroundStatus,'unconfirmed');assert.equal(expired.commandClockDynamic,false);
 });
 
 test("外部活性载荷拒绝非法集合和时间戳",()=>{
@@ -131,7 +132,8 @@ for(const execution of ["stalled","finalizing","unknown","interrupted_recoverabl
 test('开放请求没有后台命令时仍显示完整本轮耗时，活动年龄独立增加',()=>{
   const value=snapshot({lastModelToolAt:now-15_000,lastActivityAt:now-15_000});
   const first=cardPresentation(value,now),later=cardPresentation(value,now+30_000);
-  assert.equal(first.status,'idle');assert.equal(later.status,'idle');
+  assert.equal(first.status,'active');assert.equal(later.status,'active');
+  assert.equal(first.backgroundStatus,'idle');assert.equal(later.backgroundStatus,'idle');
   assert.equal(first.taskClockDynamic,true);assert.equal(later.taskElapsedMs!-first.taskElapsedMs!,30_000);
   assert.equal(later.activityAgeMs-first.activityAgeMs,30_000);
   assert.equal(value.taskState,'active');assert.equal(value.taskResult,null);
@@ -140,7 +142,7 @@ test('开放请求没有后台命令时仍显示完整本轮耗时，活动年�
 test('只有任务创建事件时也能判定全任务静默，本轮耗时保留完整时长',()=>{
   const value=snapshot({startedAt:now-11*60_000,lastModelToolAt:null,lastActivityAt:null,lastExecutionActivityAt:null});
   const view=cardPresentation(value,now);
-  assert.equal(view.status,'stalled');assert.equal(view.taskElapsedMs,11*60_000);assert.equal(view.taskClockDynamic,true);
+  assert.equal(view.status,'active');assert.equal(view.backgroundLabel,'长时间无新执行记录');assert.equal(view.taskElapsedMs,11*60_000);assert.equal(view.taskClockDynamic,true);
 });
 
 test('已完成主状态与丢失命令回执独立，重复刷新不会让任务复活',()=>{
@@ -198,17 +200,17 @@ test('交付最终确认有独立结构化状态，不依赖提示文案',()=>{
   assert.equal(failed.label,'交付确认失败');assert.equal(failed.taskClockDynamic,true);
   const executing=cardPresentation({...value,finalization:{state:'failed',requestedAt:now-5000,error:'receipt unavailable'},
     executionObservation:{observedAt:now,activeOperationIds:['op'],preparingOperationIds:[],staleOperationIds:[]}},now);
-  assert.equal(executing.status,'running');assert.equal(executing.taskClockDynamic,true);
+  assert.equal(executing.status,'finalizing');assert.equal(executing.label,'交付确认失败');assert.equal(executing.backgroundStatus,'running');assert.equal(executing.taskClockDynamic,true);
 });
 
 test('过期空闲观测显示更新延迟，刷新成功后才允许判断全任务静默',()=>{
   const value=snapshot({lastActivityAt:now-11*60_000,lastModelToolAt:now-11*60_000,
     executionObservation:{observedAt:now-60_000,activeOperationIds:[],preparingOperationIds:[],staleOperationIds:[]}});
   const delayed=cardPresentation(value,now);
-  assert.equal(delayed.status,'unavailable');assert.equal(delayed.label,'状态更新延迟');
+  assert.equal(delayed.status,'active');assert.equal(delayed.label,'任务进行中');assert.equal(delayed.backgroundLabel,'后台状态待更新');
   assert.equal(delayed.observationStale,true);assert.equal(delayed.confirmedAt,now-60_000);
   const confirmed=cardPresentation({...value,executionObservation:{...value.executionObservation!,observedAt:now}},now);
-  assert.equal(confirmed.status,'stalled');assert.equal(confirmed.label,'10 分钟没有新的执行记录');
+  assert.equal(confirmed.status,'active');assert.equal(confirmed.label,'任务进行中');assert.equal(confirmed.backgroundLabel,'长时间无新执行记录');
   const completed={...value,taskState:'closed' as const,taskResult:'completed' as const,deliveryEndedAt:now-30_000};
   assert.equal(cardPresentation(completed,now).status,'success');assert.equal(isFinal(completed,now),true);
 });
@@ -247,10 +249,10 @@ test('不同节点确认时间经过卡片再次汇总，命令仍按自己的�
   ],now);
   const value=snapshot({commands:[command],runningCommand:command,executionObservation:observation});
   const fresh=cardPresentation(value,now+2_000);
-  assert.equal(fresh.status,'running');assert.equal(fresh.commandClockDynamic,true);
+  assert.equal(fresh.status,'active');assert.equal(fresh.backgroundStatus,'running');assert.equal(fresh.commandClockDynamic,true);
   assert.equal(fresh.commandElapsedMs,1_802_000);
   const expired=cardPresentation(value,now+31_000);
-  assert.equal(expired.status,'unavailable');assert.equal(expired.commandClockDynamic,false);
+  assert.equal(expired.status,'active');assert.equal(expired.backgroundStatus,'unconfirmed');assert.equal(expired.commandClockDynamic,false);
   assert.equal(expired.commandElapsedMs,1_800_000,'停在该命令的最后确认时刻');
   const recorded=cardPresentation({...value,executionObservation:mergeExecutionObservations([observation],now+31_000)},now+40_000);
   assert.equal(recorded.commandElapsedMs,1_800_000,'服务器已将命令移入待核对集合时仍保留确认时长');

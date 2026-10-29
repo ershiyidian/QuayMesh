@@ -20,8 +20,10 @@ const fixture = await createRealTestServer({git: false, files: {"AGENTS.md": "# 
   }});
 try {
   const listing = await fixture.client.listTools();
-  const tools = listing.tools.filter(tool => !(tool._meta?.ui as {visibility?: string[]})?.visibility?.includes("app"))
-    .sort((a, b) => a.name.localeCompare(b.name));
+  const tools = listing.tools.filter(tool => {
+    const visibility = (tool._meta?.ui as {visibility?: string[]})?.visibility;
+    return visibility === undefined || visibility.includes("model");
+  }).sort((a, b) => a.name.localeCompare(b.name));
   const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value ?? null), "utf8");
   const parts = tools.map(tool => ({name: tool.name, total: bytes(tool), description: bytes(tool.description),
     input: bytes(tool.inputSchema), output: bytes(tool.outputSchema), metadata: bytes({annotations: tool.annotations, _meta: tool._meta})}));
@@ -36,8 +38,13 @@ try {
   await writeFile(program, "process.exitCode = 0;\n");
   const command = await call("exec_command", {workspace_id: workspaceId, cmd: `"${process.execPath}" "${program}"`, yield_time_ms: 2000});
   if (command.isError) throw new Error(JSON.stringify(command));
-  await call("finish_task", {task_id: (started.structuredContent as {task_id: string}).task_id,
-    status: "completed", summary: "接口测量结束"});
+  const taskId = (started.structuredContent as {task_id: string}).task_id;
+  const selected = await call("task_resume", {action: "inspect", task_id: taskId});
+  if (selected.isError) throw new Error(JSON.stringify(selected));
+  const finished = await call("finish_task", {task_id: taskId,
+    expected_task_revision: (selected.structuredContent as {task_revision: number}).task_revision,
+    message_sequence: 0, status: "completed", summary: "接口测量结束"});
+  if (finished.isError) throw new Error(JSON.stringify(finished));
   const response = (result: typeof opened) => ({modelBytes: bytes({content: result.content, structuredContent: result.structuredContent}),
     contentBytes: bytes(result.content), structuredBytes: bytes(result.structuredContent), uiBytes: bytes(result._meta)});
   const report = {time: new Date().toISOString(), commit: execFileSync("git", ["rev-parse", "HEAD"], {encoding: "utf8"}).trim(),

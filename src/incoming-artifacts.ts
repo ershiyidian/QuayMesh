@@ -4,9 +4,7 @@ import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import { ArtifactError } from "./artifact-error.js";
 
 const ADAPTER_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
-const OPENAI_FILE_HOSTS = new Set([
-  "files.oaiusercontent.com",
-]);
+const OPENAI_FILE_HOST_SUFFIX = ".oaiusercontent.com";
 // ChatGPT-generated files are served from regional OpenAI-managed Azure storage
 // accounts. Accept that account family only, never arbitrary Azure Blob hosts.
 const OPENAI_REGIONAL_BLOB_HOST_PATTERN = /^oaisdmntpr[a-z0-9]+\.blob\.core\.windows\.net$/u;
@@ -540,7 +538,7 @@ function validateOpenAIFileUrl(value: string): string {
 }
 
 function isTrustedOpenAIFileHost(hostname: string): boolean {
-  return OPENAI_FILE_HOSTS.has(hostname) || OPENAI_REGIONAL_BLOB_HOST_PATTERN.test(hostname);
+  return hostname.endsWith(OPENAI_FILE_HOST_SUFFIX) || OPENAI_REGIONAL_BLOB_HOST_PATTERN.test(hostname);
 }
 
 function isRedirectStatus(status: number): boolean {

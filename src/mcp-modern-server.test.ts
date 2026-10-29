@@ -119,7 +119,10 @@ test("输出 schema 兼容业务错误，同时保留成功结果的运行时校
     assert.equal(response.status, 200);
     const body = await response.json() as { result: CallToolResult };
     const expected = name === "proper_error" ? failure : success;
-    assert.deepEqual(body.result.content, expected.content);
+    const text = body.result.content[0];
+    assert.ok(text?.type === "text");
+    assert.deepEqual(JSON.parse(text.text), expected.structuredContent);
+    assert.deepEqual(body.result.content.slice(1), expected.content);
     assert.deepEqual(body.result.structuredContent, expected.structuredContent);
     assert.equal(body.result.isError === true, name === "proper_error");
   }

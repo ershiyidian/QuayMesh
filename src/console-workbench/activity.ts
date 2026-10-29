@@ -27,18 +27,19 @@ export function readLocalActivity(config: ServerConfig, kind: string, query: Act
     };
     let source: string;
     if (kind === "calls") {
-      const failed = `(json_extract(v.response_json,'$.kind')='error'
-        OR json_extract(v.response_json,'$.value.isError')=1 OR json_extract(v.response_json,'$.isError')=1)`;
+      const response = "(CASE WHEN v.response_uses_result=1 THEN v.result_json ELSE v.response_json END)";
+      const failed = `(json_extract(${response},'$.kind')='error'
+        OR json_extract(${response},'$.value.isError')=1 OR json_extract(${response},'$.isError')=1)`;
       source = `SELECT v.id,v.created_at at,
-        CASE WHEN json_extract(v.response_json,'$.effect')='unknown'
-          OR json_extract(v.response_json,'$.value.structuredContent.effect')='unknown'
+        CASE WHEN json_extract(${response},'$.effect')='unknown'
+          OR json_extract(${response},'$.value.structuredContent.effect')='unknown'
           OR v.response_at IS NULL AND v.state IN ('unknown','reconciliation_required') THEN 'warn'
           WHEN ${failed} THEN 'error' ELSE 'info' END level,
         COALESCE(o.label,v.tool_name) message,v.state,v.tool_name tool,v.operation_id,o.run_id,v.task_id,v.session_id,
         COALESCE(t.title,s.title,'') task_title,'invocation' event_type,
-        json_object('responseRecorded',v.response_json IS NOT NULL,'requestError',COALESCE(${failed},0),
-          'errorMessage',COALESCE(json_extract(v.response_json,'$.message'),json_extract(v.response_json,'$.value.content[0].text'),
-            json_extract(v.response_json,'$.content[0].text'))) details_json,v.request_id,
+        json_object('responseRecorded',${response} IS NOT NULL,'requestError',COALESCE(${failed},0),
+          'errorMessage',COALESCE(json_extract(${response},'$.message'),json_extract(${response},'$.value.content[0].text'),
+            json_extract(${response},'$.content[0].text'))) details_json,v.request_id,
         v.response_at,v.created_at,v.finished_at,'invocation' source
         FROM qm_invocations v JOIN qm_session_members m ON m.id=v.member_id
         JOIN qm_sessions s ON s.id=v.session_id LEFT JOIN qm_tasks t ON t.id=v.task_id

@@ -30,13 +30,27 @@ test("双节点历史观察在 worker 持写锁时保持只读，新 Cloud Task 
   const original = await call("exec_command", command);
   await until(async () => (await call("workspace_context", {workspace_id: workspaceId, action: "status", operation_id: original.operation_id})).operation_state === "succeeded");
   await call("finish_task", {task_id: task.task_id, status: "completed", summary: "The original command finished once."});
-  const nextTask = await call("start_session", {title: "New ingress task", request_key: randomUUID()});
+  const selected = await call("task_resume", {action: "inspect", task_id: task.task_id});
+  const nextTask = await call("start_session", {title: "New ingress task", request_key: randomUUID(), new_goal: true,
+    expected_binding_revision: selected.binding.binding_revision});
   assert.equal(nextTask.session_id, task.session_id);
   assert.notEqual(nextTask.task_id, task.task_id);
-  const foreign = await worker.client.callTool({name: "start_session", arguments: {title: "Separate worker task", request_key: randomUUID()},
-    _meta: {"openai/session": randomUUID()}});
+  const foreignMeta = {"openai/session": randomUUID()};
+  const refusedLocalStart = await worker.client.callTool({name: "start_session", arguments: {title: "Separate worker task", request_key: randomUUID()},
+    _meta: foreignMeta});
+  assert.equal(refusedLocalStart.isError, true, JSON.stringify(refusedLocalStart));
+  assert.equal((refusedLocalStart.structuredContent as Record<string, unknown>).error_code, "TASK_BINDING_AUTHORITY_REQUIRED");
+  assert.equal((refusedLocalStart.structuredContent as Record<string, unknown>).effect, "not_started");
+  // 另一个有效 Task 也由权威入口创建并实际镜像，不能靠绕过 Worker 的入口约束准备拒绝用例。
+  const foreign = await cloud.client.callTool({name: "start_session", arguments: {title: "Separate worker task", request_key: randomUUID()},
+    _meta: foreignMeta});
   assert.notEqual(foreign.isError, true, JSON.stringify(foreign));
   const foreignTask = foreign.structuredContent as Record<string, any>;
+  const foreignOpen = await cloud.client.callTool({name: "open_workspace", arguments: {root_id: "worker/main"}, _meta: foreignMeta});
+  assert.notEqual(foreignOpen.isError, true, JSON.stringify(foreignOpen));
+  assert.equal((foreignOpen.structuredContent as Record<string, unknown>).task_id, foreignTask.task_id);
+  assert.equal((foreignOpen.structuredContent as Record<string, unknown>).session_id, foreignTask.session_id);
+  assert.notEqual(foreignTask.session_id, task.session_id);
   const ingressDb = openDatabase(cloud.config.stateDir);
   let workerDb: Database.Database | undefined;
   let lock: Awaited<ReturnType<typeof holdSqliteWriteLock>> | undefined;
@@ -98,13 +112,18 @@ test("双节点历史观察在 worker 持写锁时保持只读，新 Cloud Task 
       conversation_id: meta["openai/session"], transport_instance_id: "observation-fixture", request_id: randomUUID(),
       session_id: task.session_id, member_id: savedAttempt.member_id, task_id: nextTask.task_id,
       workspace_id: workspaceId, actor: "model"};
-    const peer = (trustedInvocation: TrustedInvocationEnvelope) => cloud.running.federation!.request("worker", "tool", {
-      name: "workspace_context", input: {workspace_id: parseWorkspaceHandle(workspaceId)!.local, action: "status", operation_id: original.operation_id},
+    const peer = (trustedInvocation: TrustedInvocationEnvelope, input: Record<string, unknown> = {
+      workspace_id: parseWorkspaceHandle(workspaceId)!.local, action: "status", operation_id: original.operation_id,
+    }) => cloud.running.federation!.request("worker", "tool", {
+      name: "workspace_context", input,
       extra: {trustedInvocation, requestId: trustedInvocation.request_id, _meta: meta,
         authInfo: {clientId: "observation-fixture", extra: {owner_id: trustedInvocation.owner_id, transport_instance_id: "observation-fixture"}}},
     });
     await assert.rejects(peer({...envelope, owner_id: "unrelated-owner"}), /SESSION_NOT_FOUND/u);
-    await assert.rejects(peer({...envelope, task_id: foreignTask.task_id}), /TASK_SESSION_MISMATCH/u);
+    // 原 operation 的查询按持久归属恢复；Task 级 recovery 才验证不一致的 Task/session 声明。
+    await assert.rejects(peer({...envelope, task_id: foreignTask.task_id}, {
+      workspace_id: parseWorkspaceHandle(workspaceId)!.local, action: "recovery", task_id: foreignTask.task_id,
+    }), /TASK_SESSION_MISMATCH/u);
     assert.equal(released, false);
     assert.deepEqual({worker: counts(workerDb), cloud: counts(ingressDb.sqlite)}, before);
     assert.equal(workerDb.pragma("data_version", {simple: true}), workerVersion);

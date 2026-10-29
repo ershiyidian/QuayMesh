@@ -136,7 +136,9 @@ test("closed task blocks new federated work while preserving original receipts, 
   assert.equal((await call("copy_artifact", {action: "cancel", copy_id: copied.id})).status, "completed");
   assert.equal(await readFile(join(worker.project, "copied.txt"), "utf8"), "original-copy\n");
 
-  const copyOnly = await call("start_session", {title: "Copy-only task", request_key: randomUUID()});
+  const originalSelection = await call("task_resume", {action: "inspect", task_id: task.task_id});
+  const copyOnly = await call("start_session", {title: "Copy-only task", request_key: randomUUID(), new_goal: true,
+    expected_binding_revision: originalSelection.binding.binding_revision});
   const copyOnlyReceipt = await call("copy_artifact", {...copyInput, request_key: randomUUID(), destination_path: "copy-only.txt"});
   await until(async () => {
     const view = await call("copy_artifact", {action: "observe", copy_id: copyOnlyReceipt.id});
@@ -146,7 +148,9 @@ test("closed task blocks new federated work while preserving original receipts, 
   await call("finish_task", {task_id: copyOnly.task_id, status: "completed", summary: "Only copied a file"});
 
   // 入口新任务从未使用 worker，关闭后不能被一次新写入首次镜像为 active。
-  const unseen = await call("start_session", {title: "Coordinator-only task", request_key: randomUUID()});
+  const copySelection = await call("task_resume", {action: "inspect", task_id: copyOnly.task_id});
+  const unseen = await call("start_session", {title: "Coordinator-only task", request_key: randomUUID(), new_goal: true,
+    expected_binding_revision: copySelection.binding.binding_revision});
   await call("finish_task", {task_id: unseen.task_id, status: "completed", summary: "No worker work was needed"});
   const db = openDatabase(worker.config.stateDir);
   try {

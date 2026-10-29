@@ -31,17 +31,23 @@ export interface TaskActivity {
 }
 
 export interface TaskActivityTimes {
+  lastActivityAt:number|null;
   lastModelToolAt:number|null;
   lastExecutionActivityAt:number|null;
   lastOutputAt:number|null;
 }
 
 export function activityTimes(events:SessionEvent[],memberId?:string):TaskActivityTimes {
+  let lastActivityAt:number|null=null;
   let lastModelToolAt:number|null=null,lastExecutionActivityAt:number|null=null,lastOutputAt:number|null=null;
   for(const event of events) {
     if(memberId&&event.member_id!==memberId)continue;
     const timestamp=Date.parse(event.timestamp);
     if(!Number.isFinite(timestamp))continue;
+    // Observation and usage refreshes do not represent new task work.
+    if(["operation_started","operation_finished","operation_output","file_changed","agent_changed","context_read","verification_recorded"].includes(event.type)) {
+      lastActivityAt=Math.max(lastActivityAt??0,timestamp);
+    }
     const actor=String(event.payload.actor??"model");
     if(event.type==="operation_started"||event.type==="context_read") {
       if(actor==="model")lastModelToolAt=Math.max(lastModelToolAt??0,timestamp);
@@ -51,7 +57,7 @@ export function activityTimes(events:SessionEvent[],memberId?:string):TaskActivi
     }
     if(event.type==="operation_output")lastOutputAt=Math.max(lastOutputAt??0,timestamp);
   }
-  return {lastModelToolAt,lastExecutionActivityAt,lastOutputAt};
+  return {lastActivityAt,lastModelToolAt,lastExecutionActivityAt,lastOutputAt};
 }
 
 export function latestActivity(events: SessionEvent[], memberId?: string): TaskActivity | null {

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { databasePath, openDatabase } from "./db/client.js";
+import { LATEST_DATABASE_VERSION } from "./db/migrations.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { createRegisteredOAuthClient, SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
 
@@ -66,20 +67,10 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
     assert.equal(database.sqlite.pragma("busy_timeout", { simple: true }), 5000);
     assert.equal(database.sqlite.pragma("foreign_keys", { simple: true }), 1);
 
-    const migrations = database.sqlite
-      .prepare("select version, name from qm_schema_migrations order by version")
-      .all();
-    assert.deepEqual(migrations, [
-      {version:1,name:"quaymesh-initial"},
-      {version:2,name:"quaymesh-runtime-ownership"},
-      {version:3,name:"quaymesh-durable-results"},
-      {version:4,name:"quaymesh-task-lifecycle"},
-      {version:5,name:"quaymesh-execution-observation"},
-      {version:6,name:"quaymesh-invocation-attempts"},
-      {version:7,name:"quaymesh-console-audit"},
-      {version:8,name:"quaymesh-execution-owner"},
-      {version:9,name:"quaymesh-execution-quiescence"},
-    ]);
+    const versions = database.sqlite
+      .prepare("select version from qm_schema_migrations order by version")
+      .pluck().all();
+    assert.deepEqual(versions, Array.from({ length: LATEST_DATABASE_VERSION }, (_, index) => index + 1));
   } finally {
     database.close();
   }

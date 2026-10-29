@@ -9,16 +9,17 @@ import { invocationAttemptSchema } from "./invocation-attempt-schema.js";
 import { consoleAuditSchema } from "./console-audit-schema.js";
 import { executionOwnerSchema } from "./execution-owner-schema.js";
 import { executionQuiescenceSchema } from "./execution-quiescence-schema.js";
+import { taskMailboxSchema } from "./task-mailbox-schema.js";
+import { fileChangeTimeSchema } from "./file-change-time-schema.js";
+import { taskBindingSchema } from "./task-binding-schema.js";
 
-export const LATEST_DATABASE_VERSION = 9;
+import { taskFinalizationSchema } from "./task-finalization-schema.js";
+import { taskMemberSchema } from "./task-member-schema.js";
+import { invocationPayloadSchema } from "./invocation-payload-schema.js";
+import { taskCreationSchema } from "./task-creation-schema.js";
+import { needsLegacyAgentRepair, prepareStandaloneLegacyAgentMigration, repairLegacyAgentSchema } from "./legacy-agent-schema.js";
 
-const legacyAgentColumns = {
-  effort:"TEXT",task_name:"TEXT",error_code:"TEXT",error_retryable:"TEXT",
-  context_key:"TEXT",context_signature:"TEXT",work_item_id:"TEXT",progress:"TEXT",
-  recovery_type:"TEXT",parent_provider_session_id:"TEXT",
-  control_state:"TEXT NOT NULL DEFAULT 'terminal'",provider_turn_id:"TEXT",
-  control_revision:"INTEGER NOT NULL DEFAULT 0",
-};
+export const LATEST_DATABASE_VERSION = 16;
 
 function migrationState(sqlite:Database.Database):{existing:boolean;version:number} {
   const existing=Boolean(sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='qm_schema_migrations'").get());
@@ -29,14 +30,6 @@ function migrationState(sqlite:Database.Database):{existing:boolean;version:numb
   return {existing,version};
 }
 
-function needsLegacyAgentRepair(sqlite:Database.Database):boolean {
-  const columns=new Set((sqlite.pragma("table_info(local_agent_sessions)") as Array<{name:string}>).map(column=>column.name));
-  if(!columns.has("thinking"))return false;
-  if(Object.keys(legacyAgentColumns).some(name=>!columns.has(name)))return true;
-  if(!sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='local_agent_turns'").get())return true;
-  return Boolean(sqlite.prepare("SELECT 1 FROM local_agent_sessions WHERE effort IS NULL AND thinking IS NOT NULL LIMIT 1").get());
-}
-
 export function migrateDatabase(sqlite: Database.Database): void {
   sqlite.pragma("foreign_keys = ON");
   // 已最新且无旧字段待修复时，只读检查即可；普通打开不能争抢写锁。
@@ -44,11 +37,13 @@ export function migrateDatabase(sqlite: Database.Database): void {
   sqlite.transaction(() => {
     // 等到写锁后重新读取，兼容另一个进程已经完成升级的情况。
     let {existing,version}=migrationState(sqlite);
+    const standaloneSchema = prepareStandaloneLegacyAgentMigration(sqlite);
+    if (standaloneSchema) { existing = false; version = 0; }
     const record = (number: number, name: string) => sqlite.prepare(
       "INSERT INTO qm_schema_migrations(version,name,applied_at) VALUES(?,?,?)",
     ).run(number, name, new Date().toISOString());
     if (version === 0) {
-      sqlite.exec(initialSchema);
+      sqlite.exec(standaloneSchema ?? initialSchema);
       sqlite.exec("CREATE TABLE qm_schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)");
       record(1, "quaymesh-initial");
       version = 1;
@@ -94,20 +89,43 @@ export function migrateDatabase(sqlite: Database.Database): void {
     if (version === 8) {
       sqlite.exec(executionQuiescenceSchema);
       record(9, "quaymesh-execution-quiescence");
+      version = 9;
     }
-    // 旧独立 Agent 存储可能沿用原版本号；保留 thinking 设置并原子补齐缺失结构。
-    const legacy=sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='local_agent_sessions'").get();
-    if(legacy){
-      const names=new Set((sqlite.pragma("table_info(local_agent_sessions)") as Array<{name:string}>).map(c=>c.name));
-      if(names.has("thinking")){
-        for(const [name,definition] of Object.entries(legacyAgentColumns))
-          if(!names.has(name))sqlite.exec(`ALTER TABLE local_agent_sessions ADD COLUMN ${name} ${definition}`);
-        sqlite.prepare("UPDATE local_agent_sessions SET effort=thinking WHERE effort IS NULL AND thinking IS NOT NULL").run();
-        sqlite.exec(`CREATE TABLE IF NOT EXISTS local_agent_turns(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,agent_id TEXT NOT NULL REFERENCES local_agent_sessions(id) ON DELETE CASCADE,
-          prompt TEXT NOT NULL,status TEXT NOT NULL,response TEXT,error TEXT,error_code TEXT,error_retryable TEXT,
-          created_at TEXT NOT NULL,completed_at TEXT)`);
-      }
+    if (version === 9) {
+      sqlite.exec(taskMailboxSchema);
+      sqlite.exec("ALTER TABLE qm_task_finalizations ADD COLUMN mailbox_sequence INTEGER NOT NULL DEFAULT 0");
+      record(10, "quaymesh-task-messages");
+      version = 10;
     }
+    if (version === 10) {
+      sqlite.exec(fileChangeTimeSchema);
+      record(11, "quaymesh-file-evidence-time");
+      version = 11;
+    }
+    if (version === 11) {
+      sqlite.exec(taskBindingSchema);
+      record(12, "quaymesh-task-entry-bindings");
+      version = 12;
+    }
+    if (version === 12) {
+      sqlite.exec(taskFinalizationSchema);
+      record(13, "quaymesh-finalization-fence");
+      version = 13;
+    }
+    if (version === 13) {
+      sqlite.exec(taskMemberSchema);
+      record(14, "quaymesh-task-member-index");
+      version = 14;
+    }
+    if (version === 14) {
+      sqlite.exec(invocationPayloadSchema);
+      record(15, "quaymesh-invocation-payload-sharing");
+      version = 15;
+    }
+    if (version === 15) {
+      sqlite.exec(taskCreationSchema);
+      record(16, "quaymesh-task-creation-receipts");
+    }
+    repairLegacyAgentSchema(sqlite);
   }).immediate();
 }

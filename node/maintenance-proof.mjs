@@ -2,7 +2,8 @@ import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { resolve, join } from "node:path";
 import Database from "better-sqlite3";
-import { readMaintenanceStatus, unresolvedSubjects, recordExecutionQuiescence } from "../dist/maintenance-status.js";
+import { readMaintenanceStatus, unresolvedSubjects, recordExecutionQuiescence, reviewableCommandClaims,
+  releaseReviewedCommandClaims } from "../dist/maintenance-status.js";
 import { processStartIdentity, processOwnerAlive } from "../dist/process-identity.js";
 
 // Run with the candidate release's Node/native dependencies. Inspection never
@@ -24,7 +25,8 @@ const db = new Database(join(stateDir, "core", "quaymesh.sqlite"), {
 try {
   const databaseVersion = Number(db.prepare("SELECT max(version) FROM qm_schema_migrations").pluck().get());
   if (input.action === "inspect") {
-    const result = db.transaction(() => ({ databaseVersion, admission: readMaintenanceStatus(db), subjects: unresolvedSubjects(db) })).deferred();
+    const result = db.transaction(() => ({ databaseVersion, admission: readMaintenanceStatus(db), subjects: unresolvedSubjects(db),
+      claims: reviewableCommandClaims(db) })).deferred();
     result.processes = (input.pids ?? []).map(pid => {
       if (!Number.isSafeInteger(pid) || pid < 1) throw new Error("Invalid process identity.");
       return { pid, start: processStartIdentity(pid), alive: processOwnerAlive({ owner_pid: pid, process_start: null }) };
@@ -64,14 +66,17 @@ try {
             processOwnerAlive({ owner_pid: value.pid, process_start: value.start });
         }))
       throw new Error("A previous manager or Core generation has not been proven stopped.");
-    db.transaction(() => {
+    const claims=input.claims??[];
+    if(!Array.isArray(claims))throw new Error("Invalid reviewed command claim identities.");
+    const released=db.transaction(() => {
       const status = readMaintenanceStatus(db);
-      if (status.accepting || status.claims + status.waiting + status.operations + status.executions +
+      if (status.accepting || status.waiting + status.operations + status.executions +
           status.queuedOperations + status.queuedExecutions + status.activeWork > 0 ||
           db.prepare("SELECT 1 FROM qm_runtime_work LIMIT 1").get())
         throw new Error("New Core is not paused and physically drained for the receipt transaction.");
       recordExecutionQuiescence(db, input.subjects, input.receipt);
+      return releaseReviewedCommandClaims(db,claims,input.receipt.id);
     }).immediate();
-    emit({ recorded: input.subjects.length, databaseVersion,admission: readMaintenanceStatus(db) });
+    emit({ recorded: input.subjects.length, ...released, databaseVersion,admission: readMaintenanceStatus(db) });
   }
 } finally { db.close(); }

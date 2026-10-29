@@ -37,26 +37,29 @@ test("重复挂载和相同快照不重绘，卡片异常可静态降级",async(
   expect(result.sourceDisposed).toBe(1);expect(result.viewDisposed).toBe(1);
 });
 
-test('真实宿主卡片区分本轮耗时与后台执行，摘要不再显示最近命令计时',async({page})=>{
+test('真实宿主卡片区分任务历时与后台执行，摘要不再显示最近命令计时',async({page})=>{
   await page.goto('/');await expect(page.locator('#status')).toHaveText('ready');
   const card=page.frameLocator('#app-frame');
-  await expect(card.locator('#act')).toContainText('当前无后台执行');
+  await expect(card.locator('#act')).toHaveText('任务进行中 · 暂无后台执行');
   await expect(card.locator('#clock')).toHaveAttribute('data-dynamic','true');
-  await expect(card.locator('#clock')).toContainText('本轮耗时');
+  await expect(card.locator('#clock')).toContainText('任务历时');
   const elapsed=await card.locator('#clock').textContent();
   await page.waitForTimeout(1500);
   expect(await card.locator('#clock').textContent()).not.toBe(elapsed);
-  await expect(card.locator('#prog')).toContainText('最近活动');
+  await expect(card.locator('#prog')).toContainText('暂无任务活动');
+  await expect(card.locator('#prog')).toContainText('上次确认');
   await expect(card.locator('#prog')).not.toContainText('最近命令');
-  await expect(card.locator('#card')).toHaveAttribute('data-status','idle');
+  await expect(card.locator('#card')).toHaveAttribute('data-status','active');
   const marker='command-duration-'+Date.now();
   const result=await page.evaluate(command=>window.__quaymeshHost.runCommand(command),process.platform==='win32'?`cmd /c echo ${marker}`:`printf '%s\\n' ${marker}`);
   expect(result.isError).not.toBe(true);
+  await expect(card.locator('#prog')).toContainText('最近活动');
   await card.locator('#toggle').click();
   await card.locator('#t-commands').click();
   const command=card.locator('[data-x^="c:"]',{hasText:marker}).first();
   await expect(command.locator('[data-command-id]')).toContainText('耗时',{timeout:25_000});
   await expect(command.locator('[data-command-id]')).toContainText('秒');
+  await expect(card.locator('#prog')).toContainText('最近活动');
   await card.locator('#card').screenshot({path:'releases/session-acceptance/browser/card-duration-labels.png'});
 });
 

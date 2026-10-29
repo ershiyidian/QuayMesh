@@ -1,13 +1,13 @@
 import { once } from "node:events";
 import { randomUUID } from "node:crypto";
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { createServer as createViteServer, type ViteDevServer } from "vite";
-import { createRealTestServer, type RealTestServer } from "./server-fixture.js";
+import { createRealTestServer, freePort, type RealTestServer } from "./server-fixture.js";
 import { WORKSPACE_APP_URI } from "../../src/tool-surfaces/types.js";
 import { SessionChangeCollector } from "../../src/session/changes.js";
 import { SessionStore } from "../../src/session/store.js";
@@ -55,6 +55,19 @@ async function startLocalHost(): Promise<HostState> {
   const fixture = await createRealTestServer({
     prefix: "quaymesh-session-host-",
     uiEnabled: true,
+    federation: {
+      nodeId: "card-coordinator", nickname: "Card test Coordinator", priority: 1,
+      exportSecondRoot: true,
+      port: await freePort(), ingressPort: await freePort(), peers: [],
+      capabilities: { coordinator: true, worker: true, discovery: false, egress: false,
+        meshRelay: false, desktopUi: false, consoleRelay: false },
+    },
+    configure: async config => {
+      const tokenFile = join(config.stateDir, "browser-test-cluster-token");
+      await writeFile(tokenFile, randomUUID() + randomUUID(), "utf8");
+      return { ...config, federation: { ...config.federation!, coordinatorId: "card-coordinator",
+        tokenFile, tokenEnv: "QUAYMESH_BROWSER_TEST_CLUSTER_TOKEN_UNUSED" } };
+    },
     files: {
       "AGENTS.md": "# Browser acceptance instructions\n\nUse the real MCP tool surface during this acceptance run.\n",
       ".agents/skills/browser-check/SKILL.md": [
@@ -200,6 +213,7 @@ async function handleRequest(hostState: HostState, request: IncomingMessage, res
         memberId: hostState.memberId,
         secondRoot: hostState.fixture.secondRoot,
         processWorker,
+        nodeExecutable: process.execPath,
         root: hostState.fixture.project,
       });
       return;
@@ -299,7 +313,8 @@ async function handleRequest(hostState: HostState, request: IncomingMessage, res
         const result = await client.callTool({
           name,
           arguments: toolArgs,
-          _meta: { "openai/session": conversationId },
+          // Test distinct or unavailable host entries through the real OAuth/MCP boundary.
+          ...(body.entry === null ? {} : { _meta: { "openai/session": stringField(body.entry) ?? conversationId } }),
         });
         hostState.callLog.push("OK " + name + " " + JSON.stringify(toolArgs).slice(0, 200));
         hostState.browserState.lastTool = name;
@@ -350,8 +365,15 @@ async function handleRequest(hostState: HostState, request: IncomingMessage, res
 
 async function beginNewTestTask(hostState:HostState):Promise<void> {
   const metadata={"openai/session":conversationId};
+  const currentMeta=recordField(recordField(hostState.openResult._meta).quaymesh);
+  const currentTask=stringField(currentMeta.task_id);
+  if(!currentTask)throw new Error("HOST_NEW_TASK_CURRENT_ID_MISSING");
+  const inspected=await hostState.fixture.client.callTool({name:"task_resume",arguments:{action:"inspect",task_id:currentTask},_meta:metadata});
+  if(inspected.isError)throw new Error("HOST_NEW_TASK_INSPECT_FAILED");
+  const revision=recordField(recordField(inspected.structuredContent).binding).binding_revision;
+  if(typeof revision!=="number"||!Number.isSafeInteger(revision))throw new Error("HOST_NEW_TASK_BINDING_REVISION_MISSING");
   const started=await hostState.fixture.client.callTool({name:"start_session",arguments:{
-    title:"Browser acceptance task",request_key:randomUUID(),
+    title:"Browser acceptance task",request_key:randomUUID(),new_goal:true,expected_binding_revision:revision,
   },_meta:metadata});
   if(started.isError)throw new Error("HOST_NEW_TASK_FAILED");
   const opened=await hostState.fixture.client.callTool({name:"open_workspace",arguments:{

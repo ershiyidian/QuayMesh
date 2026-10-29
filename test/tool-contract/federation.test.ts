@@ -5,14 +5,35 @@ import {readFile, writeFile} from "node:fs/promises";
 import {join} from "node:path";
 import {openDatabase} from "../../src/db/client.js";
 import {SessionStore} from "../../src/session/store.js";
+import {SessionService} from "../../src/session/service.js";
 import {SessionToolRecorder, type RecordModelToolInput} from "../../src/session/tool-recording.js";
+import type {WorkspaceRegistry} from "../../src/workspaces.js";
+import type {SessionChangeCollector} from "../../src/session/changes.js";
+import type {SessionProjector} from "../../src/session/projection.js";
 import {twoNodes} from "./fixture.js";
+
+function forwardedRecorder(store: SessionStore): SessionToolRecorder {
+  // Task selection and authorization use the real service; forwarded receipts
+  // must never inspect a remote workspace or collect its files on this node.
+  const forbidden = new Proxy({}, {get(_target, property) {
+    assert.fail(`COORDINATOR_MUST_NOT_TOUCH_REMOTE_PATH: ${String(property)}`);
+  }});
+  const workspaces = forbidden as WorkspaceRegistry;
+  return new SessionToolRecorder(store, workspaces, new SessionService(store, workspaces),
+    forbidden as SessionChangeCollector, forbidden as SessionProjector);
+}
 
 test("TC01/02/A02：禁外连协调端保留执行工具与只读诊断，远程有key的首次写入与重放只执行一次", {timeout: 60000}, async t => {
   const {worker, cloud} = await twoNodes(t);
-  const tools = (await cloud.client.listTools()).tools.filter(tool => !(tool._meta?.ui as any)?.visibility?.includes("app"));
-  assert.equal(tools.length, 22);
-  assert.ok(tools.some(tool=>tool.name==='read_diagnostics'));
+  const tools = (await cloud.client.listTools()).tools.filter(tool => {
+    const visibility = (tool._meta?.ui as {visibility?: string[]}|undefined)?.visibility;
+    return !visibility || visibility.includes("model");
+  });
+  assert.equal(tools.length, 24);
+  const diagnostics = tools.find(tool=>tool.name==='read_diagnostics');
+  assert.ok(diagnostics);
+  assert.equal(diagnostics.annotations?.readOnlyHint, true);
+  assert.ok(tools.some(tool=>tool.name==='task_resume'));
   for (const name of ["spawn_agent","followup_agent","send_message","wait_agent","interrupt_agent","list_agents"]) {
     assert.ok(tools.some(tool => tool.name === name), name);
   }
@@ -71,7 +92,7 @@ test("DP06：转发写操作只记录入口回执，不在协调端执行远程�
     const member = store.upsertRemoteMember({id: randomUUID(), sessionId: session.id, nodeId: "remote-win",
       workspaceId: "remote-workspace", root: "E:\\remote-machine-only\\project", sourceRoot: null,
       mode: "checkout", online: true, revision: 0});
-    const recorder = new SessionToolRecorder(store, {} as any, {} as any, {} as any, {} as any);
+    const recorder = forwardedRecorder(store);
     let beforeWriteCalled = false;
     const result = await recorder.recordForwarded({
       identity: {owner_id:"owner",conversation_id:"conversation-forwarded",transport_instance_id:"http:test",
@@ -100,7 +121,7 @@ test("远程写请求先交付可恢复回执，完成后按同一 key 重放不
     const member = store.upsertRemoteMember({ id: randomUUID(), sessionId: session.id, nodeId: "remote-linux",
       workspaceId: "remote-ws", root: "/remote-only/project", sourceRoot: null,
       mode: "checkout", online: true, revision: 0 });
-    const recorder = new SessionToolRecorder(store, {} as any, {} as any, {} as any, {} as any);
+    const recorder = forwardedRecorder(store);
     let finish!: (result: { content: { type: string; text: string }[] }) => void;
     let invoked = 0;
     const identity = { owner_id: "owner", conversation_id: "conversation", transport_instance_id: "stable-transport",
@@ -145,7 +166,7 @@ test("前台受理回执之后远程调用失败会持久记录 unknown，不产
     const member = store.upsertRemoteMember({ id: randomUUID(), sessionId: session.id, nodeId: "remote-linux",
       workspaceId: "remote-ws", root: "/remote-only/project", sourceRoot: null,
       mode: "checkout", online: true, revision: 0 });
-    const recorder = new SessionToolRecorder(store, {} as any, {} as any, {} as any, {} as any);
+    const recorder = forwardedRecorder(store);
     let rejectWork!: (error: Error) => void;
     const result = await recorder.recordForwarded({
       identity: { owner_id: "owner", conversation_id: "conversation", transport_instance_id: "transport",

@@ -161,6 +161,7 @@ export function filterTaskIndex(tasks: TaskIndex[], query: Query, at: number): T
     && (!query.node || task.nodeIds.includes(query.node))
     && (!query.project || task.projectIds.includes(query.project))
     && (!query.session || task.sessionId === query.session)
+    && (!query.requestState || task.requestState === query.requestState)
     && (!query.root || task.roots.includes(query.root))
     && (!query.changed || task.changed)
     && (!query.execution || task.executionStatus === query.execution)
@@ -170,7 +171,7 @@ export function filterTaskIndex(tasks: TaskIndex[], query: Query, at: number): T
     && (!query.finishedDay || task.finishedAt !== null && dayAt(task.finishedAt, zone) === query.finishedDay)
     && (!search || [task.title, task.taskId ?? "", task.sessionId ?? "", ...task.phaseRefs, ...task.projectNames, ...task.nodeIds, ...task.roots]
       .some((value) => value.toLocaleLowerCase().includes(search)))
-    && (!days || task.startedAt >= at - days * 86_400_000 || ["running", "queued", "stopping", "waiting"].includes(task.executionStatus)
+    && (!days || task.startedAt >= at - days * 86_400_000 || task.requestState === 'active' || ["running", "queued", "stopping", "waiting"].includes(task.executionStatus)
       || needsAttention(task)));
 }
 

@@ -258,6 +258,8 @@ test("enabled UI exposes the production card, app-only tools and only start_sess
     "qm_revert",
     "qm_file_url",
     "qm_session_continue",
+    "qm_task_message_enqueue",
+    "qm_task_messages",
   ];
   const tools = (await context.client.listTools()).tools;
   for (const name of appOnly) {
@@ -291,7 +293,7 @@ test("enabled UI exposes the production card, app-only tools and only start_sess
   assert.doesNotMatch(content.text, /Legacy Client Support Only/);
 });
 
-test("each user request gets a distinct task while the conversation keeps one session", async (t) => {
+test("independent goals create distinct open Tasks within a compatible external entry", async (t) => {
   const context = await fixture(t, { uiEnabled: true, session: true });
   assert.ok(context.runtime);
   const first = await context.runtime.service.startTask({ owner_id: "owner-a", conversation_id: "conversation-task-contract" }, "第一轮");
@@ -300,7 +302,8 @@ test("each user request gets a distinct task while the conversation keeps one se
   assert.notEqual(second.task.id, first.task.id);
   assert.equal(first.task.title, "第一轮");
   assert.equal(second.task.title, "第二轮");
-  assert.equal(context.runtime.store.getTask(first.task.id).state, "closed");
+  assert.equal(context.runtime.store.getTask(first.task.id).state, "active");
+  assert.equal(context.runtime.store.getTask(first.task.id).closure_reason, null);
   assert.equal(context.runtime.store.currentTask(first.session.id)?.id, second.task.id);
 });
 
@@ -604,32 +607,48 @@ test("real MCP keeps conversation sessions isolated and explicit attach session-
   assert.notEqual(firstBBody.result?.structuredContent?.session_id, sessionA);
   assert.notEqual(firstBBody.result?.structuredContent?.workspace_id, firstABody.result?.structuredContent?.workspace_id);
 
-  const explicitAttach = await postModernMcp(localBaseUrl, accessToken, "tools/call", {
-    name: "attach_workspace",
-    arguments: { path: root, session_id: sessionA },
-    _meta: { "openai/session": "conversation-b" },
-  });
-  assert.equal(explicitAttach.status, 200, await explicitAttach.clone().text());
-  const explicitAttachBody = await mcpBody(explicitAttach) as {
-    result?: {
-      isError?: boolean;
-      content?: Array<{ type?: string; text?: string }>;
-      structuredContent?: { session_id?: string };
+  const database = openDatabase(join(root, ".state"));
+  try {
+    const persistedState = () => ({
+      sessions: database.sqlite.prepare("SELECT id,owner_id,conversation_id,current_task_id,selected_member_id FROM qm_sessions ORDER BY id").all(),
+      members: database.sqlite.prepare("SELECT id,session_id,node_id,workspace_id,root,mode FROM qm_session_members ORDER BY id").all(),
+      records: Object.fromEntries(["qm_tasks", "qm_task_members", "qm_task_bindings", "qm_task_binding_requests",
+        "qm_task_creation_receipts", "qm_invocations", "qm_events"].map(table =>
+        [table, database.sqlite.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()])),
+    });
+    const before = persistedState(), refusedPath = join(root, "must-not-attach-across-session");
+    const explicitAttach = await postModernMcp(localBaseUrl, accessToken, "tools/call", {
+      name: "attach_workspace",
+      arguments: { path: refusedPath, create_directory: true, session_id: sessionA },
+      _meta: conversationB,
+    });
+    assert.equal(explicitAttach.status, 200, await explicitAttach.clone().text());
+    const explicitAttachBody = await mcpBody(explicitAttach) as {
+      result?: { isError?: boolean; content?: unknown; structuredContent?: { error_code?: string; effect?: string } };
     };
-  };
-  assert.equal(explicitAttachBody.result?.isError, true);
-  assert.match(JSON.stringify(explicitAttachBody.result?.content), /SESSION_SCOPE_MISMATCH/);
+    assert.equal(explicitAttachBody.result?.isError, true);
+    assert.equal(explicitAttachBody.result?.structuredContent?.error_code, "TASK_SESSION_MISMATCH");
+    assert.equal(explicitAttachBody.result?.structuredContent?.effect, "not_started");
+    assert.match(JSON.stringify(explicitAttachBody.result?.content), /TASK_SESSION_MISMATCH/);
+    await assert.rejects(access(refusedPath), { code: "ENOENT" });
+    assert.deepEqual(persistedState(), before, "another Session ID cannot switch the selected Task, attach a member or record work");
 
-  const missingConversation = await postModernMcp(localBaseUrl, accessToken, "tools/call", {
-    name: "attach_workspace",
-    arguments: { path: root },
-    _meta: {},
-  });
-  const missingConversationBody = await mcpBody(missingConversation) as {
-    result?: { isError?: boolean; content?: Array<{ type?: string; text?: string }> };
-  };
-  assert.equal(missingConversationBody.result?.isError, true);
-  assert.match(JSON.stringify(missingConversationBody.result?.content), /SESSION_REQUIRED/);
+    const missingConversation = await postModernMcp(localBaseUrl, accessToken, "tools/call", {
+      name: "attach_workspace",
+      arguments: { path: refusedPath, create_directory: true },
+      _meta: {},
+    });
+    assert.equal(missingConversation.status, 200, await missingConversation.clone().text());
+    const missingConversationBody = await mcpBody(missingConversation) as {
+      result?: { isError?: boolean; content?: unknown; structuredContent?: { error_code?: string; effect?: string } };
+    };
+    assert.equal(missingConversationBody.result?.isError, true);
+    assert.equal(missingConversationBody.result?.structuredContent?.error_code, "TASK_EXECUTION_BINDING_REQUIRED");
+    assert.equal(missingConversationBody.result?.structuredContent?.effect, "not_started");
+    assert.match(JSON.stringify(missingConversationBody.result?.content), /TASK_EXECUTION_BINDING_REQUIRED/);
+    await assert.rejects(access(refusedPath), { code: "ENOENT" });
+    assert.deepEqual(persistedState(), before, "missing Task selection must not create an implicit Task or alter an existing binding");
+  } finally { database.close(); }
 });
 test("open_workspace scopes checkout reuse to OpenAI session metadata", async (t) => {
   const context = await fixture(t);
@@ -1365,8 +1384,13 @@ test("real MCP initialization returns the short prompt with the configured secti
   const baseInstructions = withoutSubagents.client.getInstructions();
   assert.ok(baseInstructions);
   assert.ok((baseInstructions.match(/[A-Za-z0-9][A-Za-z0-9_./:-]*/g) ?? []).length <= 180);
-  assert.match(baseInstructions, /Call start_session once/);
-  assert.match(baseInstructions, /use workspace_catalog/);
+  assert.match(baseInstructions, /One Task per goal/);
+  assert.match(baseInstructions, /New goal: start_session\(title,request_key\); reuse the key on retry/);
+  assert.match(baseInstructions, /new_goal:true and expected_binding_revision from task_resume inspect/);
+  assert.match(baseInstructions, /Follow-ups reuse Task\/workspace handles; new Tasks leave others open/);
+  assert.match(baseInstructions, /Without host conversation identity, pass task_id/);
+  assert.match(baseInstructions, /task_messages/);
+  assert.match(baseInstructions, /workspace_catalog/);
   assert.doesNotMatch(baseInstructions, /Give each agent/);
   assert.doesNotMatch(baseInstructions, /[\u4e00-\u9fff]/);
   assert.doesNotMatch(baseInstructions, /show_changes|work_task|agent_task/);

@@ -31,6 +31,8 @@ interface OrdinaryBaseline {
   files: OrdinaryBaselineFile[];
 }
 
+type CapturedFile = FileSummary & { patchRef: string; versionRef: string };
+
 export interface CaptureObservation {
   /** idle means this process currently observes no capture work or failure. */
   state: "idle" | "pending" | "failed";
@@ -232,12 +234,14 @@ export class SessionChangeCollector {
     const { sessionId, member } = this.store.memberOwner(memberId);
     const baselines = this.store.changeBaselines(sessionId, memberId, taskId);
     if (baselines.length === 0) return;
-    const previous = JSON.stringify(this.readSummaries(sessionId, memberId, taskId));
+    const previousFiles = this.store.fileSummaries(sessionId, memberId, taskId);
+    const previousByPath = new Map(previousFiles.map(file => [file.path, file]));
+    const previous = JSON.stringify(previousFiles.map(({ patchRef: _patchRef, versionRef: _versionRef, ...file }) => file));
     const files: Array<FileSummary & { patchRef: string; versionRef: string }> = [];
     const memberRoot = resolvePhysicalPath(member.root);
     for (const baseline of baselines) {
       if (baseline.baseline_ref.startsWith("ordinary:") && samePhysicalPath(baseline.repo_root, member.root)) {
-        files.push(...await this.captureOrdinary(sessionId, member, baseline.baseline_ref, taskId));
+        files.push(...await this.captureOrdinary(sessionId, member, baseline.baseline_ref, previousByPath, taskId));
       } else {
         const repoRoot = resolvePhysicalPath(baseline.repo_root);
         const scoped = changedPaths?.map(path => resolvePhysicalPath(resolve(memberRoot, path)))
@@ -245,7 +249,7 @@ export class SessionChangeCollector {
           .map(path => relative(repoRoot, path).replaceAll("\\", "/"));
         if (scoped && !scoped.length) continue;
         files.push(...await this.captureGit(sessionId, member, baseline.repo_root,
-          baseline.baseline_ref, baseline.latest_ref, taskId, scoped));
+          baseline.baseline_ref, baseline.latest_ref, previousByPath, taskId, scoped));
       }
     }
     const versions = new Map<string, Array<FileSummary & { patchRef: string }>>();
@@ -342,6 +346,7 @@ export class SessionChangeCollector {
     repoRoot: string,
     baselineRef: string,
     previousRef: string,
+    previousFiles: ReadonlyMap<string, CapturedFile>,
     taskId?: string,
     changedPaths?: string[],
   ): Promise<Array<FileSummary & { patchRef: string; versionRef: string }>> {
@@ -382,7 +387,7 @@ export class SessionChangeCollector {
       const patch = (await git(repoRoot, patchArgs, { maxBuffer: 50 * 1024 * 1024 })).stdout;
       const binary = entry.additions === null || entry.removals === null || patch.includes("GIT binary patch");
       const patchRef = await this.writeEvidence(member, `patch-${current}-${digest(entry.path)}`, Buffer.from(patch, "utf8"), taskId);
-      files.push({
+      const file: CapturedFile = {
         id: `file_${digest([sessionId, member.id, displayPath]).slice(0, 24)}`,
         member_id: member.id,
         status: entry.status,
@@ -397,7 +402,14 @@ export class SessionChangeCollector {
         revertible: canRevert,
         patchRef,
         versionRef: current,
-      });
+      };
+      const previous = previousFiles.get(displayPath);
+      // The public hash deliberately includes the whole tree for version checks.
+      // Recompute its old form using this file's full binary-capable patch: a
+      // different file changing the tree must not reset this evidence's time.
+      const unchanged = previous && sameFileIdentity(previous, file)
+        && previous.hash === (previous.versionRef === current ? file.hash : digest([previous.versionRef, entry.path, patch]));
+      files.push({ ...file, recordedAt: unchanged ? previous.recordedAt ?? null : Date.now() });
     }
     this.store.putChangeBaseline({
       session_id: sessionId,
@@ -410,7 +422,7 @@ export class SessionChangeCollector {
     return files;
   }
 
-  private async captureOrdinary(sessionId: SessionId, member: SessionMember, baselineRef: string, taskId?: string): Promise<Array<FileSummary & { patchRef: string; versionRef: string }>> {
+  private async captureOrdinary(sessionId: SessionId, member: SessionMember, baselineRef: string, previousFiles: ReadonlyMap<string, CapturedFile>, taskId?: string): Promise<Array<FileSummary & { patchRef: string; versionRef: string }>> {
     const baseline = JSON.parse(await readFile(this.ordinaryBaselinePath(member, taskId), "utf8")) as OrdinaryBaseline;
     const files: Array<FileSummary & { patchRef: string; versionRef: string }> = [];
     const owned = await readOwnedFiles(ownershipPath(this.stateDir, sessionId, member.id, taskId));
@@ -433,7 +445,7 @@ export class SessionChangeCollector {
       const additions = binary ? null : countPatchLines(patch, "+");
       const removals = binary ? null : countPatchLines(patch, "-");
       const patchRef = await this.writeEvidence(member, `ordinary-patch-${digest(before.path)}-${version}`, Buffer.from(patch, "utf8"), taskId);
-      files.push({
+      const file: CapturedFile = {
         id: `file_${digest([sessionId, member.id, before.path]).slice(0, 24)}`,
         member_id: member.id,
         status: previous === null ? "A" : current === null ? "D" : "M",
@@ -448,9 +460,13 @@ export class SessionChangeCollector {
         revertible: canRevert,
         patchRef,
         versionRef: `ordinary:${member.root}:${version}`,
-      });
+      };
+      const last = previousFiles.get(before.path);
+      const unchanged = last && sameFileIdentity(last, file) && last.hash === file.hash;
+      files.push({ ...file, recordedAt: unchanged ? last.recordedAt ?? null : Date.now() });
     }
-    const versionRef = `ordinary:${digest(files)}`;
+    // Recording metadata is not part of the content/version identity.
+    const versionRef = `ordinary:${digest(files.map(({ recordedAt: _recordedAt, ...file }) => file))}`;
     this.store.putChangeBaseline({
       session_id: sessionId,
       member_id: member.id,
@@ -530,6 +546,10 @@ function countPatchLines(patch: string, prefix: string): number {
 
 function digest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+function sameFileIdentity(previous: FileSummary, next: FileSummary): boolean {
+  return previous.id === next.id && previous.member_id === next.member_id && previous.path === next.path
+    && previous.status === next.status && previous.from === next.from && previous.binary === next.binary;
 }
 function quaymeshSnapshotExcludes(repoRoot: string, workspaceRoot: string): string[] {
   const relativePath = relative(resolvePhysicalPath(repoRoot), join(resolvePhysicalPath(workspaceRoot), ".quaymesh")).replaceAll("\\", "/");

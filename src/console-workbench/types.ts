@@ -134,3 +134,8 @@ export class WorkbenchError extends Error {
     super(message);
   }
 }
+/** The configured Task authority's observation used by an explicit finish confirmation. */
+export type TaskMessageConfirmation =
+  | { available: true; taskId: string; ownerNodeId: string; taskRevision: number;
+      taskState: "active" | "closed"; sequence: number; pending: number; observedAt: number }
+  | { available: false; taskId: string; ownerNodeId: string | null; error: string };

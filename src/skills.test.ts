@@ -167,7 +167,7 @@ try {
     workspaces: { allowedRoots: [projectRoot] },
     skills: { agentDir, paths: [explicitSkills], enabled: false },
   }));
-  assert.deepEqual(loadWorkspaceSkills(disabledConfig, projectRoot).skills, []);
+  assert.deepEqual((await loadWorkspaceSkills(disabledConfig, projectRoot)).skills, []);
 
   const config = loadConfig(writeTestQuayMeshConfig(configDir, {
     server: { port: 1 },
@@ -177,7 +177,7 @@ try {
       paths: [explicitSkills, "~/.claude/skills", "./.claude/skills"],
     },
   }));
-  const loaded = loadWorkspaceSkills(config, projectRoot);
+  const loaded = await loadWorkspaceSkills(config, projectRoot);
   assert.equal(loaded.skills.some((skill) => skill.name === "agent-global-skill"), true);
   assert.equal(loaded.skills.some((skill) => skill.name === "agent-project-skill"), true);
   assert.equal(loaded.skills.some((skill) => skill.name === "claude-global-skill"), true);
@@ -213,7 +213,7 @@ try {
     skills: { agentDir },
     subagents: { enabled: true, instructions: "on-demand", providers: [] },
   }));
-  const experimentalSkills = loadWorkspaceSkills(experimentalConfig, projectRoot).skills;
+  const experimentalSkills = (await loadWorkspaceSkills(experimentalConfig, projectRoot)).skills;
   const managedSubagents = experimentalSkills.find((skill) => skill.name === "subagents");
   assert.ok(managedSubagents);
   assert.equal(
@@ -241,7 +241,7 @@ try {
     skills: { agentDir, paths: [explicitSkills, join(projectRoot, ".pi", "skills")] },
   }));
   assert.equal(
-    loadWorkspaceSkills(legacyPiConfig, projectRoot).skills.some((skill) => skill.name === "project-skill"),
+    (await loadWorkspaceSkills(legacyPiConfig, projectRoot)).skills.some((skill) => skill.name === "project-skill"),
     true,
   );
 

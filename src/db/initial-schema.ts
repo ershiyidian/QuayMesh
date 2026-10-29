@@ -1,4 +1,5 @@
-export const initialSchema = String.raw`
+export function initialSchemaSql(options: { existingAgentSessions?: boolean } = {}): string {
+  return String.raw`
 CREATE TABLE workspace_sessions (
       id text primary key,
       root text not null,
@@ -49,7 +50,7 @@ CREATE TABLE oauth_refresh_tokens (
       foreign key (client_id) references oauth_clients(client_id) on delete cascade
     );
 
-CREATE TABLE local_agent_sessions (
+CREATE TABLE ${options.existingAgentSessions ? "IF NOT EXISTS " : ""}local_agent_sessions (
       id text primary key,
       workspace_id text,
       workspace_root text not null,
@@ -554,3 +555,6 @@ CREATE INDEX qm_events_task_sequence
 
 CREATE UNIQUE INDEX qm_tasks_request_key ON qm_tasks(session_id,request_key) WHERE request_key IS NOT NULL;
 `;
+}
+
+export const initialSchema = initialSchemaSql();

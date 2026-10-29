@@ -71,6 +71,7 @@ export const fileSchema = z
     binary: z.boolean(),
     coverage: z.enum(["session_owned", "workspace_observed", "partial"]),
     revertible: z.boolean(),
+    recordedAt: time.nullable().optional(),
   })
   .strict();
 
@@ -78,6 +79,8 @@ export const commandSchema = z
   .object({
     id,
     operation_id: id,
+    invocation_id: id.nullable().optional(),
+    effect: effectEnum.nullable().optional(),
     member_id: id,
     cmd: text,
     agent: text,
@@ -350,6 +353,7 @@ export const appSchemas = {
       cursor: text.optional(),
       mount_id: z.string().uuid().optional(),
       resource_version: z.string().min(1).max(64).optional(),
+      file_recorded_at: z.boolean().optional(),
     })
     .strict(),
   file_diff: z
@@ -408,7 +412,7 @@ export const appSchemas = {
   continue: z
     .object({
       session_id: id,
-      task_id: id.optional(),
+      task_id: id,
       member_id: id.optional(),
       agent_id: id.optional(),
     })

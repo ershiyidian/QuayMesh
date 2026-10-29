@@ -30,6 +30,15 @@ export function taskDelivery(requestState?: string | null, result?: string | nul
   return result && labels[result] ? {status:result,label:labels[result]} : {status:'ended',label:'已结束 · 交付未确认'};
 }
 
+/** The task's saved lifecycle is independent of its latest tool or process. */
+export function taskLifecycleView(input: Pick<TaskViewInput, 'requestState' | 'result' | 'finalizing' | 'finalizationFailed'>): {status: string; label: string} | null {
+  const delivery = taskDelivery(input.requestState, input.result);
+  if (delivery) return delivery;
+  if (input.requestState !== 'active') return null;
+  if (input.finalizing) return {status: 'finalizing', label: input.finalizationFailed ? '交付确认失败' : '交付确认中'};
+  return {status: 'active', label: '任务进行中'};
+}
+
 // 交付状态与后台执行分别保留；界面、API 和 SQL 分类共同使用此读取模型。
 export function taskView(input: TaskViewInput): TaskView {
   const ended = input.requestState === 'closed';

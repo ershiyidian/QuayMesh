@@ -18,15 +18,22 @@ const APP_ONLY = [
   "qm_revert",
   "qm_file_url",
   "qm_session_continue",
+  "qm_task_message_enqueue",
+  "qm_task_messages",
 ];
 
 const MODEL_NON_AGENT = [
   "start_session",
   "finish_task",
+  "task_resume",
+  "task_messages",
   "open_workspace",
   "attach_workspace",
   "read",
   "read_diagnostics",
+  "read_output",
+  "cancel_command",
+  "checkpoint_task",
   "workspace_context",
   "apply_patch",
   "exec_command",
@@ -41,8 +48,11 @@ test("enabled UI exposes the real model surface, app-only surface and one card b
 
   const tools = await server.client.listTools();
   const names = tools.tools.map((tool) => tool.name);
-  for (const name of MODEL_NON_AGENT) assert.ok(names.includes(name), "missing model tool " + name);
-  for (const name of APP_ONLY) assert.ok(names.includes(name), "missing app tool " + name);
+  assert.deepEqual([...names].sort(), [...MODEL_NON_AGENT, ...APP_ONLY].sort(), "the standalone surface must contain exactly the declared model and app tools");
+  assert.deepEqual(tools.tools.filter(tool => !tool._meta?.ui?.visibility || tool._meta.ui.visibility.includes("model"))
+    .map(tool => tool.name).sort(), [...MODEL_NON_AGENT].sort(), "app-only tools must not be advertised to the model");
+  assert.deepEqual(tools.tools.filter(tool => tool._meta?.ui?.visibility?.includes("app"))
+    .map(tool => tool.name).sort(), [...APP_ONLY, "task_resume"].sort(), "explicit app visibility is separate from a card resource binding");
   assert.equal(names.includes("workspace_catalog"), false, "single-node server registered a federation-only tool");
   for (const name of RETIRED) assert.equal(names.includes(name), false, "retired tool still registered: " + name);
 
@@ -52,11 +62,15 @@ test("enabled UI exposes the real model surface, app-only surface and one card b
   assert.equal(open?._meta?.ui, undefined);
   const attach = tools.tools.find((tool) => tool.name === "attach_workspace");
   assert.equal(attach?._meta?.ui, undefined);
+  assert.deepEqual(tools.tools.filter(tool => tool._meta?.ui?.resourceUri !== undefined).map(tool => tool.name), ["start_session"],
+    "only start_session binds a card resource");
   for (const tool of tools.tools) {
     if (APP_ONLY.includes(tool.name)) {
       assert.deepEqual(tool._meta?.ui, { visibility: ["app"] }, tool.name + " is not app-only");
+    } else if (tool.name === "task_resume") {
+      assert.deepEqual(tool._meta?.ui, { visibility: ["model", "app"] }, "Task inspection/resume is shared without binding another card");
     } else if (tool.name !== "start_session") {
-      assert.equal(tool._meta?.ui, undefined, tool.name + " unexpectedly binds the card");
+      assert.equal(tool._meta?.ui, undefined, tool.name + " has unexpected UI metadata");
     }
   }
 

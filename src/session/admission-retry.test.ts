@@ -21,7 +21,14 @@ import {SessionProjector} from "./projection.js";
 import {SessionToolRecorder} from "./tool-recording.js";
 import {OperationState} from "./types.js";
 import {toolErrorResult} from "./outcome.js";
+import Database from "better-sqlite3";
 import {migrateDatabase, LATEST_DATABASE_VERSION} from "../db/migrations.js";
+import {initialSchema} from "../db/initial-schema.js";
+import {runtimeSchema} from "../db/runtime-schema.js";
+import {taskSchema} from "../db/task-schema.js";
+import {resourceSchema} from "../db/resource-schema.js";
+import {reliabilitySchema} from "../db/reliability-schema.js";
+import {taskLifecycleSchema} from "../db/task-lifecycle-schema.js";
 import {AgentOperationTracker} from "./agent-operations.js";
 import {RecoveryService} from "./recovery.js";
 import {latestActivity} from "./activity.js";
@@ -248,7 +255,9 @@ test("first preparation errors and their replay expose identical not_started sem
 });
 
 test("schema upgrade binds historical worker attempts using their run link and does not guess a receipt's task", async t => {
-  const f = await fixture(); t.after(() => f.close());
+  const f = await fixture();
+  let legacy: Database.Database | undefined;
+  t.after(async () => { legacy?.close(); await f.close(); });
   await f.recorder.recordWithContext(createInvocationContext(f.identity("worker")), {
     tool_name: "exec_command", kind: "command", label: "worker", input: {operation_key: "worker-key"}, affectsFiles: true,
     beforeWrite: async () => {throw new ExecutionConflictError("held", undefined, "busy");},
@@ -266,41 +275,70 @@ test("schema upgrade binds historical worker attempts using their run link and d
   const latestQuiescenceObjects = quiescenceObjects.all() as Array<{type:string;name:string;sql:string}>;
   const quiescenceTriggers = latestQuiescenceObjects.filter(row => row.type === "trigger");
   assert.equal(quiescenceTriggers.length, 9);
-  // 用真实数据库还原版本 5，保留原始回执与运行关联后执行升级。
-  // 这些触发器挂在 operation/execution/owner 表上，删证据表不会自动移除它们。
-  for (const {name} of quiescenceTriggers) f.ledger.db.exec(`DROP TRIGGER "${name}"`);
-  f.ledger.db.exec(`DROP TABLE execution_quiescence;
-    DROP INDEX console_operations_maintenance_status;
-    DROP INDEX console_executions_maintenance_status;
-    DROP INDEX qm_invocations_retry_of;
-    ALTER TABLE qm_invocations DROP COLUMN retry_of_invocation_id;
-    ALTER TABLE qm_invocations DROP COLUMN task_id;
-    ALTER TABLE qm_invocations DROP COLUMN response_json;
-    DROP TABLE console_archive_steps;
-    DROP TABLE console_audit;
-    DROP TABLE console_audit_imports;
-    DROP TABLE execution_owners;
-    DROP INDEX qm_events_source_type;
-    DROP INDEX qm_events_operation_type;
-    DELETE FROM qm_schema_migrations WHERE version>=6;`);
-  assert.equal(f.ledger.db.prepare('SELECT max(version) FROM qm_schema_migrations').pluck().get(),5);
-  assert.deepEqual(quiescenceObjects.all(), []);
-  assert.equal(f.ledger.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='execution_owners'").get(), undefined);
-  assert.ok(!(f.ledger.db.pragma('table_info(qm_invocations)') as Array<{name:string}>)
+  // Build the actual v1-v5 schema prefix in another real file. Never relabel a
+  // current database as old while leaving later tables/columns behind. The seed
+  // still comes from real worker recording and receipt-only execution above.
+  legacy = new Database(join(f.directory, "version-five.sqlite"));
+  const db = legacy;
+  db.exec(initialSchema);
+  db.exec("CREATE TABLE qm_schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)");
+  db.exec(runtimeSchema);
+  db.exec(taskSchema);
+  db.exec(resourceSchema);
+  db.exec(reliabilitySchema);
+  db.exec(taskLifecycleSchema);
+  db.exec("ALTER TABLE console_operations ADD COLUMN observed_at TEXT; ALTER TABLE console_executions ADD COLUMN observed_at TEXT;");
+  const recordVersion = db.prepare("INSERT INTO qm_schema_migrations(version,name,applied_at) VALUES(?,?,?)");
+  ["quaymesh-initial", "quaymesh-runtime-ownership", "quaymesh-durable-results", "quaymesh-task-lifecycle", "quaymesh-execution-observation"]
+    .forEach((name, index) => recordVersion.run(index + 1, name, new Date().toISOString()));
+  const quote = (identifier: string) => '"' + identifier.replaceAll('"', '""') + '"';
+  const tables = db.prepare("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='qm_schema_migrations' ORDER BY name")
+    .all() as Array<{name: string; sql: string}>;
+  // Copy only columns that really existed in v5. Disable FK checks during this
+  // unordered import, then check the complete historical graph before migration.
+  db.pragma("foreign_keys = OFF");
+  try {
+    db.transaction(() => {
+      for (const table of tables) {
+        const columns = (db.pragma(`table_info(${quote(table.name)})`) as Array<{name: string}>).map(column => column.name);
+        const order = /WITHOUT\s+ROWID/iu.test(table.sql) ? "" : " ORDER BY rowid";
+        const rows = f.ledger.db.prepare(`SELECT ${columns.map(quote).join(",")} FROM ${quote(table.name)}${order}`)
+          .all() as Array<Record<string, unknown>>;
+        db.exec(`DELETE FROM ${quote(table.name)}`);
+        const insert = db.prepare(`INSERT INTO ${quote(table.name)} (${columns.map(quote).join(",")}) VALUES (${columns.map(() => "?").join(",")})`);
+        for (const row of rows) Reflect.apply(insert.run, insert, columns.map(column => row[column]));
+      }
+    }).immediate();
+  } finally { db.pragma("foreign_keys = ON"); }
+  const legacyQuiescenceObjects = db.prepare(`SELECT type,name,sql FROM sqlite_master
+    WHERE name GLOB 'execution_quiescence*'
+      OR name IN ('console_operations_maintenance_status','console_executions_maintenance_status') ORDER BY name`);
+  assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE name='qm_task_message_receivers'").get(), undefined);
+  assert.ok(!(db.pragma("table_info(qm_task_finalizations)") as Array<{name: string}>).some(column => column.name === "mailbox_sequence"));
+  for (const table of ["qm_file_changes", "qm_task_file_changes"]) {
+    assert.ok(!(db.pragma(`table_info(${table})`) as Array<{name: string}>).some(column => column.name === "recorded_at"));
+  }
+  assert.equal(db.pragma("integrity_check", {simple: true}), "ok");
+  assert.deepEqual(db.pragma("foreign_key_check"), []);
+  assert.equal(db.prepare('SELECT max(version) FROM qm_schema_migrations').pluck().get(),5);
+  assert.deepEqual(legacyQuiescenceObjects.all(), []);
+  assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='execution_owners'").get(), undefined);
+  assert.ok(!(db.pragma('table_info(qm_invocations)') as Array<{name:string}>)
     .some(column=>["task_id","retry_of_invocation_id","response_json"].includes(column.name)));
-  assert.deepEqual(f.ledger.db.prepare("SELECT id,operation_id,result_json FROM qm_invocations ORDER BY rowid").all(), before);
-  migrateDatabase(f.ledger.db); migrateDatabase(f.ledger.db);
-  assert.equal(f.ledger.db.prepare('SELECT max(version) FROM qm_schema_migrations').pluck().get(),LATEST_DATABASE_VERSION);
-  assert.deepEqual(quiescenceObjects.all(), latestQuiescenceObjects);
-  assert.equal(f.store.findInvocation("owner", "transport", "worker")!.task_id, f.task.id);
-  assert.equal(f.store.findInvocation("owner", "transport", "receipt")!.task_id, null);
-  assert.equal(f.store.findInvocation("owner", "transport", "worker")!.response_json,null);
-  assert.equal(f.store.findInvocation("owner", "transport", "receipt")!.response_json,null);
-  assert.deepEqual(f.ledger.db.prepare("SELECT id,operation_id,result_json FROM qm_invocations ORDER BY rowid").all(), before);
-  assert.deepEqual(f.ledger.db.prepare("SELECT * FROM console_work_runs ORDER BY id").all(), beforeRuns);
-  assert.deepEqual(f.ledger.db.prepare("SELECT * FROM console_operations ORDER BY id").all(), beforeOperations);
-  assert.equal(f.ledger.db.pragma("integrity_check", {simple:true}), "ok");
-  assert.deepEqual(f.ledger.db.pragma("foreign_key_check"), []);
+  assert.deepEqual(db.prepare("SELECT id,operation_id,result_json FROM qm_invocations ORDER BY rowid").all(), before);
+  migrateDatabase(db); migrateDatabase(db);
+  const upgradedStore = new SessionStore(db);
+  assert.equal(db.prepare('SELECT max(version) FROM qm_schema_migrations').pluck().get(),LATEST_DATABASE_VERSION);
+  assert.deepEqual(legacyQuiescenceObjects.all(), latestQuiescenceObjects);
+  assert.equal(upgradedStore.findInvocation("owner", "transport", "worker")!.task_id, f.task.id);
+  assert.equal(upgradedStore.findInvocation("owner", "transport", "receipt")!.task_id, null);
+  assert.equal(upgradedStore.findInvocation("owner", "transport", "worker")!.response_json,null);
+  assert.equal(upgradedStore.findInvocation("owner", "transport", "receipt")!.response_json,null);
+  assert.deepEqual(db.prepare("SELECT id,operation_id,result_json FROM qm_invocations ORDER BY rowid").all(), before);
+  assert.deepEqual(db.prepare("SELECT * FROM console_work_runs ORDER BY id").all(), beforeRuns);
+  assert.deepEqual(db.prepare("SELECT * FROM console_operations ORDER BY id").all(), beforeOperations);
+  assert.equal(db.pragma("integrity_check", {simple:true}), "ok");
+  assert.deepEqual(db.pragma("foreign_key_check"), []);
 });
 
 test("a refusal cannot be inherited by a new task or another session for the same workspace", async t => {

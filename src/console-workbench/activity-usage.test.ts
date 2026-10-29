@@ -87,8 +87,9 @@ test("invocation first response is immutable and structured tool errors remain f
     sessionId: f.session.id, memberId: f.member.id, toolName: "exec_command", argumentsJson: "{}", taskId: f.task.id });
   reserve("accepted-command");
   const identity = { ownerId: "owner", transportInstanceId: "transport", requestId: "accepted-command" };
-  const first = f.store.updateInvocation({ ...identity, state: OperationState.running, effect: "started", responded: true,
+  f.store.updateInvocation({ ...identity, state: OperationState.running, effect: "started", responded: true,
     result: { kind: "result", value: { accepted: true, running: true } } });
+  const first = f.store.findInvocation("owner", "transport", "accepted-command")!;
   assert.ok(first.response_json);
   f.store.updateInvocation({ ...identity, state: OperationState.failed, effect: "completed", finished: true, responded: true,
     result: { kind: "error", message: "later process failure" } });

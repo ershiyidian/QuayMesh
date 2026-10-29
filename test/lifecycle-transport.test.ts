@@ -12,6 +12,7 @@ import {SessionService} from "../src/session/service.js";
 import {WorkLedger} from "../src/work-ledger.js";
 import {openDatabase} from "../src/db/client.js";
 import {SessionStore} from "../src/session/store.js";
+import {SessionOutputStore} from "../src/session/output.js";
 import {ExecutionCoordinator,type RuntimeWorkLease} from "../src/execution-coordinator.js";
 import {randomUUID} from "node:crypto";
 
@@ -22,6 +23,12 @@ test("准备三十秒时立即交付受理回执，断连后同键不重写",{ti
   const original=SessionChangeCollector.prototype.prepareWrite;
   let release!:()=>void;
   const gate=new Promise<void>(resolve=>{release=resolve;});
+  const originalOutputOpen=SessionOutputStore.prototype.open;
+  let releaseOutput!:()=>void, openingOutput=false;
+  const outputGate=new Promise<void>(resolve=>{releaseOutput=resolve;});
+  t.mock.method(SessionOutputStore.prototype,"open",async function(this:SessionOutputStore,...args:Parameters<typeof originalOutputOpen>){
+    openingOutput=true;await outputGate;return originalOutputOpen.apply(this,args);
+  });
   let preparing=false;
   t.mock.method(SessionChangeCollector.prototype,"prepareWrite",async function(this:SessionChangeCollector,...args:Parameters<typeof original>){
     preparing=true;await gate;return original.apply(this,args);
@@ -58,13 +65,23 @@ test("准备三十秒时立即交付受理回执，断连后同键不重写",{ti
     const page=await call("read_output",{...f.scope,operation_id:first.operation_id,cursor:0});
     assert.equal(page.process_done,false);assert.equal(page.operation_state,"preparing");
     await delay(Math.max(0,30000-(Date.now()-started)));release();
+    await until(()=>openingOutput,15000);
+    const opening=await call("read_output",{...f.scope,operation_id:first.operation_id,cursor:0});
+    assert.equal(opening.operation_state,"starting");assert.equal(opening.process_done,false);
+    assert.equal(opening.effect,"started");assert.equal(opening.result,"");assert.equal(opening.next_cursor,0);
+    assert.equal(opening.exit_code,null);assert.equal(opening.operation_id,first.operation_id);
+    releaseOutput();
     await until(async()=>(await call("read_output",{...f.scope,operation_id:first.operation_id,cursor:0})).process_done,15000);
     const completed=await call("read_output",{...f.scope,operation_id:first.operation_id,cursor:0});
     assert.equal(completed.exit_code,0,JSON.stringify(completed));
     assert.equal(await readFile(join(f.project,"once.txt"),"utf8"),"one\n");
     const replay=await call("exec_command",args);assert.equal(replay.operation_id,first.operation_id);
     assert.equal(await readFile(join(f.project,"once.txt"),"utf8"),"one\n");
-  }finally{release();await client?.close();}
+    await rm(join(f.config.stateDir,"session-output",`${first.operation_id}.json`));
+    const missing=await client.callTool({name:"read_output",arguments:{...f.scope,operation_id:first.operation_id,cursor:0},_meta:f.meta});
+    assert.equal(missing.isError,true,"a missing completed output must not become an indefinite startup reply");
+    assert.match(JSON.stringify(missing),/OUTPUT_NOT_FOUND/);
+  }finally{release();releaseOutput();await client?.close();}
 });
 
 test("一百次输出查询不创建新 Run、Invocation 或模型进展",{timeout:30000},async t=>{
@@ -166,25 +183,26 @@ test("前四个任务仍在执行时，后续完成意图不会被饿死",{timeo
   }
 });
 
-test("交接收尾重试不等待或取消已经受理的后台命令",{timeout:30000},async t=>{
+test("交接请求在收尾前明确拒绝，后台命令完成也不自动关闭工作目标",{timeout:30000},async t=>{
   const f=await fixture(t),gate=join(f.root,"finish-background");
   const command=await f.execute(`import {existsSync} from 'node:fs';const timer=setInterval(()=>{
     if(existsSync(${JSON.stringify(gate)})){clearInterval(timer);console.log('background-complete');}},20);`,{yield_time_ms:0});
-  const finish=SessionService.prototype.finishTask,archive=WorkLedger.prototype.archiveTaskRuns;
-  let service:SessionService|undefined,blocked=true;
+  const finish=SessionService.prototype.finishTask;
+  let service:SessionService|undefined;
   t.mock.method(SessionService.prototype,"finishTask",function(this:SessionService,...args:Parameters<typeof finish>){service=this;return finish.apply(this,args);});
-  t.mock.method(WorkLedger.prototype,"archiveTaskRuns",function(this:WorkLedger,...args:Parameters<typeof archive>){
-    if(blocked)throw new Error("INJECTED_HANDOFF_ARCHIVE");return archive.apply(this,args);
-  });
   const db=openDatabase(f.config.stateDir);
   try {
     const first=await f.raw("finish_task",{task_id:f.task.task_id,status:"handed_off",summary:"后台继续"});
-    assert.equal(first.isError,true);assert.match(JSON.stringify(first),/INJECTED_HANDOFF_ARCHIVE/);
-    blocked=false;assert.ok(service);await service.retryFinalizations();
-    assert.deepEqual(db.sqlite.prepare("select state,result_status from qm_tasks where id=?").get(f.task.task_id),{state:"closed",result_status:"handed_off"});
+    assert.equal(first.isError,true);assert.match(JSON.stringify(first),/TASK_HANDOFF_NOT_TERMINAL/);
+    assert.deepEqual(first.structuredContent,{error_code:"TASK_HANDOFF_NOT_TERMINAL",effect:"not_started",retry_hint:"fix_input"});
+    assert.match(JSON.stringify(first.content),/effect=not_started; retry_hint=fix_input/);
+    assert.ok(service);await service.retryFinalizations();
+    assert.deepEqual(db.sqlite.prepare("select state,result_status from qm_tasks where id=?").get(f.task.task_id),{state:"active",result_status:null});
+    assert.equal(db.sqlite.prepare("select 1 from qm_task_finalizations where task_id=?").get(f.task.task_id),undefined);
     assert.equal((await f.call("read_output",{...f.scope,operation_id:command.operation_id})).process_done,false);
     await writeFile(gate,"finish");
     await until(async()=>(await f.call("read_output",{...f.scope,operation_id:command.operation_id})).process_done);
     assert.equal((await f.call("read_output",{...f.scope,operation_id:command.operation_id})).result,"background-complete\n");
-  } finally {blocked=false;await writeFile(gate,"finish");db.close();}
+    assert.deepEqual(db.sqlite.prepare("select state,result_status from qm_tasks where id=?").get(f.task.task_id),{state:"active",result_status:null});
+  } finally {await writeFile(gate,"finish");db.close();}
 });

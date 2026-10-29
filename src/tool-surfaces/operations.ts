@@ -43,7 +43,23 @@ export async function commandOutput(context:ToolRegistrationContext,workspaceId:
     return value();
   }
   if(command.retained_until&&Date.parse(command.retained_until)<Date.now())throw new Error(`OUTPUT_EXPIRED: ${command.retained_until}`);
-  const page=await runtime.output.modelRead(command.session_id,operationId,cursor,limit,signal);
+  const page=await runtime.output.modelRead(command.session_id,operationId,cursor,limit,signal).catch(error=>{
+    // Admission can start before the output sink has committed its metadata.
+    // Only this live recorder and an unopened sink prove that transient gap;
+    // missing output from an orphaned or previously opened command stays an error.
+    const opening = error instanceof Error && error.message === `OUTPUT_NOT_FOUND: ${operationId}`
+      && ["accepted","queued","running"].includes(saved.state)
+      && runtime.recorder.activeOperationIds().includes(operationId)
+      && runtime.store.findOperationEvent(operationId)?.payload.output_available !== true;
+    if (!opening) throw error;
+    if (cursor !== 0) throw new Error("OUTPUT_RANGE_EXPIRED: command has not produced output");
+    return null;
+  });
+  if (!page) return {
+    result:"",effect:saved.effect,operation_id:operationId,task_id:command.task_id,operation_state:"starting",
+    cursor:0,next_cursor:0,total_bytes:0,retained_from:0,retained_until:command.retained_until,
+    done:false,process_done:false,has_more:false,truncated:false,exit_code:null,signal:null,poll_after_ms:2000,
+  };
   if(page.truncated&&!preview)throw new Error(`OUTPUT_RANGE_EXPIRED: operation_id=${operationId}; requested=${cursor}; retained_from=${page.retainedFrom}`);
   const attached=context.processSessions.findOperation(operationId);
   const state=!attached&&["running","queued","starting"].includes(command.status)?"reconciliation_required":command.status;

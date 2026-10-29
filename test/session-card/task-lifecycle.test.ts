@@ -26,9 +26,12 @@ for (const git of [true, false]) {
     await waitForFixture(server,scope,"background process started before handoff",()=>readFile(started,"utf8").catch((error:NodeJS.ErrnoException)=>{
       if(error.code==="ENOENT")return null;throw error;
     }),value=>value==="ready");
-    const finish = structured(await server.client.callTool({name:"finish_task",arguments:{task_id:first.task_id,status:"handed_off",summary:"后台继续"},_meta:meta}));
-    assert.equal(finish.result_status,"handed_off");
-    const second = structured(await server.client.callTool({name:"start_session",arguments:{title:"新任务",request_key:"background-two"},_meta:meta}));
+    const handoff = await server.client.callTool({name:"finish_task",arguments:{task_id:first.task_id,status:"handed_off",summary:"后台继续"},_meta:meta});
+    assert.equal(handoff.isError,true);
+    assert.match(JSON.stringify(handoff),/TASK_HANDOFF_NOT_TERMINAL/);
+    const selected = structured(await server.client.callTool({name:"task_resume",arguments:{action:"inspect",task_id:first.task_id},_meta:meta}));
+    const second = structured(await server.client.callTool({name:"start_session",arguments:{title:"新任务",request_key:"background-two",
+      new_goal:true,expected_binding_revision:(selected.binding as {binding_revision:number}).binding_revision},_meta:meta}));
     assert.notEqual(second.task_id,first.task_id);
     await writeFile(gate,"continue");
     await waitForRecordedTool(server,scope,commandResult);
@@ -39,6 +42,8 @@ for (const git of [true, false]) {
     await waitForRecordedTool(server,scope,patch);
     const db = openDatabase(server.config.stateDir);
     try {
+      assert.deepEqual(db.sqlite.prepare("SELECT state,result_status FROM qm_tasks WHERE id=?").get(first.task_id),
+        {state:"active",result_status:null},"changing goals and finishing a background command do not close the original goal");
       const original = db.sqlite.prepare("SELECT task_id FROM qm_events WHERE event_type='operation_finished' AND task_id=?").all(first.task_id);
       assert.ok(original.length>0);
       const baseline = db.sqlite.prepare("SELECT task_id FROM qm_task_change_baselines WHERE task_id IN (?,?)").all(first.task_id,second.task_id);

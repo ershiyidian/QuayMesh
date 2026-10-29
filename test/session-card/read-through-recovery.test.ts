@@ -10,7 +10,7 @@ import Database from "better-sqlite3";
 import { federationConfigSchema } from "../../src/federation/schema.js";
 import type { SessionFeed } from "../../src/federation/session-feed.js";
 import { WORKSPACE_APP_VERSION } from "../../src/session/card-contract.js";
-import { createRealTestServer, freePort, structured, type RealTestServer } from "./server-fixture.js";
+import { createRealTestServer, freePort, structured, waitForFixture, type RealTestServer } from "./server-fixture.js";
 
 const meta={"openai/session":"read-through-recovery-conversation"};
 const feed=(server:RealTestServer)=>(server.running.federation as unknown as {sessionFeed:SessionFeed}).sessionFeed;
@@ -141,6 +141,26 @@ test("coordinator restart recovers an existing task before unchanged reads and c
   const opened=await open(entry);
   const initial=await read(entry,sessionId,taskId);
   assert.ok(initial.snapshot);
+  // Only the Coordinator selects and admits new Task work. Accept the command
+  // while it is online, then let its Worker-owned process finish during restart.
+  const gate=join(worker.root,"release-restart-command"),started=join(worker.root,"restart-command-started");
+  const script=join(worker.project,"during-restart.mjs");
+  await writeFile(script,`import {existsSync,writeFileSync} from 'node:fs';
+writeFileSync(${JSON.stringify(started)},'ready');
+const timer=setInterval(()=>{if(existsSync(${JSON.stringify(gate)})){
+  clearInterval(timer);writeFileSync('during-restart.txt','completed while coordinator was down');
+}},25);
+`);
+  const accepted=await entry.client.callTool({name:"exec_command",arguments:{workspace_id:opened.workspace_id,task_id:taskId,
+    cmd:`"${process.execPath}" "${script}"`,yield_time_ms:20,operation_key:"finish-during-coordinator-restart"},_meta:meta});
+  assert.notEqual(accepted.isError,true,JSON.stringify(accepted));
+  const command=structured(accepted);
+  assert.ok(command.accepted===true||command.running===true,JSON.stringify(command));
+  assert.equal(typeof command.operation_id,"string");
+  await waitForFixture(worker,{sessionId},"accepted command started before Coordinator shutdown",
+    ()=>readFile(started,"utf8").catch((error:NodeJS.ErrnoException)=>{if(error.code==="ENOENT")return "";throw error;}),
+    value=>value==="ready");
+  await settleOpening(entry,worker);
   const oldActivity=taskRow(entry,taskId).last_activity_at;
   const oldDatabase=new Database(join(entry.config.stateDir,"quaymesh.sqlite"));
   try{
@@ -150,15 +170,17 @@ test("coordinator restart recovers an existing task before unchanged reads and c
     oldDatabase.prepare("update qm_task_projections set snapshot_json=? where task_id=? and member_id=?").run(JSON.stringify(snapshot),taskId,opened.member_id);
   }finally{oldDatabase.close();}
   await entry.restart(async()=>{
-    const command=await worker.client.callTool({name:"exec_command",arguments:{workspace_id:String(opened.workspace_id).replace(/^qm:worker:/,""),
-      cmd:"node -e \"require('node:fs').writeFileSync('during-restart.txt','completed while coordinator was down')\"",yield_time_ms:1000},_meta:meta});
-    assert.notEqual(command.isError,true,JSON.stringify(command));
-    const until=Date.now()+5000;
-    while(Date.now()<until){
-      const content=await readFile(join(worker.project,"during-restart.txt"),"utf8").catch(error=>{if(error.code==="ENOENT")return "";throw error;});
-      if(content)break;
-      await delay(25);
-    }
+    await writeFile(gate,"continue");
+    await waitForFixture(worker,{sessionId,paths:["during-restart.txt"]},"Worker persists the accepted command while Coordinator is down",async()=>{
+      const db=new Database(join(worker.config.stateDir,"quaymesh.sqlite"),{readonly:true});
+      try{return db.prepare("select task_id,state from qm_invocations where operation_id=?").get(command.operation_id) as {task_id:string;state:string}|undefined;}
+      finally{db.close();}
+    },row=>{
+      if(!row||["accepted","queued","running"].includes(row.state))return false;
+      assert.equal(row.state,"succeeded");
+      assert.equal(row.task_id,taskId,"completion remains in the originally admitted Task");
+      return true;
+    });
     assert.equal(await readFile(join(worker.project,"during-restart.txt"),"utf8"),"completed while coordinator was down");
   });
   assert.ok(await entry.running.federation!.transport.waitForLink("worker",5000));

@@ -12,14 +12,14 @@ export function federatedTools(target: McpRegistrationTarget, runtime: Federatio
     registerTool: ((name: string, definition: Record<string, any>, handler: ToolHandler) => {
       const originalShape = definition.inputSchema;
       const appOnly = Array.isArray((definition._meta as any)?.ui?.visibility)
-        && (definition._meta as any).ui.visibility.includes("app");
+        && (definition._meta as any).ui.visibility.includes("app")
+        && !(definition._meta as any).ui.visibility.includes("model");
       if (!appOnly) runtime.addModelTool(name);
       runtime.handlers.set(name, async (input, extra) => {
         const schema = originalShape?.parse ? originalShape : z.object(originalShape ?? {});
         return handler(schema.parse(input) as JsonRecord, extra);
       });
       const wrapped = name === "open_workspace" || name === "attach_workspace" ? { ...definition,
-        annotations: { ...definition.annotations, readOnlyHint:false, destructiveHint:false, openWorldHint:false },
         description: name === "attach_workspace"
           ? "Attach a previously exported worker root using root_id from workspace_catalog. To restore a pruned workspace, pass only its workspace_id. Cloud has no file execution capability. Reuse returned workspace_id; do not invent /tmp paths on Cloud."
           : "FIRST call workspace_catalog without query, then open_workspace({root_id:\"desktop/main\"}) or another listed root_id. Cloud is Coordinator only, with no shell or filesystem execution. Do not invent /tmp or absolute paths on Cloud. Reuse returned workspace_id for all reads, commands and edits.",
@@ -33,7 +33,7 @@ export function federatedTools(target: McpRegistrationTarget, runtime: Federatio
           const registeredShape = wrapped.inputSchema;
           const schema = registeredShape?.parse ? registeredShape : z.object(registeredShape ?? {});
           const parsed = schema.parse(input) as JsonRecord;
-          const trustedInvocation = recorded ? runtime.trustedInvocation(name, parsed, extra) : undefined;
+          const trustedInvocation = recorded ? await runtime.trustedInvocation(name, parsed, extra) : undefined;
           const forwardedExtra = trustedInvocation ? { ...extra, trustedInvocation } : extra;
           if (recorded && runtime.routeNode(name, parsed) !== runtime.localId) {
             return await recorded(parsed, forwardedExtra, () => runtime.tool(name, parsed, forwardedExtra), { forwarded: true });

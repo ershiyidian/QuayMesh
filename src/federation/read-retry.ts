@@ -24,12 +24,17 @@ export function isIdempotentPeerRequest(method: string, params: unknown): boolea
   if (method === "hello") return true;
   if (method === "settings.get" || method === "mihomo.read") return true;
   if (method === "transfers.list" || method === "artifact.stat" || method === "artifact.observe" || method === "artifact.lookup") return true;
-  if (method === "console") {
+  if (method === "console" || method === "console.request") {
     const p = params as { method?: string } | undefined;
     const httpMethod = p?.method?.toUpperCase() ?? "GET";
     return httpMethod === "GET" || httpMethod === "HEAD";
   }
-  if (method === "session.feed") return true;
+  if (method === "session.feed") {
+    const kind = (params as { kind?: unknown } | null)?.kind;
+    // Finalize/archive mutate goal ownership and can outlive a lost response.
+    // Their durable intent, not read retry, controls any subsequent attempt.
+    return ["snapshot", "revision", "subscribe", "unsubscribe"].includes(String(kind));
+  }
   if (method === "tool") {
     const p = params as { name?: string; input?: Record<string, unknown> } | undefined;
     const toolName = p?.name;
@@ -59,6 +64,12 @@ export function isIdempotentPeerRequest(method: string, params: unknown): boolea
   return false;
 }
 
+
+/** Workspace membership is durable even when opening it is replay-safe. */
+export function isCancellableToolObservation(name: string, input: Record<string, unknown>): boolean {
+  return name !== "open_workspace" && name !== "attach_workspace"
+    && isIdempotentPeerRequest("tool", { name, input });
+}
 
 export interface ReadRetryLink<T> {
   connected: boolean;
@@ -145,7 +156,8 @@ export async function executeBoundedRead<T>(options: PeerDispatchOptions<T>): Pr
 }
 
 function readAttemptTimeout(method: string, params: unknown): number {
-  if (method === "console" && (params as {method?:unknown}|null)?.method === "GET") return 18_000;
+  if ((method === "console" || method === "console.request")
+    && ["GET", "HEAD"].includes(String((params as {method?:unknown}|null)?.method ?? "GET").toUpperCase())) return 18_000;
   if (method !== "tool" || !params || typeof params !== "object") return READ_ATTEMPT_TIMEOUT_MS;
   const request = params as { name?: unknown; input?: Record<string, unknown> };
   if (request.name === "open_workspace" || request.name === "attach_workspace") {
@@ -172,4 +184,12 @@ export function dispatchPeerRequest<T>(options: PeerDispatchOptions<T>): Promise
     return link.call(options.timeoutMs ?? options.rpcTimeoutMs);
   }
   return executeBoundedRead(options);
+}
+
+/** Local single-dispatch proof only. A peer's error envelope is never proof that no owner received the request. */
+export function locallyUnsentPeerRequest(error: unknown): boolean {
+  if (!error || typeof error !== "object" || error instanceof PeerApplicationError) return false;
+  const value=error as { effect?: unknown; details?: { dispatch_state?: unknown } };
+  if (value.effect!=="not_started") return false;
+  return error instanceof NodeUnavailableError || value.details?.dispatch_state==="not_sent";
 }

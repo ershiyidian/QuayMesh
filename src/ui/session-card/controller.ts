@@ -5,8 +5,12 @@ import {
   applyCommandOutput,appendPage,applySnapshot,diffCacheKey,resetAfterRevert,
   selectedCommands,type CardState,
 } from "./state.js";
-import type {CardIntent,CardView} from "./view.js";
+import type {CardContinuationResult,CardIntent,CardView} from "./view.js";
 import {needsLocalTimer,refreshDelay} from "./timing.js";
+import {createTaskMessagesController} from "./message-controller.js";
+import {createTaskResumeController} from "./task-resume-controller.js";
+import {applyTaskBinding,canContinueTask} from "./task-binding.js";
+import {createPendingMessageState,type PendingMessageState} from "./pending-message-state.js";
 
 export interface CardController {
   start():void;
@@ -18,17 +22,19 @@ export interface CardController {
 
 const MAX_OUTPUT_BATCH=8;
 const MAX_PATCH_BYTES=4*1024*1024;
+const MAX_FIRST_SNAPSHOT_FAILURES=3;
 
-export function createCardController(state:CardState,renderer:CardView,source:SessionCardSource,doc:Document=document):CardController {
-  let stopped=false,started=false,polling:Promise<void>|null=null,request:AbortController|null=null;
+export function createCardController(state:CardState,renderer:CardView,source:SessionCardSource,doc:Document=document,
+  pendingState:PendingMessageState=createPendingMessageState(()=>(doc.defaultView as (Window&{openai?:unknown})|null)?.openai)):CardController {
+  let stopped=false,started=false,snapshotRead:Promise<void>|null=null,request:AbortController|null=null;
   let timer:ReturnType<typeof setTimeout>|undefined,elapsed:ReturnType<typeof setInterval>|undefined;
   let retryDelay=0,retryAt=0,observer:IntersectionObserver|undefined;
-  let firstSnapshotRecorded=false,lastVisibility: boolean|null=null,renderFailed=false;
+  let firstSnapshotRecorded=false,firstSnapshotFailures=0,lastVisibility: boolean|null=null,renderFailed=false;
   const visible=()=>!stopped&&!renderFailed&&!doc.hidden&&state.inViewport;
   function draw(action:()=>void):void{
     if(renderFailed)return;
     try{action();}catch(error){
-      renderFailed=true;state.connection='error';clearTimeout(timer);clearInterval(elapsed);request?.abort('SESSION_CARD_RENDER_FAILED');
+      renderFailed=true;state.connection='error';clearTimeout(timer);clearInterval(elapsed);request?.abort('SESSION_CARD_RENDER_FAILED');messages.visibilityChanged();
       const target=doc.getElementById('card');
       if(target){
         const title=doc.createElement('strong'),message=doc.createElement('p');
@@ -42,13 +48,21 @@ export function createCardController(state:CardState,renderer:CardView,source:Se
   }
   const view:CardView={render:()=>draw(()=>renderer.render()),renderPanel:()=>draw(()=>renderer.renderPanel()),
     renderFooter:()=>draw(()=>renderer.renderFooter()),fillTimers:()=>draw(()=>renderer.fillTimers()),dispose:()=>renderer.dispose()};
+  const messages=createTaskMessagesController(state,source,()=>visible()&&!state.taskResume.busy,()=>view.renderPanel(),pendingState);
+  const binding=createTaskResumeController(state,source,()=>{view.renderFooter();view.renderPanel();},
+    ()=>{clearTimeout(timer);request?.abort("SESSION_CARD_BINDING_ACTION");messages.visibilityChanged();},()=>schedule());
+
+  const canReadSnapshot=()=>firstSnapshotRecorded||firstSnapshotFailures<MAX_FIRST_SNAPSHOT_FAILURES;
 
   function schedule():void {
     clearTimeout(timer);
-    if(!visible()||!source.live)return;
+    if(!visible()||!source.live||state.taskResume.busy)return;
     const interval=refreshDelay(state.snapshot,state.collapsed);
-    if(interval===null)return;
-    timer=setTimeout(()=>void pollOnce(),Math.max(interval,retryAt-Date.now()));
+    if(interval===null&&firstSnapshotRecorded)return;
+    const mailbox=messages.canRefresh();
+    if(!canReadSnapshot()&&(!mailbox||interval===null))return;
+    // Coordinator messages do not inherit a worker snapshot's retry delay or exhausted handshake budget.
+    timer=setTimeout(tick,mailbox?interval??5000:Math.max(interval??5000,retryAt-Date.now()));
   }
 
   function updateElapsedTimer():void {
@@ -57,37 +71,62 @@ export function createCardController(state:CardState,renderer:CardView,source:Se
     elapsed=setInterval(()=>view.fillTimers(),1000);
   }
 
-  async function requestSnapshot():Promise<void> {
-    request=new AbortController();const signal=request.signal;
+  async function requestSnapshot(signal:AbortSignal):Promise<void> {
     const previousConnection=state.connection;
     try {
       const next=await source.snapshot(state.snapshot?.rev??-1,signal,state.selectedMemberId??undefined);
       if(signal.aborted||stopped)return;
+      // The first full reply negotiates fields omitted from legacy bootstrap metadata.
+      const changed=next ? applySnapshot(state,next,{acceptSameRevision:!firstSnapshotRecorded}).snapshot : false;
+      messages.restorePending();
+      if(source.live&&!firstSnapshotRecorded&&!changed)throw new Error("SESSION_CARD_FIRST_SNAPSHOT_UNCONFIRMED");
+      if(next&&changed&&!firstSnapshotRecorded){firstSnapshotRecorded=true;void recordStage("first_snapshot");}
       state.connection=source.live?"live":"static";state.lastConfirmedAt=Date.now();
-      const changed=next ? applySnapshot(state,next).snapshot : false;
-      if(next&&!firstSnapshotRecorded){firstSnapshotRecorded=true;void recordStage("first_snapshot");}
+      const bindingChanged=binding.sync();
       retryDelay=0;retryAt=0;
       if(changed)view.render();
+      else if(bindingChanged){view.renderFooter();view.renderPanel();}
       updateElapsedTimer();
       await refreshOpenCommandOutputs();
     } catch(error) {
       if(!signal.aborted&&!stopped){
-        state.connection="error";
+        if(state.taskResume.available&&applyTaskBinding(state,null))view.renderPanel();
+        if(source.live&&!firstSnapshotRecorded)firstSnapshotFailures++;
+        const exhausted=!firstSnapshotRecorded&&firstSnapshotFailures>=MAX_FIRST_SNAPSHOT_FAILURES;
+        state.connection=exhausted?"unconfirmed":"error";
+        if(exhausted&&state.snapshot){
+          state.snapshot={...state.snapshot,capabilities:{...state.snapshot.capabilities,continue:false,revert:false}};
+          view.render();
+        }
         retryDelay=Math.min(Math.max(5000,retryDelay*2),30000);
         const supplied=(error as {retryAfterMs?:number})?.retryAfterMs;
         retryAt=Date.now()+(typeof supplied==="number"?Math.max(supplied,retryDelay):retryDelay);
         if(previousConnection!=="error")void recordStage("error");
       }
-    } finally {request=null;if(!stopped&&state.connection!==previousConnection)view.renderFooter();}
+    } finally {if(!stopped&&state.connection!==previousConnection)view.renderFooter();}
   }
 
-  function pollOnce():Promise<void> {
-    if(polling)return polling;
-    if(!visible()||Date.now()<retryAt){schedule();return Promise.resolve();}
-    clearTimeout(timer);
-    polling=requestSnapshot().finally(()=>{polling=null;schedule();});
-    return polling;
+  function readSnapshot():Promise<void> {
+    if(snapshotRead)return snapshotRead;
+    request=new AbortController();
+    snapshotRead=requestSnapshot(request.signal).finally(()=>{request=null;snapshotRead=null;schedule();});
+    return snapshotRead;
   }
+
+  function refreshResources():Array<Promise<void>> {
+    if(!visible()||state.taskResume.busy){schedule();return [];}
+    clearTimeout(timer);
+    const pending:Array<Promise<void>>=[];
+    if(snapshotRead)pending.push(snapshotRead);
+    else if(canReadSnapshot()&&Date.now()>=retryAt)pending.push(readSnapshot());
+    if(messages.canRefresh())pending.push(messages.poll());
+    // Keep one timer ticking even when one resource is still pending. Each reader owns its single flight.
+    schedule();
+    return pending;
+  }
+
+  function tick():void {refreshResources();}
+  function pollOnce():Promise<void> {return Promise.all(refreshResources()).then(()=>{});}
 
   async function handleIntent(intent:CardIntent):Promise<unknown>{
     if(stopped)throw new Error("SESSION_CARD_CONTROLLER_DISPOSED");
@@ -100,7 +139,19 @@ export function createCardController(state:CardState,renderer:CardView,source:Se
       case "revert":return revert(intent.expectedRev);
       case "open_link":return source.openLink(intent.url);
       case "display_mode":return false;
-      case "continue_session":return source.continueSession(intent.agentId);
+      case "continue_session":{
+        if(state.busy)return {sent:false,reason:"busy"} satisfies CardContinuationResult;
+        if(state.taskResume.available&&!canContinueTask(state))throw new Error("TASK_BINDING_NOT_CONFIRMED: 请先确认并恢复此任务的关联。");
+        state.busy=true;view.renderFooter();view.renderPanel();
+        try{await source.continueSession(intent.agentId);return {sent:true} satisfies CardContinuationResult;}
+        finally{state.busy=false;if(!stopped){view.renderFooter();view.renderPanel();}}
+      }
+      case "inspect_task_binding":return binding.inspect();
+      case "resume_task":return binding.resume();
+      case "request_host_resume":return binding.requestHost();
+      case "task_messages":return messages.refresh(intent.beforeSequence);
+      case "send_task_message":return messages.send();
+      case "tab_changed":messages.visibilityChanged();schedule();return state.tab==="messages"?messages.refresh():undefined;
     }
   }
 
@@ -146,8 +197,8 @@ export function createCardController(state:CardState,renderer:CardView,source:Se
   async function loadMore(kind:"files"|"commands"|"agents"):Promise<void>{
     if(state.loadingMore)return;const cursor=state.pageCursors[kind];if(!cursor)return;
     state.loadingMore=true;
-    try{const page=await source.snapshot(state.snapshot?.rev??-1,undefined,state.selectedMemberId??undefined,cursor);if(page)appendPage(state,page,kind);}
-    finally{state.loadingMore=false;view.renderPanel();}
+    try{const page=await source.snapshot(state.snapshot?.rev??-1,undefined,state.selectedMemberId??undefined,cursor);if(page)appendPage(state,page,kind);binding.sync();}
+    finally{state.loadingMore=false;view.renderFooter();view.renderPanel();}
   }
 
   async function loadCompletePatch():Promise<string>{
@@ -162,17 +213,19 @@ export function createCardController(state:CardState,renderer:CardView,source:Se
   async function revert(expectedRev:number):Promise<void>{
     await source.revert(expectedRev);resetAfterRevert(state);
     const next=await source.snapshot(-1);if(next)applySnapshot(state,next);
+    binding.sync();
     view.render();updateElapsedTimer();
   }
 
   function visibilityChanged():void{
     clearInterval(elapsed);
+    messages.visibilityChanged();
     const current=visible();
     if(lastVisibility!==current){lastVisibility=current;void recordStage(current?"visible":"hidden",{visible:current});}
     if(!current){clearTimeout(timer);request?.abort("SESSION_CARD_NOT_VISIBLE");return;}
-    view.fillTimers();updateElapsedTimer();void pollOnce();
+    view.fillTimers();updateElapsedTimer();tick();
   }
-  const expanded=()=>{if(state.collapsed)schedule();else void pollOnce();};
+  const expanded=()=>{messages.visibilityChanged();if(state.collapsed)schedule();else tick();};
   function start():void{
     if(stopped)throw new Error("SESSION_CARD_CONTROLLER_DISPOSED");
     if(started)return;
@@ -189,6 +242,8 @@ export function createCardController(state:CardState,renderer:CardView,source:Se
     if(stopped)return;
     void recordStage("teardown");
     stopped=true;clearTimeout(timer);clearInterval(elapsed);observer?.disconnect();request?.abort("SESSION_CARD_DISPOSED");
+    messages.dispose();
+    binding.dispose();
     doc.removeEventListener("visibilitychange",visibilityChanged);doc.removeEventListener("quaymesh:card-expanded",expanded);
     view.dispose();source.dispose();state.diffCache.clear();state.outputCache.clear();state.instructionCache.clear();
   }

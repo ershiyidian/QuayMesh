@@ -32,10 +32,10 @@ export async function main(argv=process.argv.slice(2)) {
   }
   const {values}=parseArgs({args,options:{
     config:{type:"string"},directory:{type:"string"},peer:{type:"string"},"resource-url":{type:"string"},
-    prefix:{type:"string"},system:{type:"boolean",default:false},"no-start":{type:"boolean",default:false},
+    prefix:{type:"string"},system:{type:"boolean"},"no-start":{type:"boolean",default:false},
     component:{type:"string"},cluster:{type:"string"},offline:{type:"boolean",default:false},
     inventory:{type:"string"},"existing-network":{type:"boolean",default:false},
-    "service-user":{type:"string"},"config-dir":{type:"string"},prepared:{type:"string"},
+    "service-user":{type:"string"},"service-name":{type:"string"},"config-dir":{type:"string"},prepared:{type:"string"},
   }});
   if(command==="init-site"){
     if(!values.directory||(!values.peer&&!values.inventory))throw new Error("需要 --directory，并通过 --inventory 或 --peer 指定站点");
@@ -69,8 +69,8 @@ export async function main(argv=process.argv.slice(2)) {
   }
   if(command==="install"){
     const {installNode}=await import("./install.mjs");
-    const result=await installNode(values.config,{prefix:values.prefix,user:!values.system,
-      serviceUser:values["service-user"],configDir:values["config-dir"],start:!values["no-start"]});
+    const result=await installNode(values.config,{prefix:values.prefix,user:values.system === undefined ? undefined : !values.system,
+      serviceUser:values["service-user"],serviceName:values["service-name"],configDir:values["config-dir"],start:!values["no-start"]});
     console.log(JSON.stringify(result,null,2));return;
   }
   if(command==="status"){

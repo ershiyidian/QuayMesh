@@ -1,4 +1,7 @@
 import type Database from "better-sqlite3";
+import { assertTaskMailboxReadyInTransaction } from "../messaging/task-mailbox.js";
+import { assertTaskCompletionStatus, HANDOFF_FINALIZATION_CODE, HANDOFF_FINALIZATION_MESSAGE } from "./task-completion.js";
+import { admitTaskWorkInTransaction, finalizationChangedError, type FinalizationRecoveryState } from "./task-finalization.js";
 import { pidAlive } from "../process-liveness.js";
 import { canonicalWorkspaceRoot } from "../roots.js";
 import { samePhysicalPath } from "../physical-paths.js";
@@ -23,11 +26,17 @@ export type StoredTaskFile = FileSummary & { patchRef: string; versionRef: strin
 export type TaskFinalStatus = "completed" | "failed" | "cancelled" | "handed_off";
 export interface TaskFinalization {
   task_id: string; status: TaskFinalStatus; summary: string;
-  requested_at: string; completed_at: string | null; error: string | null;
+  requested_at: string; completed_at: string | null; error: string | null; mailbox_sequence: number;
+  finalization_revision: number; recovery_state: FinalizationRecoveryState | null;
 }
 
 export class TaskDataStore {
   constructor(private readonly db: Database.Database) {}
+
+  /** SQL only. Requires the caller's existing write transaction. */
+  admitWorkInTransaction(taskId: string): void {
+    admitTaskWorkInTransaction(this.db, taskId);
+  }
 
   latestRunResult(taskId: string, memberId: string): {run_id:string;status:string;last_outcome:string|null} | null {
     return this.db.prepare(`select r.id run_id,r.status,${LAST_RUN_OUTCOME_SQL} last_outcome
@@ -59,11 +68,30 @@ export class TaskDataStore {
   pendingFinalizations(limit = 4, after?: Pick<TaskFinalization, "requested_at" | "task_id">): TaskFinalization[] {
     const read = (cursor?: typeof after) => this.db.prepare(`select f.* from qm_task_finalizations f join qm_tasks t on t.id=f.task_id
       where (t.state='active' OR f.completed_at IS NULL)
+      and f.status!='handed_off' AND (f.recovery_state IS NULL OR f.recovery_state!='superseded')
+      and f.mailbox_sequence=(SELECT COALESCE(MAX(m.sequence),0) FROM qm_task_messages m WHERE m.task_id=t.id)
+      and NOT EXISTS(SELECT 1 FROM qm_task_messages m WHERE m.task_id=t.id AND m.role='user' AND m.acknowledged_at IS NULL)
       ${cursor ? "and (f.requested_at,f.task_id)>(?,?)" : ""}
       order by f.requested_at,f.task_id limit ?`)
       .all(...(cursor ? [cursor.requested_at,cursor.task_id,limit] : [limit])) as TaskFinalization[];
     const batch = read(after);
     return batch.length || !after ? batch : read();
+  }
+
+  /** Retire only unconfirmed legacy handoffs. Never reopen or rewrite a closed Task. */
+  rejectLegacyHandoffFinalizations(): number {
+    return this.db.transaction(() => {
+      const changed = this.db.prepare(`UPDATE qm_task_finalizations
+        SET error=CASE WHEN instr(COALESCE(error,''),?)=1 THEN error
+            ELSE ? || CASE WHEN error IS NULL OR error='' THEN '' ELSE char(10)||'Previous attempt: '||error END END,
+          recovery_state='superseded',finalization_revision=finalization_revision+1
+        WHERE status='handed_off' AND completed_at IS NULL
+          AND (error IS NULL OR instr(error,?)!=1 OR recovery_state IS NULL OR recovery_state!='superseded')
+          AND EXISTS(SELECT 1 FROM qm_tasks t WHERE t.id=qm_task_finalizations.task_id AND t.state='active')
+        RETURNING task_id`).all(HANDOFF_FINALIZATION_CODE, HANDOFF_FINALIZATION_MESSAGE, HANDOFF_FINALIZATION_CODE) as Array<{ task_id: string }>;
+      for (const { task_id } of changed) this.bumpDisplay(task_id);
+      return changed.length;
+    }).immediate();
   }
 
   requireScope(taskId: string, sessionId: string, memberId?: string): void {
@@ -109,12 +137,12 @@ export class TaskDataStore {
     this.db.transaction(() => {
       this.db.prepare("DELETE FROM qm_task_file_changes WHERE task_id=? AND member_id=? AND version_ref=?").run(taskId, memberId, version);
       const insert = this.db.prepare(`INSERT INTO qm_task_file_changes
-        (task_id,session_id,member_id,version_ref,file_id,status,path,from_path,additions,removals,hash,large,binary,coverage,revertible,patch_ref,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+        (task_id,session_id,member_id,version_ref,file_id,status,path,from_path,additions,removals,hash,large,binary,coverage,revertible,patch_ref,created_at,recorded_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
       const now = new Date().toISOString();
       for (const file of files) insert.run(taskId, sessionId, memberId, version, file.id, file.status, file.path,
         file.from, file.additions, file.removals, file.hash, file.large ? 1 : 0, file.binary ? 1 : 0,
-        file.coverage, file.revertible ? 1 : 0, file.patchRef, now);
+        file.coverage, file.revertible ? 1 : 0, file.patchRef, now, file.recordedAt ?? null);
     }).immediate();
   }
 
@@ -128,7 +156,8 @@ export class TaskDataStore {
       path: String(row.path), from: row.from_path === null ? null : String(row.from_path),
       additions: row.additions === null ? null : Number(row.additions), removals: row.removals === null ? null : Number(row.removals),
       hash: String(row.hash), large: Boolean(row.large), binary: Boolean(row.binary), coverage: row.coverage as FileSummary["coverage"],
-      revertible: Boolean(row.revertible), patchRef: String(row.patch_ref), versionRef: String(row.version_ref) }));
+      revertible: Boolean(row.revertible), patchRef: String(row.patch_ref), versionRef: String(row.version_ref),
+      recordedAt: row.recorded_at === null ? null : Number(row.recorded_at) }));
   }
 
   upsertContext(taskId: string, input: ContextReadInput): void {
@@ -198,33 +227,127 @@ export class TaskDataStore {
     return active;
   }
 
-  requestFinalization(taskId: string, status: TaskFinalStatus, summary: string, expectedRevision?: number): TaskFinalization {
+  requestFinalization(
+    taskId: string,
+    status: TaskFinalStatus,
+    summary: string,
+    expectedRevision?: number,
+    mailboxSequence = 0,
+    options: { expectedFinalizationRevision?: number; delegated?: boolean } = {}
+  ): TaskFinalization {
+    assertTaskCompletionStatus(status);
     return this.db.transaction(() => {
-      if(expectedRevision!==undefined) {
-        const task=this.db.prepare('SELECT revision FROM qm_tasks WHERE id=?').get(taskId) as {revision:number}|undefined;
-        if(!task || task.revision!==expectedRevision)throw Object.assign(new Error('TASK_REVISION_CONFLICT'),{code:'TASK_REVISION_CONFLICT'});
-      }
       const existing = this.finalization(taskId);
-      if (existing) {
-        if (existing.completed_at && (existing.status !== status || existing.summary !== summary)) throw new Error("TASK_FINALIZATION_ALREADY_CONFIRMED");
-        if (!existing.completed_at && !existing.error && (existing.status!==status || existing.summary!==summary))throw new Error('TASK_FINALIZATION_CONFLICT');
-        if (!existing.completed_at) {
-          const updated=this.db.prepare("UPDATE qm_task_finalizations SET status=?,summary=?,error=NULL WHERE task_id=? AND (status!=? OR summary!=? OR error IS NOT NULL)")
-            .run(status, summary, taskId,status,summary);
-          if(updated.changes)this.bumpDisplay(taskId);
-        }
-        return this.finalization(taskId)!;
+      if (options.expectedFinalizationRevision !== undefined && (
+        !existing
+        || existing.finalization_revision !== options.expectedFinalizationRevision
+        || existing.recovery_state === "superseded"
+      )) {
+        throw finalizationChangedError();
       }
-      this.db.prepare("INSERT INTO qm_task_finalizations(task_id,status,summary,requested_at) VALUES(?,?,?,?)")
-        .run(taskId, status, summary, new Date().toISOString());
+      assertTaskMailboxReadyInTransaction(this.db, taskId, mailboxSequence);
+      const sameIntent = existing?.status === status
+        && existing.summary === summary
+        && existing.mailbox_sequence === mailboxSequence;
+      let recoveringCompleted = false;
+      if (existing?.completed_at) {
+        if (!sameIntent) throw new Error("TASK_FINALIZATION_ALREADY_CONFIRMED");
+        const task = this.db.prepare("SELECT state FROM qm_tasks WHERE id=?").get(taskId) as { state: string } | undefined;
+        if (task?.state !== "active") return existing;
+        // Older versions could confirm the intent before committing the Task's
+        // closure. Recovery must capture that exact attempt, then recheck owner
+        // receipts and local work under a new fence instead of reusing completion.
+        if (options.expectedFinalizationRevision === undefined) throw finalizationChangedError();
+        recoveringCompleted = true;
+      }
+      // A failed but possibly dispatched intent must retain its original remote outcome.
+      if (existing && existing.recovery_state !== "superseded" && existing.recovery_state !== "safe"
+        && (existing.status !== status || existing.summary !== summary))
+        throw new Error("TASK_FINALIZATION_CONFLICT");
+      if (existing && !existing.error && existing.recovery_state !== "superseded" && !sameIntent)
+        throw new Error("TASK_FINALIZATION_CONFLICT");
+      const replaced = existing?.recovery_state === "superseded";
+      // Legacy handoff cannot be replayed as a terminal action, so a new terminal
+      // status is already distinct. A superseded terminal intent requires explicit observation.
+      if (replaced && existing.status !== "handed_off" && expectedRevision === undefined) {
+        throw Object.assign(
+          new Error("TASK_REVISION_REQUIRED: Inspect this Task with task_resume, then explicitly finish with its task_revision as expected_task_revision."),
+          { code: "TASK_REVISION_REQUIRED", effect: "not_started", retryHint: "fix_input" }
+        );
+      }
+      if (expectedRevision !== undefined) {
+        const task = this.db.prepare("SELECT revision FROM qm_tasks WHERE id=?").get(taskId) as { revision: number } | undefined;
+        if (!task || task.revision !== expectedRevision)
+          throw Object.assign(
+            new Error("TASK_REVISION_CONFLICT: Inspect the current Task before explicitly ending it."),
+            { code: "TASK_REVISION_CONFLICT", effect: "not_started", retryHint: "fix_input" }
+          );
+      }
+      const recovery: FinalizationRecoveryState = options.delegated || recoveringCompleted ? "reconcile"
+        : !existing || replaced || existing.recovery_state === "safe" ? "safe" : "reconcile";
+      if (existing) {
+        this.db.prepare(`UPDATE qm_task_finalizations SET status=?,summary=?,mailbox_sequence=?,completed_at=NULL,error=NULL,
+          requested_at=?,finalization_revision=finalization_revision+1,recovery_state=? WHERE task_id=?`)
+          .run(
+            status,
+            summary,
+            mailboxSequence,
+            new Date().toISOString(),
+            recovery,
+            taskId
+          );
+      } else {
+        this.db.prepare(`INSERT INTO qm_task_finalizations(task_id,status,summary,requested_at,mailbox_sequence,finalization_revision,recovery_state)
+          VALUES(?,?,?,?,?,1,?)`)
+          .run(
+            taskId,
+            status,
+            summary,
+            new Date().toISOString(),
+            mailboxSequence,
+            recovery
+          );
+      }
       this.bumpDisplay(taskId);
       return this.finalization(taskId)!;
     }).immediate();
   }
 
-  finishFinalization(taskId: string, error?: string): void {
-    this.db.prepare("UPDATE qm_task_finalizations SET completed_at=?,error=? WHERE task_id=?")
-      .run(error ? null : new Date().toISOString(), error ?? null, taskId);
-    this.bumpDisplay(taskId);
+  /** Validate a captured attempt before any durable callback or local run completion. */
+  requireFinalization(taskId: string, revision: number): TaskFinalization {
+    const intent = this.finalization(taskId);
+    if (!intent || intent.finalization_revision !== revision || intent.recovery_state === "superseded"
+      || intent.completed_at || intent.error)
+      throw finalizationChangedError();
+    return intent;
+  }
+
+  markFinalizationDispatched(taskId: string, revision: number): void {
+    this.requireFinalization(taskId, revision);
+    this.db.prepare("UPDATE qm_task_finalizations SET recovery_state='reconcile' WHERE task_id=? AND finalization_revision=?")
+      .run(taskId, revision);
+  }
+
+  /** Failed stale callbacks are ignored; they cannot clear or overwrite a newer intent. */
+  finishFinalization(
+    taskId: string,
+    error?: string,
+    expectedRevision?: number,
+    recoveryState?: "safe" | "reconcile"
+  ): boolean {
+    const revision = expectedRevision ?? this.finalization(taskId)?.finalization_revision;
+    if (revision === undefined) return false;
+    const updated = this.db.prepare(`UPDATE qm_task_finalizations SET completed_at=?,error=?,recovery_state=COALESCE(?,recovery_state)
+      WHERE task_id=? AND finalization_revision=? AND completed_at IS NULL
+        AND (recovery_state IS NULL OR recovery_state!='superseded')`)
+      .run(
+        error ? null : new Date().toISOString(),
+        error ?? null,
+        recoveryState ?? null,
+        taskId,
+        revision
+      );
+    if (updated.changes) this.bumpDisplay(taskId);
+    return updated.changes > 0;
   }
 }

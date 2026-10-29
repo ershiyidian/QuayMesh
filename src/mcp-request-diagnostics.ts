@@ -5,12 +5,34 @@ type RecordEvent = (event: string, fields: Record<string, unknown>, level?: "inf
 const methods = new Set(["initialize", "server/discover", "tools/list", "tools/call", "resources/list", "resources/read", "resources/templates/list", "notifications/initialized", "ping"]);
 const tools = new Set(["open_workspace", "attach_workspace", "read", "read_diagnostics", "workspace_context", "spawn_agent", "followup_agent", "send_message", "wait_agent", "interrupt_agent", "list_agents",  "exec_command", "write_stdin", "apply_patch", "write", "edit", "bash",
   "start_session","finish_task","workspace_catalog","read_output","cancel_command","checkpoint_task","download_artifact","copy_artifact","qm_widget_stage",
-  "qm_session","qm_file_diff","qm_command_output","qm_command_outputs","qm_instruction","qm_patch","qm_revert","qm_file_url","qm_session_continue"]);
-const actions = new Set(["list","capture","search","status","recovery","start","observe","cancel"]);
+  "qm_session","qm_file_diff","qm_command_output","qm_command_outputs","qm_instruction","qm_patch","qm_revert","qm_file_url","qm_session_continue",
+  "task_messages","task_resume","qm_task_message_enqueue","qm_task_messages"]);
+const actions = new Set(["list","capture","search","status","recovery","start","observe","cancel",
+  "history","receive","ack","reply","inspect","resume"]);
 const errorCodes = new Set(["WORK_STATE", "INVALID_TASK", "AGENT_CONFLICT", "EXECUTION_CONFLICT", "STALE_CONTEXT", "ACCESS_DENIED", "WORKSPACE_NOT_FOUND", "WORKSPACE_RESTORE_REQUIRED", "WORKSPACE_MISMATCH", "WORKSPACE_SESSION_MISMATCH", "SESSION_SCOPE_MISMATCH", "TASK_NOT_ACTIVE", "AGENT_NOT_FOUND",
   "NODE_ADMISSION_PAUSED", "TASK_SESSION_MISMATCH", "TASK_NOT_FOUND", "INVALID_ARGUMENT", "OPERATION_KEY_INVALID", "REQUEST_ID_REUSED",
   "OPERATION_RETRY_SCOPE_MISMATCH", "OPERATION_RETRY_NOT_ALLOWED", "OPERATION_RETRY_SUPERSEDED", "OPERATION_ID_MISMATCH",
   "REQUEST_TIMEOUT", "RPC_INTERRUPTED", "NODE_UNAVAILABLE", "PEER_BUSY", "PROCESS_RECONCILIATION_REQUIRED", "TOOL_EXECUTION_ERROR", "ZOD_ERROR",
+  // Explicit Task access, mailbox, binding and finalization contracts. Unknown strings still become "other".
+  "MISSING_AUTHENTICATED_OWNER", "MISSING_AUTHENTICATED_CLIENT", "TASK_ACCESS_INVALID_ID", "TASK_ACCESS_DENIED",
+  "TASK_ACCESS_METADATA_INVALID", "TASK_ACCESS_OWNER_SOURCE_INVALID", "TASK_ACCESS_TRANSACTION_REQUIRED",
+  "TASK_MAILBOX_AUTHORITY_REQUIRED", "TASK_MAILBOX_ENTRY_REQUIRED", "TASK_MAILBOX_INVALID_ACTION", "TASK_MAILBOX_INVALID_ID",
+  "TASK_MAILBOX_INVALID_BODY", "TASK_MAILBOX_INVALID_CLAIM", "TASK_MAILBOX_INVALID_ACK", "TASK_MAILBOX_INVALID_REPLY",
+  "TASK_MAILBOX_INVALID_CURSOR", "TASK_MAILBOX_INVALID_FILTER", "TASK_MAILBOX_INVALID_SEQUENCE", "TASK_MAILBOX_IDEMPOTENCY_CONFLICT",
+  "TASK_MAILBOX_TASK_CLOSED", "TASK_MAILBOX_TASK_FINISHING", "TASK_MAILBOX_BATCH_LIMIT", "TASK_MAILBOX_RECEIVER_MISMATCH",
+  "TASK_MAILBOX_MESSAGE_NOT_OFFERED", "TASK_MAILBOX_DELIVERY_SUPERSEDED", "TASK_MAILBOX_LEASE_EXPIRED", "TASK_MAILBOX_ACK_OUT_OF_ORDER",
+  "TASK_MAILBOX_REPLY_NOT_ACKNOWLEDGED", "TASK_MAILBOX_MESSAGE_NOT_FOUND", "TASK_MAILBOX_DELIVERY_NOT_FOUND",
+  "TASK_MAILBOX_CORRUPT_DELIVERY", "TASK_MAILBOX_TRANSACTION_REQUIRED", "TASK_MAILBOX_CHANGED", "TASK_MAILBOX_INPUT_PENDING",
+  "TASK_ENTRY_REQUIRED", "TASK_BINDING_AUTHORITY_REQUIRED", "TASK_BINDING_INVALID_INPUT", "TASK_BINDING_REPLY_TOO_LARGE",
+  "TASK_START_SELECTION_REQUIRED", "TASK_BINDING_KEY_CONFLICT", "TASK_BINDING_REVISION_REQUIRED", "TASK_BINDING_REQUEST_KEY_REQUIRED", "TASK_BINDING_CHANGED",
+  "TASK_BINDING_REPLAY_SUPERSEDED", "TASK_FINISHING", "TASK_HANDOFF_NOT_TERMINAL", "TASK_REVISION_REQUIRED", "TASK_REVISION_CONFLICT",
+  "TASK_FINALIZATION_SUPERSEDED", "TASK_FINALIZATION_CONFLICT", "TASK_FINALIZATION_ALREADY_CONFIRMED",
+  "TASK_FINALIZATION_WRITE_TRANSACTION_REQUIRED", "TASK_OWNER_FINALIZATION_UNCONFIRMED",
+  // Fixed peer binding and copy contracts, including legacy receipt lookup failures.
+  "TASK_BINDING_COORDINATOR_REQUIRED", "TASK_BINDING_CAPABILITY_INVALID", "TASK_BINDING_PEER_UPGRADE_REQUIRED",
+  "TASK_BINDING_VERSION_UNSUPPORTED", "TASK_BINDING_SCOPE_REQUIRED", "TASK_SCOPE_MISMATCH", "TASK_MEMBER_REQUIRED",
+  "TASK_REMOTE_HISTORY_UNAVAILABLE", "TASK_REMOTE_SCOPE_MISMATCH", "COPY_REQUEST_KEY_REQUIRED", "COPY_REQUEST_KEY_REUSED",
+  "COPY_TASK_CONTEXT_REQUIRED", "COPY_RECEIPT_LOOKUP_FAILED", "COPY_ARGUMENT_REQUIRED",
   "ENOENT", "EACCES", "EPERM", "EINVAL", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ECONNABORTED", "EPIPE", "ENOTFOUND"]);
 const effects = new Set(["not_started", "started", "partial", "completed", "unknown"]);
 const retryHints = new Set(["fix_input", "retry_same_key", "query_original", "do_not_retry", "retry_later"]);
@@ -49,7 +71,11 @@ export function argumentFingerprint(args: Record<string, any>): string {
 export function traceMcpRequest(req: Request, res: Response, requestId: string, record: RecordEvent): { authenticated(): void } {
   const body = object(req.body), params = object(body.params), args = object(params.arguments);
   const session = object(params._meta)["openai/session"];
+  // Untrusted correlation only: never replaces requestId, authentication or operation identity.
+  const relayTrace = req.headers["x-quaymesh-relay-trace"];
   const context = { requestId, method: known(body.method, methods),
+    ...(typeof relayTrace === "string" && relayTrace.length === 36 && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(relayTrace)
+      ? { relayTraceId: relayTrace.toLowerCase() } : {}),
     source:body.method!=="tools/call" ? "protocol" : String(params.name).startsWith("qm_") ? "card" : "model",
     sourceEvidence:"tool_surface",taskId:identity(args.task_id,"task"),
     operationId:identity(args.operation_id ?? args.operationId,"op"),

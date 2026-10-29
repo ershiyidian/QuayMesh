@@ -5,12 +5,20 @@ import { setTimeout as delay } from "node:timers/promises";
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { freePort, createRealTestServer, structured } from "./server-fixture.js";
+import { freePort, createRealTestServer, structured, type RealTestServer } from "./server-fixture.js";
 
 const CLUSTER_TOKEN = "session-card-federation-cluster-token-2026";
-const withIdentity=(reply:any):Record<string,any>=>({
-  ...structured(reply),...(reply._meta?.quaymesh??{}),
-});
+function withIdentity(reply: Awaited<ReturnType<RealTestServer["client"]["callTool"]>>): Record<string, unknown> {
+  assert.notEqual(reply.isError, true, JSON.stringify(reply));
+  const body = structured(reply);
+  const identity = (reply._meta as { quaymesh?: Record<string, unknown> } | undefined)?.quaymesh;
+  assert.ok(identity, "workspace replies must retain their real card identity metadata");
+  for (const key of ["session_id", "task_id", "member_id", "workspace_id"]) {
+    assert.equal(typeof identity[key], "string", `missing workspace identity ${key}: ${JSON.stringify(reply)}`);
+    if (body[key] !== undefined) assert.equal(body[key], identity[key], `${key} differs between public data and card metadata`);
+  }
+  return { ...body, ...identity };
+}
 
 async function until(check: () => boolean | Promise<boolean>, timeoutMs = 15000, label = "condition"): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -24,8 +32,12 @@ test("F106 stale subscription is removed when its session was deleted before dis
   process.env.QUAYMESH_CLUSTER_TOKEN = CLUSTER_TOKEN;
   const portA = await freePort();
   const portB = await freePort();
+  const configure = async (config: RealTestServer["config"]) => ({
+    ...config, federation: { ...config.federation!, coordinatorId: "stale-node-a" },
+  });
   const nodeB = await createRealTestServer({
     prefix: "quaymesh-stale-federation-b-",
+    configure,
     federation: {
       nodeId: "stale-node-b",
       nickname: "Stale Node B",
@@ -39,6 +51,7 @@ test("F106 stale subscription is removed when its session was deleted before dis
   t.after(async () => { await nodeB.dispose(); delete process.env.QUAYMESH_CLUSTER_TOKEN; });
   const nodeA = await createRealTestServer({
     prefix: "quaymesh-stale-federation-a-",
+    configure,
     federation: {
       nodeId: "stale-node-a",
       nickname: "Stale Node A",
@@ -62,6 +75,11 @@ test("F106 stale subscription is removed when its session was deleted before dis
     _meta: { "openai/session": "stale-federation-conversation" },
   }));
   assert.equal(typeof attached.member_id, "string");
+  assert.equal(attached.session_id, opened.session_id);
+  assert.equal(attached.task_id, opened.task_id);
+  assert.notEqual(attached.member_id, opened.member_id);
+  assert.equal(attached.node_id, "stale-node-b");
+  assert.equal(attached.root, nodeB.project);
   const sessionId = String(opened.session_id);
   const database = new Database(join(nodeA.config.stateDir, "quaymesh.sqlite"));
   try {
@@ -98,9 +116,13 @@ test("F106 real two-node federation keeps ownership, streams revisions and recon
   const portB = await freePort();
   const ingressA = await freePort();
   const ingressB = await freePort();
+  const configure = async (config: RealTestServer["config"]) => ({
+    ...config, federation: { ...config.federation!, coordinatorId: "node-a" },
+  });
   const nodeB = await createRealTestServer({
     prefix: "quaymesh-federation-b-",
     uiEnabled: true,
+    configure,
     federation: {
       nodeId: "node-b",
       nickname: "Node B",
@@ -115,6 +137,7 @@ test("F106 real two-node federation keeps ownership, streams revisions and recon
   const nodeA = await createRealTestServer({
     prefix: "quaymesh-federation-a-",
     uiEnabled: true,
+    configure,
     federation: {
       nodeId: "node-a",
       nickname: "Node A",
@@ -150,7 +173,9 @@ test("F106 real two-node federation keeps ownership, streams revisions and recon
   assert.equal(attached.isError, undefined, JSON.stringify(attached));
   const attachedData = withIdentity(attached);
   assert.equal(attachedData.session_id, openedData.session_id);
+  assert.equal(attachedData.task_id, openedData.task_id);
   assert.notEqual(attachedData.member_id, openedData.member_id);
+  assert.equal(attachedData.node_id, "node-b");
   assert.equal(attachedData.root, nodeB.project);
 
   const remoteMember = nodeA.running.federation!.nodes().find((node) => node.id === "node-b");
@@ -228,11 +253,12 @@ test("F106 real two-node federation keeps ownership, streams revisions and recon
     "import { writeFileSync } from 'node:fs';",
     "setTimeout(() => writeFileSync(process.argv[2], 'DONE\\n'), 2000);",
   ].join("\n"), "utf8");
+  const commandText = `"${process.execPath}" long-task.mjs command-done.txt`;
   const command = await nodeA.client.callTool({
     name: "exec_command",
     arguments: {
       workspace_id: remoteWorkspaceId,
-      cmd: "node long-task.mjs command-done.txt",
+      cmd: commandText,
       yield_time_ms: 100,
     },
     _meta: { "openai/session": "federation-conversation" },
@@ -253,7 +279,7 @@ test("F106 real two-node federation keeps ownership, streams revisions and recon
   assert.equal(offlineMember.online, false);
   assert.equal(typeof offlineMember.last_observed_at, "string");
   assert.equal(offlineSnapshot.host_status, "disconnected");
-  const offlineCommands = offlineSnapshot.commands.filter((row: any) => row.cmd === "node long-task.mjs command-done.txt");
+  const offlineCommands = offlineSnapshot.commands.filter((row: any) => row.cmd === commandText);
   assert.equal(offlineCommands.length, 1, JSON.stringify(offlineSnapshot.commands));
   const commandOperationId = String(offlineCommands[0].operation_id);
   assert.equal(offlineCommands[0].status, "run", JSON.stringify(offlineCommands));
@@ -267,11 +293,11 @@ test("F106 real two-node federation keeps ownership, streams revisions and recon
   await until(async () => {
     reconnected = await readRemoteSnapshot();
     return (reconnected.rev as number) > disconnectedAt
-      && (reconnected.snapshot as any).commands.some((row: any) => row.cmd === "node long-task.mjs command-done.txt" && row.status === "ok");
+      && (reconnected.snapshot as any).commands.some((row: any) => row.cmd === commandText && row.status === "ok");
   }, 15000, "node A catches up node B revision and command completion");
   const reconnectedSnapshot = reconnected.snapshot as any;
   assert.equal(reconnectedSnapshot.files.filter((file: any) => file.path === "federated.txt").length, 1);
-  const commandRows = reconnectedSnapshot.commands.filter((row: any) => row.cmd === "node long-task.mjs command-done.txt");
+  const commandRows = reconnectedSnapshot.commands.filter((row: any) => row.cmd === commandText);
   assert.equal(commandRows.length, 1, JSON.stringify(reconnectedSnapshot.commands));
   assert.equal(commandRows[0].operation_id, commandOperationId, JSON.stringify(commandRows));
   assert.equal(commandRows[0].status, "ok", JSON.stringify(commandRows));

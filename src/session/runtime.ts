@@ -6,6 +6,7 @@ import { logEvent } from "../logger.js";
 import { diagnosticError, type ServerDiagnostics } from "../server-diagnostics.js";
 import type { ServerConfig } from "../config.js";
 import { ExecutionCoordinator } from "../execution-coordinator.js";
+import { isTaskBindingAuthority } from "../tasks/task-binding.js";
 import type { ProcessSessionManager } from "../process-sessions.js";
 import type { LocalAgentStore } from "../local-agent-store.js";
 import type { WorkLedger } from "../work-ledger.js";
@@ -84,6 +85,8 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
   const { config, workspaces, ledger, agents } = options;
   const store = openSessionDatabase(config.stateDir);
   store.reconcileFinishedInvocations();
+  // Old handoff intents must not close a goal or block its inbox after upgrade.
+  store.taskData.rejectLegacyHandoffFinalizations();
   const output = new SessionOutputStore(config.stateDir);
   options.processSessions?.setHandleStore({
     allocate: id => store.writeAsync(() => store.allocateProcessHandle(id)), resolve: handle => store.operationForHandle(handle),
@@ -113,7 +116,8 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
   );
   const recovery = new RecoveryService(store, config.stateDir);
   reverter = new SessionReverter(store, config.stateDir, execution, changes, agents);
-  const service = new SessionService(store, workspaces, ledger, agents, changes, projector, recovery, config.federation?.nodeId ?? "local", execution);
+  const service = new SessionService(store, workspaces, ledger, agents, changes, projector, recovery,
+    config.federation?.nodeId ?? "local", execution, isTaskBindingAuthority(config));
   const disposeProjectionUpdates = store.onChange((change) => {
     const member = store.getMember(change.sessionId, change.memberId);
     if (member.node_id === (config.federation?.nodeId ?? "local")) projector.schedule(change.sessionId, change.memberId, change.taskId);

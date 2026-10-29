@@ -27,6 +27,9 @@ async function fixture() {
   const session = store.createSession("owner", "review-atomicity", "原会话");
   const member = store.addMember(session.id, "local", "workspace", root, "checkout", null);
   const task = store.createTask(session.id, "原任务");
+  // Production open/attach explicitly joins the workspace to its Task. Session
+  // membership alone does not authorize or generate Task review evidence.
+  store.touchTaskMember(task.id, member.id);
   return { root, stateDir, database, store, service, ledger, session, member, task,
     async close() {
       if (database.sqlite.inTransaction) database.sqlite.exec("ROLLBACK");
@@ -130,23 +133,66 @@ test("run 提交后的 review 通知失败不会留下孤立 run，重取不重�
   } finally { detach?.(); await f.close(); }
 });
 
-test("review 等锁期间切换任务，不把旧请求的验收结果写进新任务", async () => {
+test("review 等锁期间切换任务，已捕获的显式 Task 仍只接收自己的验收结果", async () => {
   const f = await fixture();
+  let updating: Promise<void> | undefined;
   try {
     f.ledger.db.exec("BEGIN IMMEDIATE");
-    const updating = f.store.setReviewStateAsync(f.session.id, ReviewState.passed, f.task.id);
-    const refused = assert.rejects(updating, /STALE_CONTEXT/);
+    updating = f.store.setReviewStateAsync(f.session.id, ReviewState.passed, f.task.id);
+    void updating.catch(() => {});
     await delay(20);
     const writer = new SessionStore(f.ledger.db);
     writer.closeTask(f.task.id, "completed", "结束原任务");
     const next = writer.createTask(f.session.id, "新任务");
+    writer.touchTaskMember(next.id, f.member.id);
+    const beforeNext = writer.getTask(next.id);
     f.ledger.db.exec("COMMIT");
-    await refused;
+    await updating;
+    assert.equal(f.store.getSession(f.session.id).current_task_id, next.id);
     assert.equal(f.store.getSession(f.session.id).review_state, ReviewState.unknown);
-    assert.equal(f.store.eventsForTask(f.task.id).length, 0);
+    assert.equal(f.store.getTask(f.task.id).state, "closed", "验收证据不重新打开历史目标");
+    assert.equal(f.store.taskReviewState(f.task.id), ReviewState.passed);
+    assert.deepEqual(f.store.getTask(next.id), beforeNext, "旧请求不推进新目标的状态、版本或时间");
+    assert.equal(f.store.taskReviewState(next.id), ReviewState.unknown);
+    const reviews = f.store.eventsForTask(f.task.id);
+    assert.equal(reviews.length, 1);
+    assert.equal(reviews[0]!.type, "verification_recorded");
+    assert.equal(reviews[0]!.member_id, f.member.id);
+    assert.equal(reviews[0]!.payload.decision, "passed");
     assert.equal(f.store.eventsForTask(next.id).length, 0);
   } finally {
     if (f.ledger.db.inTransaction) f.ledger.db.exec("ROLLBACK");
+    await updating?.catch(() => {});
+    await f.close();
+  }
+});
+
+test("无 Task 的旧 review 等锁期间首次选择目标，拒绝把未知归属的验收写入新 Task", async () => {
+  const f = await fixture();
+  let updating: Promise<void> | undefined;
+  try {
+    const legacy = f.store.createSession("owner", "legacy-review", "尚无 Task 的旧会话");
+    const member = f.store.addMember(legacy.id, "local", "legacy-workspace", f.root, "checkout", null);
+    assert.equal(f.store.getSession(legacy.id).current_task_id, null);
+    f.ledger.db.exec("BEGIN IMMEDIATE");
+    updating = f.store.setReviewStateAsync(legacy.id, ReviewState.passed);
+    const refused = assert.rejects(updating, /STALE_CONTEXT/);
+    void refused.catch(() => {});
+    await delay(20);
+    const writer = new SessionStore(f.ledger.db);
+    const next = writer.createTask(legacy.id, "首个明确目标");
+    writer.touchTaskMember(next.id, member.id);
+    const beforeNext = writer.getTask(next.id);
+    f.ledger.db.exec("COMMIT");
+    await refused;
+    assert.equal(f.store.getSession(legacy.id).current_task_id, next.id);
+    assert.equal(f.store.getSession(legacy.id).review_state, ReviewState.unknown);
+    assert.deepEqual(f.store.getTask(next.id), beforeNext);
+    assert.equal(f.store.taskReviewState(next.id), ReviewState.unknown);
+    assert.equal(f.store.eventsForSession(legacy.id).length, 0);
+  } finally {
+    if (f.ledger.db.inTransaction) f.ledger.db.exec("ROLLBACK");
+    await updating?.catch(() => {});
     await f.close();
   }
 });

@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import {createServer,request as httpRequest,type Server} from 'node:http';
 import type {AddressInfo} from 'node:net';
 import {consoleExperienceFixture,liveCaptureFixture} from './experience-fixture.js';
-import {freePort} from '../session-card/server-fixture.js';
+import {freePort,structured} from '../session-card/server-fixture.js';
 import {canonicalWorkspaceRoot} from '../../src/roots.js';
 import {WorkLedger} from '../../src/work-ledger.js';
 // @ts-expect-error 节点管理器使用ESM脚本。
@@ -161,6 +161,52 @@ test('正常后台刷新不报警，过期来源集中到一处可展开提示',
   await page.setViewportSize({width:760,height:900});
   await page.screenshot({path:screenshots+'/sources-delayed-narrow.png',fullPage:true});
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+});
+
+test('任务生命周期独立于失败命令，筛选与详情保持同一事实',async({page})=>{
+  const isolated = await consoleExperienceFixture();
+  try {
+    const result = await isolated.server.client.callTool({
+      name: 'exec_command',
+      arguments: {
+        workspace_id: isolated.workspace.workspace_id,
+        cmd: `"${process.execPath}" -e "process.exit(1)"`,
+        operation_key: 'lifecycle-failed-command',
+        yield_time_ms: 1000,
+      },
+      _meta: {'openai/session': 'console-experience'},
+    });
+    expect(structured(result).operation_id).toEqual(expect.any(String));
+    await expect.poll(async () => {
+      const tasks = await isolated.get('runs?days=0&fresh=1&requestState=active');
+      expect(tasks.items.map((task:any) => task.taskId)).toEqual([isolated.waiting.task_id]);
+      return tasks.items[0].executionStatus;
+    }, {timeout: 15000, intervals: [250, 500, 1000]}).toBe('failed');
+
+    await login(page, isolated.server.baseUrl);
+    await page.goto(isolated.server.baseUrl + '/console/#/tasks?days=0');
+    await page.locator('[data-action=task-scope][data-value=open]').click();
+    await expect(page).toHaveURL(/requestState=active/);
+    const row = page.locator('.run-table tbody tr');
+    await expect(row).toHaveCount(1);
+    await expect(row.locator('.state.active')).toHaveText('任务进行中');
+    await expect(row).toContainText('最近执行失败');
+    await page.screenshot({path: screenshots + '/task-lifecycle-desktop.png', fullPage: true});
+
+    await row.locator('[data-action=open-run]').first().click();
+    await expect(page.locator('.inspector .state.active').first()).toHaveText('任务进行中');
+    await expect(page.getByLabel('任务生命周期', {exact:true})).toHaveValue('active');
+    await page.setViewportSize({width:760,height:900});
+    await page.screenshot({path: screenshots + '/task-lifecycle-narrow.png', fullPage: true});
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+
+    await page.goto(isolated.server.baseUrl + '/console/#/tasks?days=0');
+    await page.locator('[data-action=task-scope][data-value=ended]').click();
+    await expect(page.locator('.run-table tbody tr')).toHaveCount(2);
+    await expect(page.locator('.run-table')).not.toContainText('等待下一步的工作');
+  } finally {
+    await isolated.server.dispose();
+  }
 });
 
 test('节点配置刷新合并独立修改，明确解决冲突后才提交新版本',async({page})=>{

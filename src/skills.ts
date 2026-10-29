@@ -10,12 +10,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  loadSkills,
-  loadSkillsFromDir,
-  type Skill,
-  type LoadSkillsResult,
-} from "@earendil-works/pi-coding-agent";
+import type { Skill, LoadSkillsResult } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
 import { expandHomePath, isPathInsideRoot } from "./roots.js";
 
@@ -93,8 +88,12 @@ function resolveSkillPath(path: string, cwd: string): string {
   return resolve(cwd, expandHomePath(path));
 }
 
-export function loadWorkspaceSkills(config: ServerConfig, cwd: string): LoadedSkills {
+export async function loadWorkspaceSkills(config: ServerConfig, cwd: string): Promise<LoadedSkills> {
   if (!config.skillsEnabled) return { skills: [], diagnostics: [] };
+
+  // Keep Pi's parser and discovery semantics, but do not load its full package
+  // while Core starts or when skills are disabled. ESM caches the module.
+  const { loadSkills, loadSkillsFromDir } = await import("@earendil-works/pi-coding-agent");
 
   if (config.subagents.enabled) {
     syncManagedSubagentsSkill(config);

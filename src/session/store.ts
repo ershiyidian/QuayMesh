@@ -1,3 +1,4 @@
+import { finalizationBlocksNewWork } from "./task-finalization.js";
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { runSqliteWrite, type SqliteWriteOptions } from "../db/async-write.js";
@@ -5,6 +6,9 @@ import { canonicalWorkspaceRoot, canonicalPathIdentity } from "../roots.js";
 import { samePhysicalPath } from "../physical-paths.js";
 import { resolve } from "node:path";
 import { TaskDataStore, type ContextReadInput } from "./task-data.js";
+import { TaskMailboxStore, assertTaskMailboxReadyInTransaction, taskMailboxSnapshot } from "../messaging/task-mailbox.js";
+import { TaskBindingStore } from "../tasks/task-binding.js";
+import { assertTaskCompletionStatus } from "./task-completion.js";
 import { retryableAdmission } from "./outcome.js";
 import { aggregateReviewStates } from "./review-state.js";
 import {
@@ -46,6 +50,31 @@ interface InvocationRow {
   response_json: string | null;
 }
 
+/** Control-flow state. Large arguments and receipts are loaded only by content readers. */
+export type InvocationSummary = Omit<InvocationRow, "arguments_json" | "result_json" | "response_json"> & {
+  result_ready: 0 | 1;
+  node_id: string | null;
+  workspace_root: string | null;
+};
+
+export interface InvocationResult extends InvocationSummary {
+  result_json: string | null;
+}
+
+const INVOCATION_SUMMARY_COLUMNS = `id, owner_id, transport_instance_id, request_id,
+  session_id, member_id, tool_name, operation_id, task_id, retry_of_invocation_id,
+  state, effect, result_ref, created_at, finished_at, response_at,
+  result_json IS NOT NULL AS result_ready,
+  (SELECT m.node_id FROM qm_session_members m WHERE m.id=qm_invocations.member_id
+    AND m.session_id=qm_invocations.session_id) AS node_id,
+  (SELECT m.root FROM qm_session_members m WHERE m.id=qm_invocations.member_id
+    AND m.session_id=qm_invocations.session_id) AS workspace_root`;
+
+const INVOCATION_COLUMNS = `id, owner_id, transport_instance_id, request_id, session_id, member_id, tool_name,
+  arguments_json, operation_id, task_id, retry_of_invocation_id, state, effect, result_ref, result_json,
+  created_at, finished_at, response_at,
+  CASE WHEN response_uses_result=1 THEN result_json ELSE response_json END AS response_json`;
+
 interface EventAppendResult {
   sequence: number;
   sessionRevision: number;
@@ -84,12 +113,30 @@ export interface AgentOperationLink {
 
 export class SessionStore {
   readonly taskData: TaskDataStore;
+  private taskMailbox?: TaskMailboxStore;
+  private entryBindings?: TaskBindingStore;
   private readonly ownedDatabase: boolean;
   private readonly changeListeners = new Set<(change: { sessionId: SessionId; memberId: string; ownerId: string; revision: number; sequence: number; taskId?: string }) => void>();
 
   constructor(private readonly db: Database.Database, owned = false) {
     this.ownedDatabase = owned;
     this.taskData = new TaskDataStore(db);
+  }
+
+  get mailbox(): TaskMailboxStore {
+    return this.taskMailbox ??= new TaskMailboxStore(this.db, { ownerSource: "legacy-session" });
+  }
+
+  get taskBindings(): TaskBindingStore {
+    return this.entryBindings ??= new TaskBindingStore(this.db, { ownerSource: "legacy-session" });
+  }
+
+  /** Internal metadata read. Request entry points must separately authorize their caller. */
+  taskMessageState(taskId: string): { taskId: string; taskRevision: number; taskState: "active" | "closed"; sequence: number; pending: number } {
+    return this.db.transaction(() => {
+      const task = this.getTask(taskId);
+      return { taskId, taskRevision: task.revision, taskState: task.state, ...taskMailboxSnapshot(this.db, taskId) };
+    })();
   }
 
   // 回调只允许同步 SQL；通知、文件和进程操作放在 await 之后。
@@ -217,30 +264,40 @@ export class SessionStore {
   }
 
   closeTask(taskId: string, status: NonNullable<TaskRecord["result_status"]>, summary: string): TaskRecord {
-    const now = new Date().toISOString();
-    this.db.prepare(`UPDATE qm_tasks SET state='closed',revision=revision+1,finished_at=COALESCE(finished_at,?),
-      archived_at=COALESCE(archived_at,?),delivery_ended_at=COALESCE(delivery_ended_at,?),closure_reason='explicit',
-      last_activity_at=?,result_status=?,summary=? WHERE id=?`)
-      .run(now,now,now,now,status,summary,taskId);
-    return this.getTask(taskId);
+    assertTaskCompletionStatus(status);
+    return this.db.transaction(() => {
+      assertTaskMailboxReadyInTransaction(this.db, taskId, this.taskData.finalization(taskId)?.mailbox_sequence ?? taskMailboxSnapshot(this.db, taskId).sequence);
+      const now = new Date().toISOString();
+      this.db.prepare(`UPDATE qm_tasks SET state='closed',revision=revision+1,finished_at=COALESCE(finished_at,?),
+        archived_at=COALESCE(archived_at,?),delivery_ended_at=COALESCE(delivery_ended_at,?),closure_reason='explicit',
+        last_activity_at=?,result_status=?,summary=? WHERE id=?`)
+        .run(now,now,now,now,status,summary,taskId);
+      return this.getTask(taskId);
+    }).immediate();
   }
 
-  completeTaskFinalization(taskId: string, status: NonNullable<TaskRecord['result_status']>, summary: string): TaskRecord {
+  completeTaskFinalization(taskId: string, status: NonNullable<TaskRecord['result_status']>, summary: string, finalizationRevision?: number): TaskRecord {
+    assertTaskCompletionStatus(status);
     return this.db.transaction(() => {
       const intent=this.taskData.finalization(taskId);
       if(!intent || intent.status!==status || intent.summary!==summary)throw new Error('TASK_FINALIZATION_CONFLICT');
+      if(finalizationRevision!==undefined)this.taskData.requireFinalization(taskId,finalizationRevision);
+      assertTaskMailboxReadyInTransaction(this.db, taskId, intent.mailbox_sequence);
       // 最终确认和 Task 终态一起提交，写入失败时仍保留可接续的收尾意图。
-      this.taskData.finishFinalization(taskId);
+      if(!this.taskData.finishFinalization(taskId,undefined,finalizationRevision ?? intent.finalization_revision))throw new Error("TASK_FINALIZATION_SUPERSEDED");
       return this.closeTask(taskId,status,summary);
     }).immediate();
   }
 
   archiveTask(taskId:string,reason:"superseded"|"legacy_archive"|"recovered"="superseded"):TaskRecord {
-    const now=new Date().toISOString();
-    this.db.prepare(`UPDATE qm_tasks SET state='closed',revision=revision+1,finished_at=COALESCE(finished_at,?),
-      archived_at=COALESCE(archived_at,?),closure_reason=?,last_activity_at=? WHERE id=?`)
-      .run(now,now,reason,now,taskId);
-    return this.getTask(taskId);
+    return this.db.transaction(() => {
+      assertTaskMailboxReadyInTransaction(this.db, taskId, taskMailboxSnapshot(this.db, taskId).sequence);
+      const now=new Date().toISOString();
+      this.db.prepare(`UPDATE qm_tasks SET state='closed',revision=revision+1,finished_at=COALESCE(finished_at,?),
+        archived_at=COALESCE(archived_at,?),closure_reason=?,last_activity_at=? WHERE id=?`)
+        .run(now,now,reason,now,taskId);
+      return this.getTask(taskId);
+    }).immediate();
   }
 
   setTaskChangeSummary(taskId:string,state:"not_started"|"complete"|"incomplete",error?:string|null):void {
@@ -305,17 +362,19 @@ export class SessionStore {
   }
 
   touchTaskMember(taskId: string, memberId: string): void {
-    const row = this.db.prepare(`SELECT t.session_id task_session,m.session_id member_session
-      FROM qm_tasks t JOIN qm_session_members m ON m.id=? WHERE t.id=?`)
-      .get(memberId, taskId) as { task_session: string; member_session: string } | undefined;
-    if (!row) throw new Error(`TASK_MEMBER_NOT_FOUND: ${taskId}:${memberId}`);
-    if (row.task_session !== row.member_session) throw new Error(`TASK_MEMBER_SESSION_MISMATCH: ${taskId}:${memberId}`);
-    const inserted = this.db.prepare(`INSERT OR IGNORE INTO qm_task_members(task_id,member_id,first_seen_at) VALUES (?,?,?)`)
-      .run(taskId, memberId, new Date().toISOString());
-    if (inserted.changes) {
-      this.taskData.inheritDiscoveredContext(taskId, row.task_session, memberId);
-      this.taskData.bumpDisplay(taskId);
-    }
+    this.db.transaction(() => {
+      const row = this.db.prepare(`SELECT t.session_id task_session,m.session_id member_session
+        FROM qm_tasks t JOIN qm_session_members m ON m.id=? WHERE t.id=?`)
+        .get(memberId, taskId) as { task_session: string; member_session: string } | undefined;
+      if (!row) throw new Error(`TASK_MEMBER_NOT_FOUND: ${taskId}:${memberId}`);
+      if (row.task_session !== row.member_session) throw new Error(`TASK_MEMBER_SESSION_MISMATCH: ${taskId}:${memberId}`);
+      const inserted = this.db.prepare(`INSERT OR IGNORE INTO qm_task_members(task_id,member_id,first_seen_at,context_inherited) VALUES (?,?,?,0)`)
+        .run(taskId, memberId, new Date().toISOString());
+      const inherited = this.db.prepare(`UPDATE qm_task_members SET context_inherited=1
+        WHERE task_id=? AND member_id=? AND context_inherited=0`).run(taskId, memberId);
+      if (inherited.changes) this.taskData.inheritDiscoveredContext(taskId, row.task_session, memberId);
+      if (inserted.changes || inherited.changes) this.taskData.bumpDisplay(taskId);
+    }).immediate();
   }
 
   getSession(sessionId: SessionId): SessionRecord {
@@ -605,6 +664,11 @@ export class SessionStore {
       .map((row) => String(row.run_id));
   }
 
+  taskIdForRun(sessionId: SessionId, memberId: string, runId: string): string | null {
+    return (this.db.prepare("SELECT task_id FROM qm_run_links WHERE session_id=? AND member_id=? AND run_id=?")
+      .get(sessionId, memberId, runId) as { task_id: string | null } | undefined)?.task_id ?? null;
+  }
+
   linkRun(sessionId: SessionId, memberId: string, runId: string, taskId: string): void {
     this.db
       .prepare(
@@ -633,7 +697,7 @@ export class SessionStore {
       || (invocationId !== undefined && typeof invocationId !== "string")) throw new Error("INVALID_OPERATION_EVENT");
     const saved = await this.writeAsync(() => {
       // 等锁期间尝试可能已切换；身份检查与事件及活动时间更新必须共用事务。
-      const current = this.findInvocationByOperationId(operationId);
+      const current = this.findInvocationSummaryByOperationId(operationId);
       if ((invocationId && current && current.id !== invocationId)
         || this.hasOperationFinished(operationId, invocationId)) return null;
       return this.persistEvent(event);
@@ -659,7 +723,7 @@ export class SessionStore {
         .prepare(
           `SELECT s.revision AS session_rev, s.owner_id AS owner_id, m.revision AS member_rev
            FROM qm_sessions s
-           JOIN qm_session_members m ON m.id = ?
+           JOIN qm_session_members m ON m.id = ? AND m.session_id = s.id
            WHERE s.id = ?`,
         )
         .get(event.member_id, event.session_id) as { session_rev: number; owner_id: string; member_rev: number } | undefined;
@@ -678,6 +742,14 @@ export class SessionStore {
             ownerId: currentRevs?.owner_id ?? "",
           },
         };
+      }
+
+      if (!currentRevs) throw new Error(`SESSION_MEMBER_NOT_FOUND: ${event.member_id}`);
+      if (currentTask) {
+        this.taskData.requireScope(currentTask, event.session_id, event.member_id);
+        // 事件只证明成员关系；首次真实使用时再继承工作区上下文。
+        this.db.prepare(`INSERT OR IGNORE INTO qm_task_members(task_id,member_id,first_seen_at,context_inherited)
+          VALUES (?,?,?,0)`).run(currentTask, event.member_id, event.timestamp);
       }
 
       const res = this.db
@@ -846,11 +918,32 @@ export class SessionStore {
   putRemoteSnapshot(sessionId: SessionId, memberId: string, sourceRevision: number, snapshot: Snapshot): void {
     this.db.transaction(()=>{
       if (snapshot.taskId && !this.taskData.putProjection(snapshot.taskId, memberId, sourceRevision, snapshot, true)) return;
+      this.reconcileRemoteCommandInvocations(sessionId, memberId, snapshot);
       const now=new Date().toISOString();
       const result=this.db.prepare(`UPDATE qm_session_members SET snapshot_revision=?,snapshot_json=?,snapshot_updated_at=?
         WHERE id=? AND session_id=? AND (snapshot_revision<? OR (snapshot_revision=? AND snapshot_json IS NULL))`)
         .run(sourceRevision,JSON.stringify(snapshot),now,memberId,sessionId,sourceRevision,sourceRevision);
     }).immediate();
+  }
+
+  private reconcileRemoteCommandInvocations(sessionId: SessionId, memberId: string, snapshot: Snapshot): void {
+    if (!snapshot.taskId) return;
+    const reconcile = this.db.prepare(`UPDATE qm_invocations AS i SET state=?,effect=?,finished_at=?
+      WHERE id=? AND session_id=? AND member_id=? AND task_id=? AND operation_id=?
+        AND tool_name IN ('exec_command','bash') AND state IN ('accepted','queued','running')
+        AND NOT EXISTS(SELECT 1 FROM qm_invocations next WHERE next.retry_of_invocation_id=i.id)`);
+    for (const command of snapshot.commands) {
+      const state = command.status === "ok" ? OperationState.succeeded
+        : command.status === "fail" ? OperationState.failed
+          : command.status === "cancelled" ? OperationState.cancelled : null;
+      if (!state || command.member_id !== memberId || !command.invocation_id || command.endedAt === null
+        || !["not_started", "partial", "completed"].includes(command.effect ?? "")) continue;
+      const endedAt = new Date(command.endedAt);
+      if (!Number.isFinite(endedAt.getTime())) continue;
+      // The original response remains replayable; only this attempt's execution state advances.
+      reconcile.run(state, command.effect, endedAt.toISOString(), command.invocation_id,
+        sessionId, memberId, snapshot.taskId, command.operation_id);
+    }
   }
 
   getSnapshot(sessionId: SessionId, memberId: string): { revision: number; snapshot: Snapshot | null } {
@@ -1337,13 +1430,20 @@ export class SessionStore {
     event: Omit<SessionEvent, "sequence">; result: EventAppendResult; taskId?: string;
   }> {
     const session = this.getSession(sessionId);
-    if (expectedTaskId !== undefined && session.current_task_id !== expectedTaskId)
-      throw new Error("STALE_CONTEXT: The session task changed while the review update waited for its write lock.");
-    if (session.review_state === state) return [];
-    this.db.prepare(`UPDATE qm_sessions SET review_state = ? WHERE id = ?`).run(state, sessionId);
-    return session.members.map(member => {
+    if (expectedTaskId === null && session.current_task_id !== null)
+      throw new Error("STALE_CONTEXT: A legacy review without a Task cannot be assigned to newly selected work.");
+    const taskId = expectedTaskId ?? session.current_task_id;
+    if (taskId) this.taskData.requireScope(taskId, sessionId);
+    const previous = taskId ? this.taskReviewState(taskId) : session.review_state;
+    // The Session fields are a compatibility summary, never an authorization or
+    // execution selector. A resumed older Task updates only its own review events.
+    if (session.current_task_id === taskId && session.review_state !== state)
+      this.db.prepare(`UPDATE qm_sessions SET review_state = ? WHERE id = ?`).run(state, sessionId);
+    if (previous === state) return [];
+    const members = taskId ? this.taskMemberIds(taskId).map(id => this.getMember(sessionId, id)) : session.members;
+    return members.map(member => {
       const event: Omit<SessionEvent, "sequence"> = {
-        session_id: sessionId, task_id: expectedTaskId ?? session.current_task_id, member_id: member.id, type: "verification_recorded",
+        session_id: sessionId, task_id: taskId, member_id: member.id, type: "verification_recorded",
         source_id: `review-${randomUUID()}`, timestamp: new Date().toISOString(),
         payload: { decision: state },
       };
@@ -1355,11 +1455,54 @@ export class SessionStore {
     this.db.prepare(`UPDATE qm_sessions SET host_state = ? WHERE id = ?`).run(state, sessionId);
   }
 
+  findInvocationSummary(ownerId: string, transportInstanceId: string, requestId: string): InvocationSummary | null {
+    return this.db.prepare(`SELECT ${INVOCATION_SUMMARY_COLUMNS} FROM qm_invocations
+      WHERE owner_id=? AND transport_instance_id=? AND request_id=?`)
+      .get(ownerId,transportInstanceId,requestId) as InvocationSummary | undefined ?? null;
+  }
+
+  findInvocationSummaryByOperation(ownerId: string, operationId: string): InvocationSummary | null {
+    return this.db.prepare(`SELECT ${INVOCATION_SUMMARY_COLUMNS} FROM qm_invocations
+      WHERE owner_id=? AND operation_id=?
+        AND NOT EXISTS (SELECT 1 FROM qm_invocations n WHERE n.retry_of_invocation_id=qm_invocations.id)
+      ORDER BY rowid DESC LIMIT 1`).get(ownerId,operationId) as InvocationSummary | undefined ?? null;
+  }
+
+  findInvocationSummaryByOperationId(operationId: string): InvocationSummary | null {
+    return this.db.prepare(`SELECT ${INVOCATION_SUMMARY_COLUMNS} FROM qm_invocations
+      WHERE operation_id=?
+        AND NOT EXISTS (SELECT 1 FROM qm_invocations n WHERE n.retry_of_invocation_id=qm_invocations.id)
+      ORDER BY rowid DESC LIMIT 1`).get(operationId) as InvocationSummary | undefined ?? null;
+  }
+
+  findInvocationResult(ownerId: string, transportInstanceId: string, requestId: string): InvocationResult | null {
+    return this.db.prepare(`SELECT ${INVOCATION_SUMMARY_COLUMNS}, result_json FROM qm_invocations
+      WHERE owner_id=? AND transport_instance_id=? AND request_id=?`)
+      .get(ownerId,transportInstanceId,requestId) as InvocationResult | undefined ?? null;
+  }
+
+  findInvocationResultByOperation(ownerId: string, operationId: string): InvocationResult | null {
+    return this.db.prepare(`SELECT ${INVOCATION_SUMMARY_COLUMNS}, result_json FROM qm_invocations
+      WHERE owner_id=? AND operation_id=?
+        AND NOT EXISTS (SELECT 1 FROM qm_invocations n WHERE n.retry_of_invocation_id=qm_invocations.id)
+      ORDER BY rowid DESC LIMIT 1`).get(ownerId,operationId) as InvocationResult | undefined ?? null;
+  }
+
+  invocationMatchesInput(id: string, toolName: string, argumentsJson: string): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM qm_invocations
+      WHERE id=? AND tool_name=? AND arguments_json=?`).get(id,toolName,argumentsJson));
+  }
+
+  isRetryableInvocationAdmission(summary: InvocationSummary): boolean {
+    if (summary.state!==OperationState.failed || summary.effect!=="not_started" || !summary.result_ready) return false;
+    const saved=this.findInvocationResult(summary.owner_id,summary.transport_instance_id,summary.request_id);
+    return saved!==null && retryableAdmission(saved);
+  }
+
   findInvocation(ownerId: string, transportInstanceId: string, requestId: string): InvocationRow | null {
     const row = this.db
       .prepare(
-        `SELECT id, owner_id, transport_instance_id, request_id, session_id, member_id, tool_name,
-                arguments_json, operation_id, task_id, retry_of_invocation_id, state, effect, result_ref, result_json, created_at, finished_at, response_at, response_json
+        `SELECT ${INVOCATION_COLUMNS}
          FROM qm_invocations
          WHERE owner_id = ? AND transport_instance_id = ? AND request_id = ?`,
       )
@@ -1370,8 +1513,7 @@ export class SessionStore {
   findInvocationByOperation(ownerId: string, operationId: string): InvocationRow | null {
     const row = this.db
       .prepare(
-        `SELECT id, owner_id, transport_instance_id, request_id, session_id, member_id, tool_name,
-                arguments_json, operation_id, task_id, retry_of_invocation_id, state, effect, result_ref, result_json, created_at, finished_at, response_at, response_json
+        `SELECT ${INVOCATION_COLUMNS}
          FROM qm_invocations AS i
          WHERE owner_id = ? AND operation_id = ?
            AND NOT EXISTS (SELECT 1 FROM qm_invocations n WHERE n.retry_of_invocation_id=i.id)
@@ -1384,8 +1526,7 @@ export class SessionStore {
   findInvocationByOperationId(operationId: string): InvocationRow | null {
     const row = this.db
       .prepare(
-        `SELECT id, owner_id, transport_instance_id, request_id, session_id, member_id, tool_name,
-                arguments_json, operation_id, task_id, retry_of_invocation_id, state, effect, result_ref, result_json, created_at, finished_at, response_at, response_json
+        `SELECT ${INVOCATION_COLUMNS}
          FROM qm_invocations AS i
          WHERE operation_id = ?
            AND NOT EXISTS (SELECT 1 FROM qm_invocations n WHERE n.retry_of_invocation_id=i.id)
@@ -1408,19 +1549,19 @@ export class SessionStore {
     operationKey?: string;
     taskId?: string;
     retryOfInvocationId?: string;
-  }): InvocationRow {
+  }): InvocationSummary {
     return this.db.transaction(() => {
-      const sameRequest = this.findInvocation(input.ownerId, input.transportInstanceId, input.requestId);
+      const sameRequest = this.findInvocationSummary(input.ownerId, input.transportInstanceId, input.requestId);
       if (sameRequest) return sameRequest;
-      let previous: InvocationRow | null = null;
+      let previous: InvocationSummary | null = null;
       if (input.operationKey) {
-        const saved = this.findKeyedInvocation(input.ownerId, input.sessionId, input.memberId, input.operationKey);
+        const saved = this.findKeyedInvocationSummary(input.ownerId, input.sessionId, input.memberId, input.operationKey);
         if (saved) {
-          if (saved.id !== input.retryOfInvocationId || !retryableAdmission(saved)) return saved;
+          if (saved.id !== input.retryOfInvocationId || !this.isRetryableInvocationAdmission(saved)) return saved;
           const task = saved.task_id ? this.getTask(saved.task_id) : null;
-          if (!task || task.state !== "active" || task.id !== input.taskId || this.taskData.finalization(task.id)
+          if (!task || task.state !== "active" || task.id !== input.taskId || finalizationBlocksNewWork(this.taskData.finalization(task.id))
             || saved.session_id !== input.sessionId || saved.member_id !== input.memberId
-            || saved.tool_name !== input.toolName || saved.arguments_json !== input.argumentsJson
+            || !this.invocationMatchesInput(saved.id,input.toolName,input.argumentsJson)
             || saved.operation_id !== input.operationId) throw new Error("OPERATION_RETRY_SCOPE_MISMATCH");
           previous = saved;
         }
@@ -1441,14 +1582,22 @@ export class SessionStore {
         } else this.db.prepare("INSERT INTO qm_operation_keys(owner_id,node_id,root,operation_key,invocation_id) VALUES(?,?,?,?,?)")
             .run(input.ownerId,member.node_id,member.root,input.operationKey,input.id);
       }
-      return this.findInvocation(input.ownerId,input.transportInstanceId,input.requestId)!;
+      return this.findInvocationSummary(input.ownerId,input.transportInstanceId,input.requestId)!;
     }).immediate();
+  }
+
+  findKeyedInvocationSummary(ownerId: string, sessionId: string, memberId: string, key: string): InvocationSummary | null {
+    const member = this.getMember(sessionId, memberId);
+    return this.db.prepare(`SELECT ${INVOCATION_SUMMARY_COLUMNS} FROM qm_invocations
+      WHERE id=(SELECT invocation_id FROM qm_operation_keys
+        WHERE owner_id=? AND node_id=? AND root=? AND operation_key=?)`)
+      .get(ownerId,member.node_id,member.root,key) as InvocationSummary | undefined ?? null;
   }
 
   findKeyedInvocation(ownerId: string, sessionId: string, memberId: string, key: string): InvocationRow | null {
     const member = this.getMember(sessionId, memberId);
-    const row = this.db.prepare(`SELECT i.* FROM qm_operation_keys k JOIN qm_invocations i ON i.id=k.invocation_id
-      WHERE k.owner_id=? AND k.node_id=? AND k.root=? AND k.operation_key=?`)
+    const row = this.db.prepare(`SELECT ${INVOCATION_COLUMNS} FROM qm_invocations
+      WHERE id=(SELECT invocation_id FROM qm_operation_keys WHERE owner_id=? AND node_id=? AND root=? AND operation_key=?)`)
       .get(ownerId,member.node_id,member.root,key) as InvocationRow | undefined;
     return row ?? null;
   }
@@ -1488,15 +1637,15 @@ export class SessionStore {
     transportInstanceId: string;
     requestId: string;
     state?: OperationState;
-    effect?: InvocationRow["effect"];
+    effect?: InvocationSummary["effect"];
     operationId?: string | null;
     resultRef?: string | null;
     result?: unknown;
     finished?: boolean;
     responded?: boolean;
-  }): InvocationRow {
+  }): InvocationSummary {
     return this.db.transaction(() => {
-      const current = this.findInvocation(input.ownerId, input.transportInstanceId, input.requestId);
+      const current = this.findInvocationSummary(input.ownerId, input.transportInstanceId, input.requestId);
       if (!current) throw new Error("INVOCATION_NOT_FOUND");
       // 已被后续尝试取代的记录及其原始错误回执不可改写。
       if (this.db.prepare("SELECT 1 FROM qm_invocations WHERE retry_of_invocation_id=?").get(current.id)) return current;
@@ -1504,21 +1653,35 @@ export class SessionStore {
       const final = [OperationState.succeeded,OperationState.failed,OperationState.cancelled].includes(current.state);
       const regresses = input.state !== undefined && input.state !== current.state && (final
         || terminal && [OperationState.accepted, OperationState.queued, OperationState.running].includes(input.state));
-      this.db.prepare(`UPDATE qm_invocations SET state=?,effect=?,operation_id=?,result_ref=?,result_json=?,
-        finished_at=?,response_at=?,response_json=? WHERE owner_id=? AND transport_instance_id=? AND request_id=?`)
-        .run(
-          regresses ? current.state : input.state ?? current.state,
-          regresses ? current.effect : input.effect ?? current.effect,
-          input.operationId === undefined ? current.operation_id : input.operationId,
-          input.resultRef === undefined ? current.result_ref : input.resultRef,
-          input.result === undefined ? current.result_json : JSON.stringify(input.result),
-          current.finished_at ?? (input.finished ? new Date().toISOString() : null),
-          current.response_at ?? (input.responded ? new Date().toISOString() : null),
-          current.response_at || !input.responded ? current.response_json
-            : input.result === undefined ? current.result_json : JSON.stringify(input.result),
-          input.ownerId,input.transportInstanceId,input.requestId,
-        );
-      return this.findInvocation(input.ownerId,input.transportInstanceId,input.requestId)!;
+      const now = new Date().toISOString();
+      const values: Record<string,string|number|null|undefined> = {
+        id:current.id, state:regresses ? current.state : input.state ?? current.state,
+        effect:regresses ? current.effect : input.effect ?? current.effect,
+        operationId:input.operationId === undefined ? current.operation_id : input.operationId,
+        resultRef:input.resultRef === undefined ? current.result_ref : input.resultRef,
+        finishedAt:current.finished_at ?? (input.finished ? now : null),
+      };
+      const changes = ["state=@state", "effect=@effect", "operation_id=@operationId", "result_ref=@resultRef", "finished_at=@finishedAt"];
+      const firstResponse = input.responded && current.response_at === null;
+      if (input.result !== undefined) {
+        values.result = JSON.stringify(input.result);
+        changes.push("result_json=@result");
+        if (!firstResponse) {
+          // SQLite 同条 UPDATE 的右值均读取旧行，终态变化前先保存原首回执。
+          changes.push(`response_json=CASE WHEN response_uses_result=1 AND result_json IS NOT @result
+            THEN result_json ELSE response_json END`,
+          `response_uses_result=CASE WHEN response_uses_result=1 AND result_json IS NOT @result
+            THEN 0 ELSE response_uses_result END`);
+        }
+      }
+      if (firstResponse) {
+        values.responseAt = now;
+        changes.push("response_at=@responseAt", "response_json=NULL",
+          `response_uses_result=${input.result !== undefined || current.result_ready ? 1 : 0}`);
+      }
+      // 状态更新不读取正文；首回执与当前结果相同时只保存一份 JSON。
+      return this.db.prepare(`UPDATE qm_invocations SET ${changes.join(",")}
+        WHERE id=@id RETURNING ${INVOCATION_SUMMARY_COLUMNS}`).get(values) as InvocationSummary;
     }).immediate();
   }
 
@@ -1568,7 +1731,7 @@ export class SessionStore {
   }
 
   requireCommand(ownerId: string, nodeId: string, root: string, operationId: string) {
-    const invocation = this.findInvocationByOperation(ownerId, operationId);
+    const invocation = this.findInvocationResultByOperation(ownerId, operationId);
     if (!invocation || !["exec_command", "bash"].includes(invocation.tool_name)) throw new Error("COMMAND_NOT_FOUND");
     const member = this.getMember(invocation.session_id, invocation.member_id);
     // 历史命令校验已保存的根身份，目录清理后也无需再次访问文件系统。
@@ -1814,7 +1977,7 @@ export class SessionStore {
   }
 
   hasOperationFinished(operationId: string, invocationId?: string): boolean {
-    const current = this.findInvocationByOperationId(operationId);
+    const current = this.findInvocationSummaryByOperationId(operationId);
     const attemptId = invocationId ?? current?.id ?? null;
     return Boolean(this.db
       .prepare(
@@ -1843,8 +2006,8 @@ export class SessionStore {
       const statement = this.db.prepare(
         `INSERT INTO qm_file_changes (
            session_id, member_id, version_ref, file_id, status, path, from_path, additions, removals,
-           hash, large, binary, coverage, revertible, patch_ref, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           hash, large, binary, coverage, revertible, patch_ref, created_at, recorded_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       const now = new Date().toISOString();
       for (const file of files) {
@@ -1865,6 +2028,7 @@ export class SessionStore {
           file.revertible ? 1 : 0,
           file.patchRef,
           now,
+          file.recordedAt ?? null,
         );
       }
     });
@@ -1876,7 +2040,7 @@ export class SessionStore {
     const rows = this.db
       .prepare(
         `SELECT version_ref, file_id, status, path, from_path, additions, removals, hash, large, binary,
-                coverage, revertible, patch_ref
+                coverage, revertible, patch_ref, recorded_at
          FROM qm_file_changes
          WHERE session_id = ? AND member_id = ?
            AND version_ref IN (
@@ -1901,6 +2065,7 @@ export class SessionStore {
       revertible: Number(row.revertible) === 1,
       patchRef: String(row.patch_ref),
       versionRef: String(row.version_ref),
+      recordedAt: row.recorded_at === null ? null : Number(row.recorded_at),
     }));
   }
 
@@ -1909,7 +2074,7 @@ export class SessionStore {
     const rows = this.db
       .prepare(
         `SELECT DISTINCT f.version_ref, f.file_id, f.member_id, f.status, f.path, f.from_path, f.additions, f.removals,
-                f.hash, f.large, f.binary, f.coverage, f.revertible, f.patch_ref
+                f.hash, f.large, f.binary, f.coverage, f.revertible, f.patch_ref, f.recorded_at
          FROM qm_file_changes f
          JOIN qm_change_baselines b
            ON b.session_id = f.session_id AND b.member_id = f.member_id AND b.latest_ref = f.version_ref
@@ -1932,6 +2097,7 @@ export class SessionStore {
       revertible: Number(row.revertible) === 1,
       patchRef: String(row.patch_ref),
       versionRef: String(row.version_ref),
+      recordedAt: row.recorded_at === null ? null : Number(row.recorded_at),
     }));
   }
 
@@ -1979,8 +2145,8 @@ export class SessionStore {
   }
 
   taskMemberIds(taskId: string): string[] {
-    return (this.db.prepare(`SELECT member_id FROM qm_task_members WHERE task_id=?
-      UNION SELECT DISTINCT member_id FROM qm_events WHERE task_id=? ORDER BY member_id`).all(taskId, taskId) as Array<{ member_id: string }>)
+    return (this.db.prepare(`SELECT member_id FROM qm_task_members WHERE task_id=? ORDER BY member_id`)
+      .all(taskId) as Array<{ member_id: string }>)
       .map((row) => String(row.member_id));
   }
 

@@ -38,3 +38,10 @@ test('旧 Worker 的资源冲突保持明确拒绝，严格客户端不会拿成
   assert.deepEqual(result._meta,{quaymesh:{request:'retained',error}});
   assert.match((result.content[0] as {text:string}).text,/尚未开始/);
 });
+
+test('已规范化的资源冲突保持结构化身份和恢复字段', () => {
+  const reply:CallToolResult = { isError:true, content:[{type:'text',text:'Worker busy.'}],
+    structuredContent:{error_code:'EXECUTION_CONFLICT',effect:'not_started',retry_hint:'retry_later',
+      operation_id:'op_recorded',error:{code:'EXECUTION_CONFLICT',started:false}} };
+  assert.equal(compatibleToolReceipt(reply),reply);
+});

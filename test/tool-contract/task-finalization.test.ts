@@ -126,7 +126,10 @@ test("任务结束被真实运行进程拒绝后，仍能取消命令、修改�
     "*** Begin Patch\n*** Add File: after-failed-finish.txt\n+still writable\n*** End Patch");
   assert.equal(patched.files[0].path, "after-failed-finish.txt");
   assert.equal(await readFile(join(server.project, "after-failed-finish.txt"), "utf8"), "still writable\n");
-  const finished = await call("finish_task", { task_id: task.task_id, status: "completed", summary: "结束任务" });
+  const inspected = await call("task_resume", { action: "inspect", task_id: task.task_id });
+  assert.equal(inspected.finalization.recovery_state, "superseded");
+  const finished = await call("finish_task", { task_id: task.task_id, status: "completed", summary: "结束任务",
+    expected_task_revision: inspected.task_revision });
   assert.equal(finished.state, "closed");
   const saved = db.sqlite.prepare("SELECT error,completed_at FROM qm_task_finalizations WHERE task_id=?").get(task.task_id) as {
     error: string | null; completed_at: string | null;

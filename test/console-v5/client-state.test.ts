@@ -153,7 +153,9 @@ test('全局和项目共用主状态：已保存交付在前，后台与验收�
     finalization:{status:'failed',requestedAt:1000,error:'capture failed'}}),/交付确认失败/);
   const executing=lifecycleBadges({...completed,requestState:'active',resultStatus:null,executionStatus:'running',
     finalization:{status:'failed',requestedAt:1000,error:'capture failed'}});
-  assert.ok(executing.indexOf('执行中')<executing.indexOf('交付确认失败'));
+  assert.match(executing, /^<span class="state failed">[\s\S]*?交付确认失败<\/span> <span class="badge ">后台执行中<\/span>/);
+  assert.equal((executing.match(/交付确认失败/g) ?? []).length, 1, '交付状态只显示一次');
+  assert.doesNotMatch(executing, /class="state running"/, '运行事实不能替换Task主状态');
 });
 
 test('混合节点任务的时钟使用仍在执行节点的观察，另一离线节点不污染计时',()=>{

@@ -30,3 +30,16 @@ export function resourceHealth(entries: Array<CacheEntry | undefined>) {
     tone: errors || stale ? 'amber' : missing || loading || pending ? 'muted' : 'green',
     label: errors ? '读取失败 · 保留上次数据' : stale ? '部分数据待更新' : missing || pending ? '正在读取当前页面' : loading ? '正在刷新' : '当前数据已读取' };
 }
+
+/** A refresh in progress does not invalidate a successful, recent observation. */
+export function resourceObservation(entry: CacheEntry | undefined, now = Date.now()) {
+  const receivedAt = entry?.time && Number.isFinite(entry.time) ? entry.time : null;
+  const snapshot = entry?.data as { observedAt?: number | null } | undefined;
+  const observedAt = snapshot?.observedAt;
+  const confirmedAt = receivedAt ?? (typeof observedAt === 'number' && Number.isFinite(observedAt) ? observedAt : null);
+  const expiresAt = receivedAt === null ? null : receivedAt + 30_000;
+  // Resources clears error when retrying, but clears failures only on success.
+  const current = Boolean(entry?.data && receivedAt && !entry.error && !entry.failures
+    && now >= receivedAt && expiresAt !== null && now < expiresAt);
+  return { current, confirmedAt, expiresAt };
+}

@@ -359,6 +359,8 @@ export class WorkspaceRegistry {
       session.mode,
       session.sourceRoot,
     );
+    const loadedSkills = await this.loadSkillsForWorkspace(root);
+    // Loading the skill package may yield; recheck admission after that wait.
     confirmActive();
 
     const restoredWorkspace: Workspace = {
@@ -378,7 +380,7 @@ export class WorkspaceRegistry {
               managed: session.managed,
             }
           : undefined,
-      ...this.loadSkillsForWorkspace(root),
+      ...loadedSkills,
       agentProfiles: [],
     };
     this.rememberWorkspace(restoredWorkspace);
@@ -555,7 +557,7 @@ export class WorkspaceRegistry {
       mode: input.mode,
       sourceRoot: input.sourceRoot,
       worktree: input.worktree,
-      ...this.loadSkillsForWorkspace(input.root),
+      ...await this.loadSkillsForWorkspace(input.root),
       agentProfiles: await loadLocalAgentProfiles(this.config, input.root),
     };
 
@@ -595,8 +597,8 @@ export class WorkspaceRegistry {
     }
   }
 
-  private loadSkillsForWorkspace(root: string): Pick<Workspace, "skills" | "skillDiagnostics"> {
-    const result = loadWorkspaceSkills(this.config, root);
+  private async loadSkillsForWorkspace(root: string): Promise<Pick<Workspace, "skills" | "skillDiagnostics">> {
+    const result = await loadWorkspaceSkills(this.config, root);
     return {
       skills: result.skills,
       skillDiagnostics: result.diagnostics,

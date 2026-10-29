@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { databasePath } from "./db/client.js";
+import { databasePath, openDatabase } from "./db/client.js";
+import { LATEST_DATABASE_VERSION, migrateDatabase } from "./db/migrations.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 
 const root = mkdtempSync(join(tmpdir(), "quaymesh-local-agent-store-test-"));
@@ -167,8 +168,8 @@ assert.deepEqual(store.list({ workspaceId: "ws_1", workspaceRoot: join(root, "ot
   const migration = legacy.prepare(
     "insert into qm_schema_migrations (version, name, applied_at) values (?, ?, ?)",
   );
-  // Leave migration 3 unapplied to exercise an interrupted legacy upgrade:
-  // it adds an empty effort column before migration 6 copies thinking values.
+  // This pre-unification standalone-store fixture has its own version names.
+  // Its numeric v4 must not be treated as unified quaymesh-task-lifecycle.
   for (const [version, name] of [[1, "workspace-state"], [2, "oauth-state"], [4, "workspace-conversation-bindings"]] as const) {
     migration.run(version, name, "2026-08-01T00:00:00.000Z");
   }
@@ -187,12 +188,63 @@ assert.deepEqual(store.list({ workspaceId: "ws_1", workspaceRoot: join(root, "ot
     "2026-08-01T00:00:00.000Z",
     "2026-08-01T00:00:00.000Z",
   );
+  const originalResponse = '保留原字节\r\n"quoted"\\path\u0000end';
+  legacy.prepare("UPDATE local_agent_sessions SET latest_response=? WHERE id='agt_legacy'").run(originalResponse);
+  const originalColumns = (legacy.pragma("table_info(local_agent_sessions)") as Array<{ name: string }>)
+    .map(column => `"${column.name}"`).join(",");
+  const originalRows = legacy.prepare(`SELECT ${originalColumns} FROM local_agent_sessions ORDER BY id`).all();
+  const originalHistory = legacy.prepare("SELECT * FROM qm_schema_migrations ORDER BY version").all();
+  const originalBytes = legacy.prepare("SELECT hex(CAST(latest_response AS BLOB)) bytes FROM local_agent_sessions WHERE id='agt_legacy'").get();
   legacy.close();
+
+  // The same partial tables with unified migration names are damaged, not the
+  // recognized standalone store. Refuse them without resetting their history.
+  const malformedStateDir = join(root, "malformed-unified");
+  mkdirSync(malformedStateDir);
+  copyFileSync(databasePath(legacyStateDir), databasePath(malformedStateDir));
+  const malformed = new Database(databasePath(malformedStateDir));
+  try {
+    malformed.exec("DELETE FROM qm_schema_migrations");
+    const record = malformed.prepare("INSERT INTO qm_schema_migrations VALUES(?,?,?)");
+    ["quaymesh-initial", "quaymesh-runtime-ownership", "quaymesh-durable-results", "quaymesh-task-lifecycle"]
+      .forEach((name, index) => record.run(index + 1, name, "2026-08-01T00:00:00.000Z"));
+    const schema = () => malformed.prepare("SELECT type,name,sql FROM sqlite_master ORDER BY name").all();
+    const beforeSchema = schema(), beforeHistory = malformed.prepare("SELECT * FROM qm_schema_migrations ORDER BY version").all();
+    assert.throws(() => migrateDatabase(malformed), /no such table: console_operations/);
+    assert.equal(malformed.inTransaction, false);
+    assert.deepEqual(schema(), beforeSchema);
+    assert.deepEqual(malformed.prepare("SELECT * FROM qm_schema_migrations ORDER BY version").all(), beforeHistory);
+    assert.deepEqual(malformed.prepare(`SELECT ${originalColumns} FROM local_agent_sessions ORDER BY id`).all(), originalRows);
+  } finally { malformed.close(); }
 
   const upgradedStore = new LocalAgentStore(legacyStateDir);
   stores.push(upgradedStore);
+  const migrated = new Database(databasePath(legacyStateDir));
+  try {
+    assert.deepEqual(migrated.prepare(`SELECT ${originalColumns} FROM local_agent_sessions ORDER BY id`).all(), originalRows);
+    assert.deepEqual(migrated.prepare("SELECT hex(CAST(latest_response AS BLOB)) bytes FROM local_agent_sessions WHERE id='agt_legacy'").get(), originalBytes);
+    assert.deepEqual(migrated.prepare("SELECT * FROM qm_legacy_agent_migrations ORDER BY version").all(), originalHistory);
+    assert.deepEqual(migrated.prepare("SELECT version FROM qm_schema_migrations ORDER BY version").pluck().all(),
+      Array.from({ length: LATEST_DATABASE_VERSION }, (_, index) => index + 1));
+    for (const table of ["workspace_sessions", "oauth_clients", "console_operations", "qm_tasks", "qm_invocations", "local_agent_turns"]) {
+      assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(table));
+    }
+    assert.deepEqual(migrated.pragma("foreign_key_check"), []);
+    assert.equal(migrated.pragma("integrity_check", { simple: true }), "ok");
+    migrated.exec("BEGIN IMMEDIATE");
+    const reopened = openDatabase(legacyStateDir);
+    try {
+      assert.equal(reopened.sqlite.prepare("SELECT total_changes()").pluck().get(), 0);
+      assert.equal(migrated.inTransaction, true, "reopening an upgraded store must not need the writer lock");
+      assert.equal(reopened.sqlite.prepare("SELECT effort FROM local_agent_sessions WHERE id='agt_legacy'").pluck().get(), "high");
+    } finally { reopened.close(); }
+  } finally {
+    if (migrated.inTransaction) migrated.exec("ROLLBACK");
+    migrated.close();
+  }
   const legacyRecord = upgradedStore.getById("agt_legacy");
   assert.equal(legacyRecord?.error, "old error");
+  assert.equal(legacyRecord?.latestResponse, originalResponse);
   assert.equal(legacyRecord?.effort, "high");
   assert.equal(legacyRecord?.errorCode, undefined);
   assert.equal(legacyRecord?.errorRetryable, undefined);

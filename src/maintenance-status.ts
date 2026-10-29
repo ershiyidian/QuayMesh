@@ -10,6 +10,15 @@ export interface QuiescenceSubject {
   generation: string;
   fingerprint: string;
 }
+export interface ReviewedCommandClaim {
+  id: string;
+  operationId: string;
+  ownerId: string;
+  ownerPid: number;
+  processStart: string;
+  generation: string;
+  fingerprint: string;
+}
 type Owner = { generation: string; owner_token: string; owner_pid: number; process_start: string | null };
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const canonical = (row: Record<string, unknown>) => Object.fromEntries(Object.keys(row).sort().map(key => [key, row[key]]));
@@ -71,6 +80,106 @@ export function recordExecutionQuiescence(db: Database.Database, subjects: reado
   }).immediate();
 }
 
+const claimIdentity = (claim: ReviewedCommandClaim) => [claim.id, claim.operationId, claim.ownerId,
+  claim.ownerPid, claim.processStart, claim.generation, claim.fingerprint];
+const claimReleaseReason = "reviewed_command_physical_quiescence";
+
+/** These are identities eligible for external review, not proof of termination.
+ * The raw claim count still includes live, unsupported and unidentifiable rows. */
+export function reviewableCommandClaims(db: Database.Database): ReviewedCommandClaim[] {
+  return db.transaction(() => {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_owners'").get()) return [];
+    const rows = db.prepare(`SELECT c.* FROM execution_claims c
+      JOIN console_operations o ON o.id=c.operation_id
+      JOIN execution_owners e ON e.domain='operation' AND e.id=o.id
+      WHERE c.kind='command' AND o.kind='command' AND o.status IN ('unknown','reconciliation_required')
+        AND e.owner_pid=c.owner_pid AND e.generation=o.request_key
+        AND e.process_start IS NOT NULL AND length(e.process_start)>0
+      ORDER BY c.id`).all() as Array<Record<string, unknown>>;
+    return rows.flatMap(row => {
+      const operationId = String(row.operation_id), owner = ownerFor(db, "operation", operationId)!;
+      if (processOwnerAlive(owner)) return [];
+      const subject = quiescenceSubject(db, "operation", operationId);
+      return [{ id: String(row.id), operationId, ownerId: String(row.owner_id), ownerPid: owner.owner_pid,
+        processStart: owner.process_start!, generation: owner.generation,
+        fingerprint: digest({claim: canonical(row), subject}) }];
+    });
+  }).deferred();
+}
+
+/** Consume only the explicit installer's reviewed stop-domain receipt. The
+ * caller records that receipt in this same transaction after validating its
+ * installation, pause and process generations. No business outcome is changed. */
+export function releaseReviewedCommandClaims(db: Database.Database, claims: readonly ReviewedCommandClaim[], receiptId: string): {
+  released: number; replayed: number;
+} {
+  if (!db.inTransaction) throw new Error("Reviewed claim release requires the physical receipt transaction.");
+  if (!receiptId || !Array.isArray(claims) || claims.some(claim => !claim ||
+    [claim.id, claim.operationId, claim.ownerId, claim.processStart, claim.generation].some(value => typeof value !== "string" || !value) ||
+    !Number.isSafeInteger(claim.ownerPid) || claim.ownerPid < 1 || !/^[a-f0-9]{64}$/.test(claim.fingerprint)) ||
+    new Set(claims.map(claim => claim.id)).size !== claims.length)
+    throw new Error("Invalid reviewed command claim identities.");
+  const admission = readMaintenanceStatus(db);
+  if (admission.accepting || admission.waiting + admission.operations + admission.executions +
+    admission.queuedOperations + admission.queuedExecutions + admission.persistedRuntimeWork > 0)
+    throw new Error("Reviewed claim release requires paused admission and no other physical work.");
+  const current = new Map(reviewableCommandClaims(db).map(claim => [claim.id, claim]));
+  const release: Array<{ claim: ReviewedCommandClaim; row: Record<string, unknown>; runId: string }> = [];
+  let replayed = 0;
+  for (const claim of claims) {
+    const row = db.prepare("SELECT * FROM execution_claims WHERE id=?").get(claim.id) as Record<string, unknown> | undefined;
+    const subject = quiescenceSubject(db, "operation", claim.operationId);
+    const owner = ownerFor(db, "operation", claim.operationId);
+    if (!owner || owner.owner_pid !== claim.ownerPid || owner.process_start !== claim.processStart ||
+      owner.generation !== claim.generation || processOwnerAlive(owner))
+      throw new Error(`Reviewed command owner changed or is still present: ${claim.id}`);
+    const proof = db.prepare(`SELECT evidence_json FROM execution_quiescence WHERE domain='operation' AND object_id=?
+      AND generation=? AND fingerprint=? AND receipt_id=? AND invalidated_at IS NULL`)
+      .get(subject.id, subject.generation, subject.fingerprint, receiptId) as {evidence_json: string} | undefined;
+    const evidence = proof && JSON.parse(proof.evidence_json) as {
+      boundary?: string; context?: {attemptId?: string}; claims?: ReviewedCommandClaim[];
+    };
+    if (!evidence || evidence.boundary !== "reviewed_installation_stop_domain" || evidence.context?.attemptId !== receiptId ||
+      !Array.isArray(evidence.claims) || evidence.claims.length !== claims.length ||
+      claims.some(expected => !evidence.claims!.some(saved => JSON.stringify(claimIdentity(saved)) === JSON.stringify(claimIdentity(expected)))))
+      throw new Error(`Command claim lacks this attempt's exact physical receipt: ${claim.id}`);
+    if (!row) {
+      const audits = db.prepare("SELECT evidence FROM execution_claim_reconciliations WHERE claim_id=? AND reason=?")
+        .all(claim.id, claimReleaseReason) as Array<{evidence: string}>;
+      const saved = audits.some(audit => {
+        const evidence = JSON.parse(audit.evidence) as {receiptId?: string; claim?: ReviewedCommandClaim; originalClaim?: Record<string, unknown>};
+        return evidence.receiptId === receiptId && evidence.claim && evidence.originalClaim &&
+          JSON.stringify(claimIdentity(evidence.claim)) === JSON.stringify(claimIdentity(claim)) &&
+          digest({claim: canonical(evidence.originalClaim), subject}) === claim.fingerprint;
+      });
+      if (!saved) throw new Error(`Reviewed command claim disappeared without its matching release receipt: ${claim.id}`);
+      replayed++;
+      continue;
+    }
+    const observed = current.get(claim.id);
+    if (!observed || JSON.stringify(claimIdentity(observed)) !== JSON.stringify(claimIdentity(claim)))
+      throw new Error(`Command claim changed after physical review: ${claim.id}`);
+    const operation = db.prepare("SELECT run_id FROM console_operations WHERE id=?").get(claim.operationId) as {run_id: string};
+    release.push({claim: observed, row, runId: operation.run_id});
+  }
+  if (admission.claims !== release.length)
+    throw new Error("Unreviewed or unsupported execution claims remain; physical release is refused.");
+  // Validate every subject before either auditing or deleting a claim. An insert
+  // or delete failure rolls back the physical receipts and the whole release.
+  for (const {claim, row, runId} of release) {
+    db.prepare(`INSERT INTO execution_claim_reconciliations
+      (id,claim_id,kind,owner_pid,agent_id,checkout_root,run_id,reason,evidence,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?)`).run(`claimrec_${randomUUID()}`, claim.id, "command", claim.ownerPid,
+        row.agent_id ?? null, row.checkout_root, runId, claimReleaseReason,
+        JSON.stringify({version: 1, boundary: "reviewed_command_claim_release", receiptId, claim, originalClaim: row,
+          resultReconciliation: "unchanged"}), new Date().toISOString());
+    const removed = db.prepare("DELETE FROM execution_claims WHERE id=? AND owner_id=? AND owner_pid=? AND operation_id=?")
+      .run(claim.id, claim.ownerId, claim.ownerPid, claim.operationId);
+    if (removed.changes !== 1) throw new Error(`Reviewed command claim changed during release: ${claim.id}`);
+  }
+  return {released: release.length, replayed};
+}
+
 /** Read-only, one SQLite snapshot. Result uncertainty and physical activity are
  * separate: historical uncertainty remains visible after a proven drain. */
 export function readMaintenanceStatus(db: Database.Database) {
@@ -93,7 +202,9 @@ export function readMaintenanceStatus(db: Database.Database) {
       if (!owners.has(row.owner_pid)) owners.set(row.owner_pid, pidAlive(row.owner_pid));
       if (owners.get(row.owner_pid)) {
         const next=counts.get(row.kind)??{blocking:0,nonBlocking:0};
-        if(row.blocking)next.blocking+=row.count;else next.nonBlocking+=row.count;
+        // Older releases persisted open egress streams as non-blocking. Their
+        // live owner still holds a model connection across a service cutover.
+        if(row.blocking||row.kind==="egress")next.blocking+=row.count;else next.nonBlocking+=row.count;
         counts.set(row.kind,next);
       }
     }

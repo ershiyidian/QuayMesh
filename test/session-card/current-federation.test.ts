@@ -111,7 +111,9 @@ test("real federation preserves identity, remote card data and online status aft
   // 第一轮任务先显式结束，历史卡片才会显示清晰结束状态。
   const firstFinish = structured(await entry.client.callTool({ name: "finish_task", arguments: { task_id: taskId, status: "completed", summary: "联邦任务一完成" }, _meta: meta }));
   assert.equal(firstFinish.result_status, "completed");
-  const second = structured(await entry.client.callTool({ name: "start_session", arguments: { request_key: "request-2-7171", title: "联邦任务二" }, _meta: meta }));
+  const taskSelection = structured(await entry.client.callTool({ name: "task_resume", arguments: { action: "inspect", task_id: taskId }, _meta: meta }));
+  const second = structured(await entry.client.callTool({ name: "start_session", arguments: { request_key: "request-2-7171", title: "联邦任务二",
+    new_goal: true, expected_binding_revision: (taskSelection.binding as { binding_revision: number }).binding_revision }, _meta: meta }));
   assert.equal(second.session_id, opened.session_id);
   assert.notEqual(second.task_id, taskId);
   const taskTwoRead = await entry.client.callTool({ name: "read", arguments: { workspace_id: opened.workspace_id, path: "README.md" }, _meta: meta });

@@ -91,6 +91,8 @@ test("closed task replays its completed copy without rewriting and rejects a new
   const f = await fixture(t);
   const first = await f.settled(await f.copy());
   assert.equal(first.status, "completed", first.error);
+  assert.deepEqual(f.methods, ["artifact.lookup", "artifact.copy"], "the owner receipt is checked before the first copy dispatch");
+  const transfer = f.worker.ledger.db.prepare("SELECT * FROM qm_transfers WHERE id=?").get(first.id);
   const invocation = f.worker.store.findInvocationByOperationId(first.operationId);
   assert.equal(invocation?.id, first.operationId);
   assert.equal(invocation?.operation_id, first.operationId);
@@ -98,10 +100,11 @@ test("closed task replays its completed copy without rewriting and rejects a new
   assert.equal(invocation?.state, "succeeded");
   f.cloud.store.closeTask(f.task.id, "completed", "Done");
   f.worker.store.closeTask(f.task.id, "completed", "Done");
+  const closed = f.worker.store.getTask(f.task.id), replayStart = f.methods.length;
   await writeFile(join(f.root, "source.txt"), "changed-source\n");
   const replay = await f.copy();
-  assert.equal(replay.id, first.id); assert.equal(replay.status, "completed");
-  assert.equal(f.methods.at(-1), "artifact.lookup");
+  assert.deepEqual(replay, first);
+  assert.deepEqual(f.methods.slice(replayStart), ["artifact.lookup"], "closed-task replay reads the saved receipt without another copy dispatch");
   assert.equal(await readFile(join(f.root, "copied.txt"), "utf8"), "original-source\n");
   await assert.rejects(f.copy({ destination_path: "changed-target.txt" }), { code: "COPY_REQUEST_KEY_REUSED", effect: "not_started" });
   const unseen = (await f.cloud.service.startTask({ owner_id: "owner", conversation_id: "conversation" }, "Coordinator-only task", "unseen")).task;
@@ -109,7 +112,11 @@ test("closed task replays its completed copy without rewriting and rejects a new
   assert.equal(f.worker.store.findTask(unseen.id), null);
   await assert.rejects(f.copy({ request_key: "new-closed-key", destination_path: "after-closed.txt" }), { code: "TASK_NOT_ACTIVE", effect: "not_started" });
   assert.equal(f.worker.store.findTask(unseen.id), null);
-  assert.deepEqual(f.methods, ["artifact.copy", "artifact.lookup", "artifact.lookup", "artifact.lookup"]);
+  assert.equal(f.methods.filter(method => method === "artifact.copy").length, 1);
+  assert.ok(f.methods.slice(2).every(method => method === "artifact.lookup"));
+  assert.deepEqual(f.worker.ledger.db.prepare("SELECT * FROM qm_transfers WHERE id=?").get(first.id), transfer);
+  assert.deepEqual(f.worker.store.findInvocationByOperationId(first.operationId), invocation);
+  assert.deepEqual(f.worker.store.getTask(f.task.id), closed);
   await assert.rejects(stat(join(f.root, "after-closed.txt")), { code: "ENOENT" });
   assert.equal((await f.worker.runtime.request<TransferView[]>("worker", "transfers.list", {})).length, 1);
 });
@@ -118,10 +125,20 @@ test("a finalizing task only permits lookup of its existing copy receipt", async
   const f = await fixture(t);
   const first = await f.settled(await f.copy());
   assert.equal(first.status, "completed", first.error);
+  assert.deepEqual(f.methods, ["artifact.lookup", "artifact.copy"]);
+  const transfer = f.worker.ledger.db.prepare("SELECT * FROM qm_transfers WHERE id=?").get(first.id);
+  const invocation = f.worker.store.findInvocationByOperationId(first.operationId);
   f.cloud.store.taskData.requestFinalization(f.task.id, "completed", "Finishing");
-  assert.equal((await f.copy()).id, first.id);
+  const intent = f.cloud.store.taskData.finalization(f.task.id), replayStart = f.methods.length;
+  assert.deepEqual(await f.copy(), first);
+  assert.deepEqual(f.methods.slice(replayStart), ["artifact.lookup"], "receipt replay does not retire the pending finish or dispatch copy work");
   await assert.rejects(f.copy({ request_key: "new-finishing-key", destination_path: "while-finishing.txt" }), { code: "TASK_FINISHING", effect: "not_started" });
-  assert.deepEqual(f.methods, ["artifact.copy", "artifact.lookup", "artifact.lookup"]);
+  assert.equal(f.methods.filter(method => method === "artifact.copy").length, 1);
+  assert.ok(f.methods.slice(2).every(method => method === "artifact.lookup"));
+  assert.deepEqual(f.cloud.store.taskData.finalization(f.task.id), intent);
+  assert.deepEqual(f.worker.ledger.db.prepare("SELECT * FROM qm_transfers WHERE id=?").get(first.id), transfer);
+  assert.deepEqual(f.worker.store.findInvocationByOperationId(first.operationId), invocation);
+  assert.equal((await f.worker.runtime.request<TransferView[]>("worker", "transfers.list", {})).length, 1);
   await assert.rejects(stat(join(f.root, "while-finishing.txt")), { code: "ENOENT" });
 });
 
@@ -145,6 +162,7 @@ test("a destination task finalized before its coordinator leaves a terminal fail
 
   const receipt = await f.settled(await f.copy());
   assert.equal(receipt.status, "failed");
+  assert.deepEqual(f.methods, ["artifact.lookup", "artifact.copy"]);
   assert.match(receipt.error ?? "", /^TASK_NOT_ACTIVE:/u);
   await assert.rejects(stat(join(f.root, "copied.txt")), { code: "ENOENT" });
   const invocation = f.worker.store.findInvocationByOperationId(receipt.operationId);
@@ -159,15 +177,21 @@ test("a destination task finalized before its coordinator leaves a terminal fail
   });
   assert.equal(f.worker.store.findOperationEvent(receipt.operationId), null);
   assert.equal((f.worker.ledger.db.prepare("SELECT count(*) AS count FROM execution_claims").get() as {count: number}).count, 0);
+  const transfer = f.worker.ledger.db.prepare("SELECT * FROM qm_transfers WHERE id=?").get(receipt.id);
+  const closed = f.worker.store.getTask(f.task.id), replayStart = f.methods.length;
 
   await writeFile(join(f.root, "source.txt"), "changed-after-failure\n");
   assert.deepEqual(await f.copy(), receipt);
+  assert.deepEqual(f.methods.slice(replayStart), ["artifact.lookup"], "an active coordinator also replays a saved failure without another copy dispatch");
   f.cloud.store.closeTask(f.task.id, "completed", "Coordinator confirmation");
   assert.deepEqual(await f.copy(), receipt);
   assert.deepEqual(f.worker.store.findInvocationByOperationId(receipt.operationId), invocation);
   assert.equal((f.worker.ledger.db.prepare("SELECT count(*) AS count FROM qm_invocations").get() as {count: number}).count, 1);
   assert.equal((await f.worker.runtime.request<TransferView[]>("worker", "transfers.list", {})).length, 1);
-  assert.deepEqual(f.methods, ["artifact.copy", "artifact.copy", "artifact.lookup"]);
+  assert.deepEqual(f.methods.slice(replayStart), ["artifact.lookup", "artifact.lookup"]);
+  assert.equal(f.methods.filter(method => method === "artifact.copy").length, 1);
+  assert.deepEqual(f.worker.ledger.db.prepare("SELECT * FROM qm_transfers WHERE id=?").get(receipt.id), transfer);
+  assert.deepEqual(f.worker.store.getTask(f.task.id), closed);
   await assert.rejects(stat(join(f.root, "copied.txt")), { code: "ENOENT" });
 });
 

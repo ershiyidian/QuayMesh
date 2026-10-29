@@ -7,9 +7,12 @@ import type {
 } from "../../session/types.js";
 import { sameExecutionObservation } from "../../execution-observation.js";
 import type { DiffRow } from "./diff.js";
+import { createTaskMessagesState, type TaskMessagesState } from "./message-state.js";
+import type { TaskBindingState } from "../../tasks/task-binding.js";
+import { createTaskResumeState, type TaskResumeState } from "./task-binding.js";
 
-export type CardTab = "changes" | "commands" | "agents" | "context";
-export type ConnectionState = "connecting" | "live" | "static" | "error";
+export type CardTab = "changes" | "commands" | "agents" | "context" | "messages";
+export type ConnectionState = "connecting" | "live" | "static" | "error" | "unconfirmed";
 
 export interface DiffCacheEntry {
   rows?: DiffRow[];
@@ -55,6 +58,9 @@ export interface CardState {
   revertArmed: boolean;
   busy: boolean;
   message: string | null;
+  messages: TaskMessagesState;
+  taskBinding: TaskBindingState | null;
+  taskResume: TaskResumeState;
   selectedMemberId: string | null;
   panelScroll: Record<CardTab, number>;
   openFiles: Set<string>;
@@ -92,8 +98,11 @@ export function createCardState(): CardState {
     revertArmed: false,
     busy: false,
     message: null,
+    messages: createTaskMessagesState(),
+    taskBinding: null,
+    taskResume: createTaskResumeState(),
     selectedMemberId: null,
-    panelScroll: { changes: 0, commands: 0, agents: 0, context: 0 },
+    panelScroll: { changes: 0, commands: 0, agents: 0, context: 0, messages: 0 },
     openFiles: new Set(),
     openCommands: new Set(),
     openInstructions: new Set(),
@@ -117,6 +126,7 @@ export function createCardState(): CardState {
 export function applySnapshot(
   state: CardState,
   next: Snapshot,
+  options: { acceptSameRevision?: boolean } = {},
 ): SnapshotChange {
   if (state.disposed) throw new Error("SESSION_CARD_STATE_DISPOSED");
   const previous = state.snapshot;
@@ -126,7 +136,8 @@ export function applySnapshot(
   if (previous?.taskId && previous.taskId !== next.taskId) {
     throw new Error(`SESSION_CARD_TASK_CHANGED: ${previous.taskId} -> ${next.taskId}`);
   }
-  if (previous && previous.workspace?.id === next.workspace?.id && next.rev <= previous.rev) {
+  if (previous && previous.workspace?.id === next.workspace?.id && (next.rev < previous.rev
+    || next.rev === previous.rev && !options.acceptSameRevision)) {
     const observation=next.rev===previous.rev && next.executionObservation &&
       observationResponseAt(next) >= observationResponseAt(previous) ? next.executionObservation : previous.executionObservation;
     const live=next.rev===previous.rev && next.live && next.live.observedAt >= (previous.live?.observedAt??0) ? next.live : previous.live;
@@ -150,7 +161,8 @@ export function applySnapshot(
     next={...next,taskState:'closed',taskResult:previous.taskResult??(next.taskState==='closed'?next.taskResult:null),
       deliveryEndedAt:previous.deliveryEndedAt??next.deliveryEndedAt,
       endedAt:previous.endedAt??next.endedAt,closureReason:previous.closureReason??next.closureReason,
-      archivedAt:previous.archivedAt??next.archivedAt,finalization:null};
+      archivedAt:previous.archivedAt??next.archivedAt,finalization:null,
+      capabilities:{...next.capabilities,continue:false,revert:false}};
   }
   if(previous&&previous.workspace?.id===next.workspace?.id){
     if(previous.executionObservation&&observationResponseAt(previous)>observationResponseAt(next))
@@ -259,6 +271,9 @@ export function resetAfterRevert(state: CardState): void {
 
 export function disposeState(state: CardState): void {
   state.disposed = true;
+  state.messages = createTaskMessagesState();
+  state.taskBinding = null;
+  state.taskResume = createTaskResumeState();
   state.diffCache.clear();
   state.outputCache.clear();
   state.instructionCache.clear();
@@ -335,6 +350,7 @@ function sameFiles(left: FileSummary[], right: FileSummary[]): boolean {
     const other = right[index];
     return file.id === other.id
       && file.hash === other.hash
+      && file.recordedAt === other.recordedAt
       && file.status === other.status
       && file.additions === other.additions
       && file.removals === other.removals;

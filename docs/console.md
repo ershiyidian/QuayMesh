@@ -22,6 +22,8 @@ File differences belong to their task. Completed tasks retain their recorded fil
 
 A request, its background executions, and its review have separate states. Finishing one command or workspace phase does not close the request. A request can also be handed off while its background execution continues. The details retain the delivery result alongside the current execution state.
 
+The primary task badge follows the saved task lifecycle. An open task remains in **In progress** when it has no active process, its latest command fails, or an execution observation becomes stale. A separate badge reports those execution facts. **In progress** and **Ended** filter the task lifecycle; **Background execution** selects active commands and agents, including work continuing after a handoff. An open task is not evidence that the host model is currently generating a response.
+
 “No background execution” means there is no confirmed active command or agent. It does not imply a request for user input. A failed or stopped last execution remains visible until further work supersedes it. Unresolved effects and stale observations stay in the attention view, including those from an older phase or a closed request. Finalization failures show their recorded cause.
 
 Use **Finish request** to record a delivery result. Review acceptance and rejection are separate actions. Finishing requires confirmation that all relevant task members have no active or unresolved execution. An unrelated offline node does not block the task's controls.

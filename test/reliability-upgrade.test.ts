@@ -11,6 +11,9 @@ import { createRealTestServer } from "./session-card/server-fixture.js";
 import { SessionOutputStore } from "../src/session/output.js";
 import { ProcessSessionManager } from "../src/process-sessions.js";
 import { openDatabase } from "../src/db/client.js";
+import { SessionStore } from "../src/session/store.js";
+import { SessionProjector } from "../src/session/projection.js";
+import { WorkLedger } from "../src/work-ledger.js";
 import { REPLY_BYTES } from "../src/bounded-reply.js";
 import { toolDeadline, remainingToolTime, TOOL_DEADLINE_META } from "../src/tool-request-budget.js";
 
@@ -58,7 +61,7 @@ async function fixture(t: TestContext, files: Record<string,string>={}) {
   return {...f,task,workspace,scope,call,raw,execute,finished,newClient};
 }
 
-test("二十个小文件实际一次返回，正文仅保留一份", {timeout:60000}, async t=>{
+test("二十个小文件实际一次返回，文本镜像与结构化正文一致且不追加重复正文", {timeout:60000}, async t=>{
   const files=Object.fromEntries(Array.from({length:20},(_,i)=>[`batch-${i}.ts`,`export const value${i} = ${i};\n`]));
   const f=await fixture(t,files);
   const response=await f.raw("workspace_context",{...f.scope,action:"capture",files:Object.keys(files).map(path=>({path}))});
@@ -68,7 +71,10 @@ test("二十个小文件实际一次返回，正文仅保留一份", {timeout:60
   assert.equal(result.next_cursor,null);
   for(const entry of result.entries)assert.equal(entry.lines.map((line:any)=>line.text+line.eol).join(""),files[entry.path]);
   assert.ok(Buffer.byteLength(JSON.stringify(response))<REPLY_BYTES);
-  assert.ok(!JSON.stringify(response.content).includes("export const value"));
+  const mirror=response.content[0];
+  assert.ok(mirror?.type==="text");
+  assert.deepEqual(JSON.parse(mirror.text),result);
+  assert.equal(response.content.filter(item=>item.type==="text"&&item.text.includes("export const value")).length,1);
 });
 
 test("多文件长行分页保留原内容，原文件删除以后仍可继续", {timeout:60000}, async t=>{
@@ -204,13 +210,15 @@ test("新会话在同一授权工作区取消原命令，取消后结果仍可�
   assert.equal((again.structuredContent as any).cancel_requested,false);
 });
 
-test("检查点保存模型判断，继续任务引用原任务且时间重新开始", {timeout:60000}, async t=>{
+test("检查点保存模型判断，派生的独立目标保留来源并分别计时", {timeout:60000}, async t=>{
   const f=await fixture(t);
   await f.call("checkpoint_task",{...f.scope,goal:"核查输出",decisions:["保留原始结果"],next_action:"读取下一组结果",evidence_refs:["README.md"]});
   const first=await f.call("workspace_context",{...f.scope,action:"recovery",task_id:f.task.task_id});
   assert.equal(first.checkpoints[0].source,"model");
   assert.equal(first.facts.source,"execution_records");
-  const next=await f.call("start_session",{title:"继续核查",request_key:"continue-new",source_task_id:f.task.task_id});
+  const selected=await f.call("task_resume",{action:"inspect",task_id:f.task.task_id});
+  const next=await f.call("start_session",{title:"独立派生核查",request_key:"continue-new",source_task_id:f.task.task_id,
+    new_goal:true,expected_binding_revision:selected.binding.binding_revision});
   assert.notEqual(next.task_id,f.task.task_id);
   const db=openDatabase(f.config.stateDir);
   try {
@@ -290,21 +298,43 @@ test("明确取消只作用于指定真实进程，重复取消不创建新执�
   assert.match((await f.finished(unaffected.operation_id)).result,/independent-command/);
 });
 
-test("已交接任务继续显示后台命令，完成后保留真实结束时间", {timeout:60000}, async t=>{
+test("历史已关闭交接记录继续显示后台命令，完成后保留原结束时间", {timeout:60000}, async t=>{
   const f=await fixture(t);
-  const command=await f.execute("setTimeout(()=>console.log('handoff-completed'),3000);",{yield_time_ms:1});
-  const handed=await f.call("finish_task",{task_id:f.task.task_id,status:"handed_off",summary:"命令已接收并继续运行"});
-  assert.equal(handed.state,"closed");
-  const before=await f.call("qm_session",{session_id:f.workspace.session_id,task_id:f.task.task_id,since_rev:-1});
-  assert.equal(before.snapshot.capabilities.refresh,true);
-  assert.equal(before.snapshot.taskResult,"handed_off");
-  assert.equal(typeof before.snapshot.deliveryEndedAt,"number");
-  assert.equal(before.snapshot.endedAt,before.snapshot.deliveryEndedAt,"交接时本轮用时已固定");
-  await f.finished(command.operation_id);
-  const after=await f.call("qm_session",{session_id:f.workspace.session_id,task_id:f.task.task_id,since_rev:before.rev});
-  assert.equal(after.unchanged,false);
-  assert.equal(after.snapshot.capabilities.refresh,false);
-  assert.equal(after.snapshot.endedAt,before.snapshot.endedAt,"后台结束不重新计算本轮时长");
-  assert.ok(after.snapshot.currentCommand.endedAt>=after.snapshot.endedAt);
-  assert.equal(after.snapshot.currentCommand.status,"ok");
+  const gate=join(f.root,"legacy-handoff-complete");
+  const command=await f.execute(`import {existsSync} from 'node:fs';const timer=setInterval(()=>{
+    if(existsSync(${JSON.stringify(gate)})){clearInterval(timer);console.log('handoff-completed');}},20);`,{yield_time_ms:1});
+  // Seed a confirmed receipt from the previous release. New finish_task(handed_off) must reject.
+  try {
+    const db=openDatabase(f.config.stateDir),ledger=new WorkLedger(f.config.stateDir),store=new SessionStore(db.sqlite);
+    const projector=new SessionProjector(store,f.config.stateDir,null,undefined,f.config.federation?.nodeId ?? "local");
+    try {
+      // The old finalizer captured each member before closing the Task. A bare
+      // closed row is not a historical receipt with observable background work.
+      for(const memberId of store.taskMemberIds(f.task.task_id)) {
+        const snapshot=await projector.materialize(f.workspace.session_id,memberId,f.task.task_id);
+        store.putTaskSnapshot(f.task.task_id,memberId,snapshot.rev,snapshot,
+          store.fileSummaries(f.workspace.session_id,memberId,f.task.task_id));
+      }
+      const when=new Date().toISOString();
+      db.sqlite.prepare(`UPDATE qm_tasks SET state='closed',revision=revision+1,result_status='handed_off',
+        summary='legacy confirmed handoff',finished_at=?,archived_at=?,delivery_ended_at=?,closure_reason='explicit' WHERE id=?`)
+        .run(when,when,when,f.task.task_id);
+      db.sqlite.prepare(`INSERT INTO qm_task_finalizations(task_id,status,summary,requested_at,completed_at,error,mailbox_sequence)
+        VALUES(?,'handed_off','legacy confirmed handoff',?,?,NULL,0)`).run(f.task.task_id,when,when);
+      ledger.archiveTaskRuns(f.task.task_id);
+    } finally {await projector.close();ledger.close();db.close();}
+    const before=await f.call("qm_session",{session_id:f.workspace.session_id,task_id:f.task.task_id,since_rev:-1});
+    assert.equal(before.snapshot.capabilities.refresh,true);
+    assert.equal(before.snapshot.taskResult,"handed_off");
+    assert.equal(typeof before.snapshot.deliveryEndedAt,"number");
+    assert.equal(before.snapshot.endedAt,before.snapshot.deliveryEndedAt,"交接时本轮用时已固定");
+    await writeFile(gate,"finish");
+    await f.finished(command.operation_id);
+    const after=await f.call("qm_session",{session_id:f.workspace.session_id,task_id:f.task.task_id,since_rev:before.rev});
+    assert.equal(after.unchanged,false);
+    assert.equal(after.snapshot.capabilities.refresh,false);
+    assert.equal(after.snapshot.endedAt,before.snapshot.endedAt,"后台结束不重新计算本轮时长");
+    assert.ok(after.snapshot.currentCommand.endedAt>=after.snapshot.endedAt);
+    assert.equal(after.snapshot.currentCommand.status,"ok");
+  } finally {await writeFile(gate,"finish");}
 });
