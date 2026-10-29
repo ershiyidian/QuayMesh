@@ -54,7 +54,10 @@ for (const sample of [
         result_sha256: string;
         response_page: { offset: number; next_offset: number | null; total_code_points: number };
       };
-      assert.deepEqual(JSON.parse(textBody.text), body);
+      assert.equal(reply.content.filter(block => block.type === "text").length, 1);
+      const { _quaymesh_text_notes: notes, ...textPayload } = JSON.parse(textBody.text);
+      assert.deepEqual(textPayload, body);
+      assert.deepEqual(notes, [`已读取 ${path}，正文见 result。`]);
       assert.equal(body.result_sha256, createHash("sha256").update(expected).digest("hex"));
       assert.equal(body.response_page.offset, offset);
       assert.equal(body.response_page.total_code_points, Array.from(expected).length);

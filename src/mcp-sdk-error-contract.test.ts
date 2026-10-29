@@ -77,16 +77,24 @@ test("SDK 客户端发现输出 schema 后接受真实 ENOENT 错误并成功重
     operation_id: operationId,
   });
   assert.ok(Array.isArray(missing.content));
-  assert.ok(missing.content.some((item) => item.type === "text" && item.text.includes("ENOENT")));
-  assert.ok(missing.content.some((item) => item.type === "text" && item.text.endsWith(
-    `[QuayMesh recovery: error_code=ENOENT; effect=not_started; retry_hint=fix_input; operation_id=${operationId}]`)));
+  const missingTexts = missing.content.filter(item => item.type === "text");
+  assert.equal(missingTexts.length, 1);
+  const { _quaymesh_text_notes: notes, ...missingBody } = JSON.parse(missingTexts[0]!.text);
+  assert.deepEqual(missingBody, missing.structuredContent);
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /ENOENT/);
+  assert.ok(notes[0].endsWith(
+    `[QuayMesh recovery: error_code=ENOENT; effect=not_started; retry_hint=fix_input; operation_id=${operationId}]`));
 
   const contents = "File read through the actual MCP handler.\n";
   await writeFile(join(directory, "example.txt"), contents);
   const found = await client.callTool({ name: "read_fixture", arguments: { name: "example.txt" } });
   assert.notEqual(found.isError, true);
   assert.deepEqual(found.structuredContent, { result: contents });
-  assert.deepEqual(found.content, [{ type: "text", text: JSON.stringify({ result: contents }) }]);
+  assert.ok(Array.isArray(found.content));
+  assert.equal(found.content.length, 1);
+  assert.ok(found.content[0]?.type === "text");
+  assert.equal(found.content[0].text, JSON.stringify({ result: contents }));
   assert.equal(reads, 2);
   assert.deepEqual(handlerErrors, []);
   assert.deepEqual(transportErrors, []);

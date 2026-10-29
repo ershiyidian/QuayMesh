@@ -121,8 +121,11 @@ test("输出 schema 兼容业务错误，同时保留成功结果的运行时校
     const expected = name === "proper_error" ? failure : success;
     const text = body.result.content[0];
     assert.ok(text?.type === "text");
-    assert.deepEqual(JSON.parse(text.text), expected.structuredContent);
-    assert.deepEqual(body.result.content.slice(1), expected.content);
+    const notes = expected.content.flatMap(block => block.type === "text" ? [block.text] : []);
+    assert.deepEqual(JSON.parse(text.text), { ...expected.structuredContent,
+      ...(notes.length ? { _quaymesh_text_notes: notes } : {}) });
+    assert.equal(body.result.content.filter(block => block.type === "text").length, 1);
+    assert.deepEqual(body.result.content.slice(1), expected.content.filter(block => block.type !== "text"));
     assert.deepEqual(body.result.structuredContent, expected.structuredContent);
     assert.equal(body.result.isError === true, name === "proper_error");
   }

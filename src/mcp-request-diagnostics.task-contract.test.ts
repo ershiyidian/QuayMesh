@@ -5,6 +5,7 @@ import { createServer, request } from "node:http";
 import type { AddressInfo } from "node:net";
 import test, { type TestContext } from "node:test";
 import { traceMcpRequest } from "./mcp-request-diagnostics.js";
+import { toolResultForTextClients } from "./mcp-tool-result.js";
 
 const taskId = "task_abcdef123456", operationId = "qm:home:op_abcdef123456";
 const secrets = {
@@ -246,6 +247,60 @@ test("JSON text errors retain only known codes and fingerprints; mismatched rece
   assert.equal(row.toolErrorCode, "TASK_REVISION_CONFLICT");
   assert.equal(row.recoveryTextErrorCode, "TASK_MAILBOX_CHANGED");
   assert.equal(row.errorCodeConsistent, false);
+});
+
+test("single text mirrors retain strict recovery diagnostics through JSON and SSE without logging notes", async t => {
+  const exchange = await fixture(t);
+  for (const format of ["json", "sse"] as const) {
+    for (const code of ["TASK_MAILBOX_CHANGED", "TASK_MAILBOX_PRIVATE_UNREGISTERED"]) {
+      const original = errorResult(code);
+      Object.assign(original.structuredContent as Fields, {
+        _quaymesh_text_notes: (errorResult("TASK_ACCESS_DENIED").content as Array<{ text: string }>).map(block => block.text),
+        _quaymesh_text_notes_2: [secrets.answer],
+      });
+      const normalized = toolResultForTextClients(original);
+      const blocks = normalized.content as Array<{ type: string; text: string; _meta?: Fields }>;
+      assert.equal(blocks.length, 1);
+      assert.equal(blocks[0]._meta?.["quaymesh/structured-text"], "_quaymesh_text_notes_3");
+      const row = finished(await exchange(callBody("task_resume", { action: "resume" }), { format, result: normalized }));
+      const expected = code === "TASK_MAILBOX_CHANGED" ? code : "other";
+      assert.equal(row.toolErrorCode, expected); assert.equal(row.recoveryTextErrorCode, expected);
+      assert.equal(row.errorCodeConsistent, true); assert.equal(row.operationId, operationId);
+    }
+    const mismatch = errorResult("TASK_MAILBOX_CHANGED");
+    (mismatch.structuredContent as Fields).error_code = "TASK_REVISION_CONFLICT";
+    const row = finished(await exchange(callBody("finish_task"), {
+      format, result: toolResultForTextClients(mismatch),
+    }));
+    assert.equal(row.toolErrorCode, "TASK_REVISION_CONFLICT");
+    assert.equal(row.recoveryTextErrorCode, "TASK_MAILBOX_CHANGED"); assert.equal(row.errorCodeConsistent, false);
+  }
+});
+
+test("only marked mirror notes expose recovery tails; arbitrary JSON fields and incomplete tails remain private", async t => {
+  const exchange = await fixture(t);
+  const tail = (errorResult("TASK_MAILBOX_CHANGED").content as Array<{ text: string }>)[0].text;
+  const key = "_quaymesh_text_notes", marker = { "quaymesh/structured-text": key };
+  const cases: Array<{ value: Fields; meta?: Fields; structured?: Fields }> = [
+    { value: { [key]: [tail] } },
+    { value: { [key]: [tail] }, meta: { "quaymesh/structured-text-near-match": key } },
+    { value: { result: [tail] }, meta: { "quaymesh/structured-text": "result" } },
+    { value: { [key]: [tail] }, meta: marker, structured: { [key]: [tail] } },
+    { value: { [key]: tail }, meta: marker },
+    { value: { [key]: [tail, { body: secrets.body }] }, meta: marker },
+    { value: { result: { [key]: [tail] } }, meta: marker },
+    { value: { [key]: [tail + "\nnot a recovery tail"] }, meta: marker },
+    { value: { [key]: [tail.slice(0, -1)] }, meta: marker },
+  ];
+  for (const [index, item] of cases.entries()) {
+    const row = finished(await exchange(callBody("read"), { format: index % 2 ? "sse" : "json", result: {
+      isError: true, structuredContent: { error_code: "TASK_MAILBOX_CHANGED", ...item.structured },
+      content: [{ type: "text", text: JSON.stringify(item.value), ...(item.meta ? { _meta: item.meta } : {}) }],
+    } }));
+    assert.equal(row.toolErrorCode, "TASK_MAILBOX_CHANGED");
+    assert.equal(row.recoveryTextErrorCode, undefined, `case ${index}`);
+    assert.equal(row.errorCodeConsistent, undefined, `case ${index}`);
+  }
 });
 
 test("the 64 KiB inspection boundary keeps full wire hashes and never logs oversized message bodies", async t => {

@@ -146,19 +146,28 @@ export function traceMcpRequest(req: Request, res: Response, requestId: string, 
           // Report only presence of receipt layers; values/errors may be private.
           for (const block of content) {
             if (block?.type !== "text" || typeof block.text !== "string") continue;
-            const recoveryCode = recoverySuffix.exec(block.text)?.[1];
-            if (recoveryCode) {
-              result.recoveryTextErrorCode = known(recoveryCode, errorCodes);
-              if (typeof structured.error_code === "string") result.errorCodeConsistent = result.errorCodeConsistent !== false
-                && recoveryCode === structured.error_code;
-            }
+            const recoveryTexts = [block.text];
             try {
               const value = object(JSON.parse(block.text));
+              // Only our text mirror's dedicated notes carry legacy recovery tails. Never scan file/result JSON.
+              const notesKey = object(block._meta)["quaymesh/structured-text"];
+              if (typeof notesKey === "string" && /^_quaymesh_text_notes(?:_(?:[2-9]|[1-9][0-9]+))?$/u.test(notesKey)
+                && !Object.hasOwn(structured, notesKey)) {
+                const notes = value[notesKey];
+                if (Array.isArray(notes) && notes.every(note => typeof note === "string")) recoveryTexts.push(...notes);
+              }
               result.operationId = identity(value.operation_id ?? value.operationId, "op") ?? result.operationId;
               result.receiptPresent = result.receiptPresent === true || "completionReceipt" in value || "completionSnapshot" in value || "receipt" in value || "workRunId" in value || "work_run_id" in value;
               if (result.toolErrorCode === undefined && typeof value.code === "string") result.toolErrorCode = known(value.code, errorCodes);
               if (typeof value.message === "string" && payload.isError === true) result.errorFingerprint = createHash("sha256").update(value.message).digest("hex").slice(0, 16);
             } catch { /* Non-JSON text is never returned to logs. */ }
+            for (const text of recoveryTexts) {
+              const recoveryCode = recoverySuffix.exec(text)?.[1];
+              if (!recoveryCode) continue;
+              result.recoveryTextErrorCode = known(recoveryCode, errorCodes);
+              if (typeof structured.error_code === "string") result.errorCodeConsistent = result.errorCodeConsistent !== false
+                && recoveryCode === structured.error_code;
+            }
           }
         } catch { /* No raw malformed response in diagnostics. */ }
       }

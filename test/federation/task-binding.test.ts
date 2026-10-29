@@ -256,7 +256,12 @@ test("real peer wire: remote workspace paths stay opaque to the Coordinator with
     assert.equal(body.node_id, workerId);
     assert.equal(body.root, remoteAlias, "the remote reply is metadata, not a Coordinator filesystem path");
     const firstText = (result.content as Array<{ type: string; text?: string }>).find(block => block.type === "text");
-    assert.deepEqual(JSON.parse(firstText!.text!), structured(result), "text-only clients receive the same remote identity");
+    const { _quaymesh_text_notes: notes, ...textIdentity } = JSON.parse(firstText!.text!);
+    assert.deepEqual(textIdentity, structured(result), "text-only clients receive the same remote identity");
+    const card = (result._meta as { card?: { workspaceReused?: boolean } } | undefined)?.card;
+    assert.deepEqual(notes, [name === "open_workspace"
+      ? card?.workspaceReused ? "Workspace reused." : "Workspace opened."
+      : "Workspace attached."]);
     assert.deepEqual(f.store.taskMemberIds(f.started.task_id), [memberId]);
     assert.equal(f.store.getMember(f.started.session_id, memberId).root, originalMember.root,
       "an open reply's logical alias must not replace the owner's known canonical member root");

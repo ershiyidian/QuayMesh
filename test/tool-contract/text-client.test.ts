@@ -11,18 +11,20 @@ import { twoNodes } from "./fixture.js";
 interface TextEnvelope { content?: unknown; isError?: boolean }
 type Body = Record<string, unknown>;
 
-// 模拟只保留 content[].text 的宿主；后续操作从不读取 structuredContent。
+// 三类宿主均丢弃 structuredContent：仅取首段、仅取末段、合并文本。
 function textBody(reply: TextEnvelope): Body {
   assert.ok(Array.isArray(reply.content), JSON.stringify(reply));
-  for (const item of reply.content) {
-    if (!item || typeof item !== "object") continue;
-    const block = item as Record<string, unknown>;
-    if (block.type !== "text" || typeof block.text !== "string") continue;
-    let value: unknown;
-    try { value = JSON.parse(block.text); } catch { continue; }
-    if (value && typeof value === "object" && !Array.isArray(value)) return value as Body;
+  const texts = reply.content.flatMap((item: unknown) => {
+    const block = item && typeof item === "object" ? item as Record<string, unknown> : undefined;
+    return block?.type === "text" && typeof block.text === "string" ? [block.text] : [];
+  });
+  assert.equal(texts.length, 1, `Every text-only host must receive the complete receipt: ${JSON.stringify(reply.content)}`);
+  const observations = [texts[0]!, texts.at(-1)!, texts.join("\n")].map(text => JSON.parse(text) as unknown);
+  for (const value of observations) {
+    assert.ok(value && typeof value === "object" && !Array.isArray(value));
+    assert.deepEqual(value, observations[0]);
   }
-  assert.fail(`Missing JSON text result: ${JSON.stringify(reply.content)}`);
+  return observations[0] as Body;
 }
 
 for (const federated of [false, true]) {
@@ -45,6 +47,9 @@ for (const federated of [false, true]) {
     const task = await call("start_session", start);
     assert.equal(typeof task.task_id, "string");
     assert.equal((await call("start_session", start)).task_id, task.task_id);
+    const inspected = await call("task_resume", { action: "inspect", task_id: task.task_id });
+    assert.equal(inspected.task_id, task.task_id);
+    assert.equal((inspected.binding as Body).entry_available, false);
     let rootId: string | undefined;
     if (pair) {
       const catalog = await call("workspace_catalog", {});

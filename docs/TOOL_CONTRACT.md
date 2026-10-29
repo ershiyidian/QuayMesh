@@ -15,7 +15,7 @@ The connected node advertises its available tools and their parameter schemas. U
 
 ## Returned results
 
-Tools expose their structured result in both `structuredContent` and a JSON text block in `content`. Clients that only read text receive the same workspace IDs, operation IDs, status fields, errors, and continuation cursors. Additional explanations and image or resource blocks remain available. UI metadata stays in `_meta`.
+Tools expose their structured result in both `structuredContent` and exactly one JSON text block in `content`. Clients that keep the first text block, the last text block, or all text receive the same workspace IDs, operation IDs, status fields, errors, and continuation cursors. Unique explanations are preserved in the text JSON's `_quaymesh_text_notes` array (a numbered suffix avoids collisions with existing result fields). This text-only field does not change the declared structured output schema. Image and resource blocks remain intact; UI metadata stays in `_meta`.
 
 Use the returned `workspace_id` for workspace operations. An exported `root_id`, such as `worker/main`, selects a root when opening or attaching a workspace. The opened handle includes its worker route and must be reused unchanged.
 

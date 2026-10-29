@@ -73,7 +73,9 @@ test("二十个小文件实际一次返回，文本镜像与结构化正文一�
   assert.ok(Buffer.byteLength(JSON.stringify(response))<REPLY_BYTES);
   const mirror=response.content[0];
   assert.ok(mirror?.type==="text");
-  assert.deepEqual(JSON.parse(mirror.text),result);
+  const {_quaymesh_text_notes:notes,...textResult}=JSON.parse(mirror.text);
+  assert.deepEqual(textResult,result);
+  assert.deepEqual(notes,[`已返回 ${result.entries.length} 项；详细内容见结构化结果。`]);
   assert.equal(response.content.filter(item=>item.type==="text"&&item.text.includes("export const value")).length,1);
 });
 
