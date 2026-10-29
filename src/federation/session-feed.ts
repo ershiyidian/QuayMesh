@@ -12,7 +12,6 @@ import type { PeerLink } from "./transport.js";
 import type { JsonRecord } from "./types.js";
 import { parseWorkspaceHandle } from "./routing.js";
 import { assertTaskBindingEnvelope, type SessionFeedRequest, type SessionFeedUpdate, type TrustedInvocationEnvelope } from "./session-types.js";
-import { canonicalWorkspaceRoot } from "../roots.js";
 import { isReadOnlyObservation } from "../tool-admission.js";
 import { jsonReply } from "../bounded-reply.js";
 import { errorCode } from "../session/outcome.js";
@@ -359,8 +358,7 @@ export class SessionFeed {
     const existingMember = this.store.findMember(sessionId, memberId);
     if (handle && handle.node !== nodeId || envelope.member_id && envelope.member_id !== memberId
       || envelope.workspace_id && localWorkspaceId !== (expected?.local ?? envelope.workspace_id)
-      || existingMember && (existingMember.node_id !== nodeId || existingMember.workspace_id !== localWorkspaceId
-        || canonicalWorkspaceRoot(existingMember.root) !== canonicalWorkspaceRoot(root))) {
+      || existingMember && (existingMember.node_id !== nodeId || existingMember.workspace_id !== localWorkspaceId)) {
       throw mismatch("The Worker returned a different workspace member.");
     }
     this.store.adoptRemoteSession({
@@ -377,7 +375,10 @@ export class SessionFeed {
       sessionId,
       nodeId,
       workspaceId: localWorkspaceId,
-      root,
+      // Remote paths belong to the Worker's filesystem. Keep the owner's known
+      // canonical metadata until its feed refreshes it; an open reply can carry
+      // a logical alias which the Coordinator cannot resolve on its own host.
+      root: existingMember?.root ?? root,
       sourceRoot: typeof structured.source_root === "string" ? structured.source_root : null,
       mode,
       online: true,

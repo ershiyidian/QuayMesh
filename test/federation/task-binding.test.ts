@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -219,6 +219,78 @@ test("real peer wire: delayed and conflicting open results preserve accepted Tas
     assert.equal(f.store.findTask("wrong-task-from-worker"), null);
     assert.equal((f.db.sqlite.prepare("SELECT COUNT(*) AS n FROM qm_sessions WHERE id='wrong-session-from-worker'").get() as { n: number }).n, 0);
   } finally { release(); await pending.catch(() => {}); }
+});
+
+test("real peer wire: remote workspace paths stay opaque to the Coordinator without weakening captured identity", { timeout: 60_000 }, async t => {
+  const f = await fixture(t), transport = f.worker.running.federation!.transport;
+  const originalHandler = transport.handler;
+  const memberId = f.store.taskMemberIds(f.started.task_id)[0]!;
+  const originalMember = f.store.getMember(f.started.session_id, memberId);
+  // These tests normally share one filesystem. Supply an owner-side logical
+  // alias which really cannot be resolved here, as on two different machines.
+  const remoteAlias = join(f.worker.root, "remote-filesystem-only", "project-alias");
+  assert.throws(() => realpathSync(remoteAlias), { code: "ENOENT" });
+  let corrupt: Record<string, unknown> = {};
+  const controlled: typeof transport.handler = async (method, params, peer, context) => {
+    const result = await originalHandler(method, params, peer, context);
+    if (method !== "tool" || !["open_workspace", "attach_workspace"].includes(params.name)) return result;
+    const reply = result as Record<string, unknown>;
+    assert.notEqual(reply.isError, true, JSON.stringify(reply));
+    return { ...reply, structuredContent: { ...(reply.structuredContent as Record<string, unknown>),
+      root: remoteAlias, ...corrupt } };
+  };
+  Reflect.set(transport, "handler", controlled);
+  t.after(() => { Reflect.set(transport, "handler", originalHandler); });
+
+  for (const [name, args] of [
+    ["open_workspace", { root_id: `${workerId}/main` }],
+    ["open_workspace", { root_id: `${workerId}/main`, mode: "checkout" }],
+    ["attach_workspace", { session_id: f.started.session_id, root_id: `${workerId}/main` }],
+    ["attach_workspace", { session_id: f.started.session_id, workspace_id: f.opened.workspace_id }],
+  ] as const) {
+    const result = await f.call("replacement", name, args);
+    const body = value<OpenReply & { root: string; node_id: string }>(result);
+    assert.equal(body.workspace_id, f.opened.workspace_id);
+    assert.equal(body.session_id, f.started.session_id);
+    assert.equal(body.task_id, f.started.task_id);
+    assert.equal(body.node_id, workerId);
+    assert.equal(body.root, remoteAlias, "the remote reply is metadata, not a Coordinator filesystem path");
+    const firstText = (result.content as Array<{ type: string; text?: string }>).find(block => block.type === "text");
+    assert.deepEqual(JSON.parse(firstText!.text!), structured(result), "text-only clients receive the same remote identity");
+    assert.deepEqual(f.store.taskMemberIds(f.started.task_id), [memberId]);
+    assert.equal(f.store.getMember(f.started.session_id, memberId).root, originalMember.root,
+      "an open reply's logical alias must not replace the owner's known canonical member root");
+  }
+
+  const membersBefore = f.store.getSession(f.started.session_id).members.map(member =>
+    ({ id: member.id, node: member.node_id, workspace: member.workspace_id, root: member.root }));
+  const counts = () => f.db.sqlite.prepare(`SELECT
+    (SELECT COUNT(*) FROM qm_sessions) AS sessions,
+    (SELECT COUNT(*) FROM qm_tasks) AS tasks,
+    (SELECT COUNT(*) FROM qm_session_members) AS members`).get();
+  const countsBefore = counts();
+  for (const changedIdentity of [
+    { member_id: "different-member" },
+    { workspace_id: "different-workspace" },
+    { workspace_id: "qm:different-node:different-workspace" },
+    { node_id: "different-node" },
+    { task_id: "different-task" },
+    { session_id: "different-session" },
+  ]) {
+    corrupt = changedIdentity;
+    const result = await f.call("replacement", "attach_workspace", {
+      session_id: f.started.session_id, workspace_id: f.opened.workspace_id,
+    });
+    assert.equal(result.isError, true, JSON.stringify(result));
+    assert.equal(structured(result).error_code, "TASK_REMOTE_SCOPE_MISMATCH");
+    assert.equal(structured(result).effect, "unknown");
+    assert.equal(structured(result).retry_hint, "query_original");
+    assert.deepEqual(counts(), countsBefore, "a mismatched receipt must not adopt any session, Task, or member");
+    assert.deepEqual(f.store.taskMemberIds(f.started.task_id), [memberId]);
+    assert.deepEqual(f.store.getSession(f.started.session_id).members.map(member =>
+      ({ id: member.id, node: member.node_id, workspace: member.workspace_id, root: member.root })), membersBefore);
+  }
+  assert.throws(() => realpathSync(remoteAlias), { code: "ENOENT" }, "no Coordinator path is created as a workaround");
 });
 
 test("real peer wire: malformed binding envelopes are rejected before effects; an explicit null canonical correlation remains valid", { timeout: 60_000 }, async t => {

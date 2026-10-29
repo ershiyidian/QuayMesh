@@ -49,6 +49,27 @@ pnpm build:bundle
 
 The output directory is `releases/quaymesh-<version>-<commit>-<platform>/`. It contains `release.json`, the runtime, application files, production dependencies, and component sources.
 
+### Linux SQLite compatibility builds
+
+To support an older glibc baseline, compile the pinned SQLite package on that Linux baseline using matching Node headers and an existing node-gyp installation. GNU binutils `readelf` must be available on `PATH` both when compiling and when consuming a receipt; a private tools directory can provide it. The helper makes a private source copy, keeps its temporary files and caches in the chosen work directory, and records compiler, header, dependency, runtime, and binary fingerprints. It downloads no tools or headers. Choose a new work directory outside the Git checkout with sufficient free space.
+
+```bash
+node scripts/build-sqlite-native.mjs \
+  --work-dir /data/quaymesh-native-build \
+  --node-gyp /opt/node-gyp/bin/node-gyp.js \
+  --node-headers /opt/node-headers/24.21.0 \
+  --python /usr/bin/python3 --cc /usr/bin/gcc --cxx /usr/bin/g++ \
+  --max-glibc 2.31
+
+pnpm build:bundle --sqlite-native-receipt /data/quaymesh-native-build/build-receipt.json
+```
+
+The source build uses SQLite's `--force_build=1`, checks ELF requirements, and verifies the default loader through 500 native close/garbage-collection cycles. Its receipt and relative artifact path can be transferred together to another Linux build host. The bundle consumer requires identical Node bytes, dependency lock, and SQLite/node-addon-api sources, copies the verified artifact into a new private inode, and performs the usual full bundle and schema validation before archiving. `release.json` records the actual native SHA and the included `sqlite-native-build.json` receipt SHA. If the artifact was archived separately, also pass `--sqlite-native-artifact /path/linux-x64.node`; its recorded hash remains mandatory.
+
+If the compiler embeds a private RPATH or RUNPATH, add `--patchelf /usr/bin/patchelf`. This removes that path from a new copy while preserving the compiler output, records the tool and before/after hashes, and requires unchanged dynamic dependencies. Verification then loads the copy with `LD_LIBRARY_PATH` cleared; a missing system C++ runtime still fails the build.
+
+If the compiler's C++ runtime is newer than the target system's, add `--static-cxx-runtime`. The build records `-static-libstdc++ -static-libgcc`, rejects artifacts that still require shared `libstdc++` or `libgcc_s`, and performs the same clean-environment loading and GC checks. No system libraries are replaced.
+
 ## Check a change
 
 Run the checks relevant to the modified code:

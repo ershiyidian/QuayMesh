@@ -6,8 +6,13 @@ import { platformName } from "../node/compile.mjs";
 import { parse, stringify } from "yaml";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
+import { parseArgs } from "node:util";
+import { installSqliteNativeReceipt } from "./build-sqlite-native.mjs";
 
 const root=fileURLToPath(new URL("..",import.meta.url));
+const {values:options}=parseArgs({args:process.argv.slice(2).filter((value,index)=>index!==0||value!=="--"),
+  options:{"sqlite-native-receipt":{type:"string"},"sqlite-native-artifact":{type:"string"}}});
+if(options["sqlite-native-artifact"]&&!options["sqlite-native-receipt"])throw new Error("--sqlite-native-artifact requires --sqlite-native-receipt");
 const pkg=JSON.parse(await readFile(join(root,"package.json"),"utf8"));
 const label=platformName();
 if (!["linux-x64","linux-arm64","windows-x64"].includes(label)) throw new Error(`不支持的发行平台：${label}`);
@@ -83,6 +88,9 @@ const workspace=parse(await readFile(workspaceFile,"utf8"));
 workspace.nodeLinker="hoisted";
 await writeFile(workspaceFile,stringify(workspace),"utf8");
 await runPnpm(["install","--prod","--frozen-lockfile"],output);
+const sqliteSourceBuild=options["sqlite-native-receipt"]
+  ? await installSqliteNativeReceipt(output,resolve(options["sqlite-native-receipt"]),{artifactFile:options["sqlite-native-artifact"]})
+  : undefined;
 // 只记录发行目录实际装载的二进制，避免源码安装与 hoisted 发行布局混淆。
 const bundleRequire=createRequire(join(output,"package.json"));
 const BundleDatabase=bundleRequire("better-sqlite3");
@@ -99,7 +107,8 @@ loadedNative(bundleRequire.cache[bundleRequire.resolve("better-sqlite3")]);
 if(nativePaths.size!==1)throw new Error("无法唯一确认发行实际加载的 SQLite 原生模块");
 const hash=async path=>createHash("sha256").update(await readFile(path)).digest("hex");
 const runtime={nodeSha256:await hash(join(output,"runtime",exe("node"))),packageLockSha256:await hash(join(output,"pnpm-lock.yaml"))};
-const nativeDependencies={"better-sqlite3":{version:bundleRequire("better-sqlite3/package.json").version,sha256:await hash([...nativePaths][0])}};
+const nativeDependencies={"better-sqlite3":{version:bundleRequire("better-sqlite3/package.json").version,sha256:await hash([...nativePaths][0]),
+  ...(sqliteSourceBuild?{sourceBuild:sqliteSourceBuild}:{})}};
 const payloadEntries=(await readdir(output)).filter(name=>name!=="release.json"&&name!==".git").sort();
 await writeFile(join(output,"release.json"),JSON.stringify({...release,runtime,nativeDependencies,payloadEntries},null,2)+"\n");
 await run(join(output,"runtime",exe("node")),[join(output,"node","verify-installed.mjs")],output);
