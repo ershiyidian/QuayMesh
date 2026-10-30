@@ -68,7 +68,7 @@ export class TaskDataStore {
 
   pendingFinalizations(limit = 4, after?: Pick<TaskFinalization, "requested_at" | "task_id">): TaskFinalization[] {
     const read = (cursor?: typeof after) => this.db.prepare(`select f.* from qm_task_finalizations f join qm_tasks t on t.id=f.task_id
-      where (t.state='active' OR f.completed_at IS NULL)
+      where (t.state='active' OR (f.completed_at IS NULL AND t.closure_reason IS NOT 'superseded'))
       and f.status!='handed_off' AND (f.recovery_state IS NULL OR f.recovery_state!='superseded')
       and f.mailbox_sequence=(SELECT COALESCE(MAX(m.sequence),0) FROM qm_task_messages m WHERE m.task_id=t.id)
       and NOT EXISTS(SELECT 1 FROM qm_task_messages m WHERE m.task_id=t.id AND m.role='user' AND m.acknowledged_at IS NULL)
@@ -245,10 +245,17 @@ export class TaskDataStore {
     summary: string,
     expectedRevision?: number,
     mailboxSequence = 0,
-    options: { expectedFinalizationRevision?: number; delegated?: boolean } = {}
+    options: { expectedFinalizationRevision?: number; delegated?: boolean; automaticRetry?: boolean } = {}
   ): TaskFinalization {
     assertTaskCompletionStatus(status);
     return this.db.transaction(() => {
+      // A selected retry may have waited for another writer to supersede the Task.
+      // Explicit recovery of other archived Tasks keeps its existing retry path.
+      if (options.automaticRetry) {
+        const task = this.db.prepare("SELECT state,closure_reason FROM qm_tasks WHERE id=?").get(taskId) as { state: string; closure_reason: string | null } | undefined;
+        if (!task || task.state === "closed" && task.closure_reason === "superseded") throw Object.assign(new Error(`TASK_NOT_ACTIVE: ${taskId}`),
+          { code: "TASK_NOT_ACTIVE", effect: "not_started" });
+      }
       const existing = this.finalization(taskId);
       if (options.expectedFinalizationRevision !== undefined && (
         !existing

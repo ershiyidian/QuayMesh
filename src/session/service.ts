@@ -111,8 +111,8 @@ export class SessionService {
         if(this.localBackground(task.id).length||this.store.taskData.activeWork(task.id))continue;
         const owner=this.store.getSession(task.session_id).owner_id;
         const flight=task.source_kind==="federation_mirror"
-          ? this.finishOwnedTask(owner,task.id,intent.status,intent.summary,intent.finalization_revision)
-          : this.finishTask(owner,task.id,intent.status,intent.summary,undefined,intent.mailbox_sequence,intent.finalization_revision);
+          ? this.finishOwnedTask(owner,task.id,intent.status,intent.summary,intent.finalization_revision,{automaticRetry:true})
+          : this.finishTask(owner,task.id,intent.status,intent.summary,undefined,intent.mailbox_sequence,intent.finalization_revision,{automaticRetry:true});
         observed.push(flight.catch(error=>{
           // finishTask 已保存精确失败信息，下一轮仅接续原意图，不重执行操作。
           console.error("QuayMesh 任务收尾仍待处理",task.id,error instanceof Error?error.message:String(error));
@@ -301,12 +301,13 @@ export class SessionService {
   }
 
   async finishTask(ownerId: string, taskId: string, status: TaskFinalStatus, summary: string,
-    expectedTaskRevision?: number, messageSequence = 0, expectedFinalizationRevision?: number): Promise<TaskRecord> {
+    expectedTaskRevision?: number, messageSequence = 0, expectedFinalizationRevision?: number,
+    options: {automaticRetry?: boolean} = {}): Promise<TaskRecord> {
     const task = this.store.getTask(taskId);
     this.store.requireSession(ownerId,task.session_id);
     assertTaskCompletionStatus(status);
     return this.runFinalization(this.finalizing,taskId,status,summary,
-      ready=>this.completeTask(ownerId,taskId,status,summary,expectedTaskRevision,ready,messageSequence,expectedFinalizationRevision),messageSequence);
+      ready=>this.completeTask(ownerId,taskId,status,summary,expectedTaskRevision,ready,messageSequence,expectedFinalizationRevision,options),messageSequence);
   }
 
   private runFinalization<T>(
@@ -390,7 +391,8 @@ export class SessionService {
     expectedTaskRevision?: number,
     ready?: (revision: number) => void,
     messageSequence = 0,
-    expectedFinalizationRevision?: number
+    expectedFinalizationRevision?: number,
+    options: {automaticRetry?: boolean} = {}
   ): Promise<TaskRecord> {
     const task=this.store.getTask(taskId);
     this.store.requireSession(ownerId,task.session_id);
@@ -405,7 +407,7 @@ export class SessionService {
       summary,
       expectedTaskRevision,
       messageSequence,
-      { expectedFinalizationRevision }
+      { expectedFinalizationRevision, automaticRetry: options.automaticRetry }
     ));
     ready?.(intent.finalization_revision);
     try {
@@ -460,7 +462,7 @@ export class SessionService {
   }
 
   async finishOwnedTask(ownerId: string, taskId: string, status: TaskFinalStatus, summary: string,
-    expectedFinalizationRevision?: number): Promise<TaskOwnerReceipt> {
+    expectedFinalizationRevision?: number, options: {automaticRetry?: boolean} = {}): Promise<TaskOwnerReceipt> {
     this.store.requireSession(ownerId,this.store.getTask(taskId).session_id);
     assertTaskCompletionStatus(status);
     return this.runFinalization(this.finalizingLocal,taskId,status,summary,async ready=>{
@@ -476,7 +478,7 @@ export class SessionService {
           summary,
           undefined,
           0,
-          { expectedFinalizationRevision, delegated: true }
+          { expectedFinalizationRevision, delegated: true, automaticRetry: options.automaticRetry }
         ));
         ready(intent.finalization_revision);
         try {

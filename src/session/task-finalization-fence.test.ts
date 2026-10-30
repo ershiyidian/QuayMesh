@@ -3,6 +3,7 @@ import { appendFile, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
 import { WorkLedger } from "../work-ledger.js";
 import { ExecutionCoordinator } from "../execution-coordinator.js";
@@ -13,6 +14,7 @@ import { SessionProjector } from "./projection.js";
 import { createInvocationContext, executeRecorded } from "./invocations.js";
 import { SessionStore } from "./store.js";
 import { admitTaskWorkInTransaction, FinalizationDispatchError } from "./task-finalization.js";
+import { ReviewState } from "./types.js";
 
 const entry=(id:string)=>taskExecutionEntryFromAuthInfo({clientId:"client",extra:{owner_id:"owner"}},id);
 async function fixture(t:TestContext) {
@@ -174,3 +176,142 @@ test("retired finish disappears from current Task notices; uncertain failed fini
   assert.equal(uncertain.finalization?.state,"failed");assert.equal(uncertain.capabilities.continue,false);
   assert.equal(uncertain.notices.some(value=>value.includes("任务结束尚未确认")),true);
 });
+
+type Fixture = Awaited<ReturnType<typeof fixture>>;
+
+function retryTask(f: Fixture, source: "user_request" | "federation_mirror") {
+  const task = source === "user_request" ? f.task
+    : f.store.adoptRemoteTask(f.session.id, `${f.task.id}_mirror`, "Mirrored goal");
+  f.store.touchTaskMember(task.id, f.member.id);
+  assert.equal(task.source_kind, source);
+  return task;
+}
+
+function savedFinalization(db: Database.Database, taskId: string) {
+  return {
+    task: db.prepare("SELECT * FROM qm_tasks WHERE id=?").get(taskId),
+    intent: db.prepare("SELECT * FROM qm_task_finalizations WHERE task_id=?").get(taskId),
+    events: db.prepare("SELECT * FROM qm_events WHERE task_id=? ORDER BY sequence").all(taskId),
+  };
+}
+
+async function rejectFinalizerEffects(t: TestContext, f: Fixture, taskId: string) {
+  const remoteRoot = join(f.directory, "remote");
+  await mkdir(remoteRoot);
+  const remote = f.store.addMember(f.session.id, "remote", "remote-workspace", remoteRoot, "checkout", null);
+  f.store.touchTaskMember(taskId, remote.id);
+  const capture = t.mock.method(f.service as unknown as {captureTask: () => Promise<void>}, "captureTask", async () => {
+    throw new Error("an ineligible automatic retry must not capture the Task");
+  });
+  let dispatches = 0;
+  f.service.setRemoteFinalizer(async () => {
+    dispatches++;
+    throw new Error("an ineligible automatic retry must not dispatch to an owner");
+  });
+  return () => {
+    assert.equal(capture.mock.callCount(), 0);
+    assert.equal(dispatches, 0);
+  };
+}
+
+for (const source of ["user_request", "federation_mirror"] as const) {
+  test(`${source}: repeated automatic retries leave a superseded Task and its pending error unchanged`, async t => {
+    const f = await fixture(t), task = retryTask(f, source);
+    const noEffects = await rejectFinalizerEffects(t, f, task.id);
+    const runId = await f.service.ensureRun(f.session, f.member, {kind: "read", label: "retained history"}, task.id);
+    await f.store.setReviewStateAsync(f.session.id, ReviewState.needs_review, task.id);
+    const intent = await f.store.writeAsync(() => f.store.taskData.requestFinalization(task.id, "completed", "original finish"));
+    await f.store.writeAsync(() => f.store.taskData.finishFinalization(task.id, "retained owner failure", intent.finalization_revision));
+    f.store.archiveTask(task.id, "superseded");
+    const before = savedFinalization(f.ledger.db, task.id), run = f.ledger.run(runId);
+    assert.equal(f.store.getTask(task.id).result_status, null);
+    assert.equal(f.store.taskData.finalization(task.id)!.completed_at, null);
+    assert.equal(f.store.taskData.finalization(task.id)!.error, "retained owner failure");
+    assert.ok(f.store.eventsForTask(task.id).length > 0, "retain actual persisted run/review history");
+    for (let round = 0; round < 2; round++) {
+      assert.equal(f.store.taskData.pendingFinalizations().some(value => value.task_id === task.id), false);
+      await f.service.retryFinalizations();
+      assert.deepEqual(savedFinalization(f.ledger.db, task.id), before);
+      assert.deepEqual(f.ledger.run(runId), run);
+      noEffects();
+    }
+  });
+
+  test(`${source}: a selected retry rechecks supersession after a real second SQLite writer releases its lock`, async t => {
+    const f = await fixture(t), task = retryTask(f, source);
+    const noEffects = await rejectFinalizerEffects(t, f, task.id);
+    await f.service.ensureRun(f.session, f.member, {kind: "read", label: "before archive"}, task.id);
+    const intent = await f.store.writeAsync(() => f.store.taskData.requestFinalization(task.id, "completed", "original finish"));
+    await f.store.writeAsync(() => f.store.taskData.finishFinalization(task.id, "original error", intent.finalization_revision));
+    const selected: string[][] = [], pending = f.store.taskData.pendingFinalizations.bind(f.store.taskData);
+    t.mock.method(f.store.taskData, "pendingFinalizations", (...args: Parameters<typeof pending>) => {
+      const batch = pending(...args); selected.push(batch.map(value => value.task_id)); return batch;
+    });
+    const errors: unknown[] = [], attempts: Array<{automatic: boolean; state: string}> = [];
+    const request = f.store.taskData.requestFinalization.bind(f.store.taskData);
+    t.mock.method(f.store.taskData, "requestFinalization", (...args: Parameters<typeof request>) => {
+      attempts.push({automatic: args[5]?.automaticRetry === true, state: f.store.getTask(args[0]).state});
+      try {return request(...args);} catch (error) {errors.push(error); throw error;}
+    });
+    const logged: unknown[][] = [];
+    t.mock.method(console, "error", (...args: unknown[]) => {logged.push(args);});
+    f.otherDb.exec("BEGIN IMMEDIATE");
+    const retry = f.service.retryFinalizations();
+    try {
+      assert.deepEqual(selected, [[task.id]], "the timer selected the still-active Task before waiting");
+      await delay(30);
+      assert.deepEqual(attempts, [], "the actual SQLite writer prevents the mutation callback from running");
+      assert.equal(f.store.getTask(task.id).state, "active");
+      f.other.archiveTask(task.id, "superseded");
+      const archived = savedFinalization(f.otherDb, task.id);
+      f.otherDb.exec("COMMIT");
+      await retry;
+      assert.deepEqual(attempts, [{automatic: true, state: "closed"}]);
+      assert.equal(errors.length, 1);
+      assert.equal((errors[0] as {code?: unknown}).code, "TASK_NOT_ACTIVE");
+      assert.equal((errors[0] as {effect?: unknown}).effect, "not_started");
+      assert.deepEqual(savedFinalization(f.ledger.db, task.id), archived, "no intent, error, Task revision or event changes after the lock");
+      assert.equal(logged.length, 1);
+      assert.match(String(logged[0]![2]), /TASK_NOT_ACTIVE/);
+      noEffects();
+      await f.service.retryFinalizations();
+      assert.deepEqual(savedFinalization(f.ledger.db, task.id), archived);
+      assert.equal(attempts.length, 1);
+      assert.equal(logged.length, 1, "a superseded historical Task is not retried again");
+      noEffects();
+    } finally {
+      if (f.otherDb.inTransaction) f.otherDb.exec("ROLLBACK");
+      await retry;
+    }
+  });
+
+  for (const completed of [false, true]) test(`${source}: an active ${completed ? "legacy confirmed" : "pending"} finish still closes under its captured fence`, async t => {
+    const f = await fixture(t), task = retryTask(f, source);
+    const runId = await f.service.ensureRun(f.session, f.member, {kind: "read", label: "finish eligible work"}, task.id);
+    const intent = await f.store.writeAsync(() => f.store.taskData.requestFinalization(task.id, "completed", "original finish"));
+    await f.store.writeAsync(() => {
+      f.store.taskData.finishFinalization(task.id, completed ? undefined : "retryable original failure", intent.finalization_revision);
+      if (completed) f.ledger.db.prepare("UPDATE qm_task_finalizations SET finalization_revision=0,recovery_state=NULL WHERE task_id=?").run(task.id);
+    });
+    const previous = f.store.taskData.finalization(task.id)!;
+    assert.equal(f.store.getTask(task.id).state, "active");
+    assert.equal(Boolean(previous.completed_at), completed);
+    assert.equal(f.store.taskData.pendingFinalizations().some(value => value.task_id === task.id), true);
+    await f.service.retryFinalizations();
+    const closed = f.store.getTask(task.id), confirmed = f.store.taskData.finalization(task.id)!;
+    assert.equal(closed.state, "closed");
+    assert.equal(closed.result_status, "completed");
+    assert.equal(closed.summary, "original finish");
+    assert.equal(f.ledger.run(runId).status, "completed");
+    assert.ok(confirmed.completed_at);
+    assert.equal(confirmed.error, null);
+    assert.equal(confirmed.finalization_revision, previous.finalization_revision + 1);
+    assert.equal(confirmed.recovery_state, "reconcile");
+    const before = savedFinalization(f.ledger.db, task.id), run = f.ledger.run(runId);
+    for (let round = 0; round < 2; round++) {
+      await f.service.retryFinalizations();
+      assert.deepEqual(savedFinalization(f.ledger.db, task.id), before);
+      assert.deepEqual(f.ledger.run(runId), run);
+    }
+  });
+}
