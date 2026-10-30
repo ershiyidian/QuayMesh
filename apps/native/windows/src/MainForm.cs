@@ -31,8 +31,11 @@ namespace QuayMeshApp
         private WebView2 webView;
         private Task connecting;
         private bool permitExit;
+        private bool resourcesDisposed;
         private bool recreate;
         private bool navigationSucceeded;
+        private bool reconnectPending = true;
+        private bool viewPaused;
         private int attempts;
         private int processFailures;
 
@@ -58,10 +61,19 @@ namespace QuayMeshApp
             Controls.Add(notice);
             Controls.Add(toolbar);
             HandleCreated += delegate { WindowTheme.Apply(this, lightTheme); };
-            retry.Tick += delegate { retry.Stop(); Reconnect(); };
+            retry.Tick += delegate { retry.Stop(); Reconnect(false); };
             FormClosing += OnClosing;
             Resize += async delegate { await UpdateVisibilityAsync(); };
-            Disposed += delegate { lifetime.Cancel(); retry.Dispose(); http.Dispose(); lifetime.Dispose(); };
+            Disposed += delegate
+            {
+                if (resourcesDisposed) return;
+                resourcesDisposed = true;
+                permitExit = true;
+                lifetime.Cancel();
+                retry.Dispose();
+                http.Dispose();
+                lifetime.Dispose();
+            };
         }
 
         public void ShowAndFocus()
@@ -71,8 +83,7 @@ namespace QuayMeshApp
             if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
             Activate();
             SetForegroundWindow(Handle);
-            if (webView != null && webView.CoreWebView2 != null && !recreate) webView.CoreWebView2.Resume();
-            if (!navigationSucceeded) Reconnect();
+            ResumeView(true);
         }
 
         public void ToggleVisibility()
@@ -81,10 +92,19 @@ namespace QuayMeshApp
             else ShowAndFocus();
         }
 
-        public async void Reconnect()
+        public void Reconnect()
+        {
+            Reconnect(true);
+        }
+
+        private async void Reconnect(bool manual)
         {
             if (permitExit || IsDisposed) return;
+            if (manual) { attempts = 0; processFailures = 0; }
+            reconnectPending = true;
+            if (!Visible || WindowState == FormWindowState.Minimized || processFailures >= 3) { retry.Stop(); return; }
             if (connecting != null) { await connecting; return; }
+            retry.Stop();
             connecting = ConnectAsync();
             try { await connecting; }
             finally { connecting = null; }
@@ -145,15 +165,19 @@ namespace QuayMeshApp
             webView.CoreWebView2.NavigationCompleted += delegate(object sender, CoreWebView2NavigationCompletedEventArgs e)
             {
                 if (permitExit) return;
-                if (e.IsSuccess)
+                if (e.IsSuccess && e.HttpStatusCode >= 200 && e.HttpStatusCode < 400)
                 {
                     navigationSucceeded = true;
+                    reconnectPending = false;
                     attempts = 0;
                     retry.Stop();
                     notice.Visible = false;
                     status.Text = "已连接控制台";
                 }
-                else ConnectionFailed("页面加载失败：" + e.WebErrorStatus);
+                else ConnectionFailed(e.HttpStatusCode >= 400
+                    ? "控制台返回 HTTP " + e.HttpStatusCode
+                    : "页面加载失败：" + e.WebErrorStatus,
+                    e.HttpStatusCode != 401 && e.HttpStatusCode != 403);
             };
             webView.CoreWebView2.ProcessFailed += delegate(object sender, CoreWebView2ProcessFailedEventArgs e)
             {
@@ -167,16 +191,18 @@ namespace QuayMeshApp
             navigationSucceeded = false;
         }
 
-        private void ConnectionFailed(string message)
+        private void ConnectionFailed(string message, bool retryConnection = true)
         {
+            reconnectPending = retryConnection;
+            retry.Stop();
             toolbar.Visible = true;
-            status.Text = "连接需要检查";
+            status.Text = processFailures >= 3 ? "网页组件需要手动刷新" : retryConnection ? "等待恢复连接" : "连接需要检查";
             ShowNotice(message);
             ClientLog.Write(message);
-            if (Visible && WindowState != FormWindowState.Minimized && attempts < 5 && processFailures < 3)
+            if (retryConnection && Visible && WindowState != FormWindowState.Minimized && processFailures < 3)
             {
                 retry.Interval = Math.Min(30000, 2000 * (1 << attempts));
-                attempts++;
+                attempts = Math.Min(attempts + 1, 4);
                 retry.Start();
             }
         }
@@ -190,12 +216,21 @@ namespace QuayMeshApp
         private async Task UpdateVisibilityAsync()
         {
             if (WindowState == FormWindowState.Minimized || !Visible) { PauseView(); return; }
-            if (webView != null && webView.CoreWebView2 != null && !recreate) webView.CoreWebView2.Resume();
+            ResumeView(false);
             await Task.CompletedTask;
+        }
+
+        private void ResumeView(bool checkConnection)
+        {
+            bool wasPaused = viewPaused;
+            viewPaused = false;
+            if (webView != null && webView.CoreWebView2 != null && !recreate) webView.CoreWebView2.Resume();
+            if ((wasPaused || checkConnection) && reconnectPending) Reconnect(false);
         }
 
         private async void PauseView()
         {
+            viewPaused = true;
             retry.Stop();
             if (webView == null || webView.CoreWebView2 == null || recreate) return;
             try
@@ -281,6 +316,7 @@ namespace QuayMeshApp
 
         public void ExitApplication()
         {
+            if (permitExit || IsDisposed) return;
             permitExit = true;
             retry.Stop();
             lifetime.Cancel();
