@@ -63,7 +63,7 @@ test("首次受理回执正常关闭后，真实跨节点写入继续归档结�
   }
 });
 
-test("取消普通读取仍传到真实远端，随后读取可以正常完成", { timeout: 25_000 }, async t => {
+test("普通读取的 HTTP 观察流取消会传到 Worker，随后读取可以正常完成", { timeout: 25_000 }, async t => {
   const { worker, cloud } = await twoNodes(t);
   const meta = { "openai/session": randomUUID() };
   await cloud.client.callTool({ name: "start_session", arguments: {
@@ -87,15 +87,32 @@ test("取消普通读取仍传到真实远端，随后读取可以正常完成",
   });
   try {
     const controller = new AbortController();
-    const request = cloud.client.callTool({ name: "read", arguments: {
-      workspace_id: opened.structuredContent!.workspace_id, path: "README.md",
-    }, _meta: meta }, undefined, { signal: controller.signal });
-    // Observe the rejection before aborting to avoid an unhandled promise.
-    const cancelled = assert.rejects(request);
+    // SDK 1.x signal sends a separate notifications/cancelled POST; a fresh
+    // stateless instance cannot find the original request. Cancel its actual
+    // HTTP observation stream here. Durable work retains the preceding contract.
+    const response = await fetch(new URL("/mcp", cloud.baseUrl), {
+      method: "POST",
+      headers: {
+        authorization: "Bearer " + cloud.accessToken,
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "mcp-protocol-version": "2025-11-25",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: randomUUID(), method: "tools/call", params: {
+        name: "read", arguments: { workspace_id: opened.structuredContent!.workspace_id, path: "README.md" }, _meta: meta,
+      } }),
+      signal: controller.signal,
+    });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") ?? "", /^text\/event-stream\b/);
+    // Observe the body rejection before aborting to avoid an unhandled promise.
+    const cancelled = assert.rejects(response.text());
     await entered;
+    const cancelledAt = performance.now();
     controller.abort(new Error("test observation cancelled"));
     await cancelled;
-    await until(() => aborted);
+    await until(() => aborted, 2000);
+    assert.ok(performance.now() - cancelledAt < 2000, "远端取消不能等到普通读取的 10 秒期限");
     release();
     runtime.handlers.set("read", original);
     const read = await cloud.client.callTool({ name: "read", arguments: {
