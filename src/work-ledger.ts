@@ -194,6 +194,10 @@ export class WorkLedger {
   run(runId: string): WorkRunRow {
     return this.rawRun(runId);
   }
+  taskIdForRun(runId: string): string | null {
+    return (this.db.prepare("SELECT task_id FROM qm_run_links WHERE run_id=?")
+      .get(runId) as { task_id: string | null } | undefined)?.task_id ?? null;
+  }
   setRunTitle(runId: string, title: string): void {
     const value = title.trim().slice(0, 200);
     if (!value) throw new Error("A work title is required.");

@@ -196,7 +196,7 @@ function registerShellTool(context: ToolRegistrationContext): void {
           .describe(
             "Optional working directory relative to the workspace root. Defaults to the workspace root.",
           ),
-        execution_scope:z.string().min(1).optional().describe("Relative project directory affected by this command. cwd and resource scope are separate."),
+        execution_scope:z.string().min(1).optional().describe("Affected project area for write scheduling, relative to workspace. Shell file access follows local OS permissions."),
         timeout: z
           .number()
           .positive()

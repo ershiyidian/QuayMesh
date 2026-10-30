@@ -135,7 +135,7 @@ test("资源冲突的实际错误和持久回执重放都保留占用身份，�
   const directory = await mkdtemp(join(tmpdir(), "qm-peer-conflict-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const secret = "private-title-command-and-credential";
-  const original = new ExecutionConflictError("claim_blocker", undefined, secret, {
+  const original = new ExecutionConflictError("claim_blocker", "agt_blocker", secret, {
     type: "resource", requested: [
       { kind: "tree", path: "C:\\Work\\project", access: "write" },
       { kind: "file", path: "/srv/project/report.txt", access: "read" },
@@ -146,12 +146,16 @@ test("资源冲突的实际错误和持久回执重放都保留占用身份，�
   }, "not_started");
   const envelope = errorEnvelope(original, { sideEffecting: true });
   assert.equal((envelope.errorDetails as Record<string, unknown>).claim_id, "claim_blocker");
+  assert.equal((envelope.errorDetails as Record<string, unknown>).agent_id, "agt_blocker");
   const saved = join(directory, "receipt.json");
   await writeFile(saved, JSON.stringify(envelope));
   const replay = errorFromEnvelope(JSON.parse(await readFile(saved, "utf8")), undefined, "op_rejected");
-  const p = await pair(method => { throw method === "original" ? original : replay; });
+  const { agent_id: _agentId, ...legacyDetails } = original.details;
+  const legacy = Object.assign(new Error(secret), { code: "EXECUTION_CONFLICT", claimId: "claim_blocker",
+    agentId: "agt_blocker", effect: "not_started", details: legacyDetails });
+  const p = await pair(method => { throw method === "original" ? original : method === "legacy" ? legacy : replay; });
   try {
-    for (const method of ["original", "replay"]) {
+    for (const method of ["original", "replay", "legacy"]) {
       await assert.rejects(p.caller.links.get("target")!.call(method, {}), error => {
         assert.ok(error instanceof PeerApplicationError);
         assert.equal(error.code, "EXECUTION_CONFLICT");
@@ -159,6 +163,7 @@ test("资源冲突的实际错误和持久回执重放都保留占用身份，�
         assert.equal(error.retryHint, method === "replay" ? "retry_later" : undefined);
         const { title: _title, ...expected } = original.details;
         assert.deepEqual(error.details, expected);
+        assert.equal(error.details?.agent_id, "agt_blocker");
         assert.equal(JSON.stringify({ message: error.message, details: error.details }).includes(secret), false);
         assert.notEqual(error.details?.operationId, "op_rejected", "保留阻塞操作，不能换成被拒绝请求的操作");
         return true;
@@ -173,12 +178,12 @@ test("冲突投射拒绝未知字段、错型与过大范围，保留明确的�
   const cases: Record<string, Record<string, unknown>> = {
     projected: { type: "future-policy-v2", requested: [{ ...safeResource, authorization: secret }],
       blockedResources: [{ kind: "file", path: "/srv/work/report", access: "read", command: secret }],
-      operationId: null, taskId: null, acquiredAt: null, queued: true, title: secret, command: secret, authorization: secret,
+      operationId: null, taskId: null, agent_id: "agt_legacy", acquiredAt: null, queued: true, title: secret, command: secret, authorization: secret,
       operation_id: "op_rejected", owner_node_id: "worker", next_action: { tool: "workspace_context", authorization: secret,
         arguments: { action: "status", operation_id: "op_rejected", workspace_id: "qm:worker:ws_fixture", command: secret } } },
     invalid: { type: {}, requested: [safeResource, { kind: "shell", path: secret, access: "write" }],
       blockedResources: [{ kind: "file", path: "relative/path", access: "read" }],
-      operationId: {}, taskId: [], acquiredAt: false, queued: "false", claim_id: {}, operation_id: { command: secret },
+      operationId: {}, taskId: [], agent_id: { command: secret }, acquiredAt: false, queued: "false", claim_id: {}, operation_id: { command: secret },
       resources: [{ command: secret }], scope: { token: secret }, conflicts: { title: secret },
       next_action: { tool: "exec_command", arguments: { cmd: secret } } },
     oversized: { requested: Array.from({ length: 129 }, () => safeResource),
@@ -200,7 +205,7 @@ test("冲突投射拒绝未知字段、错型与过大范围，保留明确的�
         if (name === "projected") assert.deepEqual(error.details, {
           claim_id: "claim_blocker", type: "future-policy-v2", requested: [safeResource],
           blockedResources: [{ kind: "file", path: "/srv/work/report", access: "read" }],
-          operationId: null, taskId: null, acquiredAt: null, queued: true,
+          operationId: null, taskId: null, agent_id: "agt_legacy", acquiredAt: null, queued: true,
           operation_id: "op_rejected", owner_node_id: "worker", next_action: { tool: "workspace_context",
             arguments: { action: "status", operation_id: "op_rejected", workspace_id: "qm:worker:ws_fixture" } },
         });

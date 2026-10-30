@@ -12,6 +12,7 @@ import type { LocalAgentDriver, LocalAgentRuntime, LocalAgentRunInput } from "./
 import { ProcessSessionManager } from "./process-sessions.js";
 import { ExecutionCoordinator, ExecutionConflictError } from "./execution-coordinator.js";
 import { WorkLedger } from "./work-ledger.js";
+import { SessionStore } from "./session/store.js";
 
 function fixture(t: test.TestContext, maximum = 1) {
   const root = mkdtempSync(join(tmpdir(), "quaymesh-admission-"));
@@ -58,7 +59,49 @@ test("explicit serial/no-queue policy admits one provider turn, including unveri
   assert.equal(results.filter((r) => r.isOk()).length, 1);
   assert.equal(results.filter((r) => r.isErr() && r.error.code === "AGENT_CONFLICT").length, 7);
   await settleCalls(f.calls, 1);
+  const claim = f.processes.executionCoordinator!.inspect(f.checkout)[0]!;
+  assert.ok(claim.agentId);
+  assert.equal(claim.taskId, null);
+  assert.equal(claim.operationId, null);
   await f.release();
+});
+
+test("代理从持久 run 取得任务归属，启动回执完成后仍持有执行锁", async (t) => {
+  const f = fixture(t);
+  const ledger = new WorkLedger(f.stateDir);
+  try {
+    const sessions = new SessionStore(ledger.db);
+    const session = sessions.createSession("owner", "claim-owner-conversation", "代理归属");
+    const member = sessions.addMember(session.id, "local", f.scope.workspaceId, f.checkout, "checkout", null);
+    const task = sessions.createTask(session.id, "代理执行任务", "claim-owner-task");
+    const run = ledger.begin({ root: f.checkout, workspaceId: f.scope.workspaceId,
+      workItemId: `task-${task.id}`, runKey: "claim-owner-run", title: task.title,
+      origin: { entryPoint: "chatgpt_mcp", evidence: "server_entry" } });
+    sessions.linkRun(session.id, member.id, run.id, task.id);
+    const accepted = ledger.operation({ runId: run.id, requestKey: "spawn-accepted",
+      kind: "agent_control", label: "启动代理", status: "running" });
+    const started = await f.manager.start({ ...f.scope, target: "codex", prompt: "hold task claim",
+      workRunId: run.id });
+    assert.ok(started.isOk());
+    await settleCalls(f.calls, 1);
+    ledger.endOperation(accepted, "completed");
+    const claim = f.processes.executionCoordinator!.inspect(f.checkout)[0]!;
+    assert.equal(claim.taskId, task.id);
+    assert.equal(claim.agentId, started.value.id);
+    assert.equal(claim.operationId, null);
+    await assert.rejects(f.processes.mutate(f.checkout, async () => assert.fail("代理执行期间不得写入")), error => {
+      assert.ok(error instanceof ExecutionConflictError);
+      assert.equal(error.details.agent_id, started.value.id);
+      assert.equal(error.details.taskId, task.id);
+      assert.equal(error.details.operationId, null);
+      return true;
+    });
+    await f.release();
+    assert.deepEqual(f.processes.executionCoordinator!.inspect(f.checkout), []);
+  } finally {
+    await f.release();
+    ledger.close();
+  }
 });
 
 test("same task key is durable idempotency; follow-up resumes the original thread", async (t) => {

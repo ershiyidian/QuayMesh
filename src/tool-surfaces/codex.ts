@@ -167,7 +167,7 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
         "Run cmd or a configured profile using the workspace shell. Slow preparation returns accepted with operation_id; query workspace_context status, then read_output for command output.",
       inputSchema: {
     workspace_id:z.string(),cmd:z.string().min(1).optional(),profile:z.string().min(1).optional(),
-    execution_scope:z.string().min(1).optional().describe("Affected project directory; relative to workspace."),
+    execution_scope:z.string().min(1).optional().describe("Affected project area for write scheduling, relative to workspace. Shell file access follows local OS permissions."),
     working_directory:z.string().optional(),tty:z.boolean().optional(),
     columns:z.number().int().min(1).max(1000).optional(),rows:z.number().int().min(1).max(1000).optional(),
     yield_time_ms:z.number().int().min(0).max(MAX_PROCESS_YIELD_MS).optional().describe("Initial wait; default 2000 ms."),

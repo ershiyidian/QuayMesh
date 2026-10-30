@@ -567,6 +567,7 @@ export class LocalAgentManager {
     const analysisOnly = effectiveMode === "read_only" && this.drivers.get(record.provider as LocalAgentProvider)?.readOnlyConcurrency === true;
     overrides = { ...overrides, writeMode: effectiveMode };
     const requirement = { workspaceRoot: record.workspaceRoot, kind: "agent" as const, agentId: record.id,
+      taskId: this.ledger.taskIdForRun(this.ledger.execution(executionId).run_id) ?? undefined,
       threadKey: record.providerSessionId ? `${record.provider}:${record.providerSessionId}` : undefined,
       access: analysisOnly ? "read" as const : "write" as const,
       resources: [...new Set([...(analysisOnly ? [] : this.subagents.sharedResources ?? []), ...overrides.resources ?? []])],

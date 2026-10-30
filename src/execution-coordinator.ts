@@ -94,7 +94,7 @@ interface ExecutionConflictDetails {
 
 export class ExecutionConflictError extends Error {
   readonly code = "EXECUTION_CONFLICT";
-  readonly details: Partial<ExecutionConflictDetails> & { claim_id: string };
+  readonly details: Partial<ExecutionConflictDetails> & { claim_id: string; agent_id?: string };
   constructor(readonly claimId: string, readonly agentId: string | undefined, reason: string,
     details?: ExecutionConflictDetails,
     // Only the admission boundary knows the protected action has not started.
@@ -102,7 +102,7 @@ export class ExecutionConflictError extends Error {
     super(`${reason}。${effect === "not_started" ? "操作尚未开始。" : ""}占用：${claimId}${details ? `；${JSON.stringify(details)}` : ""}`);
     this.name = "ExecutionConflictError";
     // The claim identity must survive durable error envelopes and replay.
-    this.details = { ...details, claim_id: claimId };
+    this.details = { ...details, claim_id: claimId, ...(agentId ? { agent_id: agentId } : {}) };
   }
 }
 

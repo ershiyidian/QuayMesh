@@ -12,6 +12,8 @@ General shell commands use a project scope. Inside a Git repository, the default
 
 `working_directory` selects the command's actual directory. `execution_scope` declares the affected project area for scheduling. Operating-system permissions determine which files the process can access.
 
+For user-authorized logs outside the exported workspace roots, a shell command can read their absolute local paths. Copy the needed files into the project's diagnostics directory when they need to be inspected with structured file tools. Set the execution scope to that destination directory.
+
 Use a specific project directory for long-running commands. This leaves unrelated projects available for other operations.
 
 ## Changes and snapshots
@@ -35,7 +37,7 @@ Use separate Git worktrees for tasks that need independent copies of the same re
 }
 ```
 
-For operations sharing a checkout, select non-overlapping file or project areas. A conflict response identifies the operation and resource currently in use.
+For operations sharing a checkout, select non-overlapping file or project areas. A conflict response identifies the claim and affected resources. Agent claims include `agent_id` and the linked Task when available, so an existing agent can be inspected or interrupted even when it has no command operation ID. The agent keeps its claim until its execution ends.
 
 ## Command profiles
 

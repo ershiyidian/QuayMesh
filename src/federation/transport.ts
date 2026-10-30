@@ -94,6 +94,8 @@ function executionConflictDetails(error: Record<string, unknown>, recovery: Reco
     };
   const claimId = error.claimId ?? source.claim_id;
   if (identity(claimId)) details.claim_id = claimId;
+  const agentId = source.agent_id ?? error.agentId;
+  if (identity(agentId)) details.agent_id = agentId;
   if (text(source.type, 64) && /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/u.test(source.type)) details.type = source.type;
   for (const key of ["operationId", "taskId"]) {
     if (source[key] === null || identity(source[key])) details[key] = source[key];
