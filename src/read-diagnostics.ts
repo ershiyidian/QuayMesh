@@ -3,6 +3,7 @@ import {createReadStream} from 'node:fs';
 import {readdir, stat} from 'node:fs/promises';
 import {join} from 'node:path';
 import {createInterface} from 'node:readline';
+import {setImmediate as yieldToLoop} from 'node:timers/promises';
 import Database from 'better-sqlite3';
 import * as z from 'zod/v4';
 import {jsonReply,replyBytes,REPLY_BYTES} from './bounded-reply.js';
@@ -43,7 +44,8 @@ function select(row:Row, fields:string[]):Row {
   return result;
 }
 
-export async function readDiagnostics(config:Pick<ServerConfig,'stateDir'|'federation'>, ownerId:string, rawInput:Input):Promise<Row> {
+export async function readDiagnostics(config:Pick<ServerConfig,'stateDir'|'federation'>, ownerId:string, rawInput:Input, signal?:AbortSignal):Promise<Row> {
+  signal?.throwIfAborted();
   if (!ownerId) throw new Error('MISSING_AUTHENTICATED_OWNER');
   const input = diagnosticsInputSchema.parse(rawInput);
   const cursor = input.cursor ? cursorSchema.parse(JSON.parse(input.cursor)) : undefined;
@@ -54,7 +56,7 @@ export async function readDiagnostics(config:Pick<ServerConfig,'stateDir'|'feder
   if (input.node_id && input.node_id !== nodeId) throw new Error('DIAGNOSTIC_NODE_MISMATCH');
   const scope = JSON.stringify([nodeId,input.task_id,input.operation_id ?? null,input.resource_uri ?? null,since,until]);
   if (cursor && cursor.scope !== scope) throw new Error('DIAGNOSTIC_CURSOR_SCOPE_MISMATCH');
-  const db = new Database(join(config.stateDir,'quaymesh.sqlite'),{readonly:true,fileMustExist:true});
+  const db = new Database(join(config.stateDir,'quaymesh.sqlite'),{readonly:true,fileMustExist:true,timeout:0});
   const entries:Entry[] = [];
   const keys = new Set<string>();
   const offer = (source:Entry['source'], time:string, identity:string, data:Row) => {
@@ -68,40 +70,74 @@ export async function readDiagnostics(config:Pick<ServerConfig,'stateDir'|'feder
     const task = db.prepare(`SELECT t.id,t.session_id,t.title,t.state,t.result_status,t.closure_reason,t.created_at,t.finished_at,
       s.conversation_id FROM qm_tasks t JOIN qm_sessions s ON s.id=t.session_id WHERE t.id=? AND s.owner_id=?`).get(input.task_id,ownerId) as Row | undefined;
     if (!task) throw new Error('TASK_NOT_FOUND_OR_FORBIDDEN');
-    const operationIds = new Set<string>();
+    const operationOwnership = new Map<string,boolean>();
+    const receiptOwner = db.prepare(`SELECT 1 FROM qm_invocations i INDEXED BY qm_invocations_operation
+      JOIN qm_session_members m ON m.id=i.member_id AND m.session_id=i.session_id
+      WHERE i.operation_id=? AND i.task_id=? AND i.session_id=? AND i.owner_id=? LIMIT 1`);
+    const eventOwner = db.prepare(`SELECT 1 FROM qm_events WHERE session_id=? AND source_id=? AND task_id=?
+      ${input.operation_id ? '' : "AND json_type(data_json,'$.operation_id') IS NOT 'text'"} LIMIT 1`);
+    const payloadOwner = db.prepare(`SELECT 1 FROM qm_events INDEXED BY qm_events_operation_type
+      WHERE json_extract(data_json,'$.operation_id')=? AND task_id=? AND session_id=? LIMIT 1`);
+    const ownsOperation = (operationId:string):boolean => {
+      const saved = operationOwnership.get(operationId);
+      if (saved !== undefined) return saved;
+      const owned = Boolean(receiptOwner.get(operationId,input.task_id,task.session_id,ownerId) ||
+        (input.operation_id || operationId.startsWith('op_')) &&
+        (eventOwner.get(task.session_id,operationId,input.task_id) || payloadOwner.get(operationId,input.task_id,task.session_id)));
+      operationOwnership.set(operationId,owned);
+      return owned;
+    };
     if (input.operation_id) {
-      const owned = db.prepare(`SELECT 1 FROM qm_events WHERE task_id=? AND session_id=? AND (source_id=? OR json_extract(data_json,'$.operation_id')=?)
-        UNION ALL SELECT 1 FROM qm_invocations i JOIN qm_session_members m ON m.id=i.member_id AND m.session_id=i.session_id
-        WHERE i.task_id=? AND i.session_id=? AND i.owner_id=? AND i.operation_id=? LIMIT 1`)
-        .get(input.task_id,task.session_id,input.operation_id,input.operation_id,input.task_id,task.session_id,ownerId,input.operation_id);
-      if (!owned) throw new Error('OPERATION_NOT_IN_TASK');
-      operationIds.add(input.operation_id);
+      if (!ownsOperation(input.operation_id)) throw new Error('OPERATION_NOT_IN_TASK');
     }
-    for (const raw of db.prepare(`SELECT i.id,i.operation_id,i.tool_name,i.state,i.effect,i.created_at,i.finished_at,i.result_ref
-      FROM qm_invocations i JOIN qm_session_members m ON m.id=i.member_id AND m.session_id=i.session_id
-      WHERE i.task_id=? AND i.session_id=? AND i.owner_id=? AND (? IS NULL OR i.operation_id=?)`).iterate(
-        input.task_id,task.session_id,ownerId,input.operation_id??null,input.operation_id??null)) {
-      const receipt=raw as Row;
-      if (typeof receipt.operation_id === 'string') operationIds.add(receipt.operation_id);
-      if (!input.resource_uri) offer('operation',String(receipt.finished_at??receipt.created_at),`receipt:${receipt.id}`,{
-        event:'invocation_receipt',...select(receipt,['operation_id','tool_name','state','effect','created_at','finished_at','result_ref'])});
-    }
-    const events = db.prepare('SELECT sequence,event_type,source_id,data_json,created_at FROM qm_events WHERE task_id=? ORDER BY sequence').iterate(input.task_id);
-    for (const raw of events) {
-      const event = raw as {sequence:number;event_type:string;source_id:string;data_json:string;created_at:string};
-      const payload = JSON.parse(event.data_json) as Row;
-      const op = typeof payload.operation_id === 'string' ? payload.operation_id : event.source_id;
-      if (input.operation_id && op !== input.operation_id) continue;
-      if (op.startsWith('op_')) operationIds.add(op);
-      if (!input.resource_uri) offer('operation',event.created_at,String(event.sequence).padStart(16,'0'),{event:event.event_type,...select(payload,operationFields)});
+    const after = cursor?.after ?? '';
+    const cursorTime = after.split('|',1)[0];
+    const from = cursorTime > since ? cursorTime : since;
+    const pageSize = input.limit+1;
+    // 各来源先按索引取一页，再合并；旧操作的日志归属按需查询，避免预读整份任务历史。
+    if (!input.resource_uri) {
+      const receipts = db.prepare(`SELECT i.id,i.operation_id,i.tool_name,i.state,i.effect,i.created_at,i.finished_at,i.result_ref
+        FROM qm_invocations i ${input.operation_id ? 'INDEXED BY qm_invocations_operation' : ''}
+        JOIN qm_session_members m ON m.id=i.member_id AND m.session_id=i.session_id
+        WHERE i.task_id=? AND i.session_id=? AND i.owner_id=?
+          ${input.operation_id ? 'AND i.operation_id=?' : ''}
+          AND coalesce(i.finished_at,i.created_at)>=? AND coalesce(i.finished_at,i.created_at)<=?
+          AND coalesce(i.finished_at,i.created_at)||'|operation|receipt:'||i.id>?
+        ORDER BY coalesce(i.finished_at,i.created_at),i.id LIMIT ?`).all(
+          input.task_id,task.session_id,ownerId,...(input.operation_id ? [input.operation_id] : []),from,until,after,pageSize);
+      for (const raw of receipts) {
+        const receipt=raw as Row;
+        offer('operation',String(receipt.finished_at??receipt.created_at),`receipt:${receipt.id}`,{
+          event:'invocation_receipt',...select(receipt,['operation_id','tool_name','state','effect','created_at','finished_at','result_ref'])});
+      }
+      const eventColumns = 'sequence,event_type,data_json,created_at';
+      const eventWindow = "created_at>=? AND created_at<=? AND created_at||'|operation|'||printf('%016d',sequence)>?";
+      // 精确操作查询使用操作索引，避免查询优化器为省去排序而读取整个时间窗口。
+      const events = input.operation_id
+        ? db.prepare(`SELECT ${eventColumns} FROM qm_events INDEXED BY qm_events_operation_type
+            WHERE task_id=? AND json_extract(data_json,'$.operation_id')=? AND ${eventWindow}
+            UNION ALL SELECT ${eventColumns} FROM qm_events INDEXED BY qm_events_source_type WHERE task_id=? AND source_id=?
+              AND json_type(data_json,'$.operation_id') IS NOT 'text' AND ${eventWindow}
+            ORDER BY created_at,sequence LIMIT ?`).all(
+              input.task_id,input.operation_id,from,until,after,input.task_id,input.operation_id,from,until,after,pageSize)
+        : db.prepare(`SELECT ${eventColumns} FROM qm_events WHERE task_id=? AND ${eventWindow}
+            ORDER BY created_at,sequence LIMIT ?`).all(input.task_id,from,until,after,pageSize);
+      for (const raw of events) {
+        const event = raw as {sequence:number;event_type:string;data_json:string;created_at:string};
+        const payload = JSON.parse(event.data_json) as Row;
+        offer('operation',event.created_at,String(event.sequence).padStart(16,'0'),{event:event.event_type,...select(payload,operationFields)});
+      }
     }
     if (!input.operation_id) {
-      const stages = db.prepare(`SELECT id,stage,resource_version,mount_id,observed_at FROM qm_widget_stages WHERE task_id=? AND observed_at>=? AND observed_at<=? ORDER BY id`).iterate(input.task_id,since,until);
+      const stages = db.prepare(`SELECT id,stage,resource_version,mount_id,observed_at FROM qm_widget_stages
+        WHERE task_id=? AND observed_at>=? AND observed_at<=? AND observed_at||'|card|'||printf('%016d',id)>?
+        ORDER BY observed_at,id LIMIT ?`).all(input.task_id,from,until,after,pageSize);
       for (const raw of stages) {
         const stage = raw as Row;
         offer('card',String(stage.observed_at),String(stage.id).padStart(16,'0'),select(stage,['stage','resource_version','mount_id']));
       }
     }
+    await yieldToLoop(undefined,{signal});
     const ownerHash = diagnosticOwnerHash(ownerId);
     const conversationHash = typeof task.conversation_id === 'string'
       ? createHash('sha256').update(JSON.stringify(task.conversation_id)).digest('hex').slice(0,24) : null;
@@ -117,17 +153,18 @@ export async function readDiagnostics(config:Pick<ServerConfig,'stateDir'|'feder
     }
     candidates.sort((a,b) => b.mtimeMs-a.mtimeMs);
     let scannedBytes=0, malformedLines=0, filesRead=0, logsTruncated=false;
-    let authenticatedIngressRecords=0, finishedExchangeRecords=0;
+    let authenticatedIngressRecords=0, finishedExchangeRecords=0, scannedLines=0;
     for (const file of candidates) {
       if (file.mtimeMs < Date.parse(since)) continue;
       const remainingBytes = MAX_LOG_SCAN_BYTES-scannedBytes;
       if (remainingBytes <= 0) { logsTruncated=true; break; }
       // 在流上限制实际读取字节，超长单行和文件轮转都不能突破扫描预算。
-      const stream = createReadStream(join(directory,file.name),{end:remainingBytes-1});
+      const stream = createReadStream(join(directory,file.name),{end:remainingBytes-1,signal});
       const lines = createInterface({input:stream,crlfDelay:Infinity});
       filesRead++;
       try {
         for await (const line of lines) {
+          if (++scannedLines%128===0) await yieldToLoop(undefined,{signal});
           let row:Row;
           try { row = JSON.parse(line) as Row; } catch { malformedLines++; continue; }
           if (!row || typeof row !== 'object' || typeof row.ts !== 'string' || row.ts < since || row.ts > until) continue;
@@ -137,7 +174,7 @@ export async function readDiagnostics(config:Pick<ServerConfig,'stateDir'|'feder
           const finishedExchange = row.event === 'mcp_exchange_finished';
           const exchange = authenticatedIngress || finishedExchange;
           const exact = (exchange ? row.ownerHash === ownerHash : typeof row.ownerHash !== 'string' || row.ownerHash === ownerHash) &&
-            (input.operation_id ? op === input.operation_id : row.taskId === input.task_id || typeof op === 'string' && operationIds.has(op));
+            (input.operation_id ? op === input.operation_id : row.taskId === input.task_id || typeof op === 'string' && ownsOperation(op));
           const accountResource = !authenticatedIngress && row.method === 'resources/read' &&
             (row.ownerHash === ownerHash || row.ownerHash === undefined && conversationHash && row.conversationHash === conversationHash);
           const nodeEvent = lifecycle.has(String(row.event));
@@ -182,6 +219,6 @@ export function registerReadDiagnostics(server:McpRegistrationTarget, config:Ser
   }, async (input,extra) => {
     const owner = extra.authInfo?.extra?.owner_id;
     if (typeof owner !== 'string') throw new Error('MISSING_AUTHENTICATED_OWNER');
-    return jsonReply(await readDiagnostics(config,owner,input));
+    return jsonReply(await readDiagnostics(config,owner,input,extra.signal));
   });
 }

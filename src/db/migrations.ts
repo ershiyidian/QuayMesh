@@ -17,9 +17,10 @@ import { taskFinalizationSchema } from "./task-finalization-schema.js";
 import { taskMemberSchema } from "./task-member-schema.js";
 import { invocationPayloadSchema } from "./invocation-payload-schema.js";
 import { taskCreationSchema } from "./task-creation-schema.js";
+import { diagnosticQuerySchema } from "./diagnostic-query-schema.js";
 import { needsLegacyAgentRepair, prepareStandaloneLegacyAgentMigration, repairLegacyAgentSchema } from "./legacy-agent-schema.js";
 
-export const LATEST_DATABASE_VERSION = 16;
+export const LATEST_DATABASE_VERSION = 17;
 
 function migrationState(sqlite:Database.Database):{existing:boolean;version:number} {
   const existing=Boolean(sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='qm_schema_migrations'").get());
@@ -125,6 +126,11 @@ export function migrateDatabase(sqlite: Database.Database): void {
     if (version === 15) {
       sqlite.exec(taskCreationSchema);
       record(16, "quaymesh-task-creation-receipts");
+      version = 16;
+    }
+    if (version === 16) {
+      sqlite.exec(diagnosticQuerySchema);
+      record(17, "quaymesh-bounded-diagnostic-queries");
     }
     repairLegacyAgentSchema(sqlite);
   }).immediate();

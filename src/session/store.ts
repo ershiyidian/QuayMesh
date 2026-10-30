@@ -1607,10 +1607,11 @@ export class SessionStore {
   }
 
   reconcileFinishedInvocations(): number {
+    // 一元 + 保留操作 ID 的值并移除 TEXT 列亲和性，使既有 JSON 表达式索引可用。
     return this.db.prepare(`UPDATE qm_invocations AS i SET
       state=COALESCE(
         (SELECT json_extract(e.data_json,'$.status') FROM qm_events e
-          WHERE json_extract(e.data_json,'$.operation_id')=i.operation_id AND e.event_type='operation_finished'
+          WHERE json_extract(e.data_json,'$.operation_id')=+i.operation_id AND e.event_type='operation_finished'
             AND (json_extract(e.data_json,'$.invocation_id')=i.id
               OR json_extract(e.data_json,'$.invocation_id') IS NULL AND i.retry_of_invocation_id IS NULL)
             AND json_extract(e.data_json,'$.status') IN ('succeeded','failed','cancelled')
