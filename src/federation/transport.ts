@@ -408,7 +408,11 @@ export class PeerTransport extends EventEmitter {
       session.on("error", () => session.destroy());
       session.on("close", () => this.sessions.delete(session));
     });
-    this.server.on("stream", (stream, headers) => { void this.accept(stream as ServerHttp2Stream, headers).catch(() => stream.destroy()); });
+    this.server.on("stream", (stream, headers) => {
+      // A failed source admission must reset the stream, not look like a clean empty body.
+      void this.accept(stream as ServerHttp2Stream, headers)
+        .catch(error => stream.destroy(error instanceof Error ? error : new Error(String(error))));
+    });
     await new Promise<void>((resolve, reject) => {
       this.server!.once("error", reject);
       this.server!.listen(this.config.port, this.config.host, () => { this.server!.off("error", reject); resolve(); });
