@@ -1,5 +1,5 @@
 import { consoleError, type createApi } from "./client.js";
-import type { CacheEntry, RunDetail, RunPage, FileDiff } from "./contracts.js";
+import type { CacheEntry, RunDetail, RunPage, FileDiff, SourceState } from "./contracts.js";
 
 export class Resources {
   readonly entries = new Map<string, CacheEntry>();
@@ -20,10 +20,10 @@ export class Resources {
       this.entries.set(path, entry);
     }
     if (!force && entry?.error && Date.now() < (entry.retryAt ?? 0)) return entry.data;
-    if (!force && entry?.data && Date.now() - entry.time < this.options.freshness(path)) return entry.data;
+    if (!force && entry?.data && !entry.error && Date.now() - entry.time < this.freshness(path, entry.data)) return entry.data;
     if (!entry) { entry = { data: null, time: 0, error: null, loading: false }; this.entries.set(path, entry); }
     const current = entry, controller = new AbortController();
-    current.loading = true; current.error = null; current.ctl = controller; current.startedAt = Date.now();
+    current.loading = true; current.ctl = controller; current.startedAt = Date.now();
     const requestPath = force && !['session','login','logout','sessions/revoke-all'].includes(path.split('?')[0])
       ? path + (path.includes('?') ? '&' : '?') + 'fresh=1' : path;
     current.promise = this.api.get<unknown>(requestPath, controller.signal).then((value) => {
@@ -64,6 +64,16 @@ export class Resources {
 
   cancelAll(): void { for (const entry of this.entries.values()) entry.ctl?.abort(); }
 
+  private freshness(path: string, value: unknown): number {
+    const ttl = this.options.freshness(path);
+    const sources = (value as { sources?: SourceState[] })?.sources;
+    if (!Array.isArray(sources)) return ttl;
+    // 过渡快照须能在下一轮读取到后台结果；保留短缓存，避免 loaded 回调立即重复请求。
+    if (sources.some(source => source.state === 'loading' || source.state === 'refreshing')) return Math.min(ttl, 1_000);
+    if (sources.some(source => source.error || source.state === 'error' || source.state === 'offline')) return Math.min(ttl, 8_000);
+    return ttl;
+  }
+
   invalidate(): void {
     for (const [path, entry] of this.entries) {
       entry.ctl?.abort();
@@ -99,7 +109,26 @@ export class Resources {
       const n = node as Record<string, unknown>;
       return !['disks', 'gpus', 'components'].every(key => Array.isArray(n[key])) || !n.egress || !n.capabilities;
     }))) throw new Error("节点详情结构不完整");
-    if (base === "overview" && (!arrays(['active', 'waiting', 'recent', 'attention', 'projects']) || !data.todayUsage)) throw new Error("总览响应结构不完整");
+    if (base === "overview") {
+      if (!arrays(['active', 'waiting', 'current', 'olderOpen', 'recent', 'attention', 'projects', 'sources', 'taskSources', 'usageSources']) || !data.todayUsage) throw new Error("总览响应结构不完整");
+      const sources = ['sources', 'taskSources', 'usageSources'].flatMap(key => data[key] as unknown[]);
+      if (sources.some(item => {
+        if (!item || typeof item !== 'object') return true;
+        const source = item as Record<string, unknown>;
+        return typeof source.nodeId !== 'string' || !source.nodeId || typeof source.name !== 'string'
+          || typeof source.online !== 'boolean' || typeof source.stale !== 'boolean'
+          || typeof source.state !== 'string' || !['loading', 'ready', 'refreshing', 'error', 'offline'].includes(source.state)
+          || !(source.observedAt === null || typeof source.observedAt === 'number' && Number.isFinite(source.observedAt))
+          || !(source.error === null || typeof source.error === 'string');
+      })) throw new Error("总览数据来源结构不完整");
+      const progress = ['current', 'olderOpen', 'recent'].flatMap(key => data[key] as unknown[]);
+      if (progress.some(item => {
+        if (!item || typeof item !== 'object') return true;
+        const row = item as Record<string, unknown>;
+        return typeof row.progressLabel !== 'string' || !(row.progressSummary === null || typeof row.progressSummary === 'string');
+      }) || (data.attention as unknown[]).some(item => !item || typeof item !== 'object'
+        || typeof (item as Record<string, unknown>).actionLabel !== 'string')) throw new Error("总览任务进展结构不完整");
+    }
     if (/^runs\/[^/]+$/.test(base) && (!data.run || !arrays(['files', 'commands', 'agents', 'evidence', 'timeline']))) throw new Error("执行详情结构不完整");
     if (/^runs\/[^/]+\/files\//.test(base) && (!data.file || !Array.isArray((data.file as FileDiff['file']).rows))) throw new Error("文件响应结构不完整");
     if (/^projects\/[^/]+\/sessions$/.test(base) && !arrays(['items', 'conversations', 'batches', 'executionClaims'])) throw new Error("会话响应结构不完整");

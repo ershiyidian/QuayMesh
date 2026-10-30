@@ -6,7 +6,7 @@ import { mergeFields } from '../../src/ui/console-v5/settings-form.js';
 import { elapsed, esc, percent, resultExplanation, changeCaptureBlockReason, changeCaptureNotice, dedupeCaptureWarnings, acceptanceBadge, lifecycleBadges, executionObservationForRun, status, transferPercent } from '../../src/ui/console-v5/presentation.js';
 import { fullTime, setDisplayTimeZone, day, timestamp } from '../../src/ui/console-v5/format.js';
 import { taskStages, taskStage } from '../../src/console-task-state.js';
-import { resourceHealth, sourceWarning, sourceWarnings } from '../../src/ui/console-v5/source-state.js';
+import { resourceHealth, resourceObservation, sourceWarning, sourceWarnings } from '../../src/ui/console-v5/source-state.js';
 import { CommandOutputs } from '../../src/ui/console-v5/command-output.js';
 import type { Run, ActionReceipt, ChangeCapture, CacheEntry, SourceState } from '../../src/ui/console-v5/contracts.js';
 import { EventNotifications, type NotificationMemory, type NotificationPage } from '../../src/ui/console-v5/notifications.js';
@@ -69,6 +69,29 @@ test('不完整的总览被资源层拒绝，读取中或陈旧来源不会显�
   assert.equal(resourceHealth([stale]).tone,'amber');
 });
 
+test('总览缺失分组、进展或来源字段时保留已验证缓存，用量失败不改变任务来源', async () => {
+  const taskSource:SourceState={nodeId:'a',name:'A',online:true,state:'ready',observedAt:Date.now(),stale:false,error:null};
+  const usageSource:SourceState={...taskSource,state:'error',stale:true,error:'USAGE_TIMEOUT'};
+  const valid={active:[],waiting:[],current:[{progressLabel:'仍在处理',progressSummary:null}],olderOpen:[],recent:[],attention:[{actionLabel:'查看失败'}],projects:[],todayUsage:{},
+    sources:[usageSource],taskSources:[taskSource],usageSources:[usageSource]};
+  let response:unknown=valid;
+  const {resources}=resourceFixture(async()=>response);
+  await resources.load('overview'); assert.equal(resources.data('overview'),valid);
+  assert.equal(resources.data<typeof valid>('overview')!.taskSources[0].error,null);
+  assert.equal(resources.data<typeof valid>('overview')!.usageSources[0].error,'USAGE_TIMEOUT');
+  response={active:[],waiting:[],recent:[],attention:[],projects:[],todayUsage:{}};
+  await resources.load('overview',true);
+  assert.equal(resources.data('overview'),valid); assert.match(resources.entries.get('overview')!.error!.message,/总览响应结构不完整/);
+  response={...valid,current:[{}]}; await resources.load('overview',true);
+  assert.equal(resources.data('overview'),valid); assert.match(resources.entries.get('overview')!.error!.message,/总览任务进展结构不完整/);
+  response={...valid,attention:[{}]}; await resources.load('overview',true);
+  assert.equal(resources.data('overview'),valid); assert.match(resources.entries.get('overview')!.error!.message,/总览任务进展结构不完整/);
+  response={...valid,taskSources:undefined}; await resources.load('overview',true);
+  assert.equal(resources.data('overview'),valid); assert.match(resources.entries.get('overview')!.error!.message,/总览响应结构不完整/);
+  response={...valid,taskSources:[{...taskSource,observedAt:'unknown'}]}; await resources.load('overview',true);
+  assert.equal(resources.data('overview'),valid); assert.match(resources.entries.get('overview')!.error!.message,/总览数据来源结构不完整/);
+});
+
 test('正常刷新和首次读取保持中性，同一节点的重复异常只保留一条', () => {
   const now = Date.now();
   const source: SourceState = { nodeId: 'desktop', name: 'Desktop', state: 'refreshing', stale: false, online: true, observedAt: now - 10_000, error: null };
@@ -84,6 +107,67 @@ test('正常刷新和首次读取保持中性，同一节点的重复异常只�
   assert.equal(warnings.length, 1);
   assert.equal(warnings[0].error, '连接已断开');
   assert.equal(resourceHealth([entry([failed])]).tone, 'amber');
+});
+
+test('慢缓存的刷新快照在下一轮读取完成结果，loaded 回调与并发读取不重复请求', async t => {
+  t.mock.timers.enable({apis:['Date'],now:1_000_000});
+  const initial = Date.now(), result = deferred<unknown>();
+  const source = (state: SourceState['state'], observedAt: number): SourceState => ({nodeId:'a',name:'A',online:true,state,observedAt,stale:Date.now()-observedAt>30_000,error:null});
+  let calls=0;
+  const resources = new Resources({get:async()=>{
+    calls++;
+    if (calls===1) return {items:[],sources:[source('ready',initial)]};
+    if (calls===2) return {items:[],sources:[source('refreshing',initial)]};
+    return result.promise;
+  }} as ReturnType<typeof createApi>, {freshness:()=>60_000,paint(){},loaded:path=>{void resources.load(path);}});
+  await resources.load('projects');
+  t.mock.timers.tick(60_000); await resources.load('projects');
+  assert.equal(calls,2); assert.equal(sourceWarnings([resources.entries.get('projects')]).length,1);
+  t.mock.timers.tick(999); await resources.load('projects'); assert.equal(calls,2);
+  t.mock.timers.tick(7_001);
+  const reading=resources.load('projects'), concurrent=resources.load('projects');
+  assert.equal(calls,3);
+  result.resolve({items:[],sources:[source('ready',Date.now())]}); await Promise.all([reading,concurrent]);
+  assert.equal(calls,3); assert.equal(sourceWarnings([resources.entries.get('projects')]).length,0);
+  assert.equal(resources.entries.get('projects')!.time,Date.now());
+  assert.equal(resourceObservation(resources.entries.get('projects')).current,true);
+});
+
+test('失败来源不会占满慢缓存期限，正常后台刷新不掩盖上次真实错误', async t => {
+  t.mock.timers.enable({apis:['Date'],now:1_000_000});
+  const source: SourceState = {nodeId:'a',name:'A',online:true,state:'error',observedAt:Date.now()-1_000,stale:true,error:'RPC_TIMEOUT'};
+  let calls=0;
+  const resources = new Resources({get:async()=>{calls++;return {items:[],sources:[source]};}} as ReturnType<typeof createApi>,
+    {freshness:()=>60_000,paint(){},loaded:path=>{void resources.load(path);}});
+  await resources.load('projects'); await resources.load('projects'); assert.equal(calls,1);
+  t.mock.timers.tick(7_999); await resources.load('projects'); assert.equal(calls,1);
+  t.mock.timers.tick(1); await resources.load('projects'); assert.equal(calls,2);
+  assert.equal(sourceWarning({...source,state:'refreshing',stale:false}),'正在重试，上次读取失败：RPC_TIMEOUT');
+  assert.equal(sourceWarning({...source,state:'refreshing',stale:false,error:null}),null);
+  assert.notEqual(sourceWarning({...source,state:'refreshing',stale:false,error:null,observedAt:Date.now()-30_001}),null);
+});
+
+test('传输失败按退避重试，旧缓存与重试中的错误只在读取成功后恢复', async t => {
+  t.mock.timers.enable({apis:['Date'],now:1_000_000});
+  const retry=deferred<unknown>(), value={items:[]};
+  const failure=new Error('RPC_TIMEOUT'); let calls=0;
+  const resources = new Resources({get:async()=>{
+    calls++; if(calls===2)throw failure; if(calls===3)return retry.promise; return value;
+  }} as ReturnType<typeof createApi>, {freshness:()=>60_000,paint(){},loaded:path=>{void resources.load(path);}});
+  await resources.load('projects'); const confirmedAt=resources.entries.get('projects')!.time;
+  t.mock.timers.tick(1); await resources.load('projects',true);
+  assert.equal(calls,2); assert.equal(resources.data('projects'),value);
+  t.mock.timers.tick(29_999); await resources.load('projects'); assert.equal(calls,2);
+  t.mock.timers.tick(1); const reading=resources.load('projects'), concurrent=resources.load('projects');
+  const entry=resources.entries.get('projects')!;
+  assert.equal(calls,3); assert.equal(entry.loading,true); assert.equal(entry.error,failure);
+  assert.equal(entry.time,confirmedAt); assert.equal(resourceHealth([entry]).tone,'amber');
+  assert.equal(resourceObservation(entry).current,false);
+  retry.reject(failure); await Promise.all([reading,concurrent]);
+  t.mock.timers.tick(59_999); await resources.load('projects'); assert.equal(calls,3);
+  t.mock.timers.tick(1); await resources.load('projects');
+  assert.equal(calls,4); assert.equal(entry.error,null); assert.equal(entry.failures,0);
+  assert.equal(entry.time,Date.now()); assert.equal(resourceObservation(entry).current,true);
 });
 
 test('配置三方合并更新未编辑字段、保留独立编辑并明确冲突', () => {

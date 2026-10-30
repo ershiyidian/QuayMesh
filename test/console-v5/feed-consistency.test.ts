@@ -44,6 +44,72 @@ function lifecycle(id:string,nodes=['a']):TaskLifecycle {
     nodeId:'a',memberNodeIds:nodes,workspaces:nodes.map(nodeId=>({nodeId,projectId:workspaceHandle(nodeId,'project'),memberId:nodeId,name:'project',root:'/project'}))};
 }
 
+function deferred<T>() {
+  let resolve!: (value:T)=>void, reject!: (error:unknown)=>void;
+  const promise=new Promise<T>((yes,no)=>{resolve=yes;reject=no;});
+  return {promise,resolve,reject};
+}
+function metadataFixture() {
+  const node={id:'a',nickname:'A',online:true};
+  const body={projects:[{id:'project',localId:'project',nodeId:'a',name:'Project',path:'/project',rootId:null,active:0,review:0,total:0,updatedAt:1}],roots:[]};
+  const remote={calls:0,read:async()=>body};
+  const runtime={nodes:()=>[node],request:async(nodeId:string,method:string,args:{path:string})=>{
+    assert.equal(nodeId,node.id); assert.equal(method,'console'); assert.equal(args.path,'/workbench/metadata');
+    remote.calls++; return {status:200,body:await remote.read()};
+  }} as unknown as FederationRuntime;
+  return {feed:new WorkbenchFeed({federation:{nodeId:'controller'}} as ServerConfig,runtime),node,remote,body};
+}
+
+test('slow metadata polls await a shared fresh read and unchanged content advances the observation',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:1_000_000});
+  const f=metadataFixture(), first=await f.feed.metadata(), result=deferred<typeof f.body>();
+  f.remote.read=()=>result.promise; t.mock.timers.tick(60_000);
+  let settled=false;
+  const reading=f.feed.metadata().then(value=>{settled=true;return value;}), concurrent=f.feed.metadata();
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(f.remote.calls,2); assert.equal(settled,false);
+  result.resolve(f.body); const [fresh,same]=await Promise.all([reading,concurrent]);
+  assert.deepEqual(fresh.projects,first.projects); assert.equal(fresh.sources[0].state,'ready');
+  assert.equal(fresh.sources[0].observedAt,Date.now()); assert.equal(fresh.sources[0].stale,false);
+  assert.notEqual(fresh.sources[0].observedAt,first.sources[0].observedAt);
+  assert.deepEqual(same.sources,fresh.sources); assert.equal(f.remote.calls,2);
+});
+
+test('recent background refresh stays usable while an expired observer joins the same read',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:1_000_000});
+  const f=metadataFixture(), first=await f.feed.metadata(), result=deferred<typeof f.body>();
+  f.remote.read=()=>result.promise; t.mock.timers.tick(12_000);
+  const refreshing=await f.feed.metadata();
+  assert.equal(refreshing.sources[0].state,'refreshing'); assert.equal(refreshing.sources[0].stale,false);
+  assert.equal(refreshing.sources[0].observedAt,first.sources[0].observedAt); assert.equal(refreshing.complete,true);
+  await f.feed.metadata(); assert.equal(f.remote.calls,2);
+  t.mock.timers.tick(18_001); let settled=false;
+  const expired=f.feed.metadata().then(value=>{settled=true;return value;});
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(settled,false); assert.equal(f.remote.calls,2);
+  result.resolve(f.body); const fresh=await expired;
+  assert.equal(fresh.sources[0].state,'ready'); assert.equal(fresh.sources[0].observedAt,Date.now());
+});
+
+test('metadata failures retain real errors and data, back off, and recover only after success',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:1_000_000});
+  const f=metadataFixture(), first=await f.feed.metadata();
+  f.remote.read=async()=>{throw new Error('RPC_TIMEOUT');}; t.mock.timers.tick(60_000);
+  const failed=await f.feed.metadata();
+  assert.equal(failed.sources[0].state,'error'); assert.equal(failed.sources[0].error,'RPC_TIMEOUT');
+  assert.equal(failed.sources[0].observedAt,first.sources[0].observedAt); assert.equal(failed.complete,false);
+  assert.deepEqual(failed.projects,first.projects); assert.equal(f.remote.calls,2);
+  await f.feed.metadata(); t.mock.timers.tick(2_999); await f.feed.metadata(); assert.equal(f.remote.calls,2);
+  t.mock.timers.tick(1); const second=await f.feed.metadata(); assert.equal(second.sources[0].error,'RPC_TIMEOUT');
+  assert.equal(f.remote.calls,3); t.mock.timers.tick(5_999); await f.feed.metadata(); assert.equal(f.remote.calls,3);
+  f.remote.read=async()=>f.body; t.mock.timers.tick(1); const recovered=await f.feed.metadata();
+  assert.equal(f.remote.calls,4); assert.equal(recovered.sources[0].error,null);
+  assert.equal(recovered.sources[0].observedAt,Date.now()); assert.equal(recovered.complete,true);
+  f.node.online=false; const offline=await f.feed.metadata();
+  assert.equal(f.remote.calls,4); assert.equal(offline.sources[0].state,'offline'); assert.equal(offline.complete,false);
+  assert.deepEqual(offline.projects,recovered.projects);
+});
+
 test('task pagination freezes ordering while tokens and new tasks change, then expires explicitly',async t=>{
   t.mock.timers.enable({apis:['Date'],now:Date.now()});
   const f=fixture([phase('one','a','waiting',10),phase('two','a','waiting',9),phase('three','a','waiting',8),phase('four','a','waiting',7)]);

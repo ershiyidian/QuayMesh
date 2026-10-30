@@ -1,7 +1,7 @@
 import {readWorkbenchMetadata} from "./metadata.js";
 import { randomUUID } from "node:crypto";
 import type { ServerConfig } from "../config.js";
-import { withTaskLifecycle,activeExecution,needsAttention,observeSourceStates,type TaskLifecycle } from '../console-task-state.js';
+import { withTaskLifecycle,activeExecution,observeSourceStates,type TaskLifecycle } from '../console-task-state.js';
 import type { LocalActions } from './actions.js';
 import type { FederationRuntime } from "../federation/runtime.js";
 import type { ConsoleReply, NodeView } from "../federation/types.js";
@@ -14,11 +14,13 @@ import { decodeBoundary, pageCursor } from "./run-query.js";
 import { dayAt, mergeTotals, type Query } from "./query.js";
 import { aggregateTaskIndex, aggregateTasks, applyRunTitles, applyTaskTitles, compareTaskIndex, fallbackTask, taskOnlyIndex, filterTaskIndex, resolveSessionTitles, taskKey, taskStage, type TaskIndex } from "./task-aggregation.js";
 import { WorkbenchError, type Run, type SourceReadState, type SourceState } from "./types.js";
+import { lastObservedExecutingTasks, overviewTaskProgress, selectOverviewTasks, taskAttention } from './overview-tasks.js';
 
 interface CachedResource { data: unknown; loadedAt: number; error: string | null; wait: boolean; retryAt: number; failures: number }
 interface PageSnapshot { keys: string[]; counts: Record<string, number>; at: number; query: string; expiresAt: number }
 interface NodeResource<T> { source: SourceState; data: T | null }
 type NodeIdentity = { id: string; nickname: string; online: boolean };
+const SOURCE_FRESHNESS_MS = 30_000;
 
 export class WorkbenchFeed {
   private readonly cache = new Map<string, CachedResource>();
@@ -67,9 +69,10 @@ export class WorkbenchFeed {
     // Console commonly polls every eight seconds. A one-second per-node TTL
     // otherwise makes every page paint report all sources as "refreshing".
     const effectiveTtl = Math.max(ttl, 12_000);
+    const recent = Boolean(cached?.loadedAt && Date.now()-cached.loadedAt <= SOURCE_FRESHNESS_MS);
     const previous = (state: SourceReadState, error: string | null): NodeResource<T> => ({ data: cached?.data as T ?? null,
       source: { nodeId: node.id, name: node.nickname, online: node.online, state, observedAt: cached?.loadedAt || null,
-        stale: state === "offline" || state === "error" || state === "refreshing" && (!cached?.loadedAt || Date.now()-cached.loadedAt > 30_000), error } });
+        stale: state === "offline" || state === "error" || state === "refreshing" && !recent, error } });
     if (!node.online) return previous("offline", "节点离线");
     if (cached?.error && !cached.wait && Date.now() < cached.retryAt) return previous("error", cached.error);
     if (cached && !cached.wait && !cached.error && Date.now() - cached.loadedAt < effectiveTtl) return previous("ready", null);
@@ -79,11 +82,12 @@ export class WorkbenchFeed {
         await existing.promise;
         return this.load(node,path,local,ttl);
       }
-      return cached?.data != null && !cached.wait ? previous("refreshing",cached.error) : existing.promise as Promise<NodeResource<T>>;
+      return cached?.data != null && !cached.wait && recent ? previous("refreshing",cached.error) : existing.promise as Promise<NodeResource<T>>;
     }
     {
       const generation = this.generation;
-      const requireFresh = cached?.wait === true;
+      // 慢轮询不能反复拿到过期快照；超出确认期限后等待这次读取，失败时仍返回旧数据和实际错误。
+      const requireFresh = cached?.wait === true || !recent;
       const job: Promise<NodeResource<T>> = Promise.resolve().then(async () => {
         try {
           const data = node.id === this.localId ? await local() : await this.call<T>(node.id, path);
@@ -150,7 +154,7 @@ export class WorkbenchFeed {
     return {settings:result.data.settings,roots:result.data.roots,source:result.source};
   }
 
-  private taskIndex(phases: Parameters<typeof aggregateTaskIndex>[0], titles: {map:Map<string,string>;tasks:Map<string,TaskLifecycle>}, sources:SourceState[]) {
+  private taskIndex(phases: Parameters<typeof aggregateTaskIndex>[0], titles: {map:Map<string,string>;tasks:Map<string,TaskLifecycle>;sources?:SourceState[]}, sources:SourceState[]) {
     const tasks=applyTaskTitles(aggregateTaskIndex(observeSourceStates(phases,sources)),titles.map);
     const present=new Set(tasks.map(task=>task.taskId).filter(Boolean));
     for(const task of titles.tasks.values()) if(!present.has(task.id)) {
@@ -158,7 +162,18 @@ export class WorkbenchFeed {
       const missing=(task.memberNodeIds??[]).some(node=>!sources.some(source=>source.nodeId===node&&source.online&&source.observedAt!==null&&!source.error));
       tasks.push(missing?{...fallback,executionStatus:'unknown',actionableInterruption:true,reason:'部分任务成员尚未取得，后台执行状态待核对'}:fallback);
     }
-    return tasks.map(task=>withTaskLifecycle(task,titles.tasks.get(task.taskId ?? '')));
+    const authorityObservations = titles.sources ? new Map(observeSourceStates(titles.sources.map(source => ({
+      nodeId:source.nodeId,executionStatus:'waiting',
+    })),titles.sources).map(source=>[source.nodeId,source])) : null;
+    return tasks.map(task=>{
+      const lifecycle=titles.tasks.get(task.taskId ?? '');
+      const resolved=withTaskLifecycle(task,lifecycle);
+      if(!authorityObservations||!lifecycle?.nodeId)return resolved;
+      const authority=authorityObservations.get(lifecycle.nodeId);
+      const observedAt=!task.phaseRefs.length ? authority?.observedAt ?? null
+        : resolved.observedAt == null || authority?.observedAt == null ? null : Math.min(resolved.observedAt,authority.observedAt);
+      return {...resolved,observedAt,stale:Boolean(resolved.stale)||!authority||authority.stale};
+    });
   }
 
   async runs(query: Query) {
@@ -167,11 +182,12 @@ export class WorkbenchFeed {
     const {index,titles}=await this.scopedIndex(query);
     const usage = query.usageDate || query.usageDays ? await this.usageContributors(query) : null;
     const allTasks=this.taskIndex(index.values.flatMap(value=>value.items),titles,index.sources);
+    const lastObservedExecuting=lastObservedExecutingTasks(index.values.flatMap(value=>value.items));
     const contributes=(task:TaskIndex)=>!usage || task.phaseRefs.some(reference=>usage.runIds.has(reference));
-    const scoped = filterTaskIndex(allTasks,query,at).filter(contributes);
+    const scoped = filterTaskIndex(allTasks,query,at,lastObservedExecuting).filter(contributes);
     let counts:Record<string,number>={all:scoped.length};
     for(const task of scoped){const state=taskStage(task.executionStatus,task.acceptanceStatus,task.phaseExecutionStatus);counts[state]=(counts[state]??0)+1;}
-    const navigation=filterTaskIndex(allTasks,{...query,requestState:undefined,stage:undefined,attention:undefined},at).filter(contributes);
+    const navigation=filterTaskIndex(allTasks,{...query,requestState:undefined,stage:undefined,attention:undefined,overviewGroup:undefined},at,lastObservedExecuting).filter(contributes);
     counts.scopeAll=navigation.length;counts.scopeOpen=0;counts.scopeClosed=0;
     counts.scopeActive=0;counts.scopeWaiting=0;counts.scopeResults=0;counts.scopeAttention=0;
     for(const task of navigation){
@@ -181,7 +197,7 @@ export class WorkbenchFeed {
       if(activeExecution(task.executionStatus))counts.scopeActive++;
       if(['waiting','stalled','finalizing'].includes(state))counts.scopeWaiting++;
       if(['done','accepted','rejected','review','failed','ended','cancelled','handed_off'].includes(state))counts.scopeResults++;
-      if(needsAttention(task))counts.scopeAttention++;
+      if(taskAttention(task))counts.scopeAttention++;
     }
     const selected=scoped.filter(task=>!query.status||taskStage(task.executionStatus,task.acceptanceStatus,task.phaseExecutionStatus)===query.status)
       .sort((a,b)=>compareTaskIndex(a,b,query,at));
@@ -260,6 +276,8 @@ export class WorkbenchFeed {
       revision:run.revision+(task.taskRevision??0),taskRevision:task.taskRevision,
       reason:task.reason ?? (run.executionStatus === task.executionStatus ? run.reason : null),
       startedAt:task.startedAt,finishedAt:task.finishedAt,lastActivityAt:task.lastActivityAt,
+      observedAt:task.observedAt===undefined ? run.observedAt : task.observedAt,
+      stale:task.stale===true||run.stale===true,
       actions:{...run.actions,complete:canComplete,review:task.acceptanceStatus==='pending'&&run.actions.review}};
   }
 
@@ -382,25 +400,29 @@ export class WorkbenchFeed {
       this.sessionTitles(undefined,fresh),
     ]);
     const tasks = this.taskIndex(index.values.flatMap(value=>value.items),titles,index.sources);
+    // Preserve a cached executing Task when a member observation is temporarily
+    // missing. Its progress label remains "待更新", never a new liveness claim.
+    const lastObservedExecuting = lastObservedExecutingTasks(index.values.flatMap(value=>value.items));
+    const today = dayAt(at, zone);
+    const taskGroups = selectOverviewTasks(tasks,at,time=>dayAt(time,zone)===today,lastObservedExecuting);
     const activeIndex = tasks.filter(task=>activeExecution(task.executionStatus)).sort((a,b)=>b.lastActivityAt-a.lastActivityAt);
     const visibleActive=[...activeIndex.filter(task=>task.executionStatus!=='queued').slice(0,12),
       ...activeIndex.filter(task=>task.executionStatus==='queued').slice(0,3)];
     const waitingIndex = tasks.filter(task=>['waiting','stalled','finalizing'].includes(task.executionStatus)).sort((a,b)=>b.lastActivityAt-a.lastActivityAt);
-    const recentIndex = tasks.filter((task) => !["running", "queued", "stopping", "waiting", "stalled", "finalizing"].includes(task.executionStatus))
-      .sort((a, b) => (b.finishedAt ?? b.lastActivityAt) - (a.finishedAt ?? a.lastActivityAt)).slice(0, 6);
-    const attentionIndex = tasks.filter(needsAttention)
-      .sort((a, b) => b.lastActivityAt - a.lastActivityAt);
-    const visibleIndex = [...visibleActive, ...waitingIndex.slice(0,6), ...recentIndex, ...attentionIndex.slice(0, 6)];
+    const recentIndex = taskGroups.recent.slice(0,6);
+    const attentionIndex = taskGroups.attention;
+    const visibleCurrent = taskGroups.current.slice(0,12), visibleOlder = taskGroups.olderOpen.slice(0,6);
+    const visibleIndex = [...visibleCurrent, ...visibleOlder, ...visibleActive, ...waitingIndex.slice(0,6), ...recentIndex, ...attentionIndex.slice(0, 6)];
     const summaries = await this.runSummaries([...new Set(visibleIndex.flatMap((task) => task.phaseRefs))],fresh);
     const detailed = new Map(applyRunTitles(aggregateTasks(observeSourceStates(summaries.values,summaries.sources)), titles.map).map((run) => [taskKey(run), run]));
     const resolve = (task: TaskIndex) => this.resolvedRun(task,detailed.get(task.key));
     const active = visibleActive.map(resolve);
-    const recent = recentIndex.map(resolve);
-    const today = dayAt(at, zone);
+    const recent = recentIndex.map(task=>({...resolve(task),...overviewTaskProgress(task,'recent')}));
     const complete = group.complete && index.complete && summaries.complete && titles.complete;
     const taskCoverage=index.complete&&titles.complete;
-    const taskSources=mergeSources(index.sources,titles.sources);
-    const nodeCounts=Object.fromEntries(taskSources.map(source=>{
+    const sourceGroups=overviewSourceStates({tasks:index.sources,titles:titles.sources,details:summaries.sources,usage:group.sources});
+    const taskIndexSources=mergeSources(index.sources,titles.sources);
+    const nodeCounts=Object.fromEntries(taskIndexSources.map(source=>{
       // 节点卡片统计本节点阶段；同一 Task 在其它节点运行不能增加本节点运行数。
       const own=aggregateTaskIndex(observeSourceStates(index.values.flatMap(value=>value.items).filter(phase=>phase.nodeId===source.nodeId),[source]));
       const known=source.online&&source.observedAt!==null&&!source.error;
@@ -409,23 +431,31 @@ export class WorkbenchFeed {
         waiting:known?own.filter(task=>['waiting','stalled','finalizing'].includes(task.executionStatus)).length:null,complete:known}];
     }));
     return { active,activeCount:taskCoverage ? activeIndex.length : null,nodeCounts,
-      knownCounts:{active:activeIndex.length,waiting:waitingIndex.length,attention:attentionIndex.length},
+      current:visibleCurrent.map(task=>({...resolve(task),...overviewTaskProgress(task,'current')})),
+      currentCount:taskCoverage ? taskGroups.current.length : null,
+      olderOpen:visibleOlder.map(task=>({...resolve(task),...overviewTaskProgress(task,'older')})),
+      olderOpenCount:taskCoverage ? taskGroups.olderOpen.length : null,
+      knownCounts:{active:activeIndex.length,current:taskGroups.current.length,olderOpen:taskGroups.olderOpen.length,
+        waiting:waitingIndex.length,attention:attentionIndex.length},
       coverage:{tasks:taskCoverage,usage:group.complete,details:summaries.complete},
       waiting:waitingIndex.slice(0,6).map(resolve),waitingCount:taskCoverage ? waitingIndex.length : null,
       recent,
       attention: attentionIndex.slice(0, 6).map((task) => {
         const run = resolve(task);
-        return { id: run.id, kind: run.executionStatus, title: run.title, detail: run.reason ?? "查看保存的执行记录", nodeId: run.nodeId };
+        const issue=taskAttention(task)!;
+        return { id: run.id, title: run.title, nodeId: run.nodeId, ...issue,
+          ...(task.stale ? {detail:`状态待更新；上次记录：${issue.detail}`,actionLabel:'查看任务记录'} : {}),
+          observedAt:task.observedAt ?? null,stale:task.stale===true };
       }),
       attentionCount: taskCoverage ? attentionIndex.length : null,
       runningCount: taskCoverage ? activeIndex.filter((task) => task.executionStatus === "running" || task.executionStatus === "stopping").length : null,
       queuedCount: taskCoverage ? activeIndex.filter((task) => task.executionStatus === "queued").length : null,
-      reviewCount: taskCoverage ? tasks.filter((task) => taskStage(task.executionStatus, task.acceptanceStatus,task.phaseExecutionStatus) === "review").length : null,
-      completedToday: taskCoverage ? tasks.filter((task) => task.executionStatus === "completed" && task.finishedAt !== null && dayAt(task.finishedAt, zone) === today).length : null,
-      failedToday: taskCoverage ? tasks.filter((task) => task.executionStatus === "failed" && dayAt(task.finishedAt ?? task.lastActivityAt, zone) === today).length : null,
+      reviewCount: taskCoverage ? taskGroups.reviewCount : null,
+      completedToday: taskCoverage ? taskGroups.completedToday : null,
+      failedToday: taskCoverage ? taskGroups.failedToday : null,
       todayUsage: mergeTotals(group.values.map((value) => value.todayUsage)),
       projects: group.values.flatMap((value) => value.projects).sort((a, b) => (b.usage ?? 0) - (a.usage ?? 0)).slice(0, 4),
-      sources: mergeSources(mergeSources(mergeSources(group.sources, index.sources), summaries.sources), titles.sources), complete, observedAt: Date.now() };
+      ...sourceGroups, complete, observedAt: Date.now() };
   }
 
   async usage(query: Query) {
@@ -442,7 +472,7 @@ export class WorkbenchFeed {
 
   private async usageContributors(query:Query) {
     const input:Query={...query,days:query.usageDays??'30',date:query.usageDate};
-    for(const name of ['cursor','limit','requestState','status','stage','execution','attention','changed','usageDate','usageDays','fresh'])delete input[name];
+    for(const name of ['cursor','limit','requestState','resultStatus','overviewGroup','status','stage','execution','attention','changed','usageDate','usageDays','fresh'])delete input[name];
     const search=new URLSearchParams(Object.entries(input).filter((value):value is [string,string]=>value[1]!==undefined));
     const group=await this.collect('/workbench/usage?'+search,()=>readLocalUsage(this.config,input),input,30000,undefined,query.fresh==='1');
     return {runIds:new Set(group.values.flatMap(value=>value.runIds)),sources:group.sources,complete:group.complete};
@@ -495,6 +525,15 @@ export function mergeSources(primary:SourceState[],secondary:SourceState[]):Sour
       stale:previous.stale||source.stale,error:previous.error??source.error});
   }
   return [...result.values()];
+}
+
+export function overviewSourceStates(input: {tasks:SourceState[];titles:SourceState[];details:SourceState[];usage:SourceState[]}) {
+  return {
+    taskSources:mergeSources(mergeSources(input.tasks,input.titles),input.details),
+    usageSources:input.usage,
+    // Retain the legacy combined observation for existing clients.
+    sources:mergeSources(mergeSources(mergeSources(input.usage,input.tasks),input.details),input.titles),
+  };
 }
 
 function chunk<T>(values: readonly T[], size: number): T[][] {

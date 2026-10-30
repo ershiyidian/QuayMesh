@@ -3,8 +3,9 @@ import { dayAt, type Query } from "./query.js";
 import type { TaskPhaseIndex } from "./local-queries.js";
 import type { SessionTitleIndex } from "./local-queries.js";
 import type { Run, Usage } from "./types.js";
-import { needsAttention, relevantExecution, taskStage, withTaskLifecycle, taskTimeEnd, type TaskLifecycle } from '../console-task-state.js';
+import { relevantExecution, taskStage, withTaskLifecycle, taskTimeEnd, type TaskLifecycle } from '../console-task-state.js';
 import { taskView } from '../task-view.js';
+import { selectOverviewTasks, taskAttention } from './overview-tasks.js';
 export { taskStage } from '../console-task-state.js';
 
 export const TASK_REFERENCE_PREFIX = "qmtask:";
@@ -153,26 +154,31 @@ export function applyRunTitles(runs: Run[], titles: ReadonlyMap<string, string>)
   return runs.map((run) => !run.taskId && run.sessionId && titles.has(run.sessionId) ? { ...run, title: titles.get(run.sessionId)! } : run);
 }
 
-export function filterTaskIndex(tasks: TaskIndex[], query: Query, at: number): TaskIndex[] {
+export function filterTaskIndex(tasks: TaskIndex[], query: Query, at: number, lastObservedExecuting: ReadonlySet<string> = new Set()): TaskIndex[] {
   const search = (query.q ?? "").trim().toLocaleLowerCase();
   const days = Number(query.days ?? 7);
   const zone = query.tz || "UTC";
+  const overview = ['current','olderOpen'].includes(query.overviewGroup ?? '')
+    ? selectOverviewTasks(tasks,at,time=>dayAt(time,zone)===dayAt(at,zone),lastObservedExecuting) : null;
+  const groupKeys = overview ? new Set((query.overviewGroup==='current' ? overview.current : overview.olderOpen).map(task=>task.key)) : null;
   return tasks.filter((task) => task.startedAt <= at
+    && (!groupKeys || groupKeys.has(task.key))
     && (!query.node || task.nodeIds.includes(query.node))
     && (!query.project || task.projectIds.includes(query.project))
     && (!query.session || task.sessionId === query.session)
     && (!query.requestState || task.requestState === query.requestState)
+    && (!query.resultStatus || task.resultStatus === query.resultStatus)
     && (!query.root || task.roots.includes(query.root))
     && (!query.changed || task.changed)
     && (!query.execution || task.executionStatus === query.execution)
     && (!query.stage || query.stage.split(',').includes(taskStage(task.executionStatus,task.acceptanceStatus)))
-    && (!query.attention || needsAttention(task))
+    && (!query.attention || taskAttention(task) !== null)
     && (!query.date || dayAt(task.startedAt, zone) === query.date)
     && (!query.finishedDay || task.finishedAt !== null && dayAt(task.finishedAt, zone) === query.finishedDay)
     && (!search || [task.title, task.taskId ?? "", task.sessionId ?? "", ...task.phaseRefs, ...task.projectNames, ...task.nodeIds, ...task.roots]
       .some((value) => value.toLocaleLowerCase().includes(search)))
     && (!days || task.startedAt >= at - days * 86_400_000 || task.requestState === 'active' || ["running", "queued", "stopping", "waiting"].includes(task.executionStatus)
-      || needsAttention(task)));
+      || taskAttention(task) !== null));
 }
 
 export function compareTaskIndex(left: TaskIndex, right: TaskIndex, query: Query, at: number): number {

@@ -22,13 +22,18 @@ async function login(page:Page,base=f.server.baseUrl){
   await page.locator('#login-form [type=submit]').click();
   const reply=await sent;expect(reply.status(),await reply.text()).toBe(200);
   await expect(page.locator('#login-form')).toHaveCount(0);
-  await expect(page.locator('.summary-grid')).toBeVisible();
+  await expect(page.locator('.overview-summary')).toBeVisible();
 }
 
-test('总览只列实际执行，状态筛选、工作区和对话详情在浏览器中一致',async({page})=>{
+test('总览展示当前Task，状态筛选、工作区和对话详情在浏览器中一致',async({page})=>{
   const errors:string[]=[];page.on('pageerror',error=>errors.push(error.message));
   await login(page);
-  await expect(page.locator('.overview-active .run-card')).toHaveCount(0);
+  await expect(page.locator('.overview-current [role=listitem]')).toHaveCount(1);
+  await expect(page.locator('.overview-current')).toContainText('等待下一步的工作');
+  await expect(page.locator('.overview-recent [role=listitem]')).toHaveCount(2);
+  await expect(page.locator('.overview-recent')).not.toContainText('等待下一步的工作');
+  await expect(page.locator('#view')).not.toContainText('后台执行');
+  await expect(page.locator('#view [data-elapsed]')).toHaveCount(0);
   await expect(page.locator('#view')).toContainText('等待下一步的工作');
   await expect(page.locator('#view')).toContainText('已经完成的改动');
   expect(await page.locator('.brand-image').first().evaluate((image:HTMLImageElement)=>image.complete&&image.naturalWidth>0)).toBe(true);
@@ -117,41 +122,42 @@ test('读取等待可见，刷新失败保留旧记录且明确标为未更新',
   await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>route.fulfill({json:{active:[]}}));
   await page.locator('#topbar [data-action=refresh]').click();
   await expect(page.locator('#global-notice')).toContainText('读取失败');
-  await expect(page.locator('#statusbar')).toContainText('上次读取');
-  await expect(page.locator('.summary-grid')).toBeVisible();
+  await expect(page.locator('#statusbar')).toContainText('页面读取');
+  await expect(page.locator('.overview-summary')).toBeVisible();
   await expect(page.locator('#view')).not.toContainText('总览响应结构不完整');
   await page.locator('#global-notice summary').click();
   await expect(page.locator('#global-notice')).toContainText('总览响应结构不完整');
   await expect(page.locator('#global-notice .notice')).toHaveCount(1);
   await page.unrouteAll({behavior:'wait'});
-  const snapshot=await f.get('overview'),running={...snapshot.waiting[0],executionStatus:'running',stale:false,observedAt:Date.now(),finishedAt:null};
-  snapshot.active=[running];snapshot.runningCount=1;snapshot.waiting=[];snapshot.waitingCount=0;
+  const snapshot=await f.get('overview'),running={...snapshot.current[0],executionStatus:'running',progressLabel:'进行中',progressSummary:null,stale:false,observedAt:Date.now(),finishedAt:null};
+  snapshot.current=[running];snapshot.currentCount=1;snapshot.active=[running];snapshot.runningCount=1;
   await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>route.fulfill({json:snapshot}));
   await page.locator('#topbar [data-action=refresh]').click();
-  await expect(page.locator('[data-elapsed]')).toHaveAttribute('data-observed','0');
+  await expect(page.locator('.overview-current .overview-task-heading>.badge')).toHaveText('进行中');
+  await expect(page.locator('#view [data-elapsed]')).toHaveCount(0);
   running.observedAt+=1000;await page.locator('#topbar [data-action=refresh]').click();
-  await expect(page.locator('[data-elapsed]')).toHaveAttribute('data-observed','0');
+  await expect(page.locator('.overview-current .overview-task-heading>.badge')).toHaveText('进行中');
   const activeAt=Date.now();
-  Object.assign(running,{nodeIds:[running.nodeId,'offline-other'],nodeStates:{[running.nodeId]:'running','offline-other':'unknown'},stale:true,observedAt:activeAt-60_000});
-  snapshot.sources=snapshot.sources.map((source:any)=>({...source,observedAt:activeAt}));
-  snapshot.sources.push({nodeId:'offline-other',name:'Offline peer',online:false,state:'offline',stale:true,observedAt:activeAt-60_000,error:'offline'});
+  Object.assign(running,{nodeIds:[running.nodeId,'offline-other'],nodeStates:{[running.nodeId]:'running','offline-other':'unknown'},stale:true,observedAt:activeAt-60_000,progressSummary:'部分任务信息待更新'});
+  snapshot.taskSources=snapshot.taskSources.map((source:any)=>({...source,observedAt:activeAt}));
+  snapshot.taskSources.push({nodeId:'offline-other',name:'Offline peer',online:false,state:'offline',stale:true,observedAt:activeAt-60_000,error:'offline'});
   await page.locator('#topbar [data-action=refresh]').click();
-  await expect(page.locator('[data-elapsed]')).toHaveAttribute('data-observed','0');
-  await expect(page.locator('.overview-active .run-card')).toContainText('上次确认');
-  await page.screenshot({path:screenshots+'/mixed-source-clock.png',fullPage:true});
+  await expect(page.locator('.overview-current .overview-task-heading>.badge')).toHaveText('进行中');
+  await expect(page.locator('.overview-current')).toContainText('部分任务信息待更新');
+  await page.screenshot({path:screenshots+'/mixed-source-task-progress.png',fullPage:true});
 });
 
 test('正常后台刷新不报警，过期来源集中到一处可展开提示',async({page})=>{
   await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
   await login(page);
   const snapshot=await f.get('overview');
-  snapshot.sources=snapshot.sources.map((source:any)=>({...source,state:'refreshing',stale:false,observedAt:Date.now(),error:null}));
+  snapshot.taskSources=snapshot.taskSources.map((source:any)=>({...source,state:'refreshing',stale:false,observedAt:Date.now(),error:null}));
   await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>route.fulfill({json:snapshot}));
   await page.locator('#topbar [data-action=refresh]').click();
   await expect(page.locator('#global-notice .notice')).toHaveCount(0);
   await expect(page.locator('#view')).not.toContainText('正在刷新，当前显示上次确认的数据');
   await page.screenshot({path:screenshots+'/sources-refreshing.png',fullPage:true});
-  snapshot.sources=snapshot.sources.map((source:any)=>({...source,stale:true,observedAt:Date.now()-60_000}));
+  snapshot.taskSources=snapshot.taskSources.map((source:any)=>({...source,stale:true,observedAt:Date.now()-60_000}));
   await page.locator('#topbar [data-action=refresh]').click();
   await expect(page.locator('#global-notice .notice')).toHaveCount(1);
   await expect(page.locator('#global-notice summary')).toContainText('数据更新延迟');
@@ -161,6 +167,145 @@ test('正常后台刷新不报警，过期来源集中到一处可展开提示',
   await page.setViewportSize({width:760,height:900});
   await page.screenshot({path:screenshots+'/sources-delayed-narrow.png',fullPage:true});
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+});
+
+test('Task首页保留历史展开与焦点，当前任务入口使用相同分组筛选',async({page})=>{
+  await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
+  const snapshot=await f.get('overview?fresh=1'),current=snapshot.current[0];
+  expect(current).toMatchObject({taskId:f.waiting.task_id,requestState:'active'});
+  const unnamed={...current,id:'qmtask:overview-unnamed',taskId:'overview-unnamed',title:'QuayMesh task',progressLabel:'进行中',progressSummary:null};
+  const older={...current,id:'qmtask:overview-older',taskId:'overview-older',title:'较早的资料整理任务',progressLabel:'未结束',lastActivityAt:Date.now()-3*86400_000};
+  snapshot.current=[current,unnamed];snapshot.currentCount=15;snapshot.knownCounts.current=15;
+  snapshot.olderOpen=[older];snapshot.olderOpenCount=80;snapshot.knownCounts.olderOpen=80;
+  snapshot.attention=[];snapshot.attentionCount=0;
+  await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>route.fulfill({json:snapshot}));
+  await login(page);
+  const history=page.locator('#overview-older-open');
+  await expect(history).toHaveJSProperty('open',false);
+  await expect(page.locator('.overview-current')).toContainText('未命名任务');
+  await expect(page.locator('.overview-current')).not.toContainText('QuayMesh task');
+  await expect(page.locator('.overview-summary>div strong')).toHaveText('15');
+  await expect(page.getByRole('button',{name:'查看全部 15 项当前任务',exact:true})).toBeVisible();
+  await history.locator(':scope>summary').click();
+  const focused=page.locator('.overview-current .overview-task-title').nth(1);
+  await focused.focus();
+  snapshot.current.reverse();current.progressSummary='已记录阶段结果，任务尚未结束';
+  await page.locator('#topbar [data-action=refresh]').evaluate((button:HTMLButtonElement)=>button.click());
+  await expect(page.locator('.overview-current')).toContainText('已记录阶段结果');
+  await expect(history).toHaveJSProperty('open',true);
+  await expect(page.locator('.overview-current .overview-task-title').first()).toBeFocused();
+  await page.screenshot({path:screenshots+'/overview-task-groups-desktop.png',fullPage:true});
+  await page.setViewportSize({width:390,height:844});
+  expect(await page.locator('#view').evaluate(el=>el.scrollWidth<=el.clientWidth)).toBe(true);
+  await page.screenshot({path:screenshots+'/overview-task-groups-narrow.png',fullPage:true});
+  await page.getByRole('button',{name:'查看全部 15 项当前任务',exact:true}).click();
+  await expect(page).toHaveURL(/overviewGroup=current/);
+  await expect(page.locator('.filter-chip')).toContainText('当前任务');
+  await page.locator('[data-action=task-scope][data-value=ended]').click();
+  await expect(page).not.toHaveURL(/overviewGroup=/);
+  await expect(page.locator('.run-table tbody tr')).toHaveCount(2);
+});
+
+test('首页只观察任务来源，命令面板按需读取完整工作区目录',async({page})=>{
+  await page.clock.install();
+  await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
+  const snapshot=await f.get('overview?fresh=1'),directory=await f.get('projects?fresh=1'),requests:string[]=[];
+  expect(directory.items.length).toBeGreaterThan(0);
+  snapshot.usageSources=snapshot.usageSources.map((source:any)=>({...source,state:'error',stale:true,error:'用量统计暂时失败'}));
+  snapshot.sources=snapshot.usageSources;
+  await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>route.fulfill({json:snapshot}));
+  page.on('request',request=>{if(new URL(request.url()).pathname.endsWith('/api/v4/projects'))requests.push(request.url());});
+  let reads=0;
+  await page.route(url=>url.pathname.endsWith('/api/v4/projects'),route=>{
+    reads++;
+    return route.fulfill({json:reads<=2?{...directory,items:[],complete:false,sources:directory.sources.map((source:any)=>({...source,state:'loading',observedAt:null,error:null,stale:false}))}:directory});
+  });
+  await login(page);
+  await expect(page.locator('#global-notice .notice')).toHaveCount(0);
+  await expect(page.locator('.overview-current')).not.toContainText('状态待更新');
+  expect(requests).toHaveLength(0);
+  await page.locator('#topbar [data-action=palette]').click();
+  const palette=page.getByRole('dialog',{name:'搜索与命令面板'});
+  await palette.getByLabel('搜索命令').fill(directory.items[0].name);
+  await expect(palette).toContainText('正在读取工作区目录');
+  await expect.poll(()=>reads).toBe(1);
+  // 隔离页面内驱动可见性事件，不切换用户前台窗口。
+  await page.evaluate(()=>{Object.defineProperty(document,'hidden',{configurable:true,value:true});document.dispatchEvent(new Event('visibilitychange'));});
+  await page.clock.fastForward(2_100);
+  expect(reads).toBe(1);
+  const resumed=page.waitForResponse(response=>new URL(response.url()).pathname.endsWith('/api/v4/projects'));
+  await page.evaluate(()=>{Object.defineProperty(document,'hidden',{configurable:true,value:false});document.dispatchEvent(new Event('visibilitychange'));});
+  await (await resumed).finished();
+  await expect.poll(()=>reads).toBe(2);
+  await page.context().setOffline(true);
+  await expect.poll(()=>page.evaluate(()=>navigator.onLine)).toBe(false);
+  await page.clock.fastForward(2_100);
+  expect(reads).toBe(2);
+  await page.context().setOffline(false);
+  await expect(palette.getByText('项目',{exact:true})).toBeVisible();
+  expect(requests.length).toBeGreaterThanOrEqual(3);
+  await palette.getByLabel('搜索命令').press('Escape');
+  await expect(palette).toHaveCount(0);
+});
+
+test('当前任务失效后保留记录，空态紧凑且今日完成按Task结果查询',async({page})=>{
+  await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
+  const snapshot=await f.get('overview?fresh=1'),current=snapshot.current[0],observedAt=Date.now()-60_000;
+  snapshot.current=[{...current,executionStatus:'unknown',progressLabel:'待更新',stale:true,observedAt}];
+  snapshot.currentCount=null;snapshot.coverage.tasks=false;
+  snapshot.taskSources=snapshot.taskSources.map((source:any)=>({...source,state:'error',stale:true,observedAt,error:'任务读取超时'}));
+  await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>route.fulfill({json:snapshot}));
+  await login(page);
+  await expect(page.locator('.overview-current')).toContainText(current.title);
+  await expect(page.locator('.overview-current')).toContainText('状态待更新');
+  await expect(page.locator('.overview-current')).toContainText('上次确认');
+  await expect(page.locator('.overview-summary>div strong')).toHaveText('待确认');
+  await page.locator('#global-notice summary').click();
+  await expect(page.locator('#global-notice .source-details')).toContainText('任务数据');
+  await expect(page.locator('#global-notice .source-details')).toContainText('任务读取超时');
+  snapshot.current=[];snapshot.currentCount=0;snapshot.coverage.tasks=true;
+  snapshot.olderOpen=[];snapshot.olderOpenCount=0;snapshot.attention=[];snapshot.attentionCount=0;
+  snapshot.taskSources=snapshot.taskSources.map((source:any)=>({...source,state:'ready',stale:false,observedAt:Date.now(),error:null}));
+  await page.locator('#topbar [data-action=refresh]').click();
+  await expect(page.locator('.overview-current')).toContainText('暂无当前任务');
+  await expect(page.locator('.overview-recent')).toContainText('已经完成的改动');
+  await page.setViewportSize({width:390,height:844});
+  const empty=await page.locator('.overview-current .overview-empty').boundingBox();
+  const recent=await page.locator('[data-key=overview-recent-panel]').boundingBox();
+  expect(empty!.height).toBeLessThan(100);expect(recent!.y).toBeLessThan(450);
+  expect(await page.locator('#view').evaluate(el=>el.scrollWidth<=el.clientWidth)).toBe(true);
+  await page.screenshot({path:screenshots+'/overview-task-empty-narrow.png',fullPage:true});
+  await page.getByRole('button',{name:/今日完成/}).click();
+  await expect(page).toHaveURL(/requestState=closed/);
+  await expect(page).toHaveURL(/resultStatus=completed/);
+  await expect(page).not.toHaveURL(/execution=completed/);
+  await expect(page.locator('.run-table tbody tr')).toHaveCount(1);
+});
+
+test('任务数量与待办在观察到期后自动降级，不为侧栏再次查询总览',async({page})=>{
+  await page.clock.install();
+  await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
+  const snapshot=await f.get('overview?fresh=1'),current=snapshot.current[0];
+  const observedAt=Date.now()-10_000;
+  current.observedAt=observedAt;
+  snapshot.taskSources=snapshot.taskSources.map((source:any)=>({...source,state:'ready',stale:false,observedAt,error:null}));
+  snapshot.attention=[{id:current.id,title:current.title,nodeId:current.nodeId,kind:'review',detail:'任务结果等待验收',actionLabel:'验收结果',observedAt,stale:false}];
+  snapshot.attentionCount=1;
+  let reads=0;
+  await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>{reads++;return route.fulfill({json:snapshot});});
+  await login(page);
+  await expect(page.locator('#sidebar [data-view=tasks] .nav-count')).toHaveText(String(snapshot.currentCount));
+  await expect(page.getByRole('button',{name:'验收结果',exact:true})).toBeVisible();
+  const loaded=reads;
+  await page.clock.fastForward(21_000);
+  await expect(page.locator('#sidebar [data-view=tasks] .nav-count')).toHaveCount(0);
+  await expect(page.getByRole('button',{name:'查看任务记录',exact:true})).toBeVisible();
+  await expect(page.locator('.overview-current')).toContainText('状态待更新');
+  await expect(page.locator('#global-notice .notice')).toHaveCount(0);
+  await expect(page.locator('#statusbar')).toContainText('页面读取');
+  expect(reads).toBe(loaded);
+  await page.getByRole('button',{name:'查看任务记录',exact:true}).click();
+  await expect(page).toHaveURL(/tab=summary/);
 });
 
 test('任务生命周期独立于失败命令，筛选与详情保持同一事实',async({page})=>{
@@ -408,7 +553,7 @@ test('登录成功仍校验服务能力，不允许进入不兼容页面',async(
   });
   await page.goto(f.server.baseUrl+'/console/');await page.locator('#login-form input[name=password]').fill(f.server.config.oauth.ownerToken!);
   await page.locator('#login-form [type=submit]').click();
-  await expect(page.locator('#login-form [data-form-error]')).toContainText('版本不一致');await expect(page.locator('.summary-grid')).toHaveCount(0);
+  await expect(page.locator('#login-form [data-form-error]')).toContainText('版本不一致');await expect(page.locator('.overview-summary')).toHaveCount(0);
 });
 
 test('真实浏览器关闭重开仍保持登录，退出后再次打开需要认证',async()=>{
@@ -420,7 +565,7 @@ test('真实浏览器关闭重开仍保持登录，退出后再次打开需要�
     expect(cookie.httpOnly).toBe(true);expect(cookie.expires).toBeGreaterThan(Date.now()/1000+86400);
     await context.close();context=await chromium.launchPersistentContext(profile,{headless:true});
     page=await context.newPage();await page.goto(f.server.baseUrl+'/console/');
-    await expect(page.locator('.summary-grid')).toBeVisible();await expect(page.locator('#login-form')).toHaveCount(0);
+    await expect(page.locator('.overview-summary')).toBeVisible();await expect(page.locator('#login-form')).toHaveCount(0);
     const auth=await (await context.request.get(f.server.baseUrl+'/console/api/session')).json();
     const logout=await context.request.post(f.server.baseUrl+'/console/api/logout',{headers:{origin:f.server.baseUrl,'x-quaymesh-csrf':auth.csrf},data:{}});
     expect(logout.status()).toBe(200);
@@ -449,7 +594,7 @@ test('后端连接中断时不要求重新输入口令，真实HTTP恢复后继�
   try{
     await login(page,base);
     await page.goto(base+'/console/?entry=local#/overview');
-    await expect(page.locator('.summary-grid')).toBeVisible();
+    await expect(page.locator('.overview-summary')).toBeVisible();
     backend.closeAllConnections();await new Promise<void>(resolve=>backend.close(()=>resolve()));
     await page.reload();
     await expect(page.getByRole('heading',{name:'控制台暂未连接'})).toBeVisible();
@@ -457,7 +602,7 @@ test('后端连接中断时不要求重新输入口令，真实HTTP恢复后继�
     backend=createServer(f.server.running.app);
     await new Promise<void>(resolve=>backend.listen(port,'127.0.0.1',resolve));
     await page.getByRole('button',{name:'重新连接',exact:true}).click();
-    await expect(page.locator('.summary-grid')).toBeVisible();
+    await expect(page.locator('.overview-summary')).toBeVisible();
     await expect(page.locator('#login-form')).toHaveCount(0);
     await expect(page).toHaveURL(base+'/console/?entry=local#/overview');
     backend.closeAllConnections();await new Promise<void>(resolve=>backend.close(()=>resolve()));
@@ -465,7 +610,7 @@ test('后端连接中断时不要求重新输入口令，真实HTTP恢复后继�
     await expect(page.getByRole('heading',{name:'控制台暂未连接'})).toBeVisible();
     backend=createServer(f.server.running.app);
     await new Promise<void>(resolve=>backend.listen(port,'127.0.0.1',resolve));
-    await expect(page.locator('.summary-grid')).toBeVisible({timeout:15_000});
+    await expect(page.locator('.overview-summary')).toBeVisible({timeout:15_000});
     await expect(page.locator('#login-form')).toHaveCount(0);
     await expect(page).toHaveURL(base+'/console/?entry=local#/overview');
   }finally{

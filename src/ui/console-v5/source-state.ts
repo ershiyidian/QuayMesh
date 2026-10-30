@@ -1,7 +1,8 @@
 import type { CacheEntry, SourceState } from './contracts.js';
 
 export function sourceWarning(source: SourceState, now = Date.now()): string | null {
-  if (source.state === 'error' || source.state === 'offline') return source.error || '当前无法读取，保留最近确认的数据';
+  if (source.error) return source.state === 'refreshing' ? `正在重试，上次读取失败：${source.error}` : source.error;
+  if (source.state === 'error' || source.state === 'offline') return '当前无法读取，保留最近确认的数据';
   if ((source.state === 'loading' || source.state === 'refreshing') && source.observedAt === null && !source.error) return null;
   if (source.state === 'refreshing' && !source.stale && source.observedAt !== null && !source.error && now-source.observedAt <= 30_000) return null;
   if (source.stale || source.state === 'refreshing') return source.observedAt ? '正在刷新，当前显示上次确认的数据' : '正在读取数据';
@@ -38,7 +39,7 @@ export function resourceObservation(entry: CacheEntry | undefined, now = Date.no
   const observedAt = snapshot?.observedAt;
   const confirmedAt = receivedAt ?? (typeof observedAt === 'number' && Number.isFinite(observedAt) ? observedAt : null);
   const expiresAt = receivedAt === null ? null : receivedAt + 30_000;
-  // Resources clears error when retrying, but clears failures only on success.
+  // A retry keeps the previous failure until a successful response confirms recovery.
   const current = Boolean(entry?.data && receivedAt && !entry.error && !entry.failures
     && now >= receivedAt && expiresAt !== null && now < expiresAt);
   return { current, confirmedAt, expiresAt };

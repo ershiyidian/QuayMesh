@@ -31,10 +31,11 @@ test("Console remote GET budget covers a slow large-frame Desktop read plus retr
   assert.equal(result.projects[0].name,"Desktop");
 });
 
-test("TTL refresh returns a timestamped snapshot while one remote refresh replaces it",async t => {
+test("TTL refresh returns a timestamped snapshot while one remote refresh replaces it",{timeout:5_000},async t => {
   t.mock.timers.enable({apis:['Date'],now:Date.now()});
   let requests = 0;
   let release!: (reply: unknown) => void;
+  t.after(() => release?.(payload("cleanup")));
   const feed = new WorkbenchFeed(config,stub(async () => {
     requests++;
     if (requests === 1) return payload("old");
@@ -47,7 +48,7 @@ test("TTL refresh returns a timestamped snapshot while one remote refresh replac
   assert.ok(performance.now()-start < 500,"stale cache must not wait for a blocked remote RPC");
   assert.equal(first.projects[0].name,"old");
   assert.equal(first.sources[0].state,"refreshing");
-  assert.equal(first.sources[0].stale,false,"12s 内的已确认数据在后台刷新时仍是新鲜快照");
+  assert.equal(first.sources[0].stale,false,"30s 内的已确认数据在后台刷新时仍是新鲜快照");
   assert.equal(sourceWarning(first.sources[0]),null,"正常轮询不应触发五节点过期横幅");
   assert.match(sourceWarning({...first.sources[0],stale:true})??"",/正在刷新/,"真实过期仍需提示");
   assert.equal(first.complete,true,"a complete cached snapshot remains usable while refreshing");
@@ -57,14 +58,21 @@ test("TTL refresh returns a timestamped snapshot while one remote refresh replac
   assert.equal(second.projects[0].name,"old");
   assert.equal(requests,2,"multiple reads must reuse a single pending request");
   t.mock.timers.tick(18_000);
-  const old = await feed.metadata();
-  assert.equal(old.sources[0].stale,true,"超过 30s 且尚未确认的新数据必须报告过期");
-  assert.match(sourceWarning(old.sources[0])??"",/正在刷新/);
+  let settled = false;
+  const waiting = feed.metadata().then(value => { settled = true; return value; });
+  await delay(10);
+  assert.equal(settled,false,"an expired reader must await the in-flight refresh");
+  assert.equal(requests,2,"an expired reader must not start another remote RPC");
   release(payload("new"));
-  await delay(15);
-  const updated = await feed.metadata();
+  const updated = await waiting;
   assert.equal(updated.complete,true);
   assert.equal(updated.projects[0].name,"new");
+  assert.equal(updated.sources[0].state,"ready");
+  assert.equal(updated.sources[0].stale,false);
+  assert.equal(updated.sources[0].observedAt,Date.now());
+  assert.notEqual(updated.sources[0].observedAt,first.sources[0].observedAt);
+  assert.equal((await feed.metadata()).projects[0].name,"new");
+  assert.equal(requests,2);
 });
 
 test('a write invalidation waits for a fresh read and an older pending GET cannot repopulate the cache',async t=>{

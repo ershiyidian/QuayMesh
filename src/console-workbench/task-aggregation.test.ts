@@ -3,6 +3,8 @@ import test from "node:test";
 import { aggregateTaskIndex, aggregateTasks, filterTaskIndex, taskReference } from "./task-aggregation.js";
 import type { TaskPhaseIndex } from "./local-queries.js";
 import type { Run } from "./types.js";
+import { lastObservedExecutingTasks, selectOverviewTasks } from './overview-tasks.js';
+import { dayAt } from './query.js';
 
 function run(id: string, taskId: string, nodeId: string): Run {
   return {
@@ -108,3 +110,47 @@ for (const scenario of scenarios) {
     }
   });
 }
+
+test('Task attention paging uses the same actionable categories as the overview', () => {
+  const rows = aggregateTaskIndex([
+    {...phase('old-stalled', 'old-stalled', 'desktop'), requestState:'active', executionStatus:'stalled'},
+    {...phase('unknown', 'unknown', 'desktop'), requestState:'active', executionStatus:'unknown', actionableInterruption:true},
+    {...phase('old-failure', 'old-failure', 'desktop'), requestState:'closed', resultStatus:'failed', executionStatus:'failed', actionableInterruption:true},
+    {...phase('resume', 'resume', 'desktop'), requestState:'active', executionStatus:'interrupted_recoverable', actionableInterruption:true},
+    {...phase('review', 'review', 'desktop'), requestState:'closed', resultStatus:'completed', executionStatus:'completed'},
+    {...phase('finalization', 'finalization', 'desktop'), requestState:'active', executionStatus:'finalizing',
+      finalization:{status:'failed' as const,requestedAt:at,error:'test failure'}},
+  ], at);
+  assert.deepEqual(filterTaskIndex(rows,{attention:'1',days:'0'},at).map(row=>row.taskId).sort(),
+    ['finalization','resume','review']);
+});
+
+test('completed Task results remain filterable independently of the last execution state', () => {
+  const rows = aggregateTaskIndex([
+    {...phase('uncertain', 'task-done', 'desktop'), requestState:'closed', resultStatus:'completed', executionStatus:'unknown', finishedAt:at},
+    {...phase('residual', 'residual', 'desktop'), requestState:'closed', resultStatus:'completed', executionStatus:'running', finishedAt:at},
+    {...phase('only-phase', 'open-task', 'desktop'), requestState:'active', executionStatus:'completed', finishedAt:at},
+    {...phase('stopped', 'stopped-task', 'desktop'), requestState:'closed', resultStatus:'cancelled', executionStatus:'cancelled', finishedAt:at},
+  ], at);
+  assert.deepEqual(filterTaskIndex(rows,{requestState:'closed',resultStatus:'completed',days:'0'},at)
+    .map(row=>row.taskId).sort(),['residual','task-done']);
+});
+
+test('overview view-all filters retain exactly the displayed current and older groups beyond twelve rows', () => {
+  const time=Date.parse('2026-10-30T11:38:00Z');
+  const yesterday=Date.parse('2026-10-29T11:59:00Z');
+  const phases=[...Array.from({length:15},(_,i)=>({...phase(`new-${i}`,`new-${i}`,'desktop'),
+    requestState:'active',lastActivityAt:time-60_000,executionStatus:'waiting'})),
+    {...phase('old','old','desktop'),requestState:'active',lastActivityAt:yesterday,executionStatus:'waiting'},
+    {...phase('cached','cached','desktop'),requestState:'active',lastActivityAt:yesterday,executionStatus:'running'},
+  ];
+  const retained=lastObservedExecutingTasks(phases);
+  const indexed=aggregateTaskIndex(phases.map(value=>value.taskId==='cached'
+    ? {...value,executionStatus:'unknown',stale:true} : value),time);
+  const groups=selectOverviewTasks(indexed,time,value=>dayAt(value,'Asia/Shanghai')===dayAt(time,'Asia/Shanghai'),retained);
+  const keys=(values:typeof indexed)=>values.map(value=>value.key).sort();
+  assert.equal(groups.current.length,16);
+  assert.deepEqual(keys(filterTaskIndex(indexed,{overviewGroup:'current',tz:'Asia/Shanghai',days:'0'},time,retained)),keys(groups.current));
+  assert.deepEqual(keys(filterTaskIndex(indexed,{overviewGroup:'olderOpen',tz:'Asia/Shanghai',days:'0'},time,retained)),keys(groups.olderOpen));
+  assert.deepEqual(groups.olderOpen.map(value=>value.taskId),['old']);
+});

@@ -22,6 +22,7 @@ import { receiptLabel, canQueryReceipt } from './receipt-presentation.js';
 import { workspaceHandle } from "../../federation/routing.js";
 import "./styles.css";
 import './experience.css';
+import './overview.css';
 Prism.manual = true;
 
 
@@ -91,17 +92,17 @@ const resources = new Resources(API, { freshness, paint: schedulePaint, loaded(p
     if (path === 'fleet/status') pollNotifications();
 } });
 const CACHE = resources.entries, selectedRuns = new Set<string>(), selectedThreads = new Set<string>(), expandedRoots = new Set<string>(), loadedBigFiles = new Set<string>(), expandedGroups = new Set<string>();
-let route: Route = parseRoute(), authRequired = false, booting = true, paintQueued = false, refreshTimer: ReturnType<typeof setTimeout> | undefined = undefined, failures = 0, refreshInFlight = false, backgroundPaused = false, activityPaused = false, activePaths = new Set<string>(), lastFocus: HTMLElement | null = null, paletteState: { close: () => void } | null = null;
+let route: Route = parseRoute(), authRequired = false, booting = true, paintQueued = false, refreshTimer: ReturnType<typeof setTimeout> | undefined = undefined, failures = 0, refreshInFlight = false, backgroundPaused = false, activityPaused = false, activePaths = new Set<string>(), lastFocus: HTMLElement | null = null, paletteState: { close: () => void; pause: () => void; resume: () => void } | null = null;
 const diffLimits = new Map<string, number>();
 let pageSearch = '', sessionSearch = '', groupEvents = true, sortLayout = pref.taskLayout, machineLayout = pref.machineLayout, diffMode = pref.diffMode, writePending = new Set<string>();
-const NAV = [['overview', '运行总览', 'overview'], ['tasks', '任务', 'tasks'], ['changes', '改动审查', 'changes'], ['sessions', '会话', 'sessions'], ['machines', '机器', 'machines'], ['workspaces', '工作空间', 'workspaces'], ['activity', '活动', 'activity'], ['usage', '用量分析', 'usage'], ['settings', '设置', 'settings']];
-const titleOf = (v: string) => NAV.find(n => n[0] === v)?.[1] || '运行总览';
+const NAV = [['overview', '任务总览', 'overview'], ['tasks', '任务', 'tasks'], ['changes', '改动审查', 'changes'], ['sessions', '会话', 'sessions'], ['machines', '机器', 'machines'], ['workspaces', '工作空间', 'workspaces'], ['activity', '活动', 'activity'], ['usage', '用量分析', 'usage'], ['settings', '设置', 'settings']];
+const titleOf = (v: string) => NAV.find(n => n[0] === v)?.[1] || '任务总览';
 function parseRoute() { const [v, q] = location.hash.replace(/^#\/?/, '').split('?'); return { view: ['overview', 'tasks', 'changes', 'sessions', 'machines', 'workspaces', 'activity', 'usage', 'settings'].includes(v) ? v : 'overview', p: Object.fromEntries(new URLSearchParams(q || '')) }; }
 function currentQuery(extra: Record<string, string | number | boolean | null | undefined> = {}): string {
   const p = route.p;
   return queryString({ tz: timeZone() || deviceTimeZone, days: p.days ?? '0', node: p.node, project: p.project, q: p.q, status: p.status || (route.view === 'changes' && p.reviewMode !== 'all' ? 'review' : undefined), stage: p.stage, sort: p.sort,
     cursor: p.cursor, limit: p.limit || '25', changed: route.view === 'changes' ? '1' : p.changed, date: p.date, finishedDay: p.finishedDay,
-    execution: p.execution, requestState: p.requestState, attention: p.attention, usageDate:p.usageDate, usageDays:p.usageDays, ...extra });
+    execution: p.execution, requestState: p.requestState, resultStatus: p.resultStatus, overviewGroup: p.overviewGroup, attention: p.attention, usageDate:p.usageDate, usageDays:p.usageDays, ...extra });
 }
 function queryString(parameters: Record<string, string | number | boolean | null | undefined>): string {
   return new URLSearchParams(Object.entries(parameters).flatMap(([key, value]): Array<[string,string]> => value === undefined || value === null || value === '' ? [] : [[key,String(value)]])).toString();
@@ -125,6 +126,25 @@ function machineStatus(n: Machine) {
 }
 const overviewPath = () => 'overview?tz=' + enc(timeZone() || deviceTimeZone);
 const overview = () => data<Overview>(overviewPath());
+function renderedResourceEntry(path: string): CacheEntry | undefined {
+    const entry = CACHE.get(path);
+    if (!path.startsWith('overview') || !entry?.data) return entry;
+    const snapshot = entry.data as {sources?: SourceState[]; taskSources?: SourceState[]};
+    return {...entry, data:{...snapshot, sources:snapshot.taskSources ?? snapshot.sources}};
+}
+function observedResourceEntry(path: string): CacheEntry | undefined {
+    const entry = renderedResourceEntry(path);
+    if (!path.startsWith('overview') || !entry?.data) return entry;
+    const snapshot = entry.data as {sources?: SourceState[]}, now = Date.now();
+    // 观察到期影响任务状态与数量；自然老化不升级为读取故障。
+    const sources = snapshot.sources?.map(source => source.observedAt !== null && now - source.observedAt > 30_000
+        ? {...source, stale:true} : source);
+    return {...entry, data:{...snapshot, sources}};
+}
+function overviewObservation() {
+    const observation = resourceObservation(renderedResourceEntry(overviewPath()));
+    return {...observation, current:observation.current && !backgroundPaused && !authRequired && !bootstrapError};
+}
 const projects = () => data<ListResponse<Project>>('projects')?.items || [];
 const node = (id: string | null | undefined) => fleet()?.nodes?.find(n => n.id === id);
 const nodeTag = (id: string | null | undefined, short = false) => { const n = node(id); return `<span class="node-label"><span class="node-mark ${n?.online === false ? 'offline' : ''}">${esc(n?.short || id?.slice(0, 3) || '?')}</span>${short ? '' : `<span class="ellipsis">${esc(n?.name || id || '未知节点')}</span>`}</span>`; };
@@ -135,13 +155,13 @@ const canWrite = (cap = 'write') => !!API.session?.capabilities?.write && API.se
 const writeAttrs = (cap = 'write') => canWrite(cap) ? '' : 'disabled title="当前接口或凭据不允许此操作"';
 const selectedRun = () => data<RunDetail>('runs/' + enc(route.p.run || ''))?.run;
 function resourceName(path: string) {
-    return path.startsWith('overview') ? '任务总览' : path === 'fleet/status' ? '节点状态' : path === 'projects' ? '项目' : path.startsWith('runs?') ? '任务列表' : path.startsWith('runs/') ? '任务详情' : path.includes('/sessions') ? '会话' : path.startsWith('usage') ? '用量' : path.startsWith('activity') ? '活动' : path === 'roots' ? '工作空间' : '数据';
+    return path.startsWith('overview') ? '任务数据' : path === 'fleet/status' ? '节点状态' : path === 'projects' ? '工作区目录' : path.startsWith('runs?') ? '任务列表' : path.startsWith('runs/') ? '任务详情' : path.includes('/sessions') ? '会话' : path.startsWith('usage') ? '用量' : path.startsWith('activity') ? '活动' : path === 'roots' ? '工作空间' : '数据';
 }
 function runObservation(run: Run) {
-    const matching = [...activePaths].map(path => CACHE.get(path)).filter((entry): entry is CacheEntry => {
+    const matching = [...activePaths].map(observedResourceEntry).filter((entry): entry is CacheEntry => {
         if (!entry?.data) return false;
-        const value = entry.data as { run?: Run; items?: Run[]; active?: Run[]; waiting?: Run[]; recent?: Run[] };
-        return value.run?.id === run.id || [value.items, value.active, value.waiting, value.recent].some(rows => rows?.some(row => row.id === run.id));
+        const value = entry.data as { run?: Run; items?: Run[]; current?: Run[]; olderOpen?: Run[]; active?: Run[]; waiting?: Run[]; recent?: Run[] };
+        return value.run?.id === run.id || [value.items, value.current, value.olderOpen, value.active, value.waiting, value.recent].some(rows => rows?.some(row => row.id === run.id));
     }).sort((a, b) => b.time - a.time);
     const entry = matching[0], sources = (entry?.data as { sources?: SourceState[] } | undefined)?.sources?.filter(source => (run.nodeIds || [run.nodeId]).includes(source.nodeId)) || [];
     const observed = sources.map(source => source.observedAt).filter((at): at is number => at !== null);
@@ -152,7 +172,7 @@ function elapsed(run: Run): string { const observation=runObservation(run);retur
 function routePaths() {
     const list = ['fleet/status'];
     if (['overview', 'machines'].includes(route.view)) list.push(overviewPath());
-    if (['overview', 'tasks', 'changes', 'sessions', 'workspaces', 'usage'].includes(route.view)) list.push('projects');
+    if (['tasks', 'changes', 'sessions', 'workspaces', 'usage'].includes(route.view)) list.push('projects');
     if (['tasks', 'changes'].includes(route.view)) {
         list.push(runPath());
         if (route.p.run) {
@@ -232,7 +252,7 @@ catch {
     setTimeout(() => { if (innerWidth <= 1000)
         $('#inspector-close')?.focus(); }, 30);
 } }
-function param(p: Record<string, string | number | boolean | null | undefined>) { if ('q' in p || 'status' in p || 'stage' in p || 'requestState' in p || 'attention' in p || 'node' in p || 'project' in p || 'days' in p || 'usageDate' in p || 'usageDays' in p || 'sort' in p)
+function param(p: Record<string, string | number | boolean | null | undefined>) { if ('q' in p || 'status' in p || 'stage' in p || 'requestState' in p || 'resultStatus' in p || 'overviewGroup' in p || 'attention' in p || 'node' in p || 'project' in p || 'days' in p || 'usageDate' in p || 'usageDays' in p || 'sort' in p)
     p.cursor = null; selectedRuns.clear(); navigate(route.view, p, true, true); }
 function schedulePaint() {
     if (paintQueued) return;
@@ -280,7 +300,7 @@ function staleNotice(path: string, captures?: RunDetail['changeCaptures']) {
 }
 function empty(title: string, text = '', action = '') { return `<div class="empty">${icon('workspaces', 26)}<h3>${esc(title)}</h3>${text ? `<p>${esc(text)}</p>` : ''}${action}</div>`; }
 const pageHead = (title: string, subtitle = '', actions = '') => `<header class="page-head"><div><h1>${esc(title)}</h1>${subtitle ? `<p>${subtitle}</p>` : ''}</div>${actions ? `<div class="page-actions">${actions}</div>` : ''}</header>`;
-const panel = (title: string, body: string, right = '', foot = '') => `<section class="panel"><div class="panel-head"><h3>${title}</h3>${right ? `<div class="right">${right}</div>` : ''}</div>${body}${foot ? `<div class="panel-foot">${foot}</div>` : ''}</section>`;
+const panel = (title: string, body: string, right = '', foot = '', key = '') => `<section class="panel"${key ? ` data-key="${esc(key)}"` : ''}><div class="panel-head"><h3>${title}</h3>${right ? `<div class="right">${right}</div>` : ''}</div>${body}${foot ? `<div class="panel-foot">${foot}</div>` : ''}</section>`;
 function tabs(items: Array<[string, string, (number | null | undefined)?]>, value: string, action = 'tab', attr = 'data-value') { return `<div class="tabs" aria-label="视图筛选">${items.map(([id, text, count]) => `<button class="tab ${id === value ? 'active' : ''}" data-action="${action}" ${attr}="${esc(id)}" aria-pressed="${id === value}">${text}${count != null ? `<span class="count">${count}</span>` : ''}</button>`).join('')}</div>`; }
 function segmented(items: Array<[string, string]>, value: string | number, action: string, extra = '') { return `<div class="segmented">${items.map(([id, label]) => `<button type="button" class="${String(id) === String(value) ? 'active' : ''}" data-action="${action}" data-value="${esc(id)}" aria-pressed="${String(id) === String(value)}" ${extra}>${label}</button>`).join('')}</div>`; }
 function searchField(value: string | undefined, placeholder = '搜索标题、ID 或项目…', kind = 'query') { return `<label class="search-field">${icon('search', 15)}<span class="sr-only">${esc(placeholder)}</span><input class="input" id="${kind}-search" data-search="${kind}" type="search" value="${esc(value || '')}" placeholder="${esc(placeholder)}" autocomplete="off"></label>`; }
@@ -299,24 +319,27 @@ function pagination(d: RunPage | ActivityPage<unknown>) {
 
 const deviceTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 function chrome() {
-    const ov = overview(), f = fleet(), health = resourceHealth([...activePaths].map(p => CACHE.get(p)));
-    const connectionLabel = health.errors || health.stale ? (health.confirmedAt ? '上次读取 ' + tm(health.confirmedAt) : '等待数据') : health.label;
-    const nav = NAV.map(([v, t, i], index) => `${index === 4 ? '<div class="nav-label">基础设施</div>' : ''}${index === 8 ? '<div class="nav-divider"></div>' : ''}<button type="button" class="nav-item ${route.view === v ? 'active' : ''}" data-action="nav" data-view="${v}" ${route.view === v ? 'aria-current="page"' : ''} title="${t}">${icon(i, 16)}<span class="label">${t}</span>${v === 'tasks' && ov?.runningCount ? `<span class="nav-count" title="${ov.runningCount} 项运行中">${ov.runningCount}</span>` : ''}</button>`).join('');
+    const ov = overview(), f = fleet(), health = resourceHealth([...activePaths].map(renderedResourceEntry));
+    const taskObservationWarnings = sourceWarnings([observedResourceEntry(overviewPath())]);
+    const observationExpired = activePaths.has(overviewPath()) && taskObservationWarnings.length > 0 && !health.errors && !health.stale;
+    const connectionLabel = health.errors || health.stale || observationExpired ? (health.confirmedAt ? '页面读取 ' + tm(health.confirmedAt) : '等待数据') : health.label;
+    const currentCount = overviewObservation().current && !taskObservationWarnings.length ? ov?.currentCount : null;
+    const nav = NAV.map(([v, t, i], index) => `${index === 4 ? '<div class="nav-label">基础设施</div>' : ''}${index === 8 ? '<div class="nav-divider"></div>' : ''}<button type="button" class="nav-item ${route.view === v ? 'active' : ''}" data-action="nav" data-view="${v}" ${route.view === v ? 'aria-current="page"' : ''} title="${t}">${icon(i, 16)}<span class="label">${t}</span>${v === 'tasks' && currentCount ? `<span class="nav-count" title="${currentCount} 项当前任务">${currentCount}</span>` : ''}</button>`).join('');
     updateHTML($('#sidebar'), `<div class="brand">${brand()}<span class="brand-text">QuayMesh</span>${ib('panel', 'sidebar', '折叠侧栏')}</div><div class="nav-label">工作台</div><nav aria-label="主导航">${nav}</nav><div class="sidebar-bottom"><button class="nav-item" data-action="palette" title="搜索与命令">${icon('terminal')}<span class="label">命令面板</span><kbd class="nav-count">${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'} K</kbd></button><div class="profile"><span class="avatar">W</span><div class="profile-text"><b>${esc(API.session?.user?.name || 'Owner')}</b><small>${canWrite() ? '管理员' : '只读'}</small></div>${ib('settings', 'nav', '设置', 'data-view="settings"')}</div></div>`);
     updateHTML($('#topbar'), `<button class="collapsed-toggle icon-btn" data-action="sidebar" aria-label="展开侧栏">${icon('panel')}</button><div class="breadcrumb"><span class="workspace-label">个人工作区</span><span class="slash">/</span><b>${esc(titleOf(route.view))}</b></div><button class="top-search" data-action="palette" aria-label="搜索与命令面板">${icon('search', 14)}<span>搜索任务或命令</span><kbd>${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'} K</kbd></button><button class="demo-tag" data-action="diagnostics">诊断</button>${desktopActions()}${ib('refresh', 'refresh', refreshInFlight ? '重新发起当前页面读取' : '刷新当前页面')}${ib(document.documentElement.dataset.theme === 'dark' ? 'sun' : 'moon', 'theme', '切换主题', '', 'theme-top')}`);
     updateHTML($('#global-notice'), failureSummary());
-    updateHTML($('#statusbar'), `<span class="inline ${booting || authRequired || bootstrapError || health.errors || health.stale ? 'muted' : health.tone}" title="${esc(health.confirmedAt ? '本页最近确认：' + fullTime(health.confirmedAt) : '尚无已确认数据')}"><i class="dot"></i>${booting ? '连接中' : authRequired ? '请登录' : bootstrapError ? '未连接' : connectionLabel}</span><button data-action="nav" data-view="machines">${fleetOnlineLabel('节点在线')}</button><span>${fleetObservation().current ? '出网' : '上次出网'} ${esc(node(f?.gatewayId)?.short || '—')}</span><span class="spacer"></span><span>${document.hidden || backgroundPaused ? '已暂停' : pref.poll ? pref.poll + ' 秒检查更新' : '手动刷新'}</span><span>${timeZone() || deviceTimeZone}</span><button data-action="shortcuts">快捷键</button>`);
+    updateHTML($('#statusbar'), `<span class="inline ${booting || authRequired || bootstrapError || health.errors || health.stale || observationExpired ? 'muted' : health.tone}" title="${esc(health.confirmedAt ? '页面最近读取：' + fullTime(health.confirmedAt) : '尚无已确认数据')}"><i class="dot"></i>${booting ? '连接中' : authRequired ? '请登录' : bootstrapError ? '未连接' : connectionLabel}</span><button data-action="nav" data-view="machines">${fleetOnlineLabel('节点在线')}</button><span>${fleetObservation().current ? '出网' : '上次出网'} ${esc(node(f?.gatewayId)?.short || '—')}</span><span class="spacer"></span><span>${document.hidden || backgroundPaused ? '已暂停' : pref.poll ? pref.poll + ' 秒检查更新' : '手动刷新'}</span><span>${timeZone() || deviceTimeZone}</span><button data-action="shortcuts">快捷键</button>`);
     updateHTML($('#bottom-nav'), [['overview', '总览', 'overview'], ['tasks', '任务', 'tasks'], ['sessions', '会话', 'sessions'], ['machines', '机器', 'machines'], ['more', '更多', 'more']].map(([v, t, i]) => `<button class="${v === route.view || v === 'more' && !['overview', 'tasks', 'sessions', 'machines'].includes(route.view) ? 'active' : ''}" data-action="${v === 'more' ? 'more' : 'nav'}" data-view="${v}" aria-label="${t}">${icon(i, 19)}<span>${t}</span></button>`).join(''));
 }
 function failureSummary() {
   if (authRequired) return '<div class="notice global-notice warn">' + icon('lock', 14) + '登录已过期</div>';
   const failed = [...activePaths].filter(path => CACHE.get(path)?.error && CACHE.get(path)?.data);
-  const sources = sourceWarnings([...activePaths].map(path => CACHE.get(path)));
+  const sources = [...activePaths].flatMap(path => sourceWarnings([renderedResourceEntry(path)]).map(source => ({path,source})));
   const notices: string[] = [], details: string[] = [];
-  if (failed.length) notices.push(failed.length + ' 项读取失败');
+  if (failed.length) notices.push([...new Set(failed.map(resourceName))].join('、') + '读取失败');
   details.push(...failed.map(path => resourceName(path) + '：' + CACHE.get(path)!.error!.message));
-  if (sources.length) notices.push(sources.length + ' 个节点的数据更新延迟');
-  details.push(...sources.map(source => (source.name || source.nodeId) + '：' + sourceWarning(source) + (source.observedAt ? ' · 上次确认 ' + fullTime(source.observedAt) : '')));
+  if (sources.length) notices.push([...new Set(sources.map(({path}) => resourceName(path)))].join('、') + '更新延迟');
+  details.push(...sources.map(({path,source}) => resourceName(path) + ' · ' + (source.name || source.nodeId) + '：' + sourceWarning(source) + (source.observedAt ? ' · 上次确认 ' + fullTime(source.observedAt) : '')));
   if (pref.notifications && notificationGaps.size) {
     notices.push('活动通知待更新');
     details.push(...[...notificationGaps].map(([id,message]) => (node(id)?.name || id) + '：' + message));
@@ -328,6 +351,8 @@ let bootstrapRetryTimer:ReturnType<typeof setTimeout>|undefined;
 let bootstrapAttempts=0;
 function paint() {
     const root = $('#view')!;
+    const overviewFocus = route.view === 'overview' && document.activeElement instanceof HTMLElement && root.contains(document.activeElement)
+        ? document.activeElement : null;
     root.classList.toggle('split-view', ['tasks', 'changes', 'sessions'].includes(route.view));
     let html;
     if (authRequired)
@@ -340,6 +365,7 @@ function paint() {
         html = renderView();
     chrome();
     updateHTML(root, `<div data-key="view-${route.view}-${authRequired ? 'login' : 'app'}" style="${['tasks', 'changes', 'sessions'].includes(route.view) && !authRequired ? 'height:100%;min-height:0' : ''}">${html}</div>`);
+    if (overviewFocus?.isConnected && document.activeElement !== overviewFocus) overviewFocus.focus({preventScroll:true});
     const overlay = !!route.p.run && ['tasks', 'changes'].includes(route.view) && innerWidth <= 1000;
     ['#sidebar', '#topbar', '#bottom-nav', '#statusbar'].forEach(sel => { const el = $(sel); if (el)
         el.inert = overlay; });
@@ -381,6 +407,10 @@ async function loadMoreFile(path: string): Promise<void> {
 }
 document.addEventListener('toggle', event => {
   const target = (event.target as HTMLElement);
+  if (target instanceof HTMLDetailsElement && target.id === 'overview-older-open') {
+    if (target.open) expandedGroups.add('overview-older-open');
+    else expandedGroups.delete('overview-older-open');
+  }
   if (target instanceof HTMLDetailsElement && target.open && target.id.startsWith('command-') && route.p.run) {
     const commandId = target.id.slice('command-'.length);
     const command = data<RunDetail>('runs/' + enc(route.p.run))?.commands.find(command => command.id === commandId);
@@ -388,27 +418,45 @@ document.addEventListener('toggle', event => {
   }
 }, true);
 function renderView() { return ({ overview: overviewPage, tasks: tasksPage, changes: tasksPage, sessions: sessionsPage, machines: machinesPage, workspaces: workspacesPage, activity: activityPage, usage: usagePage, settings: settingsPage } as Record<string, () => string>)[route.view](); }
-function overviewRunCard(r: Run) {
-    const state = stage(r);
-    return `<article class="run-card" data-key="active-${esc(r.id)}"><header><span class="session-symbol">${icon('changes', 16)}<i class="session-dot ${state}"></i></span><div class="run-card-title"><button class="run-title ellipsis" data-action="open-run" data-id="${esc(r.id)}" title="${esc(r.title)}">${esc(r.title)}</button><div class="run-sub">${taskScope(r, true)}${workspaceSummary(r)}</div></div>${ib('chevron', 'open-run', '打开任务', `data-id="${esc(r.id)}"`)}</header>${r.command ? `<button class="session-live" data-action="card-command" data-id="${esc(r.id)}"><span class="spinner"></span><span class="agent-label">${esc(r.agent)}</span><code title="${esc(r.command)}">${esc(r.command)}</code></button>` : ''}<footer>${runBadges(r)}<span class="spacer"></span>${elapsed(r)}<span class="divider"></span>${usageText(r)}</footer></article>`;
+function overviewTaskTitle(title: string, startedAt?: number) {
+    const value = title.trim();
+    return !value || /^(?:QuayMesh task|TaskQuay task|Federated session|Workspace tq:\S+)$/i.test(value)
+        ? '未命名任务' + (typeof startedAt === 'number' && Number.isFinite(startedAt) && startedAt > 0 ? ' · ' + fullTime(startedAt) : '') : value;
+}
+function overviewTaskRow(r: Run & {progressLabel?: string; progressSummary?: string | null}, group: 'current' | 'older' | 'recent') {
+    const title = overviewTaskTitle(r.title, r.startedAt), observation = runObservation(r);
+    const execution = executionObservationForRun(r, observation.sources, observation);
+    const stale = r.requestState !== 'closed' && (execution.stale || !overviewObservation().current);
+    const label = stale ? '状态待更新' : r.progressLabel || stages[stage(r)] || '等待更新';
+    const tone = stale ? '' : r.requestState === 'closed' ? r.resultStatus === 'completed' ? 'good' : ''
+        : ['running','starting','stopping'].includes(r.executionStatus) ? 'live'
+        : r.actions.review || r.finalization?.error ? 'warn' : '';
+    const at = stale ? execution.observedAt : group === 'recent' ? r.finishedAt || r.lastActivityAt : r.lastActivityAt;
+    const validAt = typeof at === 'number' && Number.isFinite(at) && at > 0 ? at : null;
+    const timeLabel = stale ? '上次确认' : group === 'recent' ? '结束于' : '更新于';
+    return `<article class="overview-task-row" role="listitem" data-key="overview-${group}-${esc(r.id)}"><div class="overview-task-content"><div class="overview-task-heading"><button class="run-title overview-task-title" data-action="open-run" data-id="${esc(r.id)}" title="${esc(title)}">${esc(title)}</button>${badge(label,tone)}</div>${r.progressSummary ? `<p class="overview-task-progress">${esc(r.progressSummary)}</p>` : ''}<div class="overview-task-meta">${taskScope(r,false)}${workspaceSummary(r)}<span class="overview-task-time">${timeLabel} ${validAt !== null ? smallTime(validAt) : '尚未确认'}</span></div></div>${ib('chevron','open-run','打开任务',`data-id="${esc(r.id)}"`)}</article>`;
+}
+function overviewAttentionRow(a: Overview['attention'][number], o: Overview) {
+    const task = [...o.current, ...o.olderOpen, ...o.recent].find(r => r.id === a.id);
+    const confirmed = typeof a.observedAt === 'number' && Number.isFinite(a.observedAt) && a.observedAt > 0;
+    const stale = a.stale || !overviewObservation().current || !confirmed || Date.now() - a.observedAt! > 30_000;
+    return `<div class="attention-row" data-key="attention-${esc(a.id)}"><span class="amber">${icon('alert',16)}</span><div><button class="run-title" data-action="open-run" data-id="${esc(a.id)}">${esc(overviewTaskTitle(a.title,task?.startedAt))}</button><p title="${esc(a.detail)}">${esc(a.detail)}</p>${stale ? `<p class="small muted">${confirmed ? '上次确认 ' + smallTime(a.observedAt) : '状态尚未确认'}</p>` : ''}${btn(esc(stale ? '查看任务记录' : a.actionLabel),'overview-task-action',`data-id="${esc(a.id)}" data-kind="${stale ? 'record' : esc(a.kind)}"`,'small ghost')}</div></div>`;
 }
 function overviewPage() {
     const o = overview(), f = fleet();
     if (!o)
-        return `<div class="page">${pageHead('运行总览')}${resourceState(overviewPath())}</div>`;
-    const shown = (value: number | null | undefined) => value == null ? '未取得' : value;
-    const detail = (value: number | null | undefined, suffix: string) => value == null ? '数据未完整取得' : value + suffix;
-    const metric = (label: string, value: string | number | null, sub: string, action: string, tone = '') => `<button class="metric metric-button" data-action="${action}"><span class="metric-label">${label}</span><span class="metric-main"><b class="${tone}">${value}</b><small>${sub}</small></span></button>`;
-    const active = o.active.filter(r => ['running','stopping'].includes(stage(r))), queue = o.active.filter(r => stage(r) === 'queued');
-    const running = `<section class="overview-active"><div class="section-line"><h3>后台执行 <span class="muted small">${o.runningCount ?? ('至少 ' + active.length)}</span></h3><button class="link-btn" data-action="nav" data-view="tasks">全部任务 ${icon('arrow', 13)}</button></div><div class="active-card-grid">${active.map(overviewRunCard).join('') || empty(o.coverage.tasks ? '暂无后台执行' : '已读取范围内暂无后台执行', o.coverage.tasks ? '' : '仍有节点数据待确认。')}</div>${queue.length ? `<div class="queue-strip">${icon('queued', 14)}<b>${o.queuedCount ?? ('至少 ' + queue.length)} 项排队</b><span class="ellipsis">${esc(queue.map(r => r.title).join('、'))}</span>${btn('查看', 'queued-queue', '', 'small ghost')}</div>` : ''}</section>`;
-    const waiting = o.waiting.length ? panel('当前无后台执行 / 交付确认', o.waiting.map(r=>`<div class="recent-row"><span>${icon(stage(r),14)}</span><div class="recent-name"><button class="run-title ellipsis" data-action="open-run" data-id="${esc(r.id)}">${esc(r.title)}</button>${workspaceSummary(r)}${r.reason ? `<p class="small muted">${esc(r.reason)}</p>` : ''}</div><span class="recent-task-state">${runBadges(r)}</span>${smallTime(r.lastActivityAt)}</div>`).join(''), btn('查看全部 '+(o.waitingCount ?? ''),'waiting-queue','','ghost small')) : '';
-    const recent = panel('最近执行结果', o.recent.map(r => `<div class="recent-row" data-key="recent-${esc(r.id)}"><span>${icon(stage(r), 14)}</span><div class="recent-name"><button class="run-title ellipsis" data-action="open-run" data-id="${esc(r.id)}">${esc(r.title)}</button>${workspaceSummary(r)}</div><span class="recent-task-state">${runBadges(r)}</span>${smallTime(r.finishedAt || r.startedAt)}</div>`).join('') || empty('暂无执行记录'), btn('查看全部', 'nav', 'data-view="tasks"', 'ghost small'));
-    const attention = panel('需要处理', o.attention.slice(0, 3).map(a => `<div class="attention-row" data-key="attention-${esc(a.id)}"><span class="${a.kind === 'failed' ? 'red' : 'amber'}">${icon(a.kind, 16)}</span><div><button class="run-title" data-action="open-run" data-id="${esc(a.id)}">${esc(a.title)}</button><p title="${esc(a.detail)}">${esc(a.detail)}</p></div>${ib('chevron', 'open-run', '查看异常', `data-id="${esc(a.id)}"`)}</div>`).join('') || empty(o.coverage.tasks ? '没有待处理事项' : '已读取范围内未发现待处理事项', o.coverage.tasks ? '' : '尚有数据待确认。'), o.attentionCount == null ? badge('数据未完整取得') : badge(o.attentionCount + ' 项', o.attentionCount ? 'warn' : ''), o.attentionCount != null && o.attentionCount > 3 ? `<button class="link-btn" data-action="attention-queue">全部 ${o.attentionCount} 项 ${icon('arrow', 13)}</button>` : '');
+        return `<div class="page">${pageHead('任务总览')}${resourceState(overviewPath())}</div>`;
+    const shown = (value: number | null | undefined) => value == null ? '待确认' : value;
+    const compactEmpty = (title: string) => `<div class="overview-empty">${icon('tasks',18)}<p>${esc(title)}</p></div>`;
+    const current = panel('当前任务', `<div class="overview-task-list overview-current" role="list" aria-label="当前任务">${o.current.map(r => overviewTaskRow(r,'current')).join('') || compactEmpty(o.coverage.tasks ? '暂无当前任务' : '任务状态待确认')}</div>`, badge(String(shown(o.currentCount))), (o.currentCount ?? o.knownCounts.current) > o.current.length ? `<span class="small muted">已显示 ${o.current.length} 项</span>${btn('查看全部' + (o.currentCount == null ? '' : ' ' + o.currentCount + ' 项') + '当前任务','current-task-queue','','small ghost')}` : '', 'overview-current-panel');
+    const older = o.olderOpen.length || o.olderOpenCount ? `<details class="panel overview-older" id="overview-older-open" data-key="overview-older-open" ${expandedGroups.has('overview-older-open') ? 'open' : ''}><summary><span>较早未关闭</span>${badge(String(shown(o.olderOpenCount)))}<span class="small muted overview-expand">展开查看</span><span class="small muted overview-collapse">收起</span>${icon('down',14)}</summary><div class="overview-task-list" role="list" aria-label="较早未关闭">${o.olderOpen.map(r => overviewTaskRow(r,'older')).join('')}</div><div class="panel-foot">${btn('查看全部较早未关闭任务','older-task-queue','','small ghost')}</div></details>` : '';
+    const recent = panel('最近结束的任务', `<div class="overview-task-list overview-recent" role="list" aria-label="最近结束的任务">${o.recent.map(r => overviewTaskRow(r,'recent')).join('') || compactEmpty(o.coverage.tasks ? '暂无已结束任务' : '已结束任务状态待确认')}</div>`, btn('全部已结束任务','closed-task-queue','','small ghost'), '', 'overview-recent-panel');
+    const attention = o.attention.length ? panel('需要处理', o.attention.slice(0, 3).map(a => overviewAttentionRow(a,o)).join(''), badge(String(shown(o.attentionCount)), 'warn'), o.attentionCount != null && o.attentionCount > 3 ? `<button class="link-btn" data-action="attention-queue">全部 ${o.attentionCount} 项 ${icon('arrow',13)}</button>` : '', 'overview-attention-panel') : '';
     const fleetBody = f ? `<div class="fleet-labels"><span>节点</span><span>CPU</span><span>内存</span></div>${f.nodes.map(n => `<div class="fleet-row" data-key="fleet-${esc(n.id)}"><button class="run-title" data-action="node" data-id="${esc(n.id)}">${nodeTag(n.id)}<span class="small muted fleet-description">${n.id === f.gatewayId ? fleetObservation().current ? '当前出口' : '上次出口' : n.online ? n.gpuSampled === false ? 'GPU 尚未采集' : n.gpus.length + ' GPU' : '离线'}</span></button><div class="reading">${n.online && n.cpu != null ? fmt(n.cpu) + '%' : '—'}${meter(n.online ? n.cpu : null)}</div><div class="reading">${n.online && percent(n.memoryUsed,n.memoryTotal) !== null ? Math.round(percent(n.memoryUsed,n.memoryTotal)!) + '%' : '—'}${meter(n.online ? percent(n.memoryUsed,n.memoryTotal) : null)}</div></div>`).join('')}` : resourceState('fleet/status');
-    const machines = panel('机器', fleetBody, f ? `<button class="link-btn small" data-action="nav" data-view="machines">${fleetOnlineLabel()} ${icon('chevron', 12)}</button>` : '');
-    const gateway = f ? panel('连接', `<div class="connection-grid"><span class="muted">入口</span><span>${esc(node(f.ingressNodeId)?.short || '尚未配置')}</span>${f.ingressNodeId ? badge((fleetObservation().current ? '' : '上次确认') + (node(f.ingressNodeId)?.online ? '在线' : '未连接'), fleetObservation().current && node(f.ingressNodeId)?.online ? 'good' : 'warn') : badge('入口未配置')}<span class="muted">出网</span><span>${esc(node(f.gatewayId)?.short || '—')} · ${esc(node(f.gatewayId)?.egress?.region || '—')}</span><span class="num small">${node(f.gatewayId)?.egress?.latency ?? '—'} ms</span></div><div class="endpoint"><code>${esc(f.mcpUrl || f.ingressLabel || (f.ingressNodeId ? '由该节点的托管 MCP 隧道提供' : '尚未配置 MCP 入口'))}</code>${ib('copy', 'copy', '复制 MCP 地址', `data-text="${esc(f.mcpUrl || '')}" ${f.mcpUrl ? '' : 'disabled'}`)}</div>`) : '';
-    const usage = panel('今日项目用量', o.projects.filter(p => (p.usage ?? 0) > 0).map(p => `<div class="usage-project-line"><button class="run-title ellipsis" data-action="project-tasks" data-usage-days="1" data-id="${esc(p.id)}">${esc(p.name)}</button>${meter(o.todayUsage.total ? (p.usage ?? 0) / o.todayUsage.total * 100 : 0)}<span class="num">${compact(p.usage)}</span></div>`).join('') || empty('暂无用量'), btn('用量分析', 'usage-nav', '', 'small ghost'));
-    return `<div class="page overview-page">${pageHead('运行总览', `<span class="live-indicator"></span>${day(Date.now())}`, btn('待验收 ' + (o.reviewCount == null ? '数据未完整取得' : o.reviewCount), 'review-queue', '', 'small') + btn(icon('tasks', 14) + '全部任务', 'nav', 'data-view="tasks"', 'small'))}${staleNotice(overviewPath())}<section class="summary-grid">${metric('后台执行', shown(o.runningCount), detail(o.queuedCount, ' 项排队'), 'running-queue', 'accent')}${metric('待验收', shown(o.reviewCount), o.coverage.tasks ? '' : '任务来源未完整取得', 'review-queue')}${metric('今日完成', shown(o.completedToday), detail(o.failedToday, ' 项失败'), 'completed-queue')}${metric('今日 Token', (o.todayUsage.partial || o.todayUsage.missing ? '≥ ' : '') + compact(o.todayUsage.total), o.todayUsage.missing ? o.todayUsage.missing + ' 项未知' : '', 'usage-nav')}</section><div class="overview-grid"><div class="stack">${running}${waiting}${recent}${usage}</div><div class="stack">${attention}${machines}${gateway}</div></div></div>`;
+    const machines = panel('机器', fleetBody, f ? `<button class="link-btn small" data-action="nav" data-view="machines">${fleetOnlineLabel()} ${icon('chevron', 12)}</button>` : '', '', 'overview-machines-panel');
+    const gateway = f ? panel('连接', `<div class="connection-grid"><span class="muted">入口</span><span>${esc(node(f.ingressNodeId)?.short || '尚未配置')}</span>${f.ingressNodeId ? badge((fleetObservation().current ? '' : '上次确认') + (node(f.ingressNodeId)?.online ? '在线' : '未连接'), fleetObservation().current && node(f.ingressNodeId)?.online ? 'good' : 'warn') : badge('入口未配置')}<span class="muted">出网</span><span>${esc(node(f.gatewayId)?.short || '—')} · ${esc(node(f.gatewayId)?.egress?.region || '—')}</span><span class="num small">${node(f.gatewayId)?.egress?.latency ?? '—'} ms</span></div><div class="endpoint"><code>${esc(f.mcpUrl || f.ingressLabel || (f.ingressNodeId ? '由该节点的托管 MCP 隧道提供' : '尚未配置 MCP 入口'))}</code>${ib('copy', 'copy', '复制 MCP 地址', `data-text="${esc(f.mcpUrl || '')}" ${f.mcpUrl ? '' : 'disabled'}`)}</div>`, '', '', 'overview-connection-panel') : '';
+    const summary = `<section class="overview-summary" aria-label="任务统计"><div><span>当前任务</span><strong>${shown(o.currentCount)}</strong></div><button type="button" data-action="attention-queue"><span>需要处理</span><strong>${shown(o.attentionCount)}</strong></button><button type="button" data-action="completed-queue"><span>今日完成</span><strong>${shown(o.completedToday)}</strong></button></section>`;
+    return `<div class="page overview-page">${pageHead('任务总览', day(Date.now()), btn(icon('tasks',14)+'全部任务','nav','data-view="tasks"','small'))}${staleNotice(overviewPath())}${summary}<div class="overview-grid"><div class="stack overview-primary">${current}${older}${recent}</div><aside class="stack overview-secondary" aria-label="待办与节点">${attention}${machines}${gateway}</aside></div></div>`;
 }
 function taskRow(r: Run) {
     const selected = selectedRuns.has(r.id), active = route.p.run === r.id;
@@ -427,7 +475,7 @@ function taskScopeTabs(page?: RunPage) {
     const count = (key:string) => page?.complete ? counts?.[key] : undefined;
     const current = route.p.requestState === 'active' ? 'open' : route.p.requestState === 'closed' ? 'ended'
         : route.p.attention ? 'attention' : route.p.stage === 'running,stopping,queued' ? 'active' : '';
-    return tabs([['','全部',count('scopeAll')],['open','进行中',count('scopeOpen')],['ended','已结束',count('scopeClosed')],
+    return tabs([['','全部',count('scopeAll')],['open','未关闭',count('scopeOpen')],['ended','已结束',count('scopeClosed')],
         ['active','后台执行',count('scopeActive')],['attention','需要处理',count('scopeAttention')]], current, 'task-scope');
 }
 function runBadges(run: Run): string {
@@ -447,10 +495,10 @@ function tasksPage() {
     const chosen = (d?.items || []).filter(r => selectedRuns.has(r.id)), blocked = chosen.filter(r => changeCaptureBlockReason(data<RunDetail>('runs/' + enc(r.id))?.changeCaptures)), eligible = chosen.filter(r => r.actions.review && !blocked.includes(r));
     const states: Array<[string,string,number?]> = [['', '全部', counts.all], ...taskStages.map(([key,label]):[string,string,number?]=>[key,label,counts[key]])];
     const bulk = selectedRuns.size ? `<div class="bulkbar"><span>${selectedRuns.size} 项已选</span>${blocked.length ? `<span class="amber">${blocked.length} 项文件证据待确认</span>` : ''}<span class="spacer"></span>${btn('验收' + (eligible.length ? ' ' + eligible.length : ''), 'bulk-accept', !eligible.length || !canWrite() ? 'disabled' : '', 'small')}${btn('驳回', 'bulk-reject', !eligible.length || !canWrite() ? 'disabled' : '', 'small')}${ib('copy', 'bulk-copy', '复制所选任务引用')}${ib('close', 'clear-selection', '取消选择')}</div>` : '';
-    const lifecycleStates: Array<[string,string,number?]> = [['','全部任务',counts.scopeAll],['active','进行中',counts.scopeOpen],['closed','已结束',counts.scopeClosed]];
+    const lifecycleStates: Array<[string,string,number?]> = [['','全部任务',counts.scopeAll],['active','未关闭',counts.scopeOpen],['closed','已结束',counts.scopeClosed]];
     const lifecycleControl = `<select class="select queue-state" data-param="requestState" aria-label="任务生命周期">${lifecycleStates.map(([v,t,n]) => opt(v,t + (d?.complete && n != null ? ' · ' + n : ''),route.p.requestState || '')).join('')}</select>`;
     const stateControls = sel ? lifecycleControl + `<select class="select queue-state" data-param="status" aria-label="任务状态">${states.map(([v, t, n]) => opt(v, t + (n == null ? '' : ' · ' + n), route.p.status || '')).join('')}</select>` : taskScopeTabs(d) + `<select class="select" data-param="status" aria-label="具体任务状态">${states.map(([v,t,n]) => opt(v,t + (n == null ? '' : ' · ' + n),route.p.status || '')).join('')}</select>`;
-    const filters = `<div class="task-filters">${stateControls}<div class="toolbar list-search">${searchField(route.p.q, '搜索任务…')}${sel ? ib('filter', 'toggle-filters', '筛选任务', `aria-expanded="${route.p.filters === '1'}"`, route.p.filters === '1' ? 'active' : '') : ''}</div><div class="toolbar extended-filters ${sel && route.p.filters !== '1' ? 'hidden' : ''}">${scopes()}${rangeSelect(route.p.days ?? '0')}<select class="select" aria-label="任务排序" data-param="sort">${[['newest', '最新开始'], ['oldest', '最早开始'], ['tokens', '用量最高'], ['duration', '历时最长']].map(([v, t]) => opt(v, t, route.p.sort || 'newest')).join('')}</select></div>${route.p.finishedDay ? `<div class="filter-chip">完成于 ${esc(route.p.finishedDay)} ${ib('close', 'clear-finished', '清除完成日期')}</div>` : ''}${route.p.attention ? `<div class="filter-chip">执行异常 ${ib('close', 'clear-attention', '清除异常筛选')}</div>` : ''}${route.p.usageDate || route.p.usageDays ? `<div class="filter-chip">用量发生范围：${esc(route.p.usageDate || ('近 ' + route.p.usageDays + ' 天'))}${ib('close','clear-usage-range','清除用量发生范围')}</div>` : ''}${route.p.date ? `<div class="filter-chip">${esc(route.p.date)} ${ib('close', 'clear-date', '清除日期筛选')}</div>` : ''}</div>`;
+    const filters = `<div class="task-filters">${stateControls}<div class="toolbar list-search">${searchField(route.p.q, '搜索任务…')}${sel ? ib('filter', 'toggle-filters', '筛选任务', `aria-expanded="${route.p.filters === '1'}"`, route.p.filters === '1' ? 'active' : '') : ''}</div><div class="toolbar extended-filters ${sel && route.p.filters !== '1' ? 'hidden' : ''}">${scopes()}${rangeSelect(route.p.days ?? '0')}<select class="select" aria-label="任务排序" data-param="sort">${[['newest', '最新开始'], ['oldest', '最早开始'], ['tokens', '用量最高'], ['duration', '历时最长']].map(([v, t]) => opt(v, t, route.p.sort || 'newest')).join('')}</select></div>${route.p.overviewGroup ? `<div class="filter-chip">${route.p.overviewGroup === 'current' ? '当前任务' : '较早未关闭'} ${ib('close', 'clear-overview-group', '清除任务分组')}</div>` : ''}${route.p.finishedDay ? `<div class="filter-chip">完成于 ${esc(route.p.finishedDay)} ${ib('close', 'clear-finished', '清除完成日期')}</div>` : ''}${route.p.attention ? `<div class="filter-chip">待办事项 ${ib('close', 'clear-attention', '清除待办筛选')}</div>` : ''}${route.p.usageDate || route.p.usageDays ? `<div class="filter-chip">用量发生范围：${esc(route.p.usageDate || ('近 ' + route.p.usageDays + ' 天'))}${ib('close','clear-usage-range','清除用量发生范围')}</div>` : ''}${route.p.date ? `<div class="filter-chip">${esc(route.p.date)} ${ib('close', 'clear-date', '清除日期筛选')}</div>` : ''}</div>`;
     let list = !d ? resourceState(path) : !d.items.length ? `<div class="panel">${empty(d.complete ? '没有匹配任务' : '已读取来源中没有匹配任务', d.complete ? '' : '部分节点尚未确认，完整结果仍待核对。', btn('清除筛选', 'reset-filters'))}</div>` : sortLayout === 'timeline' && !sel ? timelineView(d) : `<div class="panel task-list-panel"><div class="table-wrap"><table class="data-table run-table"><colgroup><col style="width:34px"><col><col style="width:140px"><col style="width:58px"><col style="width:105px"><col style="width:86px"><col style="width:90px"><col style="width:94px"><col style="width:32px"></colgroup><thead><tr><th><label class="check-label"><input type="checkbox" data-select-all="runs" aria-label="选择本页全部任务" ${d.items.every(r => selectedRuns.has(r.id)) ? 'checked' : ''}></label></th><th>任务 / 项目</th><th>状态</th><th>节点</th><th>改动</th><th class="align-right">历时</th><th class="align-right">Token</th><th class="align-right">开始</th><th></th></tr></thead><tbody>${d.items.map(taskRow).join('')}</tbody></table></div>${pagination(d)}</div>`;
     const actions = sel ? ib('download', 'export-runs', '导出本页') : segmented([['list', icon('tasks', 14)], ['timeline', icon('activity', 14)]], sortLayout, 'layout') + btn(icon('download', 14) + '导出本页', 'export-runs', d?.items.length ? '' : 'disabled');
     return `<div class="split ${sel ? 'has-detail' : 'no-detail'} ${review ? 'review-mode' : ''} ${route.p.focus === '1' ? 'detail-focus' : ''}"><section class="list-pane" aria-label="任务列表"><div class="page">${pageHead(review ? '改动审查' : '任务', review ? '选择待验收结果，或切换查看所有文件改动。' : '', actions)}${review ? segmented([['review','待验收'],['all','全部改动']],route.p.reviewMode || 'review','review-mode') : ''}${filters}${bulk}${staleNotice(path)}${list}</div></section>${sel ? '<button class="inspector-mask" data-action="close-inspector" aria-label="关闭详情"></button>' + inspector() : ''}</div>`;
@@ -763,7 +811,11 @@ async function withLock(key: string, fn: () => unknown | Promise<unknown>) { if 
 finally {
     writePending.delete(key); schedulePaint();
 } }
-function findLoadedRun(id: string) { return data<RunDetail>('runs/' + enc(id))?.run || data<RunPage>(runPath())?.items?.find(r => r.id === id) || overview()?.active.find(r => r.id === id) || overview()?.recent.find(r => r.id === id); }
+function findLoadedRun(id: string) {
+    const o = overview();
+    return data<RunDetail>('runs/' + enc(id))?.run || data<RunPage>(runPath())?.items?.find(r => r.id === id)
+        || (o ? [...o.current, ...o.olderOpen, ...o.recent, ...o.active].find(r => r.id === id) : undefined);
+}
 async function reviewRuns(ids: string[], verdict: 'accept' | 'reject') {
     ensureWritable();
     const candidates = ids.map(findLoadedRun).filter((r): r is Run => Boolean(r && r.actions.review));
@@ -1044,14 +1096,15 @@ function paletteItems(query: string) { const q = query.trim().toLowerCase(), ite
         else if (/^runs\/[^/]+$/.test(path) && (entry.data as RunDetail | null)?.run)
             runs.set((entry.data as RunDetail).run.id, (entry.data as RunDetail).run);
     }
-    overview()?.active.forEach(r => runs.set(r.id, r));
+    const o = overview();
+    if (o) [...o.active, ...o.current, ...o.olderOpen, ...o.recent].forEach(r => runs.set(r.id, r));
     [...runs.values()].filter(r => [r.title, r.id, r.projectName].join(' ').toLowerCase().includes(q)).slice(0, 12).forEach(r => items.push({ type: '已加载任务', title: r.title, description: r.projectName, icon: 'tasks', action: () => navigate('tasks', { run: r.id }) }));
     projects().filter(p => [p.name, p.path].join(' ').toLowerCase().includes(q)).slice(0, 8).forEach(p => items.push({ type: '项目', title: p.name, description: node(p.nodeId)?.short, icon: 'workspaces', action: () => navigate('tasks', { project: p.id }) }));
     (fleet()?.nodes || []).filter(n => (n.name + ' ' + n.id).toLowerCase().includes(q)).forEach(n => items.push({ type: '机器', title: n.name, description: n.id, icon: 'machines', action: () => openNode(n.id) }));
     items.push({ type: '完整任务搜索', title: '搜索全部任务 “' + query + '”', description: '全部历史', icon: 'search', action: () => navigate('tasks', { q: query, days: '0' }) });
 } return items.slice(0, 40); }
 function openPalette() { if ($<HTMLDialogElement>('dialog.palette-dialog'))
-    return; const previous = document.activeElement, d = document.createElement('dialog'); d.className = 'palette-dialog'; d.setAttribute('aria-label', '搜索与命令面板'); d.innerHTML = `<div class="palette-input">${icon('search', 18)}<input type="search" placeholder="搜索页面、命令、项目或执行 ID…" role="combobox" aria-autocomplete="list" aria-controls="palette-results" aria-expanded="true" autocomplete="off" aria-label="搜索命令"><kbd>Esc</kbd></div><div class="palette-results" id="palette-results" role="listbox" aria-label="搜索结果"></div><footer class="palette-foot"><span>↑ ↓ 选择</span><span>Enter 打开</span></footer>`; document.body.append(d); let idx = 0, items: ReturnType<typeof paletteItems> = []; const input = $<HTMLInputElement>('input', d)!; const draw = () => { items = paletteItems(input.value); idx = clamp(idx, 0, Math.max(0, items.length - 1)); let group = ''; $('#palette-results', d)!.innerHTML = items.map((item, i) => { const label = group !== item.type ? `<div class="palette-group" role="presentation">${esc(item.type)}</div>` : ''; group = item.type; return label + `<button type="button" class="palette-item" role="option" id="palette-option-${i}" data-palette="${i}" aria-selected="${i === idx}" tabindex="-1">${icon(item.icon, 16)}<span class="ellipsis">${esc(item.title)}</span><small>${esc(item.description || '')}</small></button>`; }).join('') || empty('没有结果'); input.setAttribute('aria-activedescendant', 'palette-option-' + idx); $('[aria-selected=true]', d)?.scrollIntoView({ block: 'nearest' }); }; const close = () => { d.close(); d.remove(); paletteState = null; if (previous instanceof HTMLElement && previous.isConnected)
+    return; const previous = document.activeElement, d = document.createElement('dialog'); d.className = 'palette-dialog'; d.setAttribute('aria-label', '搜索与命令面板'); d.innerHTML = `<div class="palette-input">${icon('search', 18)}<input type="search" placeholder="搜索页面、命令、项目或执行 ID…" role="combobox" aria-autocomplete="list" aria-controls="palette-results" aria-expanded="true" autocomplete="off" aria-label="搜索命令"><kbd>Esc</kbd></div><div class="palette-results" id="palette-results" role="listbox" aria-label="搜索结果"></div><footer class="palette-foot"><span>↑ ↓ 选择</span><span>Enter 打开</span></footer>`; document.body.append(d); let directoryTimer: ReturnType<typeof setTimeout> | undefined; let idx = 0, items: ReturnType<typeof paletteItems> = []; const input = $<HTMLInputElement>('input', d)!; const draw = () => { items = paletteItems(input.value); idx = clamp(idx, 0, Math.max(0, items.length - 1)); let group = ''; $('#palette-results', d)!.innerHTML = items.map((item, i) => { const label = group !== item.type ? `<div class="palette-group" role="presentation">${esc(item.type)}</div>` : ''; group = item.type; return label + `<button type="button" class="palette-item" role="option" id="palette-option-${i}" data-palette="${i}" aria-selected="${i === idx}" tabindex="-1">${icon(item.icon, 16)}<span class="ellipsis">${esc(item.title)}</span><small>${esc(item.description || '')}</small></button>`; }).join('') || empty('没有结果'); const directory = CACHE.get('projects'), directorySources = (directory?.data as ListResponse<Project> | undefined)?.sources || [], directoryWarnings = sourceWarnings([directory]); const directoryNotice = directory?.error ? '工作区目录读取失败：' + directory.error.message : directoryWarnings.length ? '工作区目录待更新：' + directoryWarnings.map(source => sourceWarning(source)).join('；') : !directory?.data || directorySources.some(source => ['loading','refreshing'].includes(source.state)) ? '正在读取工作区目录…' : ''; if (directoryNotice) $('#palette-results', d)!.insertAdjacentHTML('beforeend', '<div class="palette-group">' + esc(directoryNotice) + '</div>'); input.setAttribute('aria-activedescendant', 'palette-option-' + idx); $('[aria-selected=true]', d)?.scrollIntoView({ block: 'nearest' }); }; const close = () => { clearTimeout(directoryTimer); d.close(); d.remove(); paletteState = null; if (previous instanceof HTMLElement && previous.isConnected)
     previous.focus({ preventScroll: true }); }; const choose = () => { const item = items[idx]; close(); Promise.resolve(item?.action()).catch(e => toast(e.message, 'bad')); }; input.addEventListener('input', () => { idx = 0; draw(); }); input.addEventListener('keydown', e => { if (e.isComposing)
     return; if (e.key === 'ArrowDown') {
     e.preventDefault();
@@ -1067,7 +1120,25 @@ function openPalette() { if ($<HTMLDialogElement>('dialog.palette-dialog'))
 } }); d.addEventListener('click', e => { const b = (e.target as HTMLElement).closest<HTMLElement>('[data-palette]'); if (b) {
     idx = Number(b.dataset.palette);
     choose();
-} }); d.addEventListener('cancel', e => { e.preventDefault(); close(); }); d.showModal(); paletteState = { close }; draw(); input.focus(); }
+} }); d.addEventListener('keydown', e => {
+    if (e.key !== 'Escape' || e.isComposing || e.keyCode === 229) return;
+    e.preventDefault();
+    e.stopPropagation();
+    close();
+}); d.addEventListener('cancel', e => { e.preventDefault(); close(); }); d.showModal(); draw(); input.focus();
+    const readDirectory = async () => {
+        clearTimeout(directoryTimer);
+        if (!d.isConnected || document.hidden || backgroundPaused || authRequired) return;
+        await load('projects');
+        if (!d.isConnected || document.hidden || backgroundPaused || authRequired) return;
+        draw();
+        const entry = CACHE.get('projects'), sources = (entry?.data as ListResponse<Project> | undefined)?.sources || [];
+        if (!entry?.error && (!entry?.data || sources.some(source => ['loading','refreshing'].includes(source.state))))
+            directoryTimer = setTimeout(() => void readDirectory(), 1_000);
+    };
+    paletteState = {close, pause:() => clearTimeout(directoryTimer), resume:() => void readDirectory()};
+    void readDirectory();
+}
 function closeTopDialog() { const d = $$('dialog').at(-1); if (d) {
     $('[data-dialog-close]', d)?.click();
 } }
@@ -1094,8 +1165,13 @@ const ACTIONS = {
     'detail-tab': (el: HTMLElement) => navigate(route.view, { tab: el.dataset.value! }, true, true), file: (el: HTMLElement) => navigate(route.view, { file: el.dataset.id! }, true, true),
     'load-big': (el: HTMLElement) => { loadedBigFiles.add(el.dataset.run! + ':' + el.dataset.id!); ensureRoute(); schedulePaint(); }, 'copy-path': (el: HTMLElement) => copy(el.dataset.text!), 'copy-link': () => copy(location.href), copy: (el: HTMLElement) => copy(el.dataset.text!),
     'more-diff': (el: HTMLElement) => { const key = el.dataset.run! + ':' + el.dataset.id!; diffLimits.set(key, (diffLimits.get(key) || 400) + 400); schedulePaint(); }, 'diff-mode': (el: HTMLElement) => { diffMode = el.dataset.value!; savePref({diffMode}); schedulePaint(); }, layout: (el: HTMLElement) => { sortLayout = el.dataset.value!; savePref({taskLayout:sortLayout}); schedulePaint(); }, 'machine-layout': (el: HTMLElement) => { machineLayout = el.dataset.value!; savePref({machineLayout}); schedulePaint(); },
-    'running-queue': () => navigate('tasks', { stage: 'running,stopping', days:'0' }), 'review-queue': () => navigate('tasks', { status: 'review', days: '0' }), 'completed-queue': () => navigate('tasks', { days: '0', execution: 'completed', finishedDay: day(Date.now()) }), 'attention-queue': () => navigate('tasks', { days: '0', attention: '1' }), 'usage-nav': () => navigate('usage'),
-    status: (el: HTMLElement) => param({ status: el.dataset.value!, stage:null, attention:null }), 'reset-filters': () => navigate(route.view, {}, true), 'clear-date': () => param({ date: null }), 'clear-finished': () => param({ finishedDay: null, execution: null }), 'clear-attention': () => param({ attention: null }), page: (el: HTMLElement) => { selectedRuns.clear(); param({ cursor: el.dataset.value! || null }); $('.list-pane')?.scrollTo({ top: 0 }); $('#view')!.scrollTo({ top: 0 }); },
+    'running-queue': () => navigate('tasks', { stage: 'running,stopping', days:'0' }), 'review-queue': () => navigate('tasks', { status: 'review', days: '0' }), 'completed-queue': () => navigate('tasks', { days: '0', requestState: 'closed', resultStatus: 'completed', finishedDay: day(Date.now()) }), 'attention-queue': () => navigate('tasks', { days: '0', attention: '1' }), 'usage-nav': () => navigate('usage'),
+    'current-task-queue': () => navigate('tasks', { days: '0', requestState: 'active', overviewGroup: 'current' }),
+    'older-task-queue': () => navigate('tasks', { days: '0', requestState: 'active', overviewGroup: 'olderOpen' }),
+    'clear-overview-group': () => param({overviewGroup:null}),
+    'closed-task-queue': () => navigate('tasks', { days: '0', requestState: 'closed' }),
+    'overview-task-action': (el: HTMLElement) => navigate('tasks', { run: el.dataset.id!, tab: el.dataset.kind === 'review' ? 'diff' : 'summary', days: '0' }),
+    status: (el: HTMLElement) => param({ status: el.dataset.value!, stage:null, attention:null }), 'reset-filters': () => navigate(route.view, {}, true), 'clear-date': () => param({ date: null }), 'clear-finished': () => param({ finishedDay: null, execution: null, resultStatus: null }), 'clear-attention': () => param({ attention: null }), page: (el: HTMLElement) => { selectedRuns.clear(); param({ cursor: el.dataset.value! || null }); $('.list-pane')?.scrollTo({ top: 0 }); $('#view')!.scrollTo({ top: 0 }); },
     'clear-selection': () => { selectedRuns.clear(); schedulePaint(); }, 'clear-threads': () => { selectedThreads.clear(); schedulePaint(); },
     'single-accept': (el: HTMLElement) => reviewRuns([el.dataset.id!], 'accept'), 'single-reject': (el: HTMLElement) => reviewRuns([el.dataset.id!], 'reject'), 'bulk-accept': () => reviewRuns([...selectedRuns], 'accept'), 'bulk-reject': () => reviewRuns([...selectedRuns], 'reject'),
     'bulk-copy': () => copy([...selectedRuns].map(id => { const r = findLoadedRun(id); return r ? r.nodeId + '/exec/' + r.id : id; }).join('\n')),
@@ -1116,7 +1192,7 @@ const ACTIONS = {
     'finish-task': (el:HTMLElement) => finishTask(el.dataset.id!),
     'receipt-query': async (el:HTMLElement) => { await API.get('receipts/' + enc(el.dataset.id) + '?path=' + enc(el.dataset.path) + '&target=' + enc(el.dataset.target)); await load('receipts?limit=50',true); toast('已查询原请求结果'); },
     'global-sessions': () => navigate('sessions', {q:route.view === 'sessions' ? route.p.q : undefined,node:route.p.node}),
-    'task-scope': (el:HTMLElement) => { const key=el.dataset.value!; param({status:null,requestState:key === 'open' ? 'active' : key === 'ended' ? 'closed' : null,attention:key === 'attention' ? '1' : null,stage:key === 'active' ? 'running,stopping,queued' : null}); },
+    'task-scope': (el:HTMLElement) => { const key=el.dataset.value!; param({status:null,overviewGroup:null,requestState:key === 'open' ? 'active' : key === 'ended' ? 'closed' : null,attention:key === 'attention' ? '1' : null,stage:key === 'active' ? 'running,stopping,queued' : null}); },
     'review-mode':(el:HTMLElement)=>param({reviewMode:el.dataset.value!,status:null,stage:null,attention:null,run:null,cursor:null}),
     'settings-section': (el: HTMLElement) => navigate('settings', { section: el.dataset.value! }), 'api-settings': () => navigate('settings', { section: 'connection' }), 'egress-settings': () => navigate('settings', { section: 'egress' }),
     preference: (el: HTMLElement) => { const k = el.dataset.key!, v = k === 'poll' ? Number(el.dataset.value!) : el.dataset.value!; savePref({ [k]: v }); if (k === 'poll')
@@ -1184,7 +1260,7 @@ document.addEventListener('change', async (e) => {
     try {
         if (el.dataset.param) {
             const key = el.dataset.param;
-            param({ [key]: el.value, ...(key === 'node' ? { project: null } : {}), ...(key === 'status' ? {stage:null,attention:null} : {}), ...(key === 'requestState' ? {status:null,stage:null,attention:null} : {}) });
+            param({ [key]: el.value, ...(key === 'node' ? { project: null } : {}), ...(key === 'status' ? {stage:null,attention:null} : {}), ...(key === 'requestState' ? {status:null,stage:null,attention:null,overviewGroup:null} : {}) });
         }
         else if (el.dataset.selectRun) {
             el.checked ? selectedRuns.add(el.dataset.selectRun) : selectedRuns.delete(el.dataset.selectRun);
@@ -1374,6 +1450,7 @@ document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
         clearTimeout(refreshTimer);
         clearTimeout(clockTimer);
+        paletteState?.pause();
         resources.cancelAll(); commandReader.cancelAll(); notificationReader?.cancel();
     }
     else {
@@ -1381,11 +1458,12 @@ document.addEventListener('visibilitychange', () => {
         ensureRoute();
         refresh();
         schedulePoll();
+        paletteState?.resume();
     }
 });
-addEventListener('pagehide', () => { clearTimeout(refreshTimer); clearTimeout(clockTimer); resources.cancelAll(); commandReader.cancelAll(); notificationReader?.cancel(); });
-addEventListener('online', () => { backgroundPaused = false; refresh(); schedulePoll(); });
-addEventListener('offline', () => { backgroundPaused = true; clearTimeout(refreshTimer); resources.cancelAll(); commandReader.cancelAll(); notificationReader?.cancel(); toast('浏览器离线，保留已读取的内容。', 'warn'); schedulePaint(); });
+addEventListener('pagehide', () => { clearTimeout(refreshTimer); clearTimeout(clockTimer); paletteState?.pause(); resources.cancelAll(); commandReader.cancelAll(); notificationReader?.cancel(); });
+addEventListener('online', () => { backgroundPaused = false; refresh(); schedulePoll(); paletteState?.resume(); });
+addEventListener('offline', () => { backgroundPaused = true; clearTimeout(refreshTimer); paletteState?.pause(); resources.cancelAll(); commandReader.cancelAll(); notificationReader?.cancel(); toast('浏览器离线，保留已读取的内容。', 'warn'); schedulePaint(); });
 let notificationReader: EventNotifications | null = null, notificationStorageKey = '';
 const notificationGaps = new Map<string,string>();
 function pollNotifications() {
@@ -1413,6 +1491,7 @@ function pollNotifications() {
 }
 let clockTimer: ReturnType<typeof setTimeout> | undefined, clockNodes: HTMLElement[] = [];
 let fleetWasCurrent = false;
+let overviewDisplayDeadline: number | null = null;
 function tickClock() {
     clearTimeout(clockTimer);
     if (document.hidden)
@@ -1428,13 +1507,28 @@ function tickClock() {
     }
     const observation = fleetObservation();
     if (fleetWasCurrent && !observation.current) schedulePaint();
+    if (overviewDisplayDeadline !== null && now >= overviewDisplayDeadline) {
+        overviewDisplayDeadline = null;
+        schedulePaint();
+    }
     fleetWasCurrent = observation.current;
+    const deadlines = [observation.current ? observation.expiresAt : null, overviewDisplayDeadline]
+        .filter((at): at is number => at !== null && at > now);
     if (clockNodes.length)
         clockTimer = setTimeout(tickClock, 1000 - now % 1000);
-    else if (observation.current && observation.expiresAt !== null)
-        clockTimer = setTimeout(tickClock, Math.max(1, observation.expiresAt - now));
+    else if (deadlines.length)
+        clockTimer = setTimeout(tickClock, Math.max(1, Math.min(...deadlines) - now));
 }
-function attachClock() { clockNodes = $$('[data-elapsed]'); fleetWasCurrent = fleetObservation().current; tickClock(); }
+function attachClock() {
+    clockNodes = $$('[data-elapsed]'); fleetWasCurrent = fleetObservation().current;
+    const observation = overviewObservation(), o = overview(), now = Date.now();
+    const taskTimes = o ? [...o.taskSources, ...(route.view === 'overview' ? [...o.current, ...o.olderOpen, ...o.attention] : [])].map(item => item.observedAt) : [];
+    const deadlines = [observation.current ? observation.expiresAt : null,
+        ...taskTimes.map(at => typeof at === 'number' && Number.isFinite(at) ? at + 30_001 : null)]
+        .filter((at): at is number => typeof at === 'number' && Number.isFinite(at) && at > now);
+    overviewDisplayDeadline = deadlines.length ? Math.min(...deadlines) : null;
+    tickClock();
+}
 async function migrateConsoleLink() {
     if (location.hash || !location.search) return;
     const parameters = new URLSearchParams(location.search);
