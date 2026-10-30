@@ -28,12 +28,16 @@ type Enumeration = { iterator: AsyncIterator<string>; paths:string[]; complete:b
 const enumerations = new Map<string,Enumeration>();
 const ENUMERATION_TTL_MS = 10 * 60_000;
 
-function pruneEnumerations() {
+async function pruneEnumerations() {
   const expired=[...enumerations].filter(([,value])=>Date.now()-value.touched>ENUMERATION_TTL_MS && !value.pending);
-  for(const [key,value] of expired){enumerations.delete(key);void value.iterator.return?.().catch(()=>{});}
+  for(const [key,value] of expired) {
+    // Closing an earlier iterator may yield to a continuation of this one.
+    if(enumerations.get(key)!==value || value.pending || Date.now()-value.touched<=ENUMERATION_TTL_MS)continue;
+    enumerations.delete(key);await value.iterator.return?.();
+  }
   if(enumerations.size>=32) {
     const oldest=[...enumerations].filter(([,value])=>!value.pending).sort((a,b)=>a[1].touched-b[1].touched)[0];
-    if(oldest){enumerations.delete(oldest[0]);void oldest[1].iterator.return?.().catch(()=>{});}
+    if(oldest){enumerations.delete(oldest[0]);await oldest[1].iterator.return?.();}
     else throw new Error("CONTEXT_ENUMERATION_BUSY: retry after another directory search completes");
   }
 }
@@ -64,7 +68,8 @@ async function selections(context:ToolRegistrationContext,workspace:{id:string;r
   let paths=enumeratedPaths,enumeration=enumerationToken ? enumerations.get(enumerationToken) : undefined;
   if(enumerationToken && !enumeration)throw new Error("CONTEXT_ENUMERATION_EXPIRED: start a new search; captured result pages remain readable");
   if(!paths&&!enumeration) {
-    pruneEnumerations();
+    await pruneEnumerations();
+    signal?.throwIfAborted();
     const directory=await context.workspaces.resolveWorkingDirectory(await context.workspaces.getWorkspace(workspace.id,{touch:false}),input.directory??".");
     const iterator=(async function*(){
       for await(const path of glob(input.patterns??["**/*"],{cwd:directory,exclude:EXCLUDED})) {
@@ -93,7 +98,16 @@ async function selections(context:ToolRegistrationContext,workspace:{id:string;r
       current.published=true;
     });
     current.pending=advance;
-    try {await advance;} finally {if(current.pending===advance)current.pending=undefined;}
+    try {await advance;}
+    catch(error) {
+      // No other caller can own an unpublished enumeration. Drain its iterator
+      // before the handler settles; published continuations keep their queue.
+      if(!current.published && current.pending===advance) {
+        enumerations.delete(enumerationToken!);
+        await current.iterator.return?.();
+      }
+      throw error;
+    } finally {if(current.pending===advance)current.pending=undefined;}
     paths=current.paths;
   }
   paths??=[];
@@ -112,6 +126,7 @@ async function capture(context:ToolRegistrationContext,workspace:{id:string;root
   if(input.action==="search"&&!queries.length)throw new Error("SEARCH_QUERY_REQUIRED");
   const reads=new Map<string,ReturnType<typeof readContextFileAsync>>();
   let bytesRead=0;
+  let failure:{error:unknown}|undefined;
   const load=(path:string)=>{
     let pending=reads.get(path);
     if(!pending) {
@@ -132,6 +147,7 @@ async function capture(context:ToolRegistrationContext,workspace:{id:string;root
   const files=await mapConcurrent(chosen.files,4,async(selection,selectionIndex):Promise<CapturedFile>=>{
     const first=selection.start_line??1,maxLines=selection.max_lines??(input.action==="search"?Number.MAX_SAFE_INTEGER:80);
     const empty:CapturedFile={path:selection.path,sha256:"",bytes:0,totalLines:0,startLine:first,maxLines,selectionIndex,lines:[]};
+    if(failure)return empty;
     try {
       signal?.throwIfAborted();
       const file=await load(selection.path);
@@ -153,11 +169,16 @@ async function capture(context:ToolRegistrationContext,workspace:{id:string;root
       return {...empty,path:file.path,sha256:file.sha256,bytes:file.bytes.length,totalLines:all.length,
         maxLines:Math.min(maxLines,Math.max(0,all.length-first+1)),lines};
     } catch(error) {
-      signal?.throwIfAborted();
-      if(bytesRead>CAPTURE_BYTES)throw error;
+      if(signal?.aborted || bytesRead>CAPTURE_BYTES) {
+        // Keep mapConcurrent's workers joined, stop launching new reads, and
+        // rethrow only after the already-started reads have all settled.
+        failure??={error:signal?.aborted ? signal.reason : error};
+        return empty;
+      }
       return {...empty,error:error instanceof Error?error.message:String(error)};
     }
   });
+  if(failure)throw failure.error;
   return {files,bytesRead,scope:{...chosen.scope,queries},enumeratedPaths:chosen.enumeratedPaths,enumerationToken:chosen.enumerationToken};
 }
 

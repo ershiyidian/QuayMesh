@@ -31,6 +31,9 @@ export interface RecordModelToolInput<T> {
   label: string;
   input: unknown;
   operation: (context: InvocationContext) => Promise<T>;
+  /** Internal contract: the local handler awaits every owned operation and cleanup.
+   * Never infer this from a read-only hint, operation kind or remote receipt. */
+  localCompletion?: "handler_settled";
   isError?: (result: T) => boolean;
   runningResult?: (result: T) => boolean;
   unknownResult?: (result: T) => boolean;
@@ -212,7 +215,7 @@ export class SessionToolRecorder {
     }), reserved).then(result => input.afterReply?.(result, context, recordedOperationId) ?? result);
   }
 
-  private async recordReceipt<T>(context: InvocationContext, input: Omit<RecordModelToolInput<T>, "identity" | "workspace_id">, onReserved?: () => void): Promise<T> {
+  private async recordReceipt<T>(context: InvocationContext, input: Omit<RecordModelToolInput<T>, "identity" | "workspace_id">, onReserved?: () => void, local = false): Promise<T> {
     context.tool_name = input.tool_name;
     let lease: RuntimeWorkLease | undefined;
     let failed=false;
@@ -221,6 +224,12 @@ export class SessionToolRecorder {
     const recorded = await executeRecorded<InvocationEnvelope<T>>(this.store, context, input.input, {
       onReserved,
       beforeEffect: async () => {
+        // A local read of a closed Task still owns physical work, without
+        // creating a new business operation or certifying a forwarded call.
+        if (local && input.localCompletion && this.execution) lease = await this.execution.beginWorkAsync({
+          kind: "tool", taskId: context.task_id, operationId: context.operation_id,
+          allowWhilePaused: observesAcceptedWork(input.tool_name, input.input as Record<string, unknown>), blocking: true,
+        });
         // 已有回执先由 executeRecorded 重放；只有新工作必须在转发和首次镜像前验证任务。
         if (observesAcceptedWork(input.tool_name, input.input as Record<string, unknown>)) {
           const taskId = context.task_id;
@@ -236,7 +245,7 @@ export class SessionToolRecorder {
           { code: "TASK_NOT_ACTIVE", effect: "not_started" });
         // Acquire the Task lease before admission so a finish cannot pass its
         // idle check between this transaction and the actual remote dispatch.
-        if (this.execution) lease=await this.execution.beginWorkAsync({kind:"tool",taskId:task.id,operationId:context.operation_id});
+        if (this.execution && !lease) lease=await this.execution.beginWorkAsync({kind:"tool",taskId:task.id,operationId:context.operation_id});
         await this.store.writeAsync(() => {
           this.store.taskData.admitWorkInTransaction(task.id);
           this.store.touchTaskMember(task.id,context.member_id);
@@ -308,17 +317,21 @@ export class SessionToolRecorder {
     if (context.task_id && (this.store.getTask(context.task_id).state === "closed"
       || finalization && finalization.recovery_state!=="superseded") &&
       observesAcceptedWork(input.tool_name, input.input as Record<string, unknown>)) {
-      return this.recordReceipt(context, input, onReserved);
+      return this.recordReceipt(context, input, onReserved, true);
     }
     const isWrite = input.affectsFiles ?? (input.kind === "patch" || input.kind === "command" || input.kind === "copy");
     let ticket: Awaited<ReturnType<SessionService["beforeOperation"]>> | undefined;
     let lease: RuntimeWorkLease | undefined;
+    let completion: {context: InvocationContext; settledAt: string} | undefined;
     let failed=false;
     try {
     const operation: InvocationOperation<InvocationEnvelope<T>> = {
       onReserved,
       beforeEffect: async () => {
-        if (input.pendingResult && this.execution) lease=await this.execution.beginWorkAsync({kind:"tool",taskId:context.task_id,operationId:context.operation_id});
+        if ((input.pendingResult || input.localCompletion) && this.execution) lease=await this.execution.beginWorkAsync({
+          kind:"tool",taskId:context.task_id,operationId:context.operation_id,
+          ...(input.localCompletion ? {allowWhilePaused: observesAcceptedWork(input.tool_name, input.input as Record<string, unknown>), blocking: true} : {}),
+        });
         const prepare=async()=>{
         ticket = await this.service.beforeOperation(context, input.kind, input.label);
         context.operation_id = ticket.operation_id;
@@ -334,11 +347,12 @@ export class SessionToolRecorder {
         await (lease ? lease.run(prepare) : prepare());
       },
       invoke: async () => {
+        const captured = input.localCompletion ? {...context} : undefined;
         try {
           return { kind: "result", value: await (lease ? lease.run(()=>input.operation(context)) : input.operation(context)) };
         } catch (error) {
           return errorEnvelope(error,{sideEffecting:isWrite,effectStarted:true});
-        }
+        } finally { if (captured) completion = {context: captured, settledAt: new Date().toISOString()}; }
       },
       isError: (envelope) => envelope.kind === "error" || (envelope.value !== undefined && input.isError?.(envelope.value) === true),
       runningResult: (envelope) => envelope.kind === "result" && envelope.value !== undefined && input.runningResult?.(envelope.value) === true,
@@ -391,6 +405,13 @@ export class SessionToolRecorder {
         ? input.knownPaths?.(envelope.value as T) ?? []
         : [],
     });
+    if (completion && recorded.state === OperationState.unknown) {
+      // Save only after operationFinished: its business-row update revokes any
+      // earlier proof. A failed proof write must not replace the first receipt.
+      try { await this.service.recordLocalOperationCompletion(completion.context, ticket, completion.settledAt); }
+      catch (error) { console.error("QuayMesh physical completion receipt pending", ticket.operation_id,
+        error instanceof Error ? error.message : String(error)); }
+    }
     this.projector.schedule(context.session_id, context.member_id, context.task_id);
     return unwrapEnvelope(envelope, recorded.operation_id);
     } catch(error) {failed=true;throw error;}

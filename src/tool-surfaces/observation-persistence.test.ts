@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test,{type TestContext} from "node:test";
-import {mkdir,mkdtemp,rm,writeFile} from "node:fs/promises";
+import fs,{mkdir,mkdtemp,rm,writeFile} from "node:fs/promises";
+import {syncBuiltinESMExports} from "node:module";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {Client} from "@modelcontextprotocol/sdk/client/index.js";
@@ -94,6 +95,66 @@ test("上下文首批和文件续批在真实 SQLite 写锁下取消，不阻塞
   const second=await f.capture(selections[1]!);
   assert.notEqual(second.result_ref,first.result_ref);assert.equal(count(),2);
   assert.equal(second.entries[0]?.path,"b.txt");
+});
+
+test("等待枚举清理期间重新启用的已发布续页不会被过期快照删除",{timeout:10000},async t=>{
+  const f=await fixture(t);
+  const deferred=()=>{
+    let resolve!:()=>void;
+    const promise=new Promise<void>(done=>{resolve=done;});
+    return {promise,resolve};
+  };
+  const closing=deferred(),closeRelease=deferred(),advancing=deferred(),advanceRelease=deferred();
+  const originalGlob=fs.glob;
+  let secondClosed=0,now=Date.now();
+  t.mock.method(Date,"now",()=>now);
+  const mocked=t.mock.method(fs,"glob",((...args:Parameters<typeof originalGlob>)=>{
+    const iterator=originalGlob(...args),pattern=String(args[0]);
+    return (async function*(){
+      let count=0;
+      try {
+        for await(const path of iterator) {
+          if(pattern==="second-*.txt"&&++count===129) {advancing.resolve();await advanceRelease.promise;}
+          yield path;
+        }
+      } finally {
+        if(pattern==="first-*.txt"){closing.resolve();await closeRelease.promise;}
+        if(pattern==="second-*.txt")secondClosed++;
+      }
+    })();
+  }) as typeof originalGlob);
+  syncBuiltinESMExports();
+  t.after(()=>{mocked.mock.restore();syncBuiltinESMExports();});
+  await Promise.all(["first","second"].flatMap(prefix=>Array.from({length:134},(_,index)=>
+    writeFile(join(f.workspace.root,`${prefix}-${String(index).padStart(3,"0")}.txt`),"needle\n"))));
+  await f.capture({action:"search",query:"needle",patterns:["first-*.txt"],max_files:1});
+  const second=await f.capture({action:"search",query:"needle",patterns:["second-*.txt"],max_files:1});
+  now+=10*60_000+1;
+  let pruning:ReturnType<typeof f.capture>|undefined,continuing:ReturnType<typeof f.capture>|undefined;
+  try {
+    pruning=f.capture({action:"search",query:"needle",patterns:["a.txt"],max_files:1});
+    await closing.promise;
+    continuing=f.capture({action:"search",result_ref:second.result_ref,file_offset:128});
+    await advancing.promise;
+    closeRelease.resolve();
+    let deadline:NodeJS.Timeout|undefined;
+    try {
+      const next=await Promise.race([pruning,new Promise<never>((_,reject)=>{
+        deadline=setTimeout(()=>reject(new Error("清理错误地等待了另一调用正在推进的已发布枚举")),1000);
+      })]);
+      assert.ok(next.result_ref);
+    } finally {clearTimeout(deadline);}
+    assert.equal(secondClosed,0,"过期快照不能清理已恢复 pending 的迭代器");
+    advanceRelease.resolve();
+    const continued=await continuing;
+    assert.match(String(continued.entries[0]?.path),/^second-/);
+    const following=await f.capture({action:"search",result_ref:second.result_ref,file_offset:129});
+    assert.match(String(following.entries[0]?.path),/^second-/,"共享枚举仍保留原续页身份");
+    assert.equal(secondClosed,0);
+  } finally {
+    closeRelease.resolve();advanceRelease.resolve();
+    await Promise.allSettled([pruning,continuing]);
+  }
 });
 
 test("超长准备错误遵守单项和批量回复预算，裁剪说明始终保留零输出游标",{timeout:15000},async t=>{

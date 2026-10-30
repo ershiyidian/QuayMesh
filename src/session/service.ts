@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { runSqliteWrite } from "../db/async-write.js";
+import { quiescenceSubject, recordExecutionQuiescence } from "../maintenance-status.js";
+import { processOwner } from "../process-identity.js";
 import {
   ExecutionState,
   HostState,
@@ -913,6 +915,51 @@ export class SessionService {
     }
     const member = this.store.getMember(ticket.session_id, ticket.member_id);
     this.scheduleRecovery(member.root);
+  }
+
+  /** The owning recorder calls this only after a locally joined handler settles.
+   * Its physical boundary does not change the business outcome or first reply. */
+  async recordLocalOperationCompletion(context: InvocationContext, ticket: OperationTicket, settledAt: string): Promise<void> {
+    if (!ticket.invocation_id || !Number.isFinite(Date.parse(settledAt)) || !processOwner.start
+      || context.operation_id !== ticket.operation_id || context.invocation_id !== ticket.invocation_id
+      || context.session_id !== ticket.session_id || context.task_id !== ticket.task_id
+      || context.member_id !== ticket.member_id || context.run_id !== ticket.run_id)
+      throw new Error("LOCAL_COMPLETION_IDENTITY_MISMATCH");
+    const db = this.requireLedger().db, store = new SessionStore(db);
+    const subject = quiescenceSubject(db, "operation", ticket.operation_id);
+    await runSqliteWrite(db, () => {
+      const invocation = store.findInvocationSummaryByOperationId(ticket.operation_id);
+      const member = store.findMember(ticket.session_id, ticket.member_id);
+      const owned = db.prepare(`SELECT o.status,o.request_key,e.generation,e.owner_token,e.owner_pid,e.process_start
+        FROM console_operations o JOIN execution_owners e ON e.domain='operation' AND e.id=o.id
+        JOIN qm_run_links l ON l.run_id=o.run_id JOIN console_work_runs r ON r.id=o.run_id
+        JOIN qm_tasks t ON t.id=l.task_id JOIN qm_sessions s ON s.id=l.session_id
+        WHERE o.id=? AND o.run_id=? AND l.session_id=? AND l.task_id=? AND l.member_id=?
+          AND t.session_id=l.session_id AND s.owner_id=? AND r.workspace_id=?`)
+        .get(ticket.operation_id, ticket.run_id, ticket.session_id, ticket.task_id, ticket.member_id,
+          context.owner_id, context.workspace_id) as {status:string;request_key:string;generation:string;
+            owner_token:string;owner_pid:number;process_start:string|null} | undefined;
+      if (!invocation || invocation.id !== ticket.invocation_id || invocation.owner_id !== context.owner_id
+        || invocation.session_id !== ticket.session_id || invocation.task_id !== ticket.task_id
+        || invocation.member_id !== ticket.member_id || invocation.tool_name !== context.tool_name
+        || !member || member.node_id !== this.nodeId || member.workspace_id !== context.workspace_id
+        || !owned || owned.request_key !== ticket.invocation_id || owned.generation !== ticket.invocation_id
+        || owned.owner_token !== processOwner.token || owned.owner_pid !== processOwner.pid
+        || owned.process_start !== processOwner.start)
+        throw new Error("LOCAL_COMPLETION_IDENTITY_MISMATCH");
+      if (!["unknown", "reconciliation_required"].includes(owned.status)) return;
+      if (invocation.state !== OperationState.unknown || invocation.effect !== "unknown" || !invocation.result_ready
+        || !store.hasOperationFinished(ticket.operation_id, ticket.invocation_id))
+        throw new Error("LOCAL_COMPLETION_RECEIPT_NOT_READY");
+      recordExecutionQuiescence(db, [subject], {
+        id: `local-handler:${ticket.invocation_id}:${processOwner.token}`, verifiedAt: new Date().toISOString(),
+        evidence: {version: 1, boundary: "local_handler_settled", operationId: ticket.operation_id,
+          invocationId: ticket.invocation_id, sessionId: ticket.session_id, taskId: ticket.task_id,
+          memberId: ticket.member_id, runId: ticket.run_id, nodeId: this.nodeId,
+          workspaceId: context.workspace_id, ownerToken: processOwner.token, ownerPid: processOwner.pid,
+          processStart: processOwner.start, settledAt},
+      });
+    });
   }
 
   async operationProgress(ticket: OperationTicket, result: OperationProgressResult): Promise<void> {

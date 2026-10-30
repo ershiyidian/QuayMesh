@@ -44,7 +44,11 @@ export async function readContextFileAsync(root: string, path: string, signal?: 
   if (isAbsolute(local) || local === ".." || local.startsWith(`..${sep}`)) throw new Error("Context file is outside the workspace.");
   const before = await stat(real);
   if (!before.isFile() || before.size > 512 * 1024) throw new Error("Context input must be a regular file no larger than 512 KiB.");
-  const bytes = await readFile(real,{signal});
+  // Cancellation stops new reads. Await an issued read and its owned file
+  // handle before acknowledging cancellation to the operation recorder.
+  signal?.throwIfAborted();
+  const bytes = await readFile(real);
+  signal?.throwIfAborted();
   const after = await stat(real);
   signal?.throwIfAborted();
   if (bytes.length > 512 * 1024 || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ino !== after.ino) throw new Error("Context input changed while reading; recapture it.");

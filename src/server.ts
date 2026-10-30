@@ -1032,6 +1032,10 @@ function withSessionToolRecording(
               : name === "bash" ? String(input.command ?? input.cmd ?? name) : name,
           input: recordedInput,
           affectsFiles,
+          // This handler drains its own file work before settling. Other reads
+          // and forwarded receipts do not establish a local physical boundary.
+          ...(!forwarded && name === "workspace_context" && ["list", "capture", "search"].includes(input.action)
+            ? {localCompletion: "handler_settled" as const} : {}),
           ...(["exec_command", "bash", "apply_patch", "write", "edit", "write_stdin"].includes(name) ? {
             replyWaitMs: name === "exec_command" || name === "bash"
               ? Math.max(1000, Math.min(5000, Number(input.yield_time_ms ?? 2000) + 1000)) : 2000,

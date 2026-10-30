@@ -10,7 +10,7 @@ import { currentInvocation } from "../session/invocations.js";
 import type { InvocationContext } from "../session/types.js";
 import { currentOperationEvents } from "../session/activity.js";
 import { savedOperationStatus, operationStatusBatch } from "../session/operation-status.js";
-import { observationBudget, observeWithSignal } from "../observation-budget.js";
+import { observationBudget } from "../observation-budget.js";
 
 const id = z.string().min(1).max(256);
 const fileSelectionSchema = z.object({
@@ -121,7 +121,9 @@ export function registerWorkspaceContextTool({ server, config, workspaces, proce
       return contextPage({server,workspaces,processSessions,sessionRuntime,config},liveWorkspace,{...input,action:input.action as "capture"|"search"},budget.signal);
     });
     try {
-      const result=await observeWithSignal(capture(),budget.signal);
+      // MCP/Peer boundaries may stop waiting; the recorded handler must retain
+      // ownership until all file work and cancellation cleanup have settled.
+      const result=await capture();
       return jsonReply(result, "partial" in result && result.partial ? "部分选区失败，错误与成功内容均已保留。" : undefined);
     } finally {budget.dispose();}
   });
