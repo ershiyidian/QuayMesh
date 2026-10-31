@@ -15,6 +15,8 @@ import { dayAt, mergeTotals, type Query } from "./query.js";
 import { aggregateTaskIndex, aggregateTasks, applyRunTitles, applyTaskTitles, compareTaskIndex, fallbackTask, taskOnlyIndex, filterTaskIndex, resolveSessionTitles, taskKey, taskStage, type TaskIndex } from "./task-aggregation.js";
 import { WorkbenchError, type Run, type SourceReadState, type SourceState } from "./types.js";
 import { lastObservedExecutingTasks, overviewTaskProgress, selectOverviewTasks, taskAttention } from './overview-tasks.js';
+import { taskActivityView } from '../task-view.js';
+import {mergeTaskWorkspaces,withTaskMembership} from './task-aggregation.js';
 
 interface CachedResource { data: unknown; loadedAt: number; error: string | null; wait: boolean; retryAt: number; failures: number }
 interface PageSnapshot { keys: string[]; counts: Record<string, number>; at: number; query: string; expiresAt: number }
@@ -57,67 +59,64 @@ export class WorkbenchFeed {
     return reply.body as T;
   }
 
-  private async load<T>(node: NodeIdentity, path: string, local: () => T|Promise<T>, ttl: number, fresh=false): Promise<NodeResource<T>> {
+  private async load<T>(node: NodeIdentity, path: string, local: () => T|Promise<T>, ttl: number, fresh=false, waitForFresh=false): Promise<NodeResource<T>> {
     const key = node.id + ":" + path;
-    if(fresh){
-      // 先等旧读取落定，再读取此资源；显式刷新不清除其它页面的缓存。
-      await this.pending.get(key)?.promise;
-      const previous=this.cache.get(key);
-      if(previous){previous.wait=true;previous.retryAt=0;}
-    }
     const cached = this.cache.get(key);
-    // Console commonly polls every eight seconds. A one-second per-node TTL
-    // otherwise makes every page paint report all sources as "refreshing".
+    if (fresh && cached) { cached.wait = true; cached.retryAt = 0; }
     const effectiveTtl = Math.max(ttl, 12_000);
     const recent = Boolean(cached?.loadedAt && Date.now()-cached.loadedAt <= SOURCE_FRESHNESS_MS);
     const previous = (state: SourceReadState, error: string | null): NodeResource<T> => ({ data: cached?.data as T ?? null,
       source: { nodeId: node.id, name: node.nickname, online: node.online, state, observedAt: cached?.loadedAt || null,
-        stale: state === "offline" || state === "error" || state === "refreshing" && !recent, error } });
+        stale: state === "offline" || state === "error" || state === "refreshing" && (!recent || cached?.wait === true), error } });
+    const pendingState = () => previous(cached?.data != null ? "refreshing" : "loading", cached?.error ?? null);
+    // Each screen combines several node reads. Bound its wait for each wave,
+    // while the one shared read continues filling the cache for the next poll.
+    // A cached observation keeps its original timestamp; it is never renewed by
+    // merely opening a page or by a slow refresh.
+    const bounded = async (job: Promise<NodeResource<T>>): Promise<NodeResource<T>> => {
+      if (waitForFresh) return job;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([job, new Promise<NodeResource<T>>(resolve => {
+          timer = setTimeout(() => resolve(pendingState()), 1200);
+        })]);
+      } finally { if (timer) clearTimeout(timer); }
+    };
     if (!node.online) return previous("offline", "节点离线");
     if (cached?.error && !cached.wait && Date.now() < cached.retryAt) return previous("error", cached.error);
     if (cached && !cached.wait && !cached.error && Date.now() - cached.loadedAt < effectiveTtl) return previous("ready", null);
     const existing = this.pending.get(key);
     if (existing) {
       if (existing.generation !== this.generation) {
-        await existing.promise;
-        return this.load(node,path,local,ttl);
+        // A pre-write observation must finish before the replacement starts,
+        // but it cannot hold a whole screen open or overwrite the new generation.
+        return bounded(existing.promise.then(() => this.load(node,path,local,ttl,fresh,waitForFresh)));
       }
-      return cached?.data != null && !cached.wait && recent ? previous("refreshing",cached.error) : existing.promise as Promise<NodeResource<T>>;
+      return cached?.data != null && !cached.wait && !fresh
+        ? pendingState() : bounded(existing.promise as Promise<NodeResource<T>>);
     }
-    {
-      const generation = this.generation;
-      // 慢轮询不能反复拿到过期快照；超出确认期限后等待这次读取，失败时仍返回旧数据和实际错误。
-      const requireFresh = cached?.wait === true || !recent;
-      const job: Promise<NodeResource<T>> = Promise.resolve().then(async () => {
-        try {
-          const data = node.id === this.localId ? await local() : await this.call<T>(node.id, path);
-          const loadedAt = Date.now();
-          if (generation === this.generation) {
-            this.cache.delete(key); this.cache.set(key, { data, loadedAt, error: null, wait: false, retryAt: 0, failures: 0 });
-          }
-          while (this.cache.size > 160) this.cache.delete(this.cache.keys().next().value!);
-          const source: SourceState = { nodeId: node.id, name: node.nickname, online: true, state: "ready", observedAt: loadedAt, stale: false, error: null };
-          return { data, source };
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          const failures = Math.min((cached?.failures ?? 0) + 1, 6);
-          // A disconnected or sleeping node should not be hammered on every
-          // Console poll. Per-node/path backoff is bounded and resets on success.
-          const retryDelay = Math.min(60_000, 3000 * 2 ** (failures - 1));
-          if (generation === this.generation) this.cache.set(key,{data:cached?.data ?? null,loadedAt:cached?.loadedAt ?? 0,
-            error:message,wait:false,retryAt:Date.now()+retryDelay,failures});
-          return previous("error", message);
+    const generation = this.generation;
+    const job: Promise<NodeResource<T>> = Promise.resolve().then(async () => {
+      try {
+        const data = node.id === this.localId ? await local() : await this.call<T>(node.id, path);
+        const loadedAt = Date.now();
+        if (generation === this.generation) {
+          this.cache.delete(key); this.cache.set(key, { data, loadedAt, error: null, wait: false, retryAt: 0, failures: 0 });
         }
-      }).finally(() => { if (this.pending.get(key)?.promise === job) this.pending.delete(key); });
-      this.pending.set(key, { generation, promise:job });
-      if (cached?.data != null && !requireFresh) {
-        // Background refresh owns its error handling; response uses an
-        // acknowledged stale snapshot rather than blocking for an RPC.
-        void job;
-        return previous("refreshing", cached.error);
+        while (this.cache.size > 160) this.cache.delete(this.cache.keys().next().value!);
+        const source: SourceState = { nodeId: node.id, name: node.nickname, online: true, state: "ready", observedAt: loadedAt, stale: false, error: null };
+        return { data, source };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const failures = Math.min((cached?.failures ?? 0) + 1, 6);
+        const retryDelay = Math.min(60_000, 3000 * 2 ** (failures - 1));
+        if (generation === this.generation) this.cache.set(key,{data:cached?.data ?? null,loadedAt:cached?.loadedAt ?? 0,
+          error:message,wait:false,retryAt:Date.now()+retryDelay,failures});
+        return previous("error", message);
       }
-      return job;
-    }
+    }).finally(() => { if (this.pending.get(key)?.promise === job) this.pending.delete(key); });
+    this.pending.set(key, { generation, promise:job });
+    return cached?.data != null && !cached.wait && !fresh ? pendingState() : bounded(job);
   }
 
   private async collect<T>(path: string, local: () => T|Promise<T>, query: Query = {}, ttl = 5000, nodeIds?:ReadonlySet<string>, fresh=false) {
@@ -149,8 +148,8 @@ export class WorkbenchFeed {
   async nodeSettings(nodeId:string) {
     const node=this.nodes().find(node=>node.id===nodeId);
     if(!node)throw new WorkbenchError('节点不存在',404,'node_not_found','none');
-    const result=await this.load(node,'/workbench/metadata',()=>readWorkbenchMetadata(this.config,this.runtime),1000,true);
-    if(!result.data||!result.source.online||result.source.error)throw new WorkbenchError(result.source.error??'节点设置尚未取得',503,'settings_unavailable','none');
+    const result=await this.load(node,'/workbench/metadata',()=>readWorkbenchMetadata(this.config,this.runtime),1000,true,true);
+    if(!result.data||!result.source.online||result.source.error||result.source.state!=='ready')throw new WorkbenchError(result.source.error??'正在取得节点设置，请稍后重试',503,'settings_unavailable','none');
     return {settings:result.data.settings,roots:result.data.roots,source:result.source};
   }
 
@@ -167,7 +166,7 @@ export class WorkbenchFeed {
     })),titles.sources).map(source=>[source.nodeId,source])) : null;
     return tasks.map(task=>{
       const lifecycle=titles.tasks.get(task.taskId ?? '');
-      const resolved=withTaskLifecycle(task,lifecycle);
+      const resolved=withTaskMembership(withTaskLifecycle(task,lifecycle),lifecycle);
       if(!authorityObservations||!lifecycle?.nodeId)return resolved;
       const authority=authorityObservations.get(lifecycle.nodeId);
       const observedAt=!task.phaseRefs.length ? authority?.observedAt ?? null
@@ -223,8 +222,9 @@ export class WorkbenchFeed {
     const cursor=(run:Run,next:number,direction:'next'|'previous')=>Buffer.from(JSON.stringify({
       ...JSON.parse(Buffer.from(pageCursor(run,query,at,next,direction),'base64url').toString('utf8')),snapshot:snapshotId,
     })).toString('base64url');
-    return {items,total:snapshot.keys.length,counts,offset,limit,snapshotAt:snapshot.at,
-      nextCursor:items.length&&offset+keys.length<snapshot.keys.length?cursor(items.at(-1)!,offset+keys.length,'next'):null,
+    const taskCoverage=index.complete&&titles.complete&&(!usage||usage.complete);
+    return {items,total:snapshot.keys.length,counts,offset,limit,snapshotAt:snapshot.at,coverage:{tasks:taskCoverage,details:summaries.complete},
+      nextCursor:taskCoverage&&items.length&&offset+keys.length<snapshot.keys.length?cursor(items.at(-1)!,offset+keys.length,'next'):null,
       previousCursor:items.length&&offset>0?cursor(items[0],Math.max(0,offset-limit),'previous'):null,
       sources:mergeSources(mergeSources(mergeSources(index.sources,summaries.sources),titles.sources),usage?.sources??[]),
       complete:index.complete&&summaries.complete&&titles.complete&&(!usage||usage.complete),observedAt:Date.now()};
@@ -269,9 +269,15 @@ export class WorkbenchFeed {
 
   private resolvedRun(task:TaskIndex,detail?:Run):Run {
     const run=detail ?? fallbackTask(task);
+    const workspaces=mergeTaskWorkspaces(run.workspaces,task.workspaces);
     const canComplete=task.requestState==='active' && !activeExecution(task.executionStatus)
       && task.executionStatus!=='unknown' && !(task.executionStatus==='interrupted_recoverable'&&task.actionableInterruption);
-    return {...run,title:task.title,executionStatus:task.executionStatus,acceptanceStatus:task.acceptanceStatus,sourceTaskId:task.sourceTaskId??null,
+    return {...run,title:task.title,titleSource:task.titleSource,lastProgressAt:task.lastProgressAt ?? task.lastActivityAt,
+      ...(workspaces.length?{workspaces,workspaceCount:workspaces.length,
+        projectName:workspaces.length===1?workspaces[0]!.name:`${workspaces.length} 个工作区`}:{}),
+      nodeIds:[...new Set([...(run.nodeIds??[run.nodeId]),...task.nodeIds])],
+      executionObservedAt:task.executionObservedAt ?? null,
+      executionStatus:task.executionStatus,acceptanceStatus:task.acceptanceStatus,sourceTaskId:task.sourceTaskId??null,
       requestState:task.requestState,resultStatus:task.resultStatus,phaseExecutionStatus:task.phaseExecutionStatus,finalization:task.finalization,actionableInterruption:task.actionableInterruption,
       revision:run.revision+(task.taskRevision??0),taskRevision:task.taskRevision,
       reason:task.reason ?? (run.executionStatus === task.executionStatus ? run.reason : null),
@@ -290,7 +296,9 @@ export class WorkbenchFeed {
       const tasks=conversation.tasks.map(task=>{
         // 项目决定会话归属；任务状态仍需包含它在其他工作区的执行。
         const full=aggregate.get(task.taskId);
-        const state=full?{...task,executionStatus:full.executionStatus,acceptanceStatus:full.acceptanceStatus,
+        const state=full?{...task,title:full.title,titleSource:full.titleSource,
+          lastProgressAt:full.lastProgressAt ?? full.lastActivityAt,executionObservedAt:full.executionObservedAt ?? null,
+          observedAt:full.observedAt,stale:full.stale,executionStatus:full.executionStatus,acceptanceStatus:full.acceptanceStatus,
           requestState:full.requestState,resultStatus:full.resultStatus,phaseExecutionStatus:full.phaseExecutionStatus,
           finalization:full.finalization,startedAt:full.startedAt,finishedAt:full.finishedAt,lastActivityAt:full.lastActivityAt,workspaces:full.workspaces}
           :withTaskLifecycle({...task,phaseExecutionStatus:task.executionStatus},titles.tasks.get(task.taskId ?? ''));
@@ -316,6 +324,8 @@ export class WorkbenchFeed {
         createdAt:Math.min(...current.map(task=>task.startedAt)),updatedAt:session?.lastActivityAt??Math.max(...current.map(task=>task.lastActivityAt)),
         taskCount:current.length,activeCount:current.filter(task=>activeExecution(task.executionStatus)).length,
         tasks:current.map(task=>{const run=this.resolvedRun(task);return {id:run.id,taskId:task.taskId,title:task.title,status:taskStage(task.executionStatus,task.acceptanceStatus,task.phaseExecutionStatus),
+          titleSource:task.titleSource,lastProgressAt:task.lastProgressAt ?? task.lastActivityAt,
+          executionObservedAt:task.executionObservedAt ?? null,observedAt:task.observedAt,stale:task.stale,
           root:run.root,workspaces:run.workspaces,executionStatus:task.executionStatus,acceptanceStatus:task.acceptanceStatus,
           requestState:task.requestState,resultStatus:task.resultStatus,phaseExecutionStatus:task.phaseExecutionStatus,finalization:task.finalization,
           lastActivityAt:task.lastActivityAt,startedAt:task.startedAt,finishedAt:task.finishedAt,hasRun:task.phaseRefs.length>0};})}];
@@ -365,10 +375,11 @@ export class WorkbenchFeed {
       .flatMap(([,cached])=>{const value=cached.data as ReturnType<typeof readLocalSessionTitles>|null;
         return (value?.tasks??[]).filter(task=>task.id===identity.taskId).map(task=>({task,authoritative:value!.authoritative}));})
       .sort((a,b)=>Number(b.authoritative)-Number(a.authoritative)||b.task.revision-a.task.revision)[0]?.task:undefined;
-    const titles=await this.sessionTitles(known?.nodeId?new Set([known.nodeId]):undefined,fresh);
+    const [titles,index]=await Promise.all([
+      this.sessionTitles(known?.nodeId?new Set([known.nodeId]):undefined,fresh),
+      this.collect('/workbench/task-index',()=>readLocalTaskIndex(this.config),{},1000,undefined,fresh),
+    ]);
     const lifecycle=identity.taskId?titles.tasks.get(identity.taskId):undefined;
-    const members=lifecycle?new Set([...(lifecycle.memberNodeIds??[]),...(lifecycle.nodeId?[lifecycle.nodeId]:[])]):undefined;
-    const index=await this.collect('/workbench/task-index',()=>readLocalTaskIndex(this.config),{},1000,members?.size?members:undefined,fresh);
     const matches=(phase:{taskId:string|null;sessionId:string|null})=>identity.taskId?phase.taskId===identity.taskId:phase.sessionId===identity.sessionId;
     const phases=index.values.flatMap(value=>value.items).filter(matches);
     const required=new Set([...phases.map(phase=>phase.nodeId),...(lifecycle?.memberNodeIds??[]),...(lifecycle?.nodeId?[lifecycle.nodeId]:[])]);
@@ -379,7 +390,7 @@ export class WorkbenchFeed {
       &&['ready','refreshing'].includes(source.state)&&!source.error))
       :index.complete&&titles.complete)&&summaries.complete;
     const runs=applyRunTitles(observeSourceStates(summaries.values.filter(matches),sources),titles.map).map(run=>withTaskLifecycle(run,titles.tasks.get(run.taskId??'')));
-    const task=lifecycle?this.resolvedRun(withTaskLifecycle(phases.length?aggregateTaskIndex(observeSourceStates(phases,sources))[0]!:taskOnlyIndex(lifecycle),lifecycle),runs.length?aggregateTasks(runs)[0]:undefined)
+    const task=lifecycle?this.resolvedRun(withTaskMembership(withTaskLifecycle(phases.length?aggregateTaskIndex(observeSourceStates(phases,sources))[0]!:taskOnlyIndex(lifecycle),lifecycle),lifecycle),runs.length?aggregateTasks(runs)[0]:undefined)
       :runs.length?aggregateTasks(runs)[0]:undefined;
     return {runs,task,lifecycle,complete,sources,missingNodes:[...required].filter(node=>!sources.some(source=>source.nodeId===node&&source.online&&!source.error&&source.observedAt!==null))};
   }
@@ -389,7 +400,7 @@ export class WorkbenchFeed {
     if(!lifecycle)return detail;
     const index=phases.length?aggregateTaskIndex(phases.map(run=>({...run,tokens:run.usage.total,changed:Boolean(run.diff),
       currentPhase:run.currentPhase!==false,actionableInterruption:run.actionableInterruption===true})))[0]!:taskOnlyIndex(lifecycle);
-    return this.resolvedRun(withTaskLifecycle({...index,title:lifecycle.title},lifecycle),detail);
+    return this.resolvedRun(withTaskMembership(withTaskLifecycle({...index,title:lifecycle.title},lifecycle),lifecycle),detail);
   }
 
   async overview(zone: string,fresh=false) {
@@ -400,19 +411,20 @@ export class WorkbenchFeed {
       this.sessionTitles(undefined,fresh),
     ]);
     const tasks = this.taskIndex(index.values.flatMap(value=>value.items),titles,index.sources);
-    // Preserve a cached executing Task when a member observation is temporarily
-    // missing. Its progress label remains "待更新", never a new liveness claim.
+    // Current work needs dated progress or an execution-owner observation.
     const lastObservedExecuting = lastObservedExecutingTasks(index.values.flatMap(value=>value.items));
     const today = dayAt(at, zone);
     const taskGroups = selectOverviewTasks(tasks,at,time=>dayAt(time,zone)===today,lastObservedExecuting);
-    const activeIndex = tasks.filter(task=>activeExecution(task.executionStatus)).sort((a,b)=>b.lastActivityAt-a.lastActivityAt);
+    const activeIndex = tasks.filter(task=>taskActivityView({requestState:task.requestState,result:task.resultStatus,
+      execution:task.executionStatus,lastProgressAt:task.lastProgressAt ?? task.lastActivityAt,
+      executionObservedAt:task.executionObservedAt,now:at}).state==='executing').sort((a,b)=>b.lastActivityAt-a.lastActivityAt);
     const visibleActive=[...activeIndex.filter(task=>task.executionStatus!=='queued').slice(0,12),
       ...activeIndex.filter(task=>task.executionStatus==='queued').slice(0,3)];
     const waitingIndex = tasks.filter(task=>['waiting','stalled','finalizing'].includes(task.executionStatus)).sort((a,b)=>b.lastActivityAt-a.lastActivityAt);
     const recentIndex = taskGroups.recent.slice(0,6);
     const attentionIndex = taskGroups.attention;
     const visibleCurrent = taskGroups.current.slice(0,12), visibleOlder = taskGroups.olderOpen.slice(0,6);
-    const visibleIndex = [...visibleCurrent, ...visibleOlder, ...visibleActive, ...waitingIndex.slice(0,6), ...recentIndex, ...attentionIndex.slice(0, 6)];
+    const visibleIndex = [...visibleCurrent, ...visibleOlder, ...recentIndex, ...attentionIndex.slice(0, 6)];
     const summaries = await this.runSummaries([...new Set(visibleIndex.flatMap((task) => task.phaseRefs))],fresh);
     const detailed = new Map(applyRunTitles(aggregateTasks(observeSourceStates(summaries.values,summaries.sources)), titles.map).map((run) => [taskKey(run), run]));
     const resolve = (task: TaskIndex) => this.resolvedRun(task,detailed.get(task.key));

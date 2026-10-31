@@ -20,11 +20,13 @@ File differences belong to their task. Completed tasks retain their recorded fil
 
 ### Understand task state
 
-A request, its background executions, and its review have separate states. Finishing one command or workspace phase does not close the request. A request can also be handed off while its background execution continues. The details retain the delivery result alongside the current execution state.
+A task represents the user's goal. Its executions and review have separate states. Finishing one command or workspace phase does not close the task. A handoff keeps the goal available for continuation and preserves the recorded execution result.
 
-The primary task badge follows the saved task lifecycle. An open task remains in **In progress** when it has no active process, its latest command fails, or an execution observation becomes stale. A separate badge reports those execution facts. **In progress** and **Ended** filter the task lifecycle; **Background execution** selects active commands and agents, including work continuing after a handoff. An open task is not evidence that the host model is currently generating a response.
+The primary task badge follows observed activity. A task with no substantive activity for thirty minutes moves out of the current-work group and remains available to continue. A long-running command or agent can stay current when fresh execution evidence confirms that it is still working. Reading a page, polling a saved record, and an old process status do not renew task activity. Details preserve the open or closed lifecycle separately from this activity label.
 
-“No background execution” means there is no confirmed active command or agent. It does not imply a request for user input. A failed or stopped last execution remains visible until further work supersedes it. Unresolved effects and stale observations stay in the attention view, including those from an older phase or a closed request. Finalization failures show their recorded cause.
+The overview and task filters count user goals. Commands and agent turns appear inside their task. Each task shows its last activity and preserves saved execution failures or unresolved outcomes for inspection. The attention view is reserved for a concrete action such as review, recovery, or a failed finalization; missing background commands alone do not request user action.
+
+Task names prefer the saved user goal and existing meaningful titles. Records without a meaningful title receive a recognizable workspace and time-based fallback. The fallback does not invent a goal or change the saved task identity.
 
 Use **Finish request** to record a delivery result. Review acceptance and rejection are separate actions. Finishing requires confirmation that all relevant task members have no active or unresolved execution. An unrelated offline node does not block the task's controls.
 
@@ -66,9 +68,9 @@ The tray, Host, browser favicon, and desktop application share the project icon 
 
 ## Connection state
 
-The console reports node connectivity and the freshness of displayed data. Previously received data remains visible while the next refresh runs. Normal background refreshes have no warning. Delayed updates and failed reads appear in one expandable notice, with the affected sources and their last confirmation times.
+The console reports node connectivity and the freshness of displayed data. Previously received data and the selected task remain visible during refreshes and failed reads. Normal refreshes retain their confirmation time without a yellow fault banner. An actual failed read or offline node has a local recovery notice and a retry control. A slow node does not hold up the usable parts of the page; incomplete counts remain explicitly unconfirmed until the missing sources arrive.
 
-Resources refresh independently. Hiding the page or losing the connection cancels unnecessary reads; returning resumes them. Stale execution observations show that an update is needed. The task timer measures time from request creation to delivery, while each command retains its own execution duration. Known counts and missing coverage are shown separately. The diagnostics panel provides resource timings, versions, source state, and an exportable record.
+Resources refresh independently and share an in-flight read for the same source. Hiding the page or losing the connection cancels unnecessary reads; returning resumes them. Expired or cancelled delivery releases its own data stream while the shared node connection remains available. Task activity time and individual execution duration are shown separately. The diagnostics panel provides resource timings, versions, source state, and an exportable record.
 
 Failure notifications use a separate saved event cursor for each node. An unavailable node keeps its cursor so events can be read when it returns. Notifications do not depend on the small sample shown in the overview.
 

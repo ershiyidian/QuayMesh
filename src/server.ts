@@ -1269,9 +1269,11 @@ export function createServer(
     const requestId = (req as Request & { [httpDiagnosticRequestId]?: string })[httpDiagnosticRequestId] ?? randomUUID();
     const startedAt = performance.now();
     res.locals.requestId = requestId;
+    // Mounted routers can rewrite req.path before the finish event fires.
+    // Capture only the original pathname, without OAuth query credentials.
+    const path = requestPath(req);
 
     res.on("finish", () => {
-      const path = requestPath(req);
       if (!config.logging.requests) return;
       const durationMs=Math.round(performance.now()-startedAt);
       if(["/healthz","/readyz"].includes(path) && res.statusCode===200) {

@@ -20,6 +20,13 @@ import {SessionService, type OperationTicket} from "./service.js";
 import {SessionStore} from "./store.js";
 import {SessionToolRecorder, type RecordModelToolInput} from "./tool-recording.js";
 import type {InvocationContext} from "./types.js";
+import {isReadOnlyObservation} from "../tool-admission.js";
+import {cancelManagedCommand} from "../managed-command-control.js";
+import {recoverUnstartedCommandControl} from "../execution-control-recovery.js";
+import {requestClaimStop} from "../execution-claim-control.js";
+import type {SessionRuntime} from "./runtime.js";
+import type {ProcessSessionManager} from "../process-sessions.js";
+import {workspaceContextInputSchema} from "../tool-surfaces/workspace-context.js";
 
 function deferred() {
   let resolve!: () => void;
@@ -219,4 +226,132 @@ test("真实 SQLite 拒绝物理收据时保留原 unknown 错误且不重跑读
   f.ledger.db.exec("DROP TRIGGER reject_local_completion");
   await assert.rejects(f.recorder.record(args), {code: "REQUEST_TIMEOUT"});
   assert.equal(calls, 1); assert.equal(f.proofCount(), 0); assert.deepEqual(f.business(operationId), before);
+});
+
+test("ordinary file reads keep context evidence without creating an execution or a maintenance lease", async t=>{
+  const f=await fixture(t);let observed="";
+  f.execution.pause("maintenance may continue during a file observation");
+  const result=await f.recorder.record<string>({identity:f.identity("plain-read"),workspace_id:f.member.workspace_id,
+    tool_name:"read",kind:"read",label:"read",input:{path:"input.txt"},
+    operation:()=>readFile(join(f.root,"input.txt"),"utf8"),contextRead:value=>{observed=value;}});
+  assert.equal(result,"real file observation\n");assert.equal(observed,result);
+  await assert.rejects(f.recorder.record({identity:f.identity("plain-read-timeout"),workspace_id:f.member.workspace_id,
+    tool_name:"read",kind:"read",label:"read",input:{path:"input.txt"},
+    operation:async()=>{await readFile(join(f.root,"input.txt"));throw timeout();}}),{code:"REQUEST_TIMEOUT"});
+  assert.equal(f.ledger.db.prepare("SELECT COUNT(*) FROM console_operations").pluck().get(),0);
+  assert.equal(f.ledger.db.prepare("SELECT COUNT(*) FROM qm_runtime_work").pluck().get(),0);
+  assert.equal(f.execution.admissionStatus().physicalUnknown,0);
+  assert.equal(f.execution.admissionStatus().quiescent,true);
+  assert.equal(isReadOnlyObservation("cancel_command",{}),false,"a read-kind cancellation is still an operation");
+});
+
+test("explicit claim recovery is recorded once; inspection remains a read-only observation", async t=>{
+  const f=await fixture(t);let calls=0;
+  assert.equal(isReadOnlyObservation("workspace_context",{action:"recovery",claim_id:"claim",recovery_action:"inspect"}),true);
+  assert.equal(isReadOnlyObservation("workspace_context",{action:"recovery",claim_id:"claim",recovery_action:"stop"}),false);
+  const input:RecordModelToolInput<string>={identity:f.identity("recover-one"),workspace_id:f.member.workspace_id,
+    tool_name:"workspace_context",kind:"read",label:"recover claim",
+    input:{action:"recovery",claim_id:"claim",recovery_action:"release"},operation:async()=>{calls++;return "released";}};
+  assert.equal(await f.recorder.record(input),"released");
+  assert.equal(await f.recorder.record(input),"released");
+  assert.equal(calls,1);
+  assert.equal(f.ledger.db.prepare("SELECT COUNT(*) FROM qm_invocations WHERE tool_name='workspace_context'").pluck().get(),1);
+});
+
+async function rejectedCancellation(t:TestContext,f:Awaited<ReturnType<typeof fixture>>) {
+  const command=f.context("detached-command");
+  await f.recorder.recordWithContext(command,{tool_name:"exec_command",kind:"command",label:"old command",
+    input:{cmd:"long-running job"},operation:async()=>({running:true}),runningResult:()=>true});
+  const claim=f.execution.acquire({workspaceRoot:f.root,kind:"command",operationId:command.operation_id,
+    scopes:[{kind:"file",path:join(f.root,"output.txt"),access:"write"}]});
+  t.after(()=>claim.release());
+  const terminate=t.mock.fn(()=>{throw new Error("must not send a signal without the exact attached command");});
+  const processSessions={findOperation:()=>undefined,terminate} as unknown as ProcessSessionManager;
+  const context=f.context("cancel-detached");
+  await assert.rejects(f.recorder.recordWithContext(context,{tool_name:"cancel_command",kind:"read",label:"cancel command",
+    input:{operation_id:command.operation_id},operation:()=>cancelManagedCommand({
+      runtime:{store:f.store,service:f.service} as SessionRuntime,processSessions,ownerId:f.session.owner_id,
+      nodeId:"local",workspaceRoot:f.root,operationId:command.operation_id!,
+    })}),{code:"COMMAND_NOT_ATTACHED",effect:"unknown"});
+  assert.equal(terminate.mock.callCount(),0,"the actual production guard rejects before signal delivery");
+  return {context,command,claim,input:{operationId:context.operation_id!,ownerId:f.session.owner_id,nodeId:"local",workspaceRoot:f.root}};
+}
+
+test("a saved local cancellation guard recovers only its own physical subject on a v16 database",{timeout:10_000},async t=>{
+  const f=await fixture(t),r=await rejectedCancellation(t,f);
+  // Restore the actual v16 shape in this isolated fixture. The public recovery
+  // accepts this connection; it must not open a WorkLedger or migrate it.
+  f.ledger.db.exec(`DROP INDEX execution_claims_execution;
+    ALTER TABLE execution_claims DROP COLUMN execution_id;
+    ALTER TABLE execution_claims DROP COLUMN execution_generation;
+    ALTER TABLE execution_claims DROP COLUMN owner_process_start;
+    ALTER TABLE execution_waiters DROP COLUMN execution_id;
+    ALTER TABLE execution_waiters DROP COLUMN execution_generation;
+    ALTER TABLE execution_waiters DROP COLUMN owner_process_start;
+    DROP INDEX qm_events_task_diagnostic_time;
+    DROP INDEX qm_invocations_task_diagnostic_time;
+    DROP INDEX qm_invocations_pending_state;
+    DELETE FROM qm_schema_migrations WHERE version>16;`);
+  const control=f.business(r.context.operation_id!),command=f.business(r.command.operation_id!);
+  const claims=f.ledger.db.prepare("SELECT * FROM execution_claims ORDER BY id").all(),task=f.store.getTask(f.task.id);
+  assert.equal(recoverUnstartedCommandControl(f.ledger.db,r.input).state,"recoverable");
+  assert.equal(f.proofCount(),0);
+  assert.equal(recoverUnstartedCommandControl(f.ledger.db,{...r.input,apply:true}).state,"quiescent");
+  assert.equal(recoverUnstartedCommandControl(f.ledger.db,{...r.input,apply:true}).state,"quiescent");
+  assert.equal(f.proofCount(),1,"recovery is idempotent");
+  assert.equal(f.ledger.db.prepare("SELECT max(version) FROM qm_schema_migrations").pluck().get(),16);
+  assert.deepEqual(f.business(r.context.operation_id!),control);
+  assert.deepEqual(f.business(r.command.operation_id!),command);
+  assert.deepEqual(f.ledger.db.prepare("SELECT * FROM execution_claims ORDER BY id").all(),claims);
+  assert.deepEqual(f.store.getTask(f.task.id),task);
+  const proof=f.ledger.db.prepare("SELECT object_id,evidence_json FROM execution_quiescence").get() as {object_id:string;evidence_json:string};
+  assert.equal(proof.object_id,r.context.operation_id);
+  assert.equal(JSON.parse(proof.evidence_json).targetOperationId,r.command.operation_id);
+});
+
+test("cancellation recovery rejects other errors, forwarded or missing finishes, generations and scopes",{timeout:10_000},async t=>{
+  const f=await fixture(t),r=await rejectedCancellation(t,f),db=f.ledger.db;
+  const saved=f.store.findInvocationByOperation(f.session.owner_id,r.context.operation_id!)!;
+  const envelope=JSON.parse(saved.result_json!);
+  const attempt=(sql:string,value:string|null,restore:string|null)=>{
+    db.prepare(sql).run(value,saved.id);
+    assert.equal(recoverUnstartedCommandControl(db,{...r.input,apply:true}).state,"unknown");
+    assert.equal(f.proofCount(),0);
+    db.prepare(sql).run(restore,saved.id);
+  };
+  attempt("UPDATE qm_invocations SET result_json=? WHERE id=?",JSON.stringify({...envelope,errorCode:"REQUEST_TIMEOUT"}),saved.result_json);
+  attempt("UPDATE qm_invocations SET tool_name=? WHERE id=?","read","cancel_command");
+  attempt("UPDATE qm_invocations SET task_id=? WHERE id=?",null,f.task.id);
+  db.prepare("UPDATE execution_owners SET generation='next-attempt' WHERE domain='operation' AND id=?").run(r.context.operation_id!);
+  assert.equal(recoverUnstartedCommandControl(db,{...r.input,apply:true}).state,"unknown");
+  db.prepare("UPDATE execution_owners SET generation=? WHERE domain='operation' AND id=?").run(saved.id,r.context.operation_id!);
+  for(const changed of [{ownerId:"other"},{nodeId:"remote"},{workspaceRoot:join(f.root,"elsewhere")}])
+    assert.throws(()=>recoverUnstartedCommandControl(db,{...r.input,...changed,apply:true}),/OPERATION_SCOPE_MISMATCH/);
+  db.prepare("DELETE FROM qm_events WHERE event_type='operation_finished' AND json_extract(data_json,'$.operation_id')=?").run(r.context.operation_id!);
+  assert.equal(recoverUnstartedCommandControl(db,{...r.input,apply:true}).state,"unknown");
+  assert.equal(f.proofCount(),0);
+  assert.equal(f.store.findInvocationByOperation(f.session.owner_id,r.context.operation_id!)?.effect,"unknown");
+  const base={workspace_id:"workspace",action:"recovery",operation_id:r.context.operation_id};
+  assert.equal(workspaceContextInputSchema.safeParse({...base,recovery_action:"release"}).success,true);
+  assert.equal(workspaceContextInputSchema.safeParse({...base,recovery_action:"stop"}).success,false);
+  assert.equal(workspaceContextInputSchema.safeParse({...base,claim_id:"claim"}).success,false);
+  assert.equal(isReadOnlyObservation("workspace_context",{...base,recovery_action:"release"}),false);
+});
+
+test("an unconfirmed dispatched agent stop stays unknown and replays without another interrupt",{timeout:10_000},async t=>{
+  const f=await fixture(t);let interrupts=0;
+  const input:RecordModelToolInput<never>={identity:f.identity("stop-unknown"),workspace_id:f.member.workspace_id,
+    tool_name:"workspace_context",kind:"read",label:"stop exact claim",
+    input:{action:"recovery",claim_id:"claim",recovery_action:"stop"},operation:()=>requestClaimStop(async()=>{
+      interrupts++;
+      throw Object.assign(new Error("Control result is unconfirmed. Reconcile the exact provider turn before further writes."),
+        {code:"AGENT_CONFLICT"});
+    })};
+  await assert.rejects(f.recorder.record(input),{code:"AGENT_CONFLICT",effect:"unknown",retryHint:"query_original"});
+  await assert.rejects(f.recorder.record(input),{code:"AGENT_CONFLICT",effect:"unknown",retryHint:"query_original"});
+  assert.equal(interrupts,1);
+  const saved=f.ledger.db.prepare("SELECT state,effect,result_json FROM qm_invocations WHERE tool_name='workspace_context'")
+    .get() as {state:string;effect:string;result_json:string};
+  assert.equal(saved.state,"unknown");assert.equal(saved.effect,"unknown");
+  assert.equal(JSON.parse(saved.result_json).retryHint,"query_original");
 });

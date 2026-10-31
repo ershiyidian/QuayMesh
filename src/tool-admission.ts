@@ -32,8 +32,9 @@ function withTaskScopeInput(value: unknown): StandardSchemaWithJSON {
 
 export function isReadOnlyObservation(name: string, input: Record<string, unknown>): boolean {
   if (name === "task_resume") return input.action === "inspect";
-  if (["read_output", "read_diagnostics", "list_agents", "wait_agent", "qm_session", "qm_task_messages"].includes(name)) return true;
-  if (name === "workspace_context") return input.action === "status" || input.action === "recovery";
+  if (["read", "read_output", "read_diagnostics", "list_agents", "wait_agent", "qm_session", "qm_task_messages"].includes(name)) return true;
+  if (name === "workspace_context") return input.action === "status" || input.action === "recovery"
+    && (input.recovery_action === undefined || input.recovery_action === "inspect");
   return name === "write_stdin" && !input.chars && input.columns === undefined && input.rows === undefined;
 }
 

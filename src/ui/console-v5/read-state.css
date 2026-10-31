@@ -1,0 +1,25 @@
+.resource-state-slot:empty { display:none; }
+.resource-state { padding:18px; display:grid; gap:12px; align-content:start; }
+.resource-state-heading { display:flex; align-items:center; gap:9px; color:var(--secondary); }
+.resource-state-heading h3 { font-size:13px; }
+.resource-state p { color:var(--muted); line-height:1.65; margin:0; }
+.resource-state.read-failed .resource-state-heading > svg { color:var(--amber); }
+.resource-state-actions { display:flex; flex-wrap:wrap; gap:8px; }
+.resource-state-actions:empty { display:none; }
+.resource-skeletons { display:grid; gap:10px; padding:4px 0; }
+.resource-update { display:flex; align-items:flex-start; gap:9px; margin-bottom:10px; }
+.resource-update > div { min-width:0; flex:1; }
+.resource-update p { margin:3px 0 0; overflow-wrap:anywhere; }
+.resource-update b { font-weight:550; }
+.resource-update.pending { color:var(--muted); font-size:11px; padding:6px 0; }
+.resource-update .spinner { margin-top:3px; flex-shrink:0; }
+.detail-read-help { color:var(--muted); font-size:12px; margin:14px 0; }
+/* WebView2 may focus the first link without keyboard navigation. */
+html:not([data-input-method=keyboard]) .skip-link:focus { top:-80px; }
+html[data-input-method=keyboard] .skip-link:focus { left:50%; transform:translateX(-50%); max-width:calc(100vw - 24px); }
+@media(max-width:760px) {
+  .resource-state { padding:14px; }
+  .resource-update { flex-wrap:wrap; }
+  .resource-update > div { flex-basis:calc(100% - 30px); }
+  .resource-update > .btn { margin-left:25px; }
+}

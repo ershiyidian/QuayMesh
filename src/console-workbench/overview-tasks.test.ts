@@ -19,15 +19,15 @@ function task(id: string, changes: Partial<TaskIndex> = {}): TaskIndex {
   };
 }
 
-test('today\'s open requests remain current without any background execution', () => {
-  const rows = [task('thinking'), task('between-tools', { executionStatus: 'stalled', lastActivityAt: now - 30 * 60_000 }),
+test('recent open requests remain current without background execution', () => {
+  const rows = [task('thinking'), task('between-tools', { executionStatus: 'stalled', lastActivityAt: now - 29 * 60_000 }),
     task('phase-done', { executionStatus: 'waiting', phaseExecutionStatus: 'completed' })];
   const before = structuredClone(rows);
   const result = selectOverviewTasks(rows, now, todayAt(now));
   assert.deepEqual(new Set(result.current.map(row => row.taskId)), new Set(['thinking', 'between-tools', 'phase-done']));
   assert.equal(result.attention.length, 0);
   assert.equal(result.completedToday, 0);
-  assert.equal(overviewTaskProgress(rows[1]!, 'current').progressLabel, '进行中');
+  assert.equal(overviewTaskProgress(rows[1]!, 'current', now).progressLabel, '最近有活动');
   assert.deepEqual(rows, before, 'display grouping must not change saved Task state');
 });
 
@@ -36,7 +36,7 @@ test('yesterday\'s 19:59 request is older at today\'s 19:38, despite being less 
   const result = selectOverviewTasks([old], now, todayAt(now));
   assert.equal(result.current.length, 0);
   assert.deepEqual(result.olderOpen.map(row => row.taskId), ['older']);
-  assert.deepEqual(overviewTaskProgress(old, 'older'), { progressLabel: '未结束', progressSummary: null });
+  assert.deepEqual(overviewTaskProgress(old, 'older', now), { progressLabel: '等待继续', progressSummary: '最近 30 分钟没有新活动；任务仍可继续' });
   assert.equal(old.requestState, 'active');
   assert.equal(result.attention.length, 0);
 });
@@ -49,24 +49,25 @@ test('recent Task activity carries across local midnight without extending yeste
   assert.equal(selectOverviewTasks([recent], later, todayAt(later)).olderOpen.length, 1);
 });
 
-test('long running, queued and finalizing requests remain current without new output', () => {
+test('confirmed long running and queued requests remain current; old finalization alone does not', () => {
   const old = now - 3 * 86_400_000;
-  const rows = [task('experiment', { lastActivityAt: old, executionStatus: 'running' }),
-    task('queue', { lastActivityAt: old, executionStatus: 'queued' }),
+  const rows = [task('experiment', { lastActivityAt: old, executionStatus: 'running', executionObservedAt: now-1000 }),
+    task('queue', { lastActivityAt: old, executionStatus: 'queued', executionObservedAt: now-1000 }),
     task('delivery', { lastActivityAt: old, finalization: { status: 'pending', requestedAt: old, error: null } })];
   const result = selectOverviewTasks(rows, now, todayAt(now));
-  assert.deepEqual(result.current.map(row => row.taskId), ['experiment', 'queue', 'delivery']);
-  assert.equal(result.olderOpen.length, 0);
+  assert.deepEqual(result.current.map(row => row.taskId), ['experiment', 'queue']);
+  assert.deepEqual(result.olderOpen.map(row=>row.taskId), ['delivery']);
   assert.equal(result.attention.length, 0, 'normal finalization is not a user action');
 });
 
-test('a missing observation preserves an executing snapshot without claiming fresh execution', () => {
+test('a missing observation keeps the Task reachable without retaining a current execution claim', () => {
   const cached = task('experiment', { executionStatus: 'unknown', stale: true,
     observedAt: now - 10 * 60_000, lastActivityAt: now - 3 * 86_400_000 });
   const result = selectOverviewTasks([cached], now, todayAt(now), new Set([cached.key]));
-  assert.equal(result.current.length, 1);
-  assert.deepEqual(overviewTaskProgress(cached, 'current'), {
-    progressLabel: '待更新', progressSummary: '显示上次取得的任务状态',
+  assert.equal(result.current.length, 0);
+  assert.equal(result.olderOpen.length, 1);
+  assert.deepEqual(overviewTaskProgress(cached, 'older', now), {
+    progressLabel: '等待继续', progressSummary: '最近 30 分钟没有新活动；任务仍可继续',
   });
   assert.equal(result.attention.length, 0, 'unavailable data is not automatically a user task');
 });
@@ -76,7 +77,7 @@ test('an open Task without an activity time stays available without inventing a 
   const result = selectOverviewTasks([unknown], now, todayAt(now));
   assert.equal(result.current.length, 0);
   assert.deepEqual(result.olderOpen.map(row => row.taskId), ['missing-time']);
-  assert.equal(overviewTaskProgress(unknown, 'older').progressLabel, '待更新');
+  assert.equal(overviewTaskProgress(unknown, 'older', now).progressLabel, '活动待确认');
   assert.equal(unknown.requestState, 'active');
   assert.equal(unknown.finishedAt, null);
 });
@@ -96,7 +97,7 @@ test('recent results and today counts use the Task lifecycle and outcome', () =>
   assert.equal(result.completedToday, 1);
   assert.equal(result.failedToday, 1);
   assert.equal(overviewTaskProgress(rows[0]!, 'recent').progressLabel, '已完成');
-  assert.equal(overviewTaskProgress(rows[2]!, 'recent').progressLabel, '已结束');
+  assert.equal(overviewTaskProgress(rows[2]!, 'recent', now).progressLabel, '已结束 · 交付未确认');
   assert.equal(overviewTaskProgress(rows[4]!, 'recent').progressLabel, '已停止');
 });
 
@@ -129,11 +130,11 @@ test('a pending acceptance on an executing phase is not yet an actionable review
 
 test('stopping an execution does not label its open Task as stopped', () => {
   for (const executionStatus of ['running','starting']) {
-    assert.equal(overviewTaskProgress(task(executionStatus,{executionStatus}),'current').progressLabel,'进行中');
+    assert.equal(overviewTaskProgress(task(executionStatus,{executionStatus,executionObservedAt:now}),'current',now).progressLabel,'执行中');
   }
-  assert.deepEqual(overviewTaskProgress(task('stopping',{executionStatus:'stopping'}),'current'),{
-    progressLabel:'进行中',progressSummary:'正在停止当前执行',
+  assert.deepEqual(overviewTaskProgress(task('stopping',{executionStatus:'stopping',executionObservedAt:now}),'current',now),{
+    progressLabel:'执行中',progressSummary:'正在停止当前执行',
   });
-  assert.equal(overviewTaskProgress(task('queued',{executionStatus:'queued'}),'current').progressLabel,'等待执行');
+  assert.equal(overviewTaskProgress(task('queued',{executionStatus:'queued',executionObservedAt:now}),'current',now).progressLabel,'等待执行');
   assert.equal(overviewTaskProgress(task('cancelled',{requestState:'closed',resultStatus:'cancelled',executionStatus:'stopping'}),'recent').progressLabel,'已停止');
 });

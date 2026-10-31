@@ -6,6 +6,8 @@ import { runSqliteWrite, type SqliteWriteOptions } from "./db/async-write.js";
 import { canonicalPathIdentity } from "./roots.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { pidAlive } from "./process-liveness.js";
+import { processOwner } from "./process-identity.js";
+import { recoverExecutionClaim } from "./execution-claim-recovery.js";
 import { readMaintenanceStatus } from "./maintenance-status.js";
 import { changeAdmission, readAdmissionState, type AdmissionState, type AdmissionChange } from "./admission-state.js";
 import { canonicalResourcePath, normalizeExecutionResources, resourcesConflict,
@@ -56,6 +58,8 @@ export interface ExecutionClaimInput {
   /** Only the trusted adapter/host reader assigns read, never inferred from a prompt. */
   access?: SourceAccess;
   agentId?: string;
+  /** The exact agent turn in console_executions, never its latest turn. */
+  executionId?: string;
   threadKey?: string;
   resources?: readonly string[];
   scopes?: readonly ExecutionResource[];
@@ -72,12 +76,14 @@ interface ClaimRow {
   checkout_root: string; agent_id: string | null; thread_key: string | null;
   access_mode: SourceAccess; resources: string; acquired_at?: string;
   scopes_json: string | null; operation_id: string | null; task_id: string | null; title: string | null;
+  execution_id: string | null; execution_generation: string | null; owner_process_start: string | null;
 }
 interface WaiterRow extends ClaimRow { sequence: number; expires_at_ms: number }
 
 export interface ExecutionClaim {
   readonly id: string;
   bindThread(threadKey: string): void;
+  bindOperation(operationId: string): void;
   release(): void;
   releaseAsync(options?: SqliteWriteOptions): Promise<void>;
 }
@@ -90,6 +96,7 @@ export interface ExecutionTicket {
 interface ExecutionConflictDetails {
   type: string; requested: ExecutionResource[]; blockedResources: ExecutionResource[];
   operationId: string | null; taskId: string | null; title: string | null; acquiredAt: string | null; queued: boolean;
+  executionId?: string | null;
 }
 
 export class ExecutionConflictError extends Error {
@@ -330,27 +337,25 @@ export class ExecutionCoordinator {
       if (!Number.isInteger(value) || value < 1 || value > 16) throw new Error("Concurrency must be between 1 and 16.");
     }
     if (input.access !== undefined && input.access !== "read" && input.access !== "write") throw new Error("Invalid source access.");
+    const objectId = input.kind === "agent" ? input.executionId : input.operationId;
+    const owner = objectId ? this.database.sqlite.prepare("SELECT generation FROM execution_owners WHERE domain=? AND id=?")
+      .get(input.kind === "agent" ? "execution" : "operation", objectId) as { generation: string } | undefined : undefined;
     return { id: `claim_${randomUUID().replaceAll("-", "")}`, owner_id: this.ownerId, owner_pid: process.pid,
       kind: input.kind, checkout_root: canonicalExecutionRoot(input.workspaceRoot), agent_id: input.agentId ?? null,
       thread_key: input.threadKey ?? null, access_mode: input.access ?? "write", resources: JSON.stringify(resources),
       scopes_json: input.scopes === undefined ? null : JSON.stringify(normalizeExecutionResources(input.scopes)),
-      operation_id: input.operationId ?? null, task_id: input.taskId ?? null, title:input.title?.slice(0,200) ?? null };
+      operation_id: input.operationId ?? null, task_id: input.taskId ?? null, title:input.title?.slice(0,200) ?? null,
+      execution_id: input.executionId ?? null, execution_generation: owner?.generation ?? null,
+      owner_process_start: processOwner.start };
   }
 
   private blocker(candidate: ClaimRow, input: ExecutionClaimInput, sequence = Number.MAX_SAFE_INTEGER): ClaimRow | undefined {
     // Expired WAITERS never started work. Active claims have no timeout-steal path.
     this.database.sqlite.prepare("delete from execution_waiters where expires_at_ms <= ?").run(Date.now());
     const active = (this.database.sqlite.prepare("select * from execution_claims").all() as ClaimRow[]).filter(row => {
-      if (pidAlive(row.owner_pid)) return true;
-      // A dead owner is not sufficient to infer that a subprocess stopped.
-      // Reclaim only claims whose authoritative operation is already terminal.
-      const terminal = row.operation_id && this.database.sqlite.prepare(
-        "select 1 from console_operations where id=? and status in ('completed','failed','cancelled')",
-      ).get(row.operation_id);
-      if (!terminal) return true;
-      this.database.sqlite.prepare("delete from execution_claims where id=? and owner_id=?")
-        .run(row.id,row.owner_id);
-      return false;
+      // The same single-claim recovery is used by admission and explicit recovery.
+      // A live Core may own an ended attempt; a dead Core may leave live children.
+      return recoverExecutionClaim(this.database.sqlite, row.id).state !== "released";
     });
     const conflict = active.find((row) => exclusiveConflict(candidate, row));
     if (conflict) return conflict;
@@ -370,15 +375,27 @@ export class ExecutionCoordinator {
 
   private insert(row: ClaimRow): ExecutionClaim {
     this.database.sqlite.prepare(`insert into execution_claims
-      (id, owner_id, owner_pid, kind, checkout_root, agent_id, resources, acquired_at, access_mode, thread_key,scopes_json,operation_id,task_id,title)
-      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      (id, owner_id, owner_pid, kind, checkout_root, agent_id, resources, acquired_at, access_mode, thread_key,scopes_json,operation_id,task_id,title,execution_id,execution_generation,owner_process_start)
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(row.id, row.owner_id, row.owner_pid, row.kind, row.checkout_root, row.agent_id, row.resources,
-        new Date().toISOString(), row.access_mode, row.thread_key,row.scopes_json,row.operation_id,row.task_id,row.title);
+        new Date().toISOString(), row.access_mode, row.thread_key,row.scopes_json,row.operation_id,row.task_id,row.title,
+        row.execution_id,row.execution_generation,row.owner_process_start);
     const release = this.createReleaseHandle(row.id, "execution_claims");
     return {
       id: row.id,
       release: release.release,
       releaseAsync: release.releaseAsync,
+      bindOperation: (operationId) => {
+        release.assertActive();
+        this.database.sqlite.transaction(() => {
+          const owner = this.database.sqlite.prepare("SELECT generation,owner_pid,process_start FROM execution_owners WHERE domain='operation' AND id=?")
+            .get(operationId) as { generation: string; owner_pid: number; process_start: string | null } | undefined;
+          if (!owner || owner.owner_pid !== processOwner.pid || owner.process_start !== processOwner.start)
+            throw new Error("The operation does not belong to this execution owner.");
+          this.database.sqlite.prepare("UPDATE execution_claims SET operation_id=?,execution_generation=? WHERE id=? AND owner_id=?")
+            .run(operationId,owner.generation,row.id,this.ownerId);
+        }).immediate();
+      },
       bindThread: (threadKey) => {
         release.assertActive();
         this.database.sqlite.transaction(() => {
@@ -410,7 +427,9 @@ export class ExecutionCoordinator {
           .all(this.ownerId,candidate.operation_id) as ClaimRow[];
         const parent = owned.find(row => !this.pendingReleases.has(row.id) &&
           claimResources(candidate).every(requested => claimResources(row).some(scope => resourceContains(scope,requested))));
-        if (parent) return { id:parent.id,release:()=>{},releaseAsync:async()=>{},bindThread:()=>{throw new Error("内部调用不能改变所属代理线程");} };
+        if (parent) return { id:parent.id,release:()=>{},releaseAsync:async()=>{},
+          bindThread:()=>{throw new Error("内部调用不能改变所属代理线程");},
+          bindOperation:()=>{throw new Error("内部调用不能改变所属执行");} };
       }
       const blocker = this.blocker(candidate, input);
       if (blocker) {
@@ -418,7 +437,7 @@ export class ExecutionCoordinator {
         const blockedResources = claimResources(blocker).filter(scope => requested.some(other => resourcesConflict(scope,other)));
         throw new ExecutionConflictError(blocker.id,blocker.agent_id ?? undefined,"执行资源暂时不可用",{
           type:blockedResources.length ? "resource" : blocker.thread_key && blocker.thread_key===candidate.thread_key ? "thread" : blocker.agent_id && blocker.agent_id===candidate.agent_id ? "agent" : "capacity",
-          requested,blockedResources,operationId:blocker.operation_id,taskId:blocker.task_id,title:blocker.title,
+          requested,blockedResources,operationId:blocker.operation_id,executionId:blocker.execution_id,taskId:blocker.task_id,title:blocker.title,
           acquiredAt:blocker.acquired_at ?? null,queued:"sequence" in blocker,
         }, "not_started");
       }
@@ -435,10 +454,11 @@ export class ExecutionCoordinator {
       const count = (this.database.sqlite.prepare("select count(*) as n from execution_waiters").get() as { n: number }).n;
       if (count >= 64) throw new ExecutionConflictError("queue", undefined, "Local queue capacity reached; no provider invoked", undefined, "not_started");
       this.database.sqlite.prepare(`insert into execution_waiters
-        (id, owner_id, owner_pid, kind, checkout_root, agent_id, thread_key, access_mode, resources, expires_at_ms,scopes_json,operation_id,task_id,title)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        (id, owner_id, owner_pid, kind, checkout_root, agent_id, thread_key, access_mode, resources, expires_at_ms,scopes_json,operation_id,task_id,title,execution_id,execution_generation,owner_process_start)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(candidate.id, this.ownerId, process.pid, candidate.kind, candidate.checkout_root, candidate.agent_id,
-          candidate.thread_key, candidate.access_mode, candidate.resources, Date.now() + waitMs,candidate.scopes_json,candidate.operation_id,candidate.task_id,candidate.title);
+          candidate.thread_key, candidate.access_mode, candidate.resources, Date.now() + waitMs,candidate.scopes_json,candidate.operation_id,candidate.task_id,candidate.title,
+          candidate.execution_id,candidate.execution_generation,candidate.owner_process_start);
     }).immediate();
     return {
       id: candidate.id,
@@ -478,7 +498,8 @@ export class ExecutionCoordinator {
       .filter((row) => overlaps(row.checkout_root, root))
       .map((row) => ({ id: row.id, kind: row.kind, access: row.access_mode, state: row.state,
         agentId: row.agent_id ?? undefined, ownerPid: row.owner_pid, resources: JSON.parse(row.resources) as string[],
-        scopes:claimResources(row),operationId:row.operation_id,taskId:row.task_id,title:row.title,
+        scopes:claimResources(row),operationId:row.operation_id,executionId:row.execution_id,
+        generation:row.execution_generation,taskId:row.task_id,title:row.title,
         acquiredAt: row.acquired_at,
         recovery: "Active claims require reconciliation after an interrupted owner; never replay or steal them by timeout." }));
   }

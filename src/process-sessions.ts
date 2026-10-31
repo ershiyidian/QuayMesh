@@ -15,8 +15,6 @@ import { diagnosticError } from "./server-diagnostics.js";
 import { currentInvocation } from "./session/invocations.js";
 import { requireCommandScope } from "./command-profiles.js";
 import { type ExecutionResource } from "./execution-resources.js";
-import { quiescenceSubject, recordExecutionQuiescence } from "./maintenance-status.js";
-import { processOwner } from "./process-identity.js";
 
 const DEFAULT_EXEC_YIELD_MS = 2_000;
 const DEFAULT_INTERACTIVE_YIELD_MS = 250;
@@ -162,8 +160,10 @@ interface ProcessSession {
   commandJob?: WindowsCommandJob;
   executionClaim?: ExecutionClaim;
   workOperationId?: string;
+  workOperationGeneration?: string;
   workRunId?: string;
   sessionOperationId?: string;
+  sessionOperationGeneration?: string;
   onFinish?: (finish: ProcessFinish) => void;
   failure?: Record<string, unknown>;
   outputBytes: number;
@@ -476,6 +476,8 @@ export class ProcessSessionManager {
               return ledger.operation({runId: input.workRunId!, requestKey,
                 kind: "command", label: "受管命令（不记录原始命令或凭据）", status: "running" });
             });
+            session.workOperationGeneration = requestKey;
+            if (!session.sessionOperationId) session.executionClaim?.bindOperation(session.workOperationId);
           } finally { ledger.close(); }
         } else if (input.workRunId) throw new Error("Work accounting is unavailable; command was not started.");
         if (this.handleStore && session.sessionOperationId) session.legacyId = await this.handleStore.allocate(session.sessionOperationId);
@@ -644,6 +646,7 @@ export class ProcessSessionManager {
       workspaceId: input.workspaceId,
       workRunId: input.workRunId,
       sessionOperationId: input.sessionOperationId ?? currentInvocation()?.operation_id,
+      sessionOperationGeneration: currentInvocation()?.invocation_id,
       onFinish: input.onFinish,
       outputBytes: 0,
       outputHash: createHash("sha256"),
@@ -977,6 +980,7 @@ export class ProcessSessionManager {
         // 退出与持久输出已确认；投影/归档失败由协调器补齐，保留真实执行结果。
       }
     }
+    await this.recordPhysicalCompletion(session);
     session.resolveExit();
     session.cleanupTimer = setTimeout(
       () => this.removeSession(session.id),
@@ -994,7 +998,7 @@ export class ProcessSessionManager {
     try {
       const outputPersisted = this.persistOutput(session);
       ledger = new WorkLedger(this.workStateDir);
-      const operationStatus = session.disposition === "reconciliation_required" ? "reconciliation_required"
+      const operationStatus = session.disposition === "reconciliation_required" || session.disposition === "incomplete_output" ? "reconciliation_required"
         : session.cancelRequestedAt !== undefined ? "cancelled" : success ? "completed" : "failed";
       const activeLedger = ledger;
       await runSqliteWrite(activeLedger.db, () => {
@@ -1009,11 +1013,9 @@ export class ProcessSessionManager {
         outcome: success ? "passed" : session.disposition === "reconciliation_required" ? "not_run" : "failed",
         }]);
         if (operationStatus === "reconciliation_required" && session.physicalQuiescent) {
-          recordExecutionQuiescence(activeLedger.db, [quiescenceSubject(activeLedger.db, "operation", session.workOperationId!)], {
-            id: `process:${session.id}:${processOwner.token}`, verifiedAt: new Date().toISOString(),
-            evidence: { version: 1, boundary: "managed_process_group_empty", sessionId: session.id,
-              ownerPid: processOwner.pid, processStart: processOwner.start, pgid: session.pgid ?? null,
-              rootPid: session.rootPid ?? null, rootExitedAt: session.rootExitedAt ?? null },
+          activeLedger.completePhysicalExecution("operation", session.workOperationId!, session.workOperationGeneration!, {
+            version: 1, boundary: "managed_process_group_empty", sessionId: session.id,
+            pgid: session.pgid ?? null, rootPid: session.rootPid ?? null, rootExitedAt: session.rootExitedAt ?? null,
           });
         }
         if (operationStatus === "reconciliation_required" && session.workRunId) {
@@ -1027,6 +1029,26 @@ export class ProcessSessionManager {
       try { ledger?.close(); }
       catch (error) { this.record(session, "process_accounting_failed", diagnosticError(error), "error"); }
     }
+  }
+
+  private async recordPhysicalCompletion(session: ProcessSession): Promise<void> {
+    if (!session.physicalQuiescent || !this.workStateDir) return;
+    const ledger = new WorkLedger(this.workStateDir);
+    try {
+      await runSqliteWrite(ledger.db, () => {
+        for (const [operationId,generation] of [[session.sessionOperationId,session.sessionOperationGeneration],
+          [session.workOperationId,session.workOperationGeneration]]) {
+          if (!operationId || !generation) continue;
+          if (!ledger.db.prepare("SELECT 1 FROM console_operations WHERE id=?").get(operationId)) continue;
+          ledger.completePhysicalExecution("operation", operationId, generation, {
+            version: 1, boundary: "managed_process_group_empty", sessionId: session.id,
+            pgid: session.pgid ?? null, rootPid: session.rootPid ?? null, rootExitedAt: session.rootExitedAt ?? null,
+          });
+        }
+      });
+    } catch (error) {
+      this.record(session,"process_physical_receipt_pending",diagnosticError(error),"error");
+    } finally { ledger.close(); }
   }
 
   private record(session: ProcessSession, event: string, fields: Record<string, unknown> = {}, level: "info" | "warn" | "error" = "info"): void {

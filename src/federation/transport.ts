@@ -59,6 +59,7 @@ const CONTROL_FRAME_BYTES = 64 * 1024;
 const MAX_QUEUED_CONTROL_BYTES = 2 * 1024 * 1024;
 const MAX_PENDING_CALLS = 256;
 const MAX_LARGE_FRAMES = 8;
+const FRAME_TRANSFER_TIMEOUT_MS = 30_000;
 const FRAME_SERVICE = "$frame.v1";
 const FEATURES = "frame-stream-v1";
 
@@ -97,7 +98,7 @@ function executionConflictDetails(error: Record<string, unknown>, recovery: Reco
   const agentId = source.agent_id ?? error.agentId;
   if (identity(agentId)) details.agent_id = agentId;
   if (text(source.type, 64) && /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/u.test(source.type)) details.type = source.type;
-  for (const key of ["operationId", "taskId"]) {
+  for (const key of ["operationId", "executionId", "taskId"]) {
     if (source[key] === null || identity(source[key])) details[key] = source[key];
   }
   if (source.acquiredAt === null || text(source.acquiredAt, 64) && Number.isFinite(Date.parse(source.acquiredAt))) details.acquiredAt = source.acquiredAt;
@@ -294,12 +295,12 @@ export class PeerLink extends EventEmitter {
   private async dispatch(frame: Frame): Promise<void> {
     const controller = new AbortController();
     try {
-      if (frame.id && frame.method !== "$openStream") {
+      if (frame.id) {
         if (this.incoming.size >= MAX_PENDING_CALLS) throw unsentError("PEER_BUSY", "节点请求队列已满，请稍后重试。");
         this.incoming.set(frame.id, controller);
       }
       const result = frame.method === "$openStream"
-        ? await this.owner.openReverse(this, frame.params as { id: string; service: string; metadata: unknown })
+        ? await this.owner.openReverse(this, frame.params as { id: string; service: string; metadata: unknown }, controller.signal)
         : await this.owner.handler(frame.method!, frame.params, this.peerId, { signal: controller.signal, requestId: frame.id,
           notify: value => {
             const notification = progressNotification(value);
@@ -307,25 +308,26 @@ export class PeerLink extends EventEmitter {
               this.notify("$progress", { id: frame.id, notification });
           } });
       if (frame.id && this.connected && !controller.signal.aborted) {
-        try { await this.send({ id: frame.id, result: result ?? null }); }
+        try { await this.send({ id: frame.id, result: result ?? null }, controller.signal); }
         catch (error) {
           // 工作已经返回，正文交付失败须保留效果待核对，不能回报“未执行”。
           throw Object.assign(error instanceof Error ? error : new Error(String(error)), { effect: "unknown", retryHint: "query_original" });
         }
       }
     } catch (error) {
-      if (frame.id && this.connected && !controller.signal.aborted) await this.send({ id: frame.id, error: peerError(error) }).catch(() => {});
+      if (frame.id && this.connected && !controller.signal.aborted) await this.send({ id: frame.id, error: peerError(error) }, controller.signal).catch(() => {});
     } finally { if (frame.id) this.incoming.delete(frame.id); }
   }
-  async send(frame: Frame): Promise<void> {
+  async send(frame: Frame, signal?: AbortSignal): Promise<void> {
     if (this.closed) throw Object.assign(new NodeUnavailableError(this.peerId), { effect: "not_started", retryHint: "retry_later" });
+    if (signal?.aborted) throw interruptedStream("节点正文交付已取消");
     const text = JSON.stringify(frame) + "\n";
     const bytes = Buffer.byteLength(text);
     if (this.frameStreams && bytes > CONTROL_FRAME_BYTES) {
       if (bytes > MAX_STREAM_FRAME) throw unsentError("PEER_PAYLOAD_TOO_LARGE", "节点消息超过 16 MiB，请使用文件传输接口。");
       if (this.outgoingLargeFrames >= MAX_LARGE_FRAMES) throw unsentError("PEER_BUSY", "节点大正文传输已满，请稍后重试。");
       this.outgoingLargeFrames++;
-      try { await this.owner.sendFrameStream(this, text); }
+      try { await this.owner.sendFrameStream(this, text, signal); }
       finally { this.outgoingLargeFrames--; }
       return;
     }
@@ -343,10 +345,12 @@ export class PeerLink extends EventEmitter {
     const id = randomUUID();
     return new Promise<T>((resolve, reject) => {
       let settled = false;
+      const delivery = new AbortController();
       const finish = (error?: Error, value?: T) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer); signal?.removeEventListener("abort", aborted); this.pending.delete(id);
+        delivery.abort(error);
         error ? reject(error) : resolve(value as T);
       };
       const aborted = () => {
@@ -365,7 +369,7 @@ export class PeerLink extends EventEmitter {
       this.pending.set(id, { resolve: value => finish(undefined, value), reject: error => finish(error),
         timer, startedAt: performance.now(), onProgress });
       signal?.addEventListener("abort", aborted, { once: true });
-      void this.send({ id, method, params }).catch((error) => finish(error));
+      void this.send({ id, method, params }, delivery.signal).catch((error) => finish(error));
     });
   }
   notify(method: string, params: unknown): void { void this.send({ method, params }).catch(() => {}); }
@@ -542,22 +546,34 @@ export class PeerTransport extends EventEmitter {
     for (const [id, timer] of this.reconnects) if (!peers.some((p) => p.id === id)) { clearTimeout(timer); this.reconnects.delete(id); }
     for (const peer of peers) this.dial(peer);
   }
-  async openStream(link: PeerLink, service: string, metadata: unknown): Promise<Duplex> {
+  async openStream(link: PeerLink, service: string, metadata: unknown, signal?: AbortSignal): Promise<Duplex> {
     if (!link.connected) throw new NodeUnavailableError(link.peerId);
-    if (link.client) return this.requestStream(link, service, metadata);
+    if (signal?.aborted) throw interruptedStream("传输流等待已取消");
+    if (link.client) return this.requestStream(link, service, metadata, undefined, signal);
     const id = randomUUID();
     const stream = new Promise<Duplex>((resolve, reject) => {
-      const timer = setTimeout(() => { this.streams.delete(id); reject(new NodeUnavailableError(link.peerId, "建立传输流超时")); }, 10_000);
-      timer.unref(); this.streams.set(id, { link, resolve, reject, timer });
+      let settled = false;
+      const finish = (error?: Error, value?: Duplex) => {
+        if (settled) { value?.destroy(); return; }
+        settled = true; clearTimeout(timer); signal?.removeEventListener("abort", aborted); this.streams.delete(id);
+        error ? reject(error) : resolve(value!);
+      };
+      const aborted = () => finish(interruptedStream("传输流等待已取消"));
+      const timer = setTimeout(() => finish(new NodeUnavailableError(link.peerId, "建立传输流超时")), 10_000);
+      timer.unref();
+      this.streams.set(id, { link, resolve: value => finish(undefined,value), reject: error => finish(error), timer });
+      signal?.addEventListener("abort", aborted, {once:true});
+      if (signal?.aborted) aborted();
     });
     // Register the receiving slot BEFORE asking the remote client to open it.
-    void link.call("$openStream", { id, service, metadata }, 10_000).catch((error) => {
+    void link.call("$openStream", { id, service, metadata }, 10_000, undefined, signal).catch((error) => {
       const pending = this.streams.get(id); if (pending) { clearTimeout(pending.timer); this.streams.delete(id); pending.reject(error); }
     });
     return stream;
   }
-  private requestStream(link: PeerLink, service: string, metadata: unknown, reverse?: string): Promise<ClientHttp2Stream> {
+  private requestStream(link: PeerLink, service: string, metadata: unknown, reverse?: string, signal?: AbortSignal): Promise<ClientHttp2Stream> {
     return new Promise((resolve, reject) => {
+      if (signal?.aborted) { reject(interruptedStream("传输流等待已取消")); return; }
       const stream = link.client!.request({ ":method": "POST", ":path": "/stream", authorization: `Bearer ${this.token}`,
         "x-quaymesh-node": this.config.nodeId,
         ...(reverse ? { "x-quaymesh-reverse": reverse } : { "x-quaymesh-service": service, "x-quaymesh-metadata": Buffer.from(JSON.stringify(metadata)).toString("base64url") }),
@@ -565,11 +581,14 @@ export class PeerTransport extends EventEmitter {
       let settled = false;
       const finish = (error?: Error) => {
         if (settled) return;
-        settled = true; clearTimeout(timer);
+        settled = true; clearTimeout(timer); signal?.removeEventListener("abort", aborted);
         if (error) { reject(error); stream.close(constants.NGHTTP2_CANCEL); }
         else resolve(stream);
       };
       const timer = setTimeout(() => finish(interruptedStream("传输流握手超时")), 10_000); timer.unref();
+      const aborted = () => finish(interruptedStream("传输流等待已取消"));
+      signal?.addEventListener("abort", aborted, {once:true});
+      if (signal?.aborted) aborted();
       stream.on("error", error => finish(interruptedStream("传输流在响应头前出错", error)));
       stream.once("aborted", () => finish(interruptedStream("传输流在响应头前被取消")));
       stream.once("response", (headers) => {
@@ -578,9 +597,9 @@ export class PeerTransport extends EventEmitter {
       stream.once("close", () => finish(interruptedStream(`传输流在响应头前关闭 (rstCode=${stream.rstCode})`)));
     });
   }
-  async openReverse(link: PeerLink, params: { id: string; service: string; metadata: unknown }): Promise<void> {
+  async openReverse(link: PeerLink, params: { id: string; service: string; metadata: unknown }, signal?: AbortSignal): Promise<void> {
     if (!link.client) throw new Error("反向传输需要主动连接");
-    const stream = await this.requestStream(link, params.service, params.metadata, params.id);
+    const stream = await this.requestStream(link, params.service, params.metadata, params.id, signal);
     void this.receiveStream(link, params.service, params.metadata, stream).catch((error) => stream.destroy(error));
   }
   private async receiveStream(link: PeerLink, service: string, metadata: unknown, stream: Duplex): Promise<void> {
@@ -589,7 +608,7 @@ export class PeerTransport extends EventEmitter {
     const active = this.incomingFrameCounts.get(link.id) ?? 0;
     if (active >= MAX_LARGE_FRAMES) throw new Error("节点正文流接收数量已达上限");
     this.incomingFrameCounts.set(link.id, active + 1);
-    const timer = setTimeout(() => stream.destroy(new Error("节点正文流接收超时")), Math.max(10_000, this.config.rpcTimeoutMs));
+    const timer = setTimeout(() => stream.destroy(new Error("节点正文流接收超时")), FRAME_TRANSFER_TIMEOUT_MS);
     timer.unref();
     try {
       const chunks: Buffer[] = []; let bytes = 0;
@@ -607,21 +626,27 @@ export class PeerTransport extends EventEmitter {
       if (count) this.incomingFrameCounts.set(link.id, count); else this.incomingFrameCounts.delete(link.id);
     }
   }
-  async sendFrameStream(link: PeerLink, text: string): Promise<void> {
-    const stream = await this.openStream(link, FRAME_SERVICE, {});
+  async sendFrameStream(link: PeerLink, text: string, signal?: AbortSignal): Promise<void> {
+    const stream = await this.openStream(link, FRAME_SERVICE, {}, signal);
     await new Promise<void>((resolve, reject) => {
       let settled = false;
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true; clearTimeout(timer);
+        signal?.removeEventListener("abort", aborted);
         stream.off("error", failed); stream.off("close", closed);
         if (error) { stream.destroy(); reject(error); } else resolve();
       };
       const failed = (error: Error) => finish(interruptedStream("节点正文流传输中断", error));
       const closed = () => finish(interruptedStream("节点正文流在发送完成前关闭"));
-      const timer = setTimeout(() => finish(interruptedStream("节点正文流发送超时")), Math.max(10_000, this.config.rpcTimeoutMs));
+      const aborted = () => finish(interruptedStream("节点正文交付已取消"));
+      const timer = setTimeout(() => finish(interruptedStream("节点正文流发送超时")), FRAME_TRANSFER_TIMEOUT_MS);
       timer.unref();
       stream.once("error", failed); stream.once("close", closed);
+      signal?.addEventListener("abort", aborted, {once:true});
+      if (signal?.aborted) { aborted(); return; }
+      // Consume the peer's empty acknowledgement so both HTTP/2 halves close.
+      stream.resume();
       // 数据流按 HTTP/2 帧调度，小控制消息无需排在整段 JSON 正文之后。
       stream.end(text, () => finish());
     });

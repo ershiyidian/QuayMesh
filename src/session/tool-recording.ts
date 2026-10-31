@@ -178,6 +178,16 @@ export class SessionToolRecorder {
       ?? await this.contextForWorkspace(identity, input.workspace_id);
     if (observation) {
       context.tool_name=input.tool_name;
+      if (input.tool_name === "read") {
+        // Keep the saved read result and context evidence, without a business
+        // execution or a durable work lease that can outlive the observation.
+        return this.recordReceipt(context,{...input,localCompletion:undefined,operation:async captured=>{
+          const result=await input.operation(captured);
+          await input.contextRead?.(result,captured);
+          await input.afterResult?.(result,captured);
+          return result;
+        }},undefined,true).then(result=>input.afterReply?.(result,context,context.operation_id)??result);
+      }
       return observationContext.run(context, () => input.operation(context)).then(result => input.afterReply?.(result, context) ?? result);
     }
     let notifyReserved!: () => void;
@@ -203,6 +213,8 @@ export class SessionToolRecorder {
     const identity = selected ? { ...input.identity, task_id: selected.task.id } : input.identity;
     const context = this.contextForKnownWorkspace(identity, input.workspace_id,false);
     if (!context) throw new Error(`REMOTE_SESSION_MEMBER_REQUIRED: ${input.workspace_id}`);
+    if (input.tool_name === "read") return this.recordReceipt(context,input)
+      .then(result=>input.afterReply?.(result,context,context.operation_id)??result);
     if(observation){context.tool_name=input.tool_name;return observationContext.run(context,()=>input.operation(context)).then(result => input.afterReply?.(result, context) ?? result);}
     // 入口回执由协调端持久保存，远程操作仍使用相同的确定性 operation_id。
     // 等待时间达到上限即返回可查询的受理回执，后台 RPC 继续执行并归档结果。
@@ -254,7 +266,7 @@ export class SessionToolRecorder {
       invoke: async () => {
         try { return { kind: "result", value: await (lease ? lease.run(()=>input.operation(context)) : input.operation(context)) }; }
         catch (error) {
-          const envelope = errorEnvelope(error,{sideEffecting:input.affectsFiles??false,forwarded:true,effectStarted:true});
+          const envelope = errorEnvelope(error,{sideEffecting:input.affectsFiles??false,forwarded:!local,effectStarted:true});
           if (envelope.effect === "unknown" && context.operation_id) {
             const member = this.store.getMember(context.session_id, context.member_id);
             const workspaceId = parseWorkspaceHandle(member.workspace_id) ? member.workspace_id : `qm:${member.node_id}:${member.workspace_id}`;
@@ -270,7 +282,7 @@ export class SessionToolRecorder {
       outcome:(envelope)=>envelope.kind==="error"?{state:envelope.effect==="unknown"?OperationState.unknown:OperationState.failed,effect:envelope.effect??"unknown"}
         : envelope.value!==undefined?input.operationStatus?.(envelope.value,context)??null:null,
       sideEffecting:input.affectsFiles??false,
-      forwarded:true,
+      forwarded:!local,
       resultRef: (envelope) => envelope.kind === "result" && envelope.value !== undefined ? input.resultRef?.(envelope.value, context) ?? null : null,
     });
     if (!recorded.result) throw new Error(`INVOCATION_REPLAY_RESULT_PENDING: ${recorded.operation_id ?? "unknown"}`);

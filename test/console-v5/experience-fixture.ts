@@ -69,6 +69,14 @@ export async function consoleExperienceFixture(options: { historicalBackground?:
 /** Obtain the real collector without adding a production-only test hook. */
 export async function liveCaptureFixture(f:Awaited<ReturnType<typeof consoleExperienceFixture>>) {
   await f.call('read',{workspace_id:f.second.workspace_id,path:'finished.txt'});
+  // A read adds a Task member, not an execution phase. Establish a real phase
+  // without changing files so the first capture below still has no saved diff.
+  const operation=await f.server.client.callTool({name:'exec_command',arguments:{
+    workspace_id:f.second.workspace_id,cmd:`"${process.execPath}" -e "process.exit(0)"`,
+    operation_key:'capture-fixture-scope',yield_time_ms:1000,
+  },_meta:{'openai/session':'console-experience'}});
+  await waitForRecordedTool(f.server,{sessionId:String(f.waiting.session_id),
+    workspaceId:String(f.second.workspace_id),conversationId:'console-experience',paths:[]},operation);
   const reference='qmtask:'+f.waiting.task_id;
   const observed:{collector?:SessionChangeCollector}={};
   const original=SessionChangeCollector.prototype.captureObservation;

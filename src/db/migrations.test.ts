@@ -12,7 +12,22 @@ import { taskSchema } from "./task-schema.js";
 import { resourceSchema } from "./resource-schema.js";
 import { reliabilitySchema } from "./reliability-schema.js";
 
+function removeExactExecutionClaims(db: Database.Database) {
+  db.exec(`DROP INDEX execution_claims_execution;
+    ALTER TABLE execution_claims DROP COLUMN execution_id;
+    ALTER TABLE execution_claims DROP COLUMN execution_generation;
+    ALTER TABLE execution_claims DROP COLUMN owner_process_start;
+    ALTER TABLE execution_waiters DROP COLUMN execution_id;
+    ALTER TABLE execution_waiters DROP COLUMN execution_generation;
+    ALTER TABLE execution_waiters DROP COLUMN owner_process_start;
+    DELETE FROM qm_schema_migrations WHERE version>=18;`);
+}
+
 function removeQuiescenceMigration(db: Database.Database) {
+  removeExactExecutionClaims(db);
+  db.exec(`DROP INDEX qm_events_task_diagnostic_time;
+    DROP INDEX qm_invocations_task_diagnostic_time;
+    DROP INDEX qm_invocations_pending_state;`);
   for (const { name } of db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'execution_quiescence_%'").all() as {name:string}[])
     db.exec(`DROP TRIGGER "${name}"`);
   db.exec(`DROP TABLE execution_quiescence;
@@ -65,7 +80,9 @@ test("初始数据库创建全部工作区、任务和认证表", () => {
         {version:10,name:"quaymesh-task-messages"},{version:11,name:"quaymesh-file-evidence-time"},
         {version:12,name:"quaymesh-task-entry-bindings"},{version:13,name:"quaymesh-finalization-fence"},
         {version:14,name:"quaymesh-task-member-index"},{version:15,name:"quaymesh-invocation-payload-sharing"},
-        {version:16,name:"quaymesh-task-creation-receipts"}]);
+        {version:16,name:"quaymesh-task-creation-receipts"},
+        {version:17,name:"quaymesh-bounded-diagnostic-queries"},
+        {version:18,name:"quaymesh-exact-execution-claims"}]);
     for (const name of ["workspace_sessions","oauth_clients","console_work_runs","execution_claims",
       "local_agent_sessions","qm_sessions","qm_tasks","qm_task_members","qm_task_snapshots","qm_task_context",
       "qm_runtime_work","qm_runtime_admission","qm_transfers","qm_task_change_baselines","qm_task_file_changes","qm_task_finalizations",
@@ -75,6 +92,24 @@ test("初始数据库创建全部工作区、任务和认证表", () => {
     assert.equal(db.pragma("foreign_keys",{simple:true}),1);
     assert.equal(db.pragma("integrity_check",{simple:true}),"ok");
   } finally { db.close(); }
+});
+
+test("版本十七的旧占用增量升级保留原归属，不猜测执行代次或物理结束", () => {
+  const db=new Database(":memory:");
+  try {
+    migrateDatabase(db);removeExactExecutionClaims(db);
+    db.prepare(`INSERT INTO execution_claims
+      (id,owner_id,owner_pid,kind,checkout_root,agent_id,resources,acquired_at,operation_id,task_id)
+      VALUES('legacy-claim','legacy-owner',123,'agent','/project','legacy-agent','[]','2026-10-30T01:00:00.000Z',NULL,'legacy-task')`).run();
+    const before=db.prepare("SELECT id,owner_id,owner_pid,kind,checkout_root,agent_id,resources,acquired_at,operation_id,task_id FROM execution_claims").all();
+    migrateDatabase(db);migrateDatabase(db);
+    assert.deepEqual(db.prepare("SELECT id,owner_id,owner_pid,kind,checkout_root,agent_id,resources,acquired_at,operation_id,task_id FROM execution_claims").all(),before);
+    assert.deepEqual(db.prepare("SELECT execution_id,execution_generation,owner_process_start FROM execution_claims").get(),
+      {execution_id:null,execution_generation:null,owner_process_start:null});
+    assert.equal(db.prepare("SELECT COUNT(*) FROM execution_quiescence").pluck().get(),0);
+    assert.equal(db.prepare("SELECT max(version) FROM qm_schema_migrations").pluck().get(),LATEST_DATABASE_VERSION);
+    assert.equal(db.pragma("integrity_check",{simple:true}),"ok");
+  } finally {db.close();}
 });
 
 test("再次打开数据库保留任务数据", () => {

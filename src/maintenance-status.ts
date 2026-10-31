@@ -31,10 +31,12 @@ function ownerFor(db: Database.Database, domain: ExecutionDomain, id: string): O
 
 /** The complete row and owner identity bind the proof to one persisted attempt.
  * A same-id retry, new owner or later evidence invalidates the previous proof. */
-export function quiescenceSubject(db: Database.Database, domain: ExecutionDomain, id: string): QuiescenceSubject {
+export function quiescenceSubject(db: Database.Database, domain: ExecutionDomain, id: string,
+  options: {allowTerminal?: boolean} = {}): QuiescenceSubject {
   const table = domain === "operation" ? "console_operations" : "console_executions";
   const row = db.prepare(`SELECT * FROM ${table} WHERE id=?`).get(id) as Record<string, unknown> | undefined;
-  if (!row || !unresolved.has(String(row.status))) throw new Error("Quiescence proof requires an existing unresolved execution.");
+  if (!row || !unresolved.has(String(row.status)) && !(options.allowTerminal && ["completed","failed","cancelled"].includes(String(row.status))))
+    throw new Error("Quiescence proof requires an existing unresolved execution.");
   const owner = ownerFor(db, domain, id);
   const generation = owner?.generation ?? digest([domain, row.id, row.created_at, row.request_key ?? null,
     row.agent_id ?? null, row.managed_thread_id ?? null, row.provider_turn_id ?? null]);
@@ -59,7 +61,7 @@ export function unresolvedSubjects(db: Database.Database): QuiescenceSubject[] {
 /** Called only after an authoritative physical boundary was verified. It never
  * changes a result, finish timestamp, owner, resource claim or replay decision. */
 export function recordExecutionQuiescence(db: Database.Database, subjects: readonly QuiescenceSubject[],
-  receipt: { id: string; verifiedAt: string; evidence: Record<string, unknown> }): void {
+  receipt: { id: string; verifiedAt: string; evidence: Record<string, unknown> }, options: {allowTerminal?: boolean} = {}): void {
   if (!receipt.id || !Number.isFinite(Date.parse(receipt.verifiedAt)) || !receipt.evidence ||
       subjects.length === 0 || subjects.some(row => !["operation","execution"].includes(row.domain) ||
         !row.id || !row.generation || !/^[a-f0-9]{64}$/.test(row.fingerprint)) ||
@@ -71,7 +73,7 @@ export function recordExecutionQuiescence(db: Database.Database, subjects: reado
     ON CONFLICT(domain,object_id,fingerprint,receipt_id) DO NOTHING`);
     // No partial batch may survive a changed subject or a failed insert.
     for (const subject of subjects) {
-      const current = quiescenceSubject(db, subject.domain, subject.id);
+      const current = quiescenceSubject(db, subject.domain, subject.id, options);
       if (current.fingerprint !== subject.fingerprint || current.generation !== subject.generation)
         throw new Error(`Execution changed after physical review: ${subject.domain}:${subject.id}`);
     }

@@ -11,6 +11,7 @@ import type { InvocationContext } from "../session/types.js";
 import { currentOperationEvents } from "../session/activity.js";
 import { savedOperationStatus, operationStatusBatch } from "../session/operation-status.js";
 import { observationBudget } from "../observation-budget.js";
+import { recoverWorkspaceClaim, recoverWorkspaceOperation } from "../execution-claim-control.js";
 
 const id = z.string().min(1).max(256);
 const fileSelectionSchema = z.object({
@@ -30,6 +31,7 @@ export const workspaceContextInputSchema = z.object({
   file_offset:z.number().int().nonnegative().optional(),max_files:z.number().int().min(1).max(500).optional(),
   selection_index:z.number().int().min(0).max(499).optional(),line_offset:z.number().int().min(0).max(4*1024*1024).optional(),
   operation_id:id.optional(),operation_ids:z.array(id).min(1).max(8).optional(),
+  claim_id:id.optional(),recovery_action:z.enum(["inspect","release","stop"]).optional(),
   session_id:id.optional(),task_id:id.optional(),limit:z.number().int().min(1).max(20).optional(),
   environment:z.boolean().optional(),python:z.string().min(1).optional(),
 }).strict().superRefine((input,context)=>{
@@ -38,7 +40,7 @@ export const workspaceContextInputSchema = z.object({
     capture:["files","result_ref","cursor","selection_index","line_offset"],
     search:["files","result_ref","cursor","query","queries","directory","patterns","context_lines","file_offset","max_files","selection_index","line_offset"],
     status:["operation_id","operation_ids","limit","environment","python","offset"],
-    recovery:["session_id","task_id","cursor","limit"],
+    recovery:["session_id","task_id","cursor","limit","claim_id","operation_id","recovery_action"],
   };
   const error=(message:string,path:string)=>context.addIssue({code:"custom",path:[path],message});
   for(const key of Object.keys(input))if(!["workspace_id","task_id","action",...allowed[input.action]!].includes(key))error("参数不适用于当前 action",key);
@@ -50,14 +52,19 @@ export const workspaceContextInputSchema = z.object({
   if(input.files&&(input.directory||input.patterns||input.file_offset))error("明确选区与目录搜索范围只能选择一项","files");
   if(input.operation_id&&input.operation_ids)error("单项与批量只能选择一项","operation_ids");
   if(input.python&&!input.environment)error("python 只用于 environment 查询","python");
+  if(input.recovery_action&&!input.claim_id&&!input.operation_id)error("recovery_action 需要 claim_id 或 operation_id","claim_id");
+  if(input.claim_id&&input.operation_id)error("claim_id 与 operation_id 只能选择一项","claim_id");
+  if(input.action==="recovery"&&(input.claim_id||input.operation_id)&&(input.session_id||input.cursor||input.limit))
+    error("单项恢复不能与历史分页混用","recovery_action");
+  if(input.recovery_action==="stop"&&!input.claim_id)error("stop 需要精确 claim_id","claim_id");
 });
 
 export function registerWorkspaceContextTool({ server, config, workspaces, processSessions, sessionRuntime }: ToolRegistrationContext): void {
   server.registerTool("workspace_context", {
     title: "Inspect workspace",
-    description: "Batch file ranges or literal searches. Reuse result_ref: page via cursor=next_cursor, then file_offset=scope.next_file_offset. status/recovery inspect saved work.",
+    description: "Batch file ranges or literal searches. Reuse result_ref: page via cursor=next_cursor, then file_offset=scope.next_file_offset. status/recovery inspect saved work. recovery with claim_id inspects one resource claim; recovery_action=release consumes proven completion, stop requests cancellation of that exact execution. recovery with operation_id inspects or releases a saved pre-effect cancellation guard; it never stops the target command.",
     inputSchema: workspaceContextInputSchema,
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   }, async (rawInput, extra) => {
     const input = workspaceContextInputSchema.parse(rawInput);
     const historical = input.action === "recovery" || (input.action === "status" && !input.environment);
@@ -82,6 +89,18 @@ export function registerWorkspaceContextTool({ server, config, workspaces, proce
     }
     if (input.action === "recovery") {
       if (!sessionRuntime) throw new Error("SESSION_RUNTIME_REQUIRED");
+      if (input.claim_id) {
+        const invocation=currentInvocation();
+        if(!invocation)throw new Error("MISSING_OPERATION_CONTEXT");
+        return jsonReply(await recoverWorkspaceClaim({server,config,workspaces,processSessions,sessionRuntime},
+          {...input,claim_id:input.claim_id},workspace,invocation));
+      }
+      if(input.operation_id){
+        const invocation=currentInvocation();
+        if(!invocation)throw new Error("MISSING_OPERATION_CONTEXT");
+        return jsonReply(await recoverWorkspaceOperation({server,config,workspaces,processSessions,sessionRuntime},
+          {operation_id:input.operation_id,recovery_action:input.recovery_action==="release"?"release":"inspect"},workspace,invocation));
+      }
       if (input.task_id) {
         const invocation=currentInvocation();
         if(!invocation)throw new Error("MISSING_OPERATION_CONTEXT");

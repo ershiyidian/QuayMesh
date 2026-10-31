@@ -5,11 +5,17 @@ import type { SessionTitleIndex } from "./local-queries.js";
 import type { Run, Usage } from "./types.js";
 import { relevantExecution, taskStage, withTaskLifecycle, taskTimeEnd, type TaskLifecycle } from '../console-task-state.js';
 import { taskView } from '../task-view.js';
+import { placeholderTaskTitle, resolveTaskTitle } from '../task-title.js';
 import { selectOverviewTasks, taskAttention } from './overview-tasks.js';
 export { taskStage } from '../console-task-state.js';
 
 export const TASK_REFERENCE_PREFIX = "qmtask:";
 export const SESSION_REFERENCE_PREFIX = "qmsession:";
+
+const latestTime = (times: Array<number | null | undefined>): number | null => {
+  const known = times.filter((time): time is number => typeof time === 'number' && Number.isFinite(time));
+  return known.length ? Math.max(...known) : null;
+};
 
 export interface TaskIndex {
   key: string;
@@ -17,6 +23,9 @@ export interface TaskIndex {
   taskId: string | null;
   sourceTaskId?: string | null;
   title: string;
+  titleSource?: 'task' | 'session' | 'user_message' | 'work_item' | 'workspace' | 'fallback';
+  lastProgressAt?: number | null;
+  executionObservedAt?: number | null;
   phaseRefs: string[];
   nodeIds: string[];
   projectIds: string[];
@@ -65,6 +74,7 @@ export function taskOnlyIndex(task: TaskLifecycle, at = Date.now()): TaskIndex {
   const workspaces = task.workspaces ?? [];
   return withTaskLifecycle({
     key: `task:${task.id}`, sessionId:task.sessionId, taskId:task.id, title:task.title,
+    titleSource:task.titleSource,lastProgressAt:task.lastProgressAt ?? task.lastActivityAt,executionObservedAt:null,
     phaseRefs:[], currentPhaseRefs:[], nodeIds:task.memberNodeIds?.length ? task.memberNodeIds : [task.nodeId ?? 'local'],
     projectIds:[...new Set(workspaces.map(value=>value.projectId).filter(Boolean))],
     projectNames:[...new Set(workspaces.map(value=>value.name))], roots:[...new Set(workspaces.map(value=>value.root))], workspaces,
@@ -74,6 +84,22 @@ export function taskOnlyIndex(task: TaskLifecycle, at = Date.now()): TaskIndex {
     lastActivityAt:task.lastActivityAt, tokens:0, changed:false, actionableInterruption:false,
     reason:task.state==='active' ? '任务已创建，尚未登记后台执行；请求仍然开放' : null,
   },task);
+}
+
+export function mergeTaskWorkspaces<T extends {nodeId:string;root:string}>(left:readonly T[]|undefined,right:readonly T[]|undefined):T[] {
+  return [...new Map([...(left??[]),...(right??[])].map(workspace=>[JSON.stringify([workspace.nodeId,workspace.root]),workspace])).values()];
+}
+
+/** Task membership also includes observed workspaces without an execution.
+ * Keep their navigation metadata without inventing another phase or outcome. */
+export function withTaskMembership(task:TaskIndex,lifecycle?:TaskLifecycle):TaskIndex {
+  if(!lifecycle||lifecycle.id!==task.taskId)return task;
+  const workspaces=mergeTaskWorkspaces(task.workspaces,lifecycle.workspaces);
+  return {...task,workspaces,
+    nodeIds:[...new Set([...task.nodeIds,...(lifecycle.memberNodeIds??[]),...workspaces.map(value=>value.nodeId)])],
+    projectIds:[...new Set([...task.projectIds,...workspaces.map(value=>value.projectId).filter(Boolean)])],
+    projectNames:[...new Set([...task.projectNames,...workspaces.map(value=>value.name)])],
+    roots:[...new Set([...task.roots,...workspaces.map(value=>value.root)])]};
 }
 
 export function aggregateTasks(runs: Run[], at = Date.now()): Run[] {
@@ -102,11 +128,16 @@ export function aggregateTaskIndex(phases: TaskPhaseIndex[], at = Date.now()): T
     const stateValues = current.length ? values.filter(relevantExecution) : values;
     const tokenValues = values.map((value) => value.tokens).filter((value): value is number => value !== null);
     const lastActivityAt = Math.max(...values.map(value => value.lastActivityAt));
+    const title = chooseIndexTitle(values);
     return {
       key,
       sessionId,
       taskId,
-      title: chooseIndexTitle(values),
+      title,
+      titleSource:values.find(value=>value.title===title)?.titleSource,
+      lastProgressAt:latestTime(values.map(value=>value.lastProgressAt ?? value.lastActivityAt)),
+      executionObservedAt:latestTime(stateValues.filter(value=>!value.stale
+        && ['running','starting','stopping','queued'].includes(value.executionStatus)).map(value=>value.executionObservedAt)),
       phaseRefs: values.map((value) => value.id),
       nodeIds: [...new Set(values.map((value) => value.nodeId))],
       projectIds: [...new Set(values.map((value) => value.projectId))],
@@ -204,6 +235,9 @@ export function fallbackTask(task: TaskIndex): Run {
     id: task.taskId ? taskReference(task.taskId) : task.sessionId ? sessionReference(task.sessionId) : reference,
     localId: task.taskId ?? task.sessionId ?? parsed?.local ?? reference,
     title: task.title,
+    titleSource:task.titleSource,
+    lastProgressAt:task.lastProgressAt ?? task.lastActivityAt,
+    executionObservedAt:task.executionObservedAt ?? null,
     nodeId: task.nodeIds[0] ?? parsed?.node ?? "unknown",
     projectId: project,
     projectLocalId: projectParsed?.local ?? project,
@@ -241,7 +275,7 @@ export function fallbackTask(task: TaskIndex): Run {
     phaseRefs: task.phaseRefs,
     currentPhaseRefs: task.currentPhaseRefs,
     nodeIds: task.nodeIds,
-    workspaceCount: task.projectIds.length,
+    workspaceCount: task.workspaces?.length || task.projectIds.length,
     workspaces:task.workspaces,
     currentPhase: true,
   };
@@ -277,6 +311,10 @@ function mergeTask(group: Run[], at: number): Run {
     id: current.taskId ? taskReference(current.taskId) : current.sessionId ? sessionReference(current.sessionId) : current.id,
     localId: current.taskId ?? current.sessionId ?? current.localId,
     title: chooseTaskTitle(group),
+    titleSource:group.find(run=>run.title===chooseTaskTitle(group))?.titleSource,
+    lastProgressAt:latestTime(group.map(run=>run.lastProgressAt ?? run.lastActivityAt)),
+    executionObservedAt:latestTime(stateRuns.filter(run=>!run.stale
+      && ['running','starting','stopping','queued'].includes(run.executionStatus)).map(run=>run.executionObservedAt)),
     projectName: projects.length === 1 ? projects[0]! : `${memberIds.size || projects.length} 个工作区`,
     executionStatus,
     acceptanceStatus,
@@ -319,16 +357,16 @@ function mergeTask(group: Run[], at: number): Run {
 function chooseTaskTitle(group: Run[]): string {
   const candidates = group.map((run) => run.title.trim()).filter(Boolean);
   const meaningful = candidates.find(isTaskTitle);
-  return meaningful ?? candidates[0] ?? "QuayMesh task";
+  return meaningful ?? resolveTaskTitle({workspaceNames:group.map(run=>run.projectName),createdAt:Math.min(...group.map(run=>run.startedAt))}).title;
 }
 
 function chooseIndexTitle(values: TaskPhaseIndex[]): string {
   const titles = values.map((value) => value.title.trim()).filter(Boolean);
-  return titles.find(isTaskTitle) ?? titles[0] ?? "QuayMesh task";
+  return titles.find(isTaskTitle) ?? resolveTaskTitle({workspaceNames:values.map(value=>value.projectName),createdAt:Math.min(...values.map(value=>value.startedAt))}).title;
 }
 
 function isTaskTitle(title: string): boolean {
-  return !/^(?:Federated session|Workspace tq:[^\s]+|read|workspace_context|exec_command|write_stdin|apply_patch)$/i.test(title)
+  return !placeholderTaskTitle(title) && !/^(?:Federated session|Workspace tq:[^\s]+|read|workspace_context|exec_command|write_stdin|apply_patch)$/i.test(title)
     && !/^(?:git|node|powershell|pwsh|python|pnpm|npm|yarn)\b/i.test(title);
 }
 

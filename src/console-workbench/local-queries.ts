@@ -6,6 +6,12 @@ import { runQuery, selectRunPage } from "./run-query.js";
 import { workspaceHandle } from "../federation/routing.js";
 import type { TaskLifecycle } from "../console-task-state.js";
 import { basename } from "node:path";
+import { placeholderTaskTitle, resolveTaskTitle, taskTitleMessage, type TaskTitleSource } from '../task-title.js';
+
+const latestTimestamp=(values: Array<string|null|undefined>): number|null => {
+  const times=values.map(value=>value ? Date.parse(value) : NaN).filter(Number.isFinite);
+  return times.length ? Math.max(...times) : null;
+};
 
 export interface TaskPhaseIndex {
   id: string;
@@ -14,6 +20,9 @@ export interface TaskPhaseIndex {
   sessionId: string | null;
   taskId: string | null;
   title: string;
+  titleSource?: TaskTitleSource;
+  lastProgressAt?: number | null;
+  executionObservedAt?: number | null;
   projectId: string;
   projectName: string;
   root: string;
@@ -82,7 +91,21 @@ export function readLocalTaskIndex(config: ServerConfig, at = Date.now()): { ite
     // Keep every phase for exact cross-node grouping; summary bodies belong to detail reads.
     const rows = ledger.db.prepare(`${base.sql} SELECT id,reference,session_id,task_id,title,project_id,project_name,root,execution,acceptance,status,task_result,
       started_ms,finished_ms,last_activity_at,tokens,changed,unresolved,failed_child,latest,task_state,
-      finalizing,finalization_requested_at,finalization_error FROM selected ORDER BY started_ms DESC,reference`)
+      finalizing,finalization_requested_at,finalization_error,
+      (SELECT title FROM qm_tasks WHERE id=selected.task_id) task_title,
+      (SELECT title FROM qm_sessions WHERE id=selected.session_id) session_title,
+      (SELECT title FROM console_work_items WHERE id=selected.item_id) work_item_title,
+      (SELECT MAX(observed_at) FROM (
+        SELECT observed_at FROM console_operations WHERE run_id=selected.id AND status IN ('running','starting','queued','stopping')
+        UNION ALL SELECT observed_at FROM console_executions WHERE run_id=selected.id AND status IN ('running','starting','queued','stopping')
+      )) execution_observed_at,
+      (SELECT MAX(at) FROM (
+        SELECT MAX(created_at) at FROM console_operations WHERE run_id=selected.id
+        UNION ALL SELECT MAX(finished_at) at FROM console_operations WHERE run_id=selected.id
+        UNION ALL SELECT MAX(created_at) at FROM console_executions WHERE run_id=selected.id
+        UNION ALL SELECT MAX(finished_at) at FROM console_executions WHERE run_id=selected.id
+      )) progress_at
+      FROM selected ORDER BY started_ms DESC,reference`)
       .all(...base.params) as Array<Record<string, unknown>>;
     return { items: rows.map((row) => ({
       id: String(row.reference),
@@ -90,7 +113,10 @@ export function readLocalTaskIndex(config: ServerConfig, at = Date.now()): { ite
       nodeId: own.node,
       sessionId: row.session_id === null ? null : String(row.session_id),
       taskId: row.task_id === null ? null : String(row.task_id),
-      title: String(row.title ?? row.project_name ?? "QuayMesh task"),
+      ...resolveTaskTitle({title:typeof row.task_title==='string'?row.task_title:null,
+        sessionTitle:typeof row.session_title==='string'?row.session_title:null,
+        workItemTitle:typeof row.work_item_title==='string'?row.work_item_title:null,
+        workspaceNames:[String(row.project_name)],createdAt:Number(row.started_ms)}),
       projectId: workspaceHandle(own.node, String(row.project_id)),
       projectName: String(row.project_name),
       root: String(row.root),
@@ -100,6 +126,9 @@ export function readLocalTaskIndex(config: ServerConfig, at = Date.now()): { ite
       startedAt: Number(row.started_ms),
       finishedAt: row.finished_ms === null ? null : Number(row.finished_ms),
       lastActivityAt: Date.parse(String(row.last_activity_at)),
+      lastProgressAt:latestTimestamp([typeof row.progress_at==='string'?row.progress_at:null,
+        typeof row.finalization_requested_at==='string'?row.finalization_requested_at:null]) ?? Number(row.started_ms),
+      executionObservedAt: row.execution_observed_at == null ? null : Date.parse(String(row.execution_observed_at)),
       tokens: row.tokens === null ? null : Number(row.tokens),
       changed: Number(row.changed) === 1,
       actionableInterruption: Number(row.unresolved) === 1 || ['failed','interrupted_recoverable'].includes(String(row.execution)) && Number(row.failed_child) === 1,
@@ -119,9 +148,13 @@ export function readLocalSessionTitles(config: ServerConfig): { items: SessionTi
       .all() as Array<{ id: string; title: string; revision: number; last_activity_at: string }>;
     const nodeId = config.federation?.nodeId ?? 'local';
     const tasks = ledger.db.prepare(`SELECT t.id,t.session_id,t.title,t.state,t.result_status,t.revision,t.created_at,t.finished_at,t.delivery_ended_at,t.last_activity_at,t.source_task_id,
-      f.requested_at,f.completed_at,f.error FROM qm_tasks t LEFT JOIN qm_task_finalizations f ON f.task_id=t.id`).all() as Array<{
+      f.requested_at,f.completed_at,f.error,s.title session_title,
+      (SELECT created_at FROM qm_task_messages WHERE task_id=t.id ORDER BY sequence DESC LIMIT 1) message_at
+      FROM qm_tasks t LEFT JOIN qm_task_finalizations f ON f.task_id=t.id LEFT JOIN qm_sessions s ON s.id=t.session_id`).all() as Array<{
       id:string; session_id:string; source_task_id:string|null; title:string; state:string; result_status:string|null; revision:number;
       created_at:string; finished_at:string|null; delivery_ended_at:string|null; last_activity_at:string; requested_at:string|null; completed_at:string|null; error:string|null;
+      session_title:string|null;
+      message_at:string|null;
     }>;
     const members = ledger.db.prepare(`SELECT tm.task_id,m.id member_id,m.node_id,m.root,p.id project_id,p.name
       FROM qm_task_members tm JOIN qm_session_members m ON m.id=tm.member_id
@@ -139,11 +172,20 @@ export function readLocalSessionTitles(config: ServerConfig): { items: SessionTi
     });
     const visibleSessions = new Set(visibleTasks.map(task => task.session_id));
     const taskSessions = new Set(tasks.map(task => task.session_id));
+    // Only a few Task-scoped user messages; never scan invocation payloads/results.
+    const titleMessages=ledger.db.prepare(`SELECT substr(body,1,1024) body FROM qm_task_messages
+      WHERE task_id=? AND role='user' ORDER BY sequence LIMIT 3`);
     return { authoritative:config.federation?.capabilities.coordinator ?? true,
       tasks:visibleTasks.map(row=>{
         const own = (byTask.get(row.id) ?? []).filter(member => member.node_id !== nodeId || permitted(config, member.root));
         const finishedAt = row.result_status && row.delivery_ended_at ? row.delivery_ended_at : row.finished_at;
-        return {id:row.id,sessionId:row.session_id,sourceTaskId:row.source_task_id,title:row.title,state:row.state,resultStatus:row.result_status,
+        const userMessage=placeholderTaskTitle(row.title) ? (titleMessages.all(row.id) as Array<{body:string}>)
+          .map(message=>taskTitleMessage(message.body)).find((message): message is string=>message!==null) ?? null : null;
+        return {id:row.id,sessionId:row.session_id,sourceTaskId:row.source_task_id,
+          ...resolveTaskTitle({title:row.title,sessionTitle:row.session_title,userMessage,
+            workspaceNames:own.map(member=>member.name??basename(member.root)),createdAt:Date.parse(row.created_at)}),
+          state:row.state,resultStatus:row.result_status,
+          lastProgressAt:latestTimestamp([row.created_at,row.message_at,row.requested_at,row.completed_at,row.finished_at]),
           nodeId,createdAt:Date.parse(row.created_at),memberNodeIds:[...new Set(own.map(member=>member.node_id))],
           workspaces:own.map(member=>({nodeId:member.node_id,projectId:member.project_id ? workspaceHandle(member.node_id,member.project_id) : '',
             memberId:member.member_id,name:member.name ?? basename(member.root),root:member.root})),
@@ -160,7 +202,32 @@ export function readLocalSessionTitles(config: ServerConfig): { items: SessionTi
 export function readLocalRunSummaries(config: ServerConfig, ids: readonly string[]) {
   const unique = [...new Set(ids)].filter(Boolean);
   if (unique.length > 100) throw new Error("RUN_SUMMARY_BATCH_TOO_LARGE");
-  return { items: readLocalIndex(config, unique).runs, observedAt: Date.now() };
+  const runs=readLocalIndex(config, unique).runs;
+  if(!runs.length)return {items:runs,observedAt:Date.now()};
+  const ledger=new WorkLedger(config.stateDir);
+  try {
+    const selected=JSON.stringify(runs.map(run=>run.localId));
+    const rows=ledger.db.prepare(`SELECT run_id,MAX(created_at) created_at,MAX(finished_at) finished_at,
+      MAX(CASE WHEN status IN ('running','starting','queued','stopping') THEN observed_at END) execution_observed_at
+      FROM (
+        SELECT run_id,created_at,finished_at,status,observed_at FROM console_operations WHERE run_id IN (SELECT value FROM json_each(?))
+        UNION ALL SELECT run_id,created_at,finished_at,status,observed_at FROM console_executions WHERE run_id IN (SELECT value FROM json_each(?))
+      ) GROUP BY run_id`).all(selected,selected) as Array<{
+        run_id:string;created_at:string|null;finished_at:string|null;execution_observed_at:string|null;
+      }>;
+    const byRun=new Map(rows.map(row=>[row.run_id,row]));
+    const workTitles=new Map((ledger.db.prepare(`SELECT r.id,i.title FROM console_work_runs r
+      JOIN console_work_items i ON i.id=r.item_id WHERE r.id IN (SELECT value FROM json_each(?))`)
+      .all(selected) as Array<{id:string;title:string}>).map(row=>[row.id,row.title]));
+    return {items:runs.map(run=>{
+      const row=byRun.get(run.localId);
+      return {...run,...resolveTaskTitle({title:run.title,workItemTitle:workTitles.get(run.localId),
+        workspaceNames:[run.projectName],createdAt:run.startedAt}),
+        lastProgressAt:Math.max(run.startedAt,run.finalization?.requestedAt ?? 0,
+          latestTimestamp([row?.created_at,row?.finished_at]) ?? run.startedAt),
+        executionObservedAt:row?.execution_observed_at ? Date.parse(row.execution_observed_at) : null};
+    }),observedAt:Date.now()};
+  } finally {ledger.close();}
 }
 
 export { readLocalUsage } from "./usage-query.js";

@@ -50,7 +50,7 @@ test("tasks aggregate across nodes by task_id and keep later user requests separ
 
 const at = 1_800_000_000_000;
 
-test('进行中按任务生命周期筛选，包含无命令和失败试验，排除已交接的后台执行', () => {
+test('未关闭按任务生命周期筛选，包含无命令和失败试验，排除已交接的后台执行', () => {
   const rows=aggregateTaskIndex([
     {...phase('idle','open-idle','desktop'),requestState:'active',executionStatus:'waiting'},
     {...phase('failed','open-failed','desktop'),requestState:'active',executionStatus:'failed'},
@@ -66,9 +66,9 @@ const scenarios: Array<{name: string; values: Array<Partial<Run>>; expected: str
     {executionStatus: 'waiting', lastActivityAt: at - 10_000},
     {executionStatus: 'stalled', lastActivityAt: at - 25 * 60_000},
   ], expected: 'waiting'},
-  {name: '全部工作区确实超过十分钟没有活动', values: [
-    {executionStatus: 'stalled', lastActivityAt: at - 11 * 60_000},
-    {executionStatus: 'stalled', lastActivityAt: at - 25 * 60_000},
+  {name: '全部工作区确实超过三十分钟没有活动', values: [
+    {executionStatus: 'stalled', lastActivityAt: at - 31 * 60_000},
+    {executionStatus: 'stalled', lastActivityAt: at - 45 * 60_000},
   ], expected: 'stalled'},
   {name: '新鲜命令运行时另一个空闲成员暂时失联', values: [
     {executionStatus: 'running', lastActivityAt: at - 1_800_000},
@@ -149,8 +149,8 @@ test('overview view-all filters retain exactly the displayed current and older g
     ? {...value,executionStatus:'unknown',stale:true} : value),time);
   const groups=selectOverviewTasks(indexed,time,value=>dayAt(value,'Asia/Shanghai')===dayAt(time,'Asia/Shanghai'),retained);
   const keys=(values:typeof indexed)=>values.map(value=>value.key).sort();
-  assert.equal(groups.current.length,16);
+  assert.equal(groups.current.length,15);
   assert.deepEqual(keys(filterTaskIndex(indexed,{overviewGroup:'current',tz:'Asia/Shanghai',days:'0'},time,retained)),keys(groups.current));
   assert.deepEqual(keys(filterTaskIndex(indexed,{overviewGroup:'olderOpen',tz:'Asia/Shanghai',days:'0'},time,retained)),keys(groups.olderOpen));
-  assert.deepEqual(groups.olderOpen.map(value=>value.taskId),['old']);
+  assert.deepEqual(new Set(groups.olderOpen.map(value=>value.taskId)),new Set(['old','cached']));
 });

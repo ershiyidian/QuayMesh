@@ -635,6 +635,10 @@ export class SessionService {
       workspace.mode,
       workspace.sourceRoot,
     );
+    // A Task can observe an attached workspace without creating an execution.
+    // Register only its existing project identity for directory/filter metadata.
+    const ledger=this.ledger;
+    if(ledger&&member.node_id===this.nodeId)await runSqliteWrite(ledger.db,()=>ledger.project(member.root));
     this.store.touchTaskMember(task.id, member.id);
 
     this.store.appendEvent({
@@ -961,6 +965,8 @@ export class SessionService {
           workspaceId: context.workspace_id, ownerToken: processOwner.token, ownerPid: processOwner.pid,
           processStart: processOwner.start, settledAt},
       });
+      for (const claim of db.prepare("SELECT id FROM execution_claims WHERE operation_id=?").all(ticket.operation_id) as Array<{id:string}>)
+        this.requireLedger().recoverClaim(claim.id);
     });
   }
 

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { WorkbenchFeed } from "../../src/console-workbench/feed.js";
-import { sourceWarning } from "../../src/ui/console-v5/source-state.js";
+import { sourceWarning, sourceNeedsAttention } from "../../src/ui/console-v5/source-state.js";
 import type { FederationRuntime } from "../../src/federation/runtime.js";
 import type { ServerConfig } from "../../src/config.js";
 
@@ -50,7 +50,7 @@ test("TTL refresh returns a timestamped snapshot while one remote refresh replac
   assert.equal(first.sources[0].state,"refreshing");
   assert.equal(first.sources[0].stale,false,"30s 内的已确认数据在后台刷新时仍是新鲜快照");
   assert.equal(sourceWarning(first.sources[0]),null,"正常轮询不应触发五节点过期横幅");
-  assert.match(sourceWarning({...first.sources[0],stale:true})??"",/正在刷新/,"真实过期仍需提示");
+  assert.equal(sourceNeedsAttention({...first.sources[0],stale:true}),false,"后台刷新以确认时间说明，不升级为故障告警");
   assert.equal(first.complete,true,"a complete cached snapshot remains usable while refreshing");
   // Give the background job a microtask to begin.
   await delay(10);
@@ -58,13 +58,14 @@ test("TTL refresh returns a timestamped snapshot while one remote refresh replac
   assert.equal(second.projects[0].name,"old");
   assert.equal(requests,2,"multiple reads must reuse a single pending request");
   t.mock.timers.tick(18_000);
-  let settled = false;
-  const waiting = feed.metadata().then(value => { settled = true; return value; });
-  await delay(10);
-  assert.equal(settled,false,"an expired reader must await the in-flight refresh");
+  const expired = await feed.metadata();
+  assert.equal(expired.projects[0].name,"old");
+  assert.equal(expired.sources[0].stale,true,"过期快照保留真实的新鲜度");
+  assert.equal(expired.sources[0].observedAt,first.sources[0].observedAt,"查看旧数据不能刷新确认时间");
   assert.equal(requests,2,"an expired reader must not start another remote RPC");
   release(payload("new"));
-  const updated = await waiting;
+  await delay(10);
+  const updated = await feed.metadata();
   assert.equal(updated.complete,true);
   assert.equal(updated.projects[0].name,"new");
   assert.equal(updated.sources[0].state,"ready");
@@ -120,4 +121,27 @@ test('explicit refresh bypasses a valid TTL and a failed read backoff without di
   fail=true;const failed=await feed.metadata(true);assert.equal(failed.projects[0].name,'version-2');assert.equal(failed.sources[0].state,'error');
   fail=false;assert.equal((await feed.metadata()).projects[0].name,'version-2');assert.equal(requests,3);
   assert.equal((await feed.metadata(true)).projects[0].name,'version-4');
+});
+
+test("a cold screen returns healthy nodes while one shared slow read continues",{timeout:5000},async t=>{
+  let release!:(reply:unknown)=>void,slowRequests=0;
+  t.after(()=>release?.(payload("cleanup")));
+  const runtime={nodes:()=>[
+    {id:"fast",nickname:"Fast",online:true},{id:"slow",nickname:"Slow",online:true},
+  ],request:async(node:string)=>{
+    if(node==="fast")return payload("fast");
+    slowRequests++;return new Promise(resolve=>{release=resolve;});
+  }} as unknown as FederationRuntime;
+  const feed=new WorkbenchFeed(config,runtime);
+  const start=performance.now(),first=await feed.metadata();
+  assert.ok(performance.now()-start<2000,"a slow node cannot consume the outer HTTP deadline");
+  assert.deepEqual(first.projects.map(project=>project.name),["fast"]);
+  assert.equal(first.complete,false);
+  assert.equal(first.sources.find(source=>source.nodeId==="slow")?.state,"loading");
+  assert.equal(first.sources.find(source=>source.nodeId==="slow")?.observedAt,null);
+  const next=feed.metadata();await delay(10);
+  assert.equal(slowRequests,1,"polls share the one pending node read");
+  release(payload("slow"));const complete=await next;
+  assert.equal(complete.complete,true);
+  assert.deepEqual(complete.projects.map(project=>project.name),["fast","slow"]);
 });

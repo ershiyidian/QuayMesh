@@ -566,7 +566,7 @@ export class LocalAgentManager {
     // Resolve effective capability BEFORE choosing the source lock, not after it.
     const analysisOnly = effectiveMode === "read_only" && this.drivers.get(record.provider as LocalAgentProvider)?.readOnlyConcurrency === true;
     overrides = { ...overrides, writeMode: effectiveMode };
-    const requirement = { workspaceRoot: record.workspaceRoot, kind: "agent" as const, agentId: record.id,
+    const requirement = { workspaceRoot: record.workspaceRoot, kind: "agent" as const, agentId: record.id, executionId,
       taskId: this.ledger.taskIdForRun(this.ledger.execution(executionId).run_id) ?? undefined,
       threadKey: record.providerSessionId ? `${record.provider}:${record.providerSessionId}` : undefined,
       access: analysisOnly ? "read" as const : "write" as const,
@@ -641,17 +641,25 @@ export class LocalAgentManager {
         });
         if (!ticket) throw error;
       }
-    }).finally(() => {
+    }).finally(async () => {
       try {
         const terminal = this.store.getById(record.id)?.status;
         this.ledger.endExecution(executionId, terminal === "idle" ? "completed" : terminal === "stopped" ? "cancelled" : "failed");
       } finally {
-        this.queuedTurns.delete(record.id);
-        const current = this.store.getById(record.id);
-        if (current && ["qm_active", "interrupting", "desktop_pending"].includes(current.controlState)) {
-          this.store.setControlState(record.id, "terminal", null, "turn_finished");
+        // runTurn has settled. Keep an unresolved result, but persist the same
+        // turn's physical end before releasing its resource claim.
+        try {
+          this.ledger.completePhysicalExecution("execution", executionId, executionId, { version: 1, boundary: "managed_agent_turn_settled" });
+          const current = this.store.getById(record.id);
+          if (current && ["qm_active", "interrupting", "desktop_pending"].includes(current.controlState)) {
+            this.store.setControlState(record.id, "terminal", null, "turn_finished");
+          }
+        } finally {
+          this.queuedTurns.delete(record.id);
+          this.activeTurns.delete(record.id);
+          try { ticket?.cancel(); }
+          finally { await claim?.releaseAsync(); }
         }
-        ticket?.cancel(); claim?.release(); this.activeTurns.delete(record.id);
       }
     });
     const ownedWorkRunId = this.ledger.execution(executionId).run_id;

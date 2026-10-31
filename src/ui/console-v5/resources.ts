@@ -58,7 +58,7 @@ export class Resources {
       current.loading = false; current.promise = null; this.options.paint();
       if (!controller.signal.aborted) this.options.loaded(path);
     });
-    if (!current.data) this.options.paint();
+    this.options.paint();
     return current.promise;
   }
 

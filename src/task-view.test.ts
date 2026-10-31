@@ -5,7 +5,7 @@ import { taskView, taskLifecycleView } from './task-view.js';
 test('任务主状态取持久生命周期，后台状态变化不能结束开放任务', () => {
   for (const execution of ['running', 'queued', 'idle', 'waiting', 'failed', 'unknown', 'stalled', 'completed']) {
     const input = {requestState:'active', result:null, execution};
-    assert.deepEqual(taskLifecycleView(input), {status:'active', label:'任务进行中'});
+    assert.deepEqual(taskLifecycleView(input), {status:'open', label:'未关闭'});
     assert.equal(taskView(input).requestEnded, false);
   }
   assert.equal(taskLifecycleView({requestState:'closed',result:'failed'})?.label,'未完成');

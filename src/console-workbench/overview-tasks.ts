@@ -1,10 +1,13 @@
 import type { TaskIndex } from './task-aggregation.js';
+import { taskActivityView, TASK_EXECUTION_FRESHNESS_MS, TASK_SILENCE_MS } from '../task-view.js';
 
 // A display grouping, never a Task timeout or a lifecycle transition.
-export const OVERVIEW_MIDNIGHT_CARRYOVER_MS = 2 * 60 * 60_000;
+export const OVERVIEW_ACTIVITY_WINDOW_MS = TASK_SILENCE_MS;
 
-export function lastObservedExecutingTasks(phases: readonly {taskId: string | null; executionStatus: string}[]): Set<string> {
-  return new Set(phases.filter(phase=>phase.taskId && ['running','starting','queued','stopping'].includes(phase.executionStatus))
+export function lastObservedExecutingTasks(phases: readonly {taskId: string | null; executionStatus: string; executionObservedAt?: number | null}[], at=Date.now()): Set<string> {
+  return new Set(phases.filter(phase=>phase.taskId && ['running','starting','queued','stopping'].includes(phase.executionStatus)
+    && typeof phase.executionObservedAt==='number' && Number.isFinite(phase.executionObservedAt)
+    && phase.executionObservedAt<=at && at-phase.executionObservedAt<TASK_EXECUTION_FRESHNESS_MS)
     .map(phase=>`task:${phase.taskId}`));
 }
 
@@ -37,21 +40,17 @@ export function selectOverviewTasks(
   tasks: readonly TaskIndex[],
   at: number,
   isToday: (time: number) => boolean,
-  lastObservedExecuting: ReadonlySet<string> = new Set(),
+  _lastObservedExecuting: ReadonlySet<string> = new Set(),
 ) {
   const realTasks = tasks.filter(task => Boolean(task.taskId));
   const open = realTasks.filter(task => task.requestState === 'active');
-  const isCurrent = (task: TaskIndex) => {
-    const recentlyActive = Number.isFinite(task.lastActivityAt) && (isToday(task.lastActivityAt)
-      || task.lastActivityAt <= at && at - task.lastActivityAt < OVERVIEW_MIDNIGHT_CARRYOVER_MS);
-    return recentlyActive || ['running', 'starting', 'queued', 'stopping'].includes(task.executionStatus)
-      || Boolean(task.finalization) || lastObservedExecuting.has(task.key);
-  };
-  const byActivity = (left: TaskIndex, right: TaskIndex) => right.lastActivityAt - left.lastActivityAt
+  const activity = (task: TaskIndex) => taskActivityView({requestState:task.requestState,result:task.resultStatus,
+    execution:task.executionStatus,lastProgressAt:task.lastProgressAt ?? task.lastActivityAt,
+    executionObservedAt:task.executionObservedAt,stale:task.stale,now:at});
+  const byActivity = (left: TaskIndex, right: TaskIndex) => (right.lastProgressAt ?? right.lastActivityAt) - (left.lastProgressAt ?? left.lastActivityAt)
     || left.key.localeCompare(right.key);
-  const current = open.filter(isCurrent).sort((left, right) => {
-    const rank = (task: TaskIndex) => !task.stale && ['running', 'starting', 'stopping'].includes(task.executionStatus) ? 0
-      : !task.stale && task.executionStatus === 'queued' ? 1 : task.finalization ? 2 : 3;
+  const current = open.filter(task=>activity(task).current).sort((left, right) => {
+    const rank = (task: TaskIndex) => activity(task).state==='executing' ? 0 : 1;
     return rank(left) - rank(right) || byActivity(left, right);
   });
   const currentKeys = new Set(current.map(task => task.key));
@@ -75,26 +74,14 @@ export interface OverviewTaskProgress {
   progressSummary: string | null;
 }
 
-export function overviewTaskProgress(task: TaskIndex, group: 'current' | 'older' | 'recent'): OverviewTaskProgress {
-  if (task.requestState === 'closed') {
-    const labels: Record<string, string> = { completed: '已完成', failed: '未完成', cancelled: '已停止', handed_off: '已交接' };
-    return { progressLabel: labels[task.resultStatus ?? ''] ?? '已结束',
-      progressSummary: labels[task.resultStatus ?? ''] ? null : '交付结果尚未确认' };
-  }
-  // A confirmed member may still be executing while another member is stale.
-  if (['running', 'starting', 'stopping'].includes(task.executionStatus)) {
-    const summary=[task.executionStatus === 'stopping' ? '正在停止当前执行' : null,
-      task.stale ? '部分任务信息待更新' : null].filter(Boolean).join('；');
-    return { progressLabel: '进行中', progressSummary: summary || null };
-  }
-  if (task.executionStatus === 'queued') return { progressLabel: '等待执行', progressSummary: task.stale ? '部分任务信息待更新' : null };
-  if (task.stale) return { progressLabel: '待更新', progressSummary: '显示上次取得的任务状态' };
+export function overviewTaskProgress(task: TaskIndex, _group: 'current' | 'older' | 'recent', at=Date.now()): OverviewTaskProgress {
+  const activity=taskActivityView({requestState:task.requestState,result:task.resultStatus,execution:task.executionStatus,
+    lastProgressAt:task.lastProgressAt ?? task.lastActivityAt,executionObservedAt:task.executionObservedAt,stale:task.stale,now:at});
+  if(activity.state==='ended')return {progressLabel:activity.label,progressSummary:activity.detail};
+  if(activity.state==='executing')return {progressLabel:activity.label,
+    progressSummary:[activity.detail,task.stale?'部分任务信息待更新':null].filter(Boolean).join('；') || null};
   const attention = taskAttention(task);
   if (attention) return { progressLabel: attention.kind === 'review' ? '待验收'
     : attention.kind === 'resume' ? '执行中断' : '确认失败', progressSummary: attention.detail };
-  if (task.finalization) return { progressLabel: '交付确认中', progressSummary: null };
-  if (task.executionStatus === 'unknown') return { progressLabel: '状态待确认', progressSummary: '任务尚未结束' };
-  return { progressLabel: group === 'older' ? '未结束' : '进行中',
-    progressSummary: task.executionStatus === 'failed' ? '最近执行未成功，任务尚未结束'
-      : task.phaseExecutionStatus === 'completed' ? '已记录阶段结果，任务尚未结束' : null };
+  return {progressLabel:activity.label,progressSummary:activity.detail};
 }

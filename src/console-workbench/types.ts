@@ -13,6 +13,9 @@ export interface Run {
   id: string;
   localId: string;
   title: string;
+  titleSource?: 'task' | 'session' | 'user_message' | 'work_item' | 'workspace' | 'fallback';
+  lastProgressAt?: number | null;
+  executionObservedAt?: number | null;
   nodeId: string;
   projectId: string;
   projectLocalId: string;

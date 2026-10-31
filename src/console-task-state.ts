@@ -1,4 +1,5 @@
 import { taskView } from './task-view.js';
+import { resolveTaskTitle } from './task-title.js';
 
 export const taskStages: ReadonlyArray<readonly [string, string]> = [
   ['running', '执行中'], ['stopping', '正在停止'], ['queued', '排队'], ['waiting', '当前无后台执行'],
@@ -45,6 +46,8 @@ export interface TaskLifecycle {
   id: string;
   sessionId: string;
   title: string;
+  titleSource?: 'task' | 'session' | 'user_message' | 'work_item' | 'workspace' | 'fallback';
+  lastProgressAt?: number | null;
   state: string;
   resultStatus: string | null;
   revision: number;
@@ -64,15 +67,27 @@ export function withTaskLifecycle<T extends {
   startedAt?: number;
   reason?: string | null;
   phaseExecutionStatus?: string;
+  title?: string;
+  titleSource?: 'task' | 'session' | 'user_message' | 'work_item' | 'workspace' | 'fallback';
+  lastProgressAt?: number | null;
 }>(value: T, task?: TaskLifecycle): T {
   if (!task || task.id !== value.taskId) return value;
   const awaitingDelivery=task.state==='active' && !task.finalization && value.executionStatus==='completed';
   const newerActivity = value.executionStatus === 'stalled' && task.lastActivityAt > value.lastActivityAt;
   const lastActivityAt = Math.max(value.lastActivityAt, task.lastActivityAt);
+  const progress = [value.lastProgressAt ?? value.lastActivityAt,task.lastProgressAt ?? task.lastActivityAt]
+    .filter((time): time is number => typeof time === 'number' && Number.isFinite(time));
+  const lastProgressAt = progress.length ? Math.max(...progress) : null;
+  const richerPhaseTitle=['workspace','fallback'].includes(task.titleSource ?? '')
+    && value.title && ['task','session','user_message','work_item'].includes(value.titleSource ?? '');
+  const title = richerPhaseTitle ? {title:value.title!,titleSource:value.titleSource!}
+    : task.titleSource ? {title:task.title,titleSource:task.titleSource}
+    : resolveTaskTitle({title:task.title,workItemTitle:value.title,
+      workspaceNames:task.workspaces?.map(workspace=>workspace.name),createdAt:task.createdAt});
   const status = taskView({requestState:task.state, result:task.resultStatus, execution:awaitingDelivery||newerActivity?'waiting':value.executionStatus,
     finalizing:Boolean(task.finalization),finalizationFailed:Boolean(task.finalization?.error),
     ...(newerActivity ? {lastProgressAt: lastActivityAt, now: Date.now()} : {})}).status;
-  return {...value, executionStatus:status, sourceTaskId:task.sourceTaskId??null,
+  return {...value, ...title, lastProgressAt, executionStatus:status, sourceTaskId:task.sourceTaskId??null,
     ...(task.createdAt !== undefined ? {startedAt: task.createdAt} : {}),
     phaseExecutionStatus:value.phaseExecutionStatus ?? value.executionStatus,
     requestState:task.state, resultStatus:task.resultStatus, taskRevision:task.revision, finalization:task.finalization??null,
@@ -87,7 +102,7 @@ export function withTaskLifecycle<T extends {
     lastActivityAt};
 }
 
-export function observeSourceStates<T extends {nodeId:string;executionStatus:string}>(
+export function observeSourceStates<T extends {nodeId:string;executionStatus:string;executionObservedAt?:number|null}>(
   values:readonly T[],sources:readonly {nodeId:string;online:boolean;observedAt:number|null;error?:string|null}[],now=Date.now(),
 ):Array<T & {observedAt:number|null;stale:boolean}>{
   const byNode=new Map(sources.map(source=>[source.nodeId,source]));
@@ -95,6 +110,7 @@ export function observeSourceStates<T extends {nodeId:string;executionStatus:str
     const source=byNode.get(value.nodeId);
     const stale=!source||!source.online||Boolean(source.error)||source.observedAt===null||now-source.observedAt>30_000;
     return {...value, observedAt:source?.observedAt ?? null, stale,
+      executionObservedAt:stale ? null : value.executionObservedAt ?? null,
       ...(stale&&activeExecution(value.executionStatus)?{executionStatus:'unknown'}:{})};
   });
 }

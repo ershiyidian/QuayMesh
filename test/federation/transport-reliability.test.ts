@@ -141,12 +141,13 @@ test("资源冲突的实际错误和持久回执重放都保留占用身份，�
       { kind: "file", path: "/srv/project/report.txt", access: "read" },
       { kind: "named", key: "compiler:shared", access: "write" },
     ], blockedResources: [{ kind: "named", key: "compiler:shared", access: "write" }],
-    operationId: "op_blocker", taskId: "task_blocker", title: secret,
+    operationId: "op_blocker", executionId: "exec_blocker_turn", taskId: "task_blocker", title: secret,
     acquiredAt: "2026-10-29T15:15:00.000Z", queued: false,
   }, "not_started");
   const envelope = errorEnvelope(original, { sideEffecting: true });
   assert.equal((envelope.errorDetails as Record<string, unknown>).claim_id, "claim_blocker");
   assert.equal((envelope.errorDetails as Record<string, unknown>).agent_id, "agt_blocker");
+  assert.equal((envelope.errorDetails as Record<string, unknown>).executionId, "exec_blocker_turn");
   const saved = join(directory, "receipt.json");
   await writeFile(saved, JSON.stringify(envelope));
   const replay = errorFromEnvelope(JSON.parse(await readFile(saved, "utf8")), undefined, "op_rejected");
@@ -164,6 +165,7 @@ test("资源冲突的实际错误和持久回执重放都保留占用身份，�
         const { title: _title, ...expected } = original.details;
         assert.deepEqual(error.details, expected);
         assert.equal(error.details?.agent_id, "agt_blocker");
+        assert.equal(error.details?.executionId, "exec_blocker_turn");
         assert.equal(JSON.stringify({ message: error.message, details: error.details }).includes(secret), false);
         assert.notEqual(error.details?.operationId, "op_rejected", "保留阻塞操作，不能换成被拒绝请求的操作");
         return true;
