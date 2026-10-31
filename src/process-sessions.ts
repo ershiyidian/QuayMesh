@@ -15,6 +15,7 @@ import { diagnosticError } from "./server-diagnostics.js";
 import { currentInvocation } from "./session/invocations.js";
 import { requireCommandScope } from "./command-profiles.js";
 import { type ExecutionResource } from "./execution-resources.js";
+import { ExactSecretRedactor } from "./exact-secret-redactor.js";
 
 const DEFAULT_EXEC_YIELD_MS = 2_000;
 const DEFAULT_INTERACTIVE_YIELD_MS = 250;
@@ -174,6 +175,7 @@ interface ProcessSession {
 
 interface ProcessSessionManagerOptions {
   environment?: () => NodeJS.ProcessEnv;
+  executionEnvironment?: () => Promise<NodeJS.ProcessEnv>;
   diagnostics?: (event: string, fields: Record<string, unknown>, level: "info" | "warn" | "error") => void;
   maxBufferCharacters?: number;
   completedSessionTtlMs?: number;
@@ -204,7 +206,8 @@ function processEnvironment(input?: {
 }): Record<string, string> {
   return {
     ...Object.fromEntries(
-      Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+      Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined
+        && !/^QUAYMESH_LOCAL_API_/i.test(entry[0])),
     ),
     NO_COLOR: "1",
     TERM: "dumb",
@@ -667,9 +670,10 @@ export class ProcessSessionManager {
 
   private async startPipe(session: ProcessSession, input: StartCommandInput): Promise<void> {
     const shell = input.program ? {executable:input.program.executable,args:input.program.args} : resolveShellCommand(input.command);
+    const executionEnvironment = await this.options.executionEnvironment?.();
     const environment = mergeEnvironment(process.platform,
       processEnvironment({ workspaceId: input.workspaceId, workspaceRoot: input.workspaceRoot }),
-      this.options.environment?.());
+      {...this.options.environment?.(), ...executionEnvironment});
     const windows = process.platform === "win32";
     const job = windows ? new WindowsCommandJob() : undefined;
     session.commandJob = job;
@@ -702,15 +706,21 @@ export class ProcessSessionManager {
       },
     };
     const consume = (stream: typeof stdout) => {
+      // stdout and stderr may interleave, so each keeps its own partial match.
+      const redactor = new ExactSecretRedactor(executionEnvironment?.QUAYMESH_LOCAL_API_CREDENTIAL);
       stream.setEncoding("utf8");
       const output = new Writable({
         decodeStrings: false,
         highWaterMark: 64 * 1024,
         write: (chunk: string | Buffer, _encoding, done) => {
-          this.append(session, typeof chunk === "string" ? chunk : chunk.toString("utf8")).then(() => done(), error => done(error as Error));
+          const clean = redactor.push(typeof chunk === "string" ? chunk : chunk.toString("utf8"));
+          (clean ? this.append(session, clean) : Promise.resolve()).then(() => done(), error => done(error as Error));
         },
       });
-      return pipeline(stream, output).catch(error => {
+      return pipeline(stream, output).finally(() => {
+        const remainder = redactor.flush();
+        return remainder ? this.append(session, remainder) : undefined;
+      }).catch(error => {
         session.outputError = error instanceof Error ? error : new Error(String(error));
         session.failure = diagnosticError(error);
         this.record(session, "process_output_stream_failed", session.failure, "error");
@@ -846,11 +856,13 @@ export class ProcessSessionManager {
   private async startPty(session: ProcessSession, input: StartCommandInput): Promise<void> {
     const nodePty = await import("node-pty");
     const shell = input.program ? {executable:input.program.executable,args:input.program.args} : resolveShellCommand(input.command);
+    const executionEnvironment = await this.options.executionEnvironment?.();
+    const redactor = new ExactSecretRedactor(executionEnvironment?.QUAYMESH_LOCAL_API_CREDENTIAL);
     const pty = nodePty.spawn(shell.executable, shell.args, {
       cwd: input.cwd,
       env: mergeEnvironment(process.platform,
         processEnvironment({ workspaceId: input.workspaceId, workspaceRoot: input.workspaceRoot }),
-        this.options.environment?.()) as Record<string, string>,
+        {...this.options.environment?.(), ...executionEnvironment}) as Record<string, string>,
       name: "xterm-256color", cols: session.columns, rows: session.rows,
     });
     session.rootPid = pty.pid;
@@ -867,7 +879,8 @@ export class ProcessSessionManager {
     this.record(session, "process_started", { childPid: pty.pid });
     pty.onData(data => {
       pty.pause();
-      void this.append(session, data).then(() => { if (session.running) pty.resume(); }, error => {
+      const clean = redactor.push(data);
+      void (clean ? this.append(session, clean) : Promise.resolve()).then(() => { if (session.running) pty.resume(); }, error => {
         session.outputError = error instanceof Error ? error : new Error(String(error));
         pty.kill();
       });
@@ -879,12 +892,19 @@ export class ProcessSessionManager {
       session.rootExitCode = exitCode;
       session.rootSignal = signal === 0 ? undefined : String(signal);
       session.pipeClosed = true;
-      session.stdioSettled = true;
-      session.stdioCompletion = Promise.resolve();
+      const remainder = redactor.flush();
+      session.stdioCompletion = (remainder ? this.append(session, remainder) : Promise.resolve()).catch(error => {
+        session.outputError = error instanceof Error ? error : new Error(String(error));
+        session.failure = diagnosticError(error);
+        this.record(session, "process_output_stream_failed", session.failure, "error");
+      }).finally(() => {
+        session.stdioSettled = true;
+        this.checkOwnedCompletion(session);
+        resolveClose();
+      });
       session.resolveRootExit();
       session.stopOwnedWatch = watchOwnedProcesses(() => this.checkOwnedCompletion(session));
       this.checkOwnedCompletion(session);
-      resolveClose();
     });
   }
 

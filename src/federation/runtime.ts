@@ -31,6 +31,7 @@ import { errorCode, toolErrorResult } from "../session/outcome.js";
 import { WorkspaceAccessError } from "../workspaces.js";
 import { dispatchPeerRequest, isTransientPeerFailure, isIdempotentPeerRequest, isCancellableToolObservation } from "./read-retry.js";
 import { dispatchConsoleRequest } from "./console-request.js";
+import type {LocalApiPeerHooks} from "../local-user-api/service.js";
 
 export interface ArtifactWriteLifecycle {
   temporaryPath: string;
@@ -90,6 +91,8 @@ export class FederationRuntime extends EventEmitter {
   private runtimeIdentity?: NodeManifest["runtime"];
   private readonly modelTools = new Set<string>();
   private sessionFeed?: SessionFeed;
+  private localUserApi?: LocalApiPeerHooks;
+  setLocalUserApi(api: LocalApiPeerHooks): void {this.localUserApi = api;}
   private stopped = false;
   ready: Promise<void> = Promise.resolve();
   startupError?: string;
@@ -327,6 +330,10 @@ export class FederationRuntime extends EventEmitter {
       throw Object.assign(new Error("TASK_BINDING_COORDINATOR_REQUIRED"), { code: "TASK_BINDING_COORDINATOR_REQUIRED", effect: "not_started" });
     }
     switch (method) {
+      case "local-user.call": case "local-user.terminal": case "local-user.install": case "local-user.describe": {
+        if (!this.localUserApi) throw Object.assign(new Error("LOCAL_API_UNAVAILABLE"), {code: "LOCAL_API_UNAVAILABLE", effect: "not_started"});
+        return this.localUserApi.receive(peer, method.slice("local-user.".length) as "call" | "terminal" | "install" | "describe", params, signal);
+      }
       case "hello": this.remember(params.manifest, peer); return { manifest: this.makeManifest() };
       case "manifest": this.remember(params, peer); this.notePeerSuccess(peer); this.emit("change"); return null;
       case "tool": return this.invokeLocal(params.name, params.input, { ...(params.extra ?? {}), signal, sendNotification: notify });
@@ -626,6 +633,7 @@ export class FederationRuntime extends EventEmitter {
       ? extra.signal : undefined;
     const query=()=>this.request(node, "tool", { name, input: args, extra: context }, remainingToolTime(deadlineAt), onProgress, signal);
     const dispatch = async () => {
+      if (name === "exec_command" && trustedInvocation) await this.localUserApi?.beforeExec(node, trustedInvocation);
       const result = name==="workspace_context" && this.sessionFeed
         ? await this.sessionFeed.recoverOperationStatus(input,trustedInvocation,node,query)
         : await query();

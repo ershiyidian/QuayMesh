@@ -79,6 +79,8 @@ interface DeliveryRow {
 function failure(code: string): Error & { code: string } {
   const message = code === "TASK_MAILBOX_LEASE_EXPIRED" || code === "TASK_MAILBOX_DELIVERY_SUPERSEDED"
     ? `${code}: Call task_messages receive with a new request_key, then acknowledge only the new delivery.`
+    : code === "TASK_MAILBOX_REPLY_TURN_CLOSED"
+      ? `${code}: A referenced user message already has a saved reply. Retry the original message_key and input, or wait for new user input.`
     : code === "TASK_MAILBOX_BATCH_LIMIT"
       ? `${code}: This saved message or prior delivery cannot fit a complete tool reply. Its content and receipt state remain unchanged.` : code;
   return Object.assign(new Error(message), { code, effect: "not_started" });
@@ -341,11 +343,20 @@ export class TaskMailboxStore {
       for (const id of input.replyTo) {
         const row = this.getMessage(scope.taskId, id);
         // Acknowledgement records who received the input. It grants no permanent
-        // ownership over replies to this Task, which other entries may continue.
+        // ownership over unanswered input, which other authorized entries may continue.
         if (row.role !== "user" || !row.acknowledged_at) {
           throw failure("TASK_MAILBOX_REPLY_NOT_ACKNOWLEDGED");
         }
       }
+      // Each user message authorizes one saved reply. Check inside the same
+      // immediate write transaction as insertion so another receiver cannot
+      // reuse an answered turn with a new key. Exact retries returned above.
+      const answered = this.db.prepare(`SELECT 1 FROM qm_task_messages replies,
+        json_each(replies.reply_to_json) target
+        WHERE replies.task_id=? AND replies.role='assistant' AND target.type='text'
+          AND target.value IN (${input.replyTo.map(() => "?").join(",")}) LIMIT 1`)
+        .get(scope.taskId, ...input.replyTo);
+      if (answered) throw failure("TASK_MAILBOX_REPLY_TURN_CLOSED");
       const id = `message_${randomUUID()}`, sequence = this.snapshot(scope.taskId).sequence + 1;
       this.db.prepare(`INSERT INTO qm_task_messages
         (id,task_id,sequence,message_key,body,role,reply_to_json,sender_receiver_id,created_at)

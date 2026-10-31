@@ -58,6 +58,7 @@ import { createRuntimeControlServer, type RuntimeControlRequest } from "./runtim
 import { ServerDiagnostics, diagnosticError } from "./server-diagnostics.js";
 import { logEvent } from "./logger.js";
 import { pruneStaleManagedWorktrees } from "./worktree-prune.js";
+import { runLocalUserApiCli } from "./local-user-api/cli.js";
 
 type Command =
   | "serve"
@@ -67,6 +68,8 @@ type Command =
   | "worktrees"
   | "agents"
   | "show-changes"
+  | "local"
+  | "client"
   | "help"
   | "version";
 const require = createRequire(import.meta.url);
@@ -101,6 +104,10 @@ async function main(argv: string[]): Promise<void> {
     case "show-changes":
       await runShowChanges(args);
       return;
+    case "local":
+    case "client":
+      process.exitCode = await runLocalUserApiCli([command, ...args]);
+      return;
     case "help":
       printHelp();
       return;
@@ -119,6 +126,8 @@ function normalizeCommand(command: string | undefined): Command {
     || command === "worktrees"
     || command === "agents"
     || command === "show-changes"
+    || command === "local"
+    || command === "client"
   ) return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
@@ -519,6 +528,8 @@ function printHelp(): void {
       "  quaymesh config set publicBaseUrl <url|null>",
       "  quaymesh worktrees prune Prune managed worktrees unused for 3 days",
       "  quaymesh show-changes <review-ref> [--json]",
+      "  quaymesh local --help    Read local status/tasks/events or use Task-bound peer messaging",
+      "  quaymesh client import <alias> --stdin  Save an owner-issued local client in the OS vault",
       "  quaymesh agents targets [--json]  List usable subagent providers and profiles",
       "  quaymesh agents ls       List subagent sessions",
       "  quaymesh agents run <target> [--task-key <key>] [--work-item <id>] [--context-key <domain>] [--fresh-context] [--read-only] [--model <model>] [--effort <level>] <prompt>",

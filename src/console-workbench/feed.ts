@@ -398,6 +398,19 @@ export class WorkbenchFeed {
     return this.relatedRuns({taskId},fresh);
   }
 
+  /** Exact requested Tasks, using the same owner observations as the console.
+   * Peer traffic and API receipt time never renew an execution proof. */
+  async taskActivities(taskIds:readonly string[]) {
+    const selected=new Set(taskIds);
+    const [index,titles]=await Promise.all([
+      this.collect('/workbench/task-index',()=>readLocalTaskIndex(this.config),{},1000),this.sessionTitles(),
+    ]);
+    const scoped={...titles,tasks:new Map([...titles.tasks].filter(([id])=>selected.has(id)))};
+    return this.taskIndex(index.values.flatMap(value=>value.items).filter(phase=>phase.taskId!==null&&selected.has(phase.taskId)),scoped,index.sources)
+      .filter(task=>task.taskId!==null&&selected.has(task.taskId)).map(task=>({taskId:task.taskId!,title:task.title,executionStatus:task.executionStatus,
+        lastProgressAt:task.lastProgressAt??null,executionObservedAt:task.executionObservedAt??null,stale:task.stale===true}));
+  }
+
   private async relatedRuns(identity:{taskId?:string;sessionId?:string},fresh=false) {
     const known=identity.taskId?[...this.cache.entries()].filter(([key])=>key.endsWith(':/workbench/session-titles'))
       .flatMap(([,cached])=>{const value=cached.data as ReturnType<typeof readLocalSessionTitles>|null;

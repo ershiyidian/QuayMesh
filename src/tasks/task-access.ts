@@ -19,6 +19,11 @@ export function taskPrincipalFromAuthInfo(authInfo: VerifiedTaskAuthInfo | null 
   return Object.freeze({ ownerId, [authenticatedPrincipal]: true as const });
 }
 
+export function requireTaskPrincipal(principal: TaskPrincipal): void {
+  if (!principal || principal[authenticatedPrincipal] !== true || !validIdentifier(principal.ownerId))
+    throw failure("MISSING_AUTHENTICATED_OWNER");
+}
+
 export type TaskOwnerSource = "task" | "legacy-session";
 
 /** An ownership observation, not an execution permit or a receiver binding. */
@@ -72,9 +77,7 @@ export class TaskAccessResolver {
   }
 
   resolve(principal: TaskPrincipal, taskId: string): TaskAccess {
-    if (!principal || principal[authenticatedPrincipal] !== true || !validIdentifier(principal.ownerId)) {
-      throw failure("MISSING_AUTHENTICATED_OWNER");
-    }
+    requireTaskPrincipal(principal);
     if (!validIdentifier(taskId)) throw failure("TASK_ACCESS_INVALID_ID");
     const row = this.lookup.get(taskId, principal.ownerId) as TaskAccessRow | undefined;
     // Missing, orphaned and another owner's Tasks have the same public failure.

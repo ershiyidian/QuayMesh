@@ -11,6 +11,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { ConflictingToolAliasError, normalizeCachedToolCall } from "./mcp-cached-arguments.js";
 import { workspaceOutputSchema } from "./workspace-bootstrap.js";
 import {currentInvocation} from "./session/invocations.js";
+import {LocalUserApiService} from "./local-user-api/service.js";
 import { registerTaskMessageTools, withTaskMessageNotice } from "./messaging/task-messages.js";
 import { registerTaskResumeTool, taskBindingForRequest } from "./tasks/task-resume.js";
 import { textPage, REPLY_BYTES, IMAGE_BYTES, jsonReply, compatibleToolReceipt, type TextPage } from "./bounded-reply.js";
@@ -1173,7 +1174,9 @@ export function createServer(
   workRunReconciler.start();
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
+  let localUserApi: LocalUserApiService | undefined;
   const processSessions = new ProcessSessionManager({ stateDir: config.stateDir,
+    executionEnvironment: () => localUserApi?.terminalEnvironment() ?? Promise.resolve({}),
     environment: () => config.federation?.enabled && config.federation.egress.enabled && config.federation.egress.inheritProxy
       ? proxyEnvironment(config.federation.egress.listenPort, { NO_PROXY: process.env.NO_PROXY ?? process.env.no_proxy }, config.federation.peers.filter((peer) => peer.url).map((peer) => new URL(peer.url).hostname)) : {},
     diagnostics: (event, fields, level) => options.diagnostics
@@ -1212,6 +1215,8 @@ export function createServer(
     (method, path, body) => projectConsole.dispatch(method, path, body), sessionRuntime, processSessions.executionCoordinator,
     (event,fields,level)=>options.diagnostics ? options.diagnostics.record(event,fields,level) : logEvent(config.logging,level??"info",event,fields));
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
+  localUserApi = new LocalUserApiService(config, sessionLedger.db, federation);
+  federation?.setLocalUserApi(localUserApi);
   const bearerAuth = requireBearerAuth({
     verifier: oauthProvider,
     requiredScopes: [config.oauth.scopes[0] ?? "quaymesh"],
@@ -1393,7 +1398,7 @@ export function createServer(
       uptimeSec: Math.floor(process.uptime()), port: config.port, database: "ok" });
   });
 
-  projectConsole = createProjectConsoleRouter(config, { assetDirectory: uiBuildDirectory(), federation, sessionRuntime, processSessions, relayConsoleEnabled: true,
+  projectConsole = createProjectConsoleRouter(config, { assetDirectory: uiBuildDirectory(), federation, sessionRuntime, processSessions, relayConsoleEnabled: true, localUserApi,
     fleetDirectory: fileURLToPath(new URL("./ui/fleet/", import.meta.url)) });
   app.get(/^\/console$/, (req, res) => res.redirect(303, `/console/${req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : ""}`));
   app.use("/console", async (req, res, next) => {
@@ -1478,7 +1483,7 @@ export function createServer(
     workspaceStore,
     localAgentProviders,
     federation,
-    ready: federation?.start() ?? Promise.resolve(),
+    ready: localUserApi.start().then(() => federation?.start()),
     execution: processSessions.executionCoordinator!,
     close: () => {
       closePromise ??= (async () => {
@@ -1491,6 +1496,7 @@ export function createServer(
           });
         }
         await workRunReconciler.close();
+        await localUserApi?.close();
         await federation?.close();
         await toolActivities.waitForIdle();
         await processSessions.shutdown();

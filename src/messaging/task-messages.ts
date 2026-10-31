@@ -108,7 +108,7 @@ export function registerTaskMessageTools(
 
   server.registerTool("task_messages", {
     title: "Read and reply to Task messages",
-    description: "history reads this Task's conversation without acknowledging input; filter=awaiting_reply returns acknowledged user messages with no saved linked reply. After resuming, read that history, receive pending input, ack exact IDs, and reply in the Task card. Other authorized entries may continue replies. Same message_key/input replays one saved reply; different keys permit parallel replies. Acknowledgement or reply does not prove completion. Return mailbox.sequence as finish_task message_sequence.",
+    description: "history reads this Task's conversation without acknowledging input; filter=awaiting_reply returns acknowledged user messages with no saved linked reply. After resuming, read that history, receive pending input, ack exact IDs, and reply in the Task card. Other authorized entries may continue unanswered input. Each acknowledged user message authorizes one saved reply; the same message_key/input replays it. A new reply requires new user input. Acknowledgement or reply does not prove Task completion. Return mailbox.sequence as finish_task message_sequence.",
     // MCP advertises an object input schema; action-specific validation remains strict below.
     inputSchema: z.object({ action: z.enum(["history", "receive", "ack", "reply"]), task_id: id,
       request_key: id.optional(), delivery_id: id.optional(), message_ids: z.array(id).min(1).max(8).optional(),
@@ -135,7 +135,7 @@ export function registerTaskMessageTools(
       return jsonReply({ task_id: input.task_id, messages: result.messages.map(taskMessageView),
         next_before_sequence: result.nextBeforeSequence, mailbox: result.snapshot },
         input.filter === "awaiting_reply"
-          ? "These user messages were acknowledged but have no saved linked reply. History does not acknowledge input or prove requirements fulfilled; other entries may reply concurrently."
+          ? "These user messages were acknowledged but have no saved linked reply. An authorized entry may reply once to each; another entry may have answered since this read. History does not acknowledge input or prove requirements fulfilled."
           : "Task conversation history. Original receipt facts are unchanged; receive pending input separately before acknowledging it.");
     }
     const receiverId = await mailbox.bindReceiver(access, receiverEntry(extra));
@@ -157,7 +157,7 @@ export function registerTaskMessageTools(
     const result = await mailbox.reply(access, { receiverId, messageKey: input.message_key, replyTo: input.reply_to, body: input.body });
     const receipt: TaskMessageReceipt = { task_id: input.task_id, message: taskMessageView(result.message),
       replayed: result.replayed, mailbox: mailbox.inspect(access) };
-    return jsonReply({ ...receipt }, "Reply saved in the Task card.");
+    return jsonReply({ ...receipt }, "Reply saved in the Task card. Its referenced user messages cannot authorize another new reply; an exact message_key/input retry returns this saved reply. This does not mark the Task completed.");
   });
 }
 

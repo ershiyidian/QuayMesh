@@ -17,13 +17,29 @@ const usage=`QuayMesh
   quaymesh status --config ./site/desktop.json
   quaymesh restart --config ./site/desktop.json --component discovery
   quaymesh publish --config ./site/cloud.json --cluster ./site/cluster.json
+  quaymesh local status|tasks|events|peer ... --json   本机受授权 API，不启动节点
+  quaymesh client import <alias> --stdin --json      将已授权凭据存入系统凭据库
   quaymesh core <command>         核心命令与工作区工具
 `;
 export async function main(argv=process.argv.slice(2)) {
+  // Both installed entry forms are supported; do not send --json to the
+  // lifecycle/config parser or reinterpret local status as manager status.
+  if(argv[0]==="--json"&&["local","client"].includes(argv[1]))argv=[argv[1],"--json",...argv.slice(2)];
   const [command="help",...args]=argv;
   if(["help","--help","-h"].includes(command)){console.log(usage);return;}
   if(["version","--version","-v"].includes(command)){
     console.log(JSON.parse(await readFile(join(packageRoot,"package.json"),"utf8")).version);return;
+  }
+  if(command==="local"||command==="client"){
+    try{
+      const {runLocalUserApiCli}=await import(pathToFileURL(join(packageRoot,"dist","local-user-api","cli.js")).href);
+      process.exitCode=await runLocalUserApiCli([command,...args]);
+    }catch{
+      console.error(JSON.stringify({ok:false,error:{code:"LOCAL_API_CLIENT_UNAVAILABLE",effect:"not_started",
+        message:"The installed release could not load its local API client. Install a release with local API support."}}));
+      process.exitCode=1;
+    }
+    return;
   }
   if(command==="core"){
     await access(join(packageRoot,"dist","cli.js"));

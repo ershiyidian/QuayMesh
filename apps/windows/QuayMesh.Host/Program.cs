@@ -44,6 +44,10 @@ internal static class Program
 
         var config = HostConfig.Load();
         if (args.Contains("--supervise")) config.Supervise = true;
+        using var localUserApi = new LocalUserPipeServer();
+        config.Worker.Environment["QUAYMESH_LOCAL_API_ENDPOINT"] = localUserApi.Endpoint;
+        config.Worker.Environment["QUAYMESH_LOCAL_API_INTERNAL_PIPE"] = localUserApi.InternalEndpoint;
+        config.Worker.Environment["QUAYMESH_LOCAL_API_BRIDGE_KEY"] = localUserApi.BridgeKey;
 
         var runtimeInstanceId = Guid.NewGuid().ToString("N");
         var runtimeStartedAt = DateTimeOffset.UtcNow.ToString("O");
@@ -108,6 +112,7 @@ internal static class Program
 
                 // 4. 停止命名管道服务
                 pipe?.Stop();
+                localUserApi.Stop();
                 log.Write("QuayMesh Host 受管服务已全部停止");
             }
             catch (Exception error)
@@ -135,6 +140,14 @@ internal static class Program
             toggleUi: () => ui.Toggle());
 
         pipe.Start();
+        try { localUserApi.Start(); }
+        catch
+        {
+            config.Worker.Environment.Remove("QUAYMESH_LOCAL_API_ENDPOINT");
+            config.Worker.Environment.Remove("QUAYMESH_LOCAL_API_INTERNAL_PIPE");
+            config.Worker.Environment.Remove("QUAYMESH_LOCAL_API_BRIDGE_KEY");
+            log.Write("Local user API pipe is unavailable; existing worker supervision continues.");
+        }
         log.Write(config.Supervise ? "host supervising" : "host observe-only");
 
         if (args.Contains("--install-startup"))

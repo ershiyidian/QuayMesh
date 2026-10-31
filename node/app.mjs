@@ -88,6 +88,9 @@ export class QuayMeshNode {
       if (node.mesh.enabled) await atomicWrite(join(generatedDir,"easytier.toml"), easyTierConfig(node,cluster));
       const plans = componentPlans(node, cluster, env, { root:this.root, generatedDir, configDir:coreConfigDir, release:this.release });
       for (const plan of plans) {
+        // The NativeHost channel belongs to Core, never to mesh, discovery,
+        // egress, or a command inherited from a previous model terminal.
+        for (const key of Object.keys(plan.env)) if (/^QUAYMESH_LOCAL_API_/i.test(key)) delete plan.env[key];
         await access(plan.command, process.platform === "win32" ? constants.F_OK : constants.X_OK);
         const settings = node.components[plan.id === "mesh" ? "easytier" : plan.id === "discovery" ? "tunnel" : plan.id];
         if (settings?.configFile) plan.configuration = await readFile(settings.configFile,"utf8");
@@ -97,6 +100,11 @@ export class QuayMeshNode {
           await access(join(this.root,"dist","cli.js"));
           effective.configuration = compiled.runtime;
           delete effective.env.QUAYMESH_CONFIG_DIR;
+          plan.env.QUAYMESH_LOCAL_API_CONFIG_DIR = dirname(configuration.configFile);
+          effective.env.QUAYMESH_LOCAL_API_CONFIG_DIR = dirname(configuration.configFile);
+          for (const key of ["QUAYMESH_LOCAL_API_ENDPOINT", "QUAYMESH_LOCAL_API_INTERNAL_PIPE", "QUAYMESH_LOCAL_API_BRIDGE_KEY"]) {
+            if (env[key]) {plan.env[key] = env[key]; effective.env[key] = env[key];}
+          }
           plan.ready = () => requestJson(`http://127.0.0.1:${node.corePort}/readyz`, {timeoutMs:2500});
           for (const key of ["QUAYMESH_RUNTIME_CONTROL_PIPE","QUAYMESH_RUNTIME_INSTANCE_ID","QUAYMESH_RUNTIME_STARTED_AT"]) {
             delete plan.env[key]; delete effective.env[key];

@@ -277,7 +277,7 @@ test("待回复历史有界分页且不重入pending，已确认未答消息不�
   assert.throws(() => mailbox.list({ ...scope, taskId: "task-b" }, { filter: "awaiting_reply" }), { code: "TASK_ACCESS_DENIED" });
 });
 
-test("同key跨入口并发只保存一份回复，不同key允许并行回复且关闭后不新增正文", async t => {
+test("同key跨入口并发只保存一份回复，新key不能重用已答回合且关闭后不新增正文", async t => {
   const { scope, mailbox, db } = fixture(t);
   const item = (await mailbox.enqueue(scope, { messageKey: "question", body: "Please review" })).message;
   const delivery = offered(await mailbox.claim(scope, { receiverId: "old", requestKey: "read" }));
@@ -286,16 +286,115 @@ test("同key跨入口并发只保存一份回复，不同key允许并行回复�
   const same = await Promise.all([mailbox.reply(scope, { ...input, receiverId: "old" }), mailbox.reply(scope, { ...input, receiverId: "new" })]);
   assert.equal(same[0].message.id, same[1].message.id);
   assert.equal(same.filter(row => row.replayed).length, 1);
-  const separate = await Promise.all([mailbox.reply(scope, { ...input, receiverId: "old", messageKey: "parallel-a", body: "First perspective" }),
+  const separate = await Promise.allSettled([mailbox.reply(scope, { ...input, receiverId: "old", messageKey: "parallel-a", body: "First perspective" }),
     mailbox.reply(scope, { ...input, receiverId: "new", messageKey: "parallel-b", body: "Second perspective" })]);
-  assert.notEqual(separate[0].message.id, separate[1].message.id);
-  assert.deepEqual(mailbox.inspect(scope), { sequence: 4, pending: 0 });
+  assert.deepEqual(separate.map(result => result.status === "rejected" ? result.reason.code : "saved"),
+    ["TASK_MAILBOX_REPLY_TURN_CLOSED", "TASK_MAILBOX_REPLY_TURN_CLOSED"]);
+  assert.deepEqual(mailbox.inspect(scope), { sequence: 2, pending: 0 });
   await assert.rejects(mailbox.reply(scope, { ...input, receiverId: "new", body: "Different intent" }), { code: "TASK_MAILBOX_IDEMPOTENCY_CONFLICT" });
   await assert.rejects(mailbox.reply(scope, { ...input, receiverId: "invented" }), { code: "TASK_MAILBOX_RECEIVER_MISMATCH" });
   db.prepare("UPDATE qm_tasks SET state='closed' WHERE id=?").run(scope.taskId);
   assert.equal((await mailbox.reply(scope, { ...input, receiverId: "new" })).message.id, same[0].message.id);
   await assert.rejects(mailbox.reply(scope, { ...input, receiverId: "new", messageKey: "after-close" }), { code: "TASK_MAILBOX_TASK_CLOSED" });
-  assert.equal(mailbox.list(scope).messages.length, 4);
+  assert.equal(mailbox.list(scope).messages.length, 2);
+});
+
+test("两个入口以不同key竞争尚未答复的用户消息，事务只允许一个新回复", async t => {
+  const { scope, mailbox, db } = fixture(t);
+  const user = (await mailbox.enqueue(scope, { messageKey: "question", body: "Please inspect" })).message;
+  const delivery = offered(await mailbox.claim(scope, { receiverId: "old", requestKey: "read" }));
+  await mailbox.acknowledge(scope, { receiverId: "old", deliveryId: delivery.deliveryId, messageIds: [user.id] });
+  const restored = new TaskMailboxStore(db, { ownerSource: "legacy-session" });
+  const results = await Promise.allSettled([
+    mailbox.reply(scope, { receiverId: "old", messageKey: "answer-a", replyTo: [user.id], body: "First response" }),
+    restored.reply(scope, { receiverId: "new", messageKey: "answer-b", replyTo: [user.id], body: "Second response" }),
+  ]);
+  assert.equal(results.filter(result => result.status === "fulfilled").length, 1);
+  const rejected = results.find(result => result.status === "rejected") as PromiseRejectedResult;
+  assert.equal(rejected.reason.code, "TASK_MAILBOX_REPLY_TURN_CLOSED");
+  assert.equal(rejected.reason.effect, "not_started");
+  assert.deepEqual(mailbox.inspect(scope), { sequence: 2, pending: 0 });
+  assert.deepEqual(mailbox.list(scope).messages.map(row => row.role), ["user", "assistant"]);
+  assert.equal(mailbox.list(scope, { filter: "awaiting_reply" }).messages.length, 0);
+});
+
+test("长任务首次回复不过期，古老已答消息不能主动开新回合，新用户输入可以", async t => {
+  const { scope, mailbox, advance } = fixture(t);
+  const user = (await mailbox.enqueue(scope, { messageKey: "long-request", body: "Report when the long job finishes" })).message;
+  const delivery = offered(await mailbox.claim(scope, { receiverId: "old", requestKey: "read" }));
+  await mailbox.acknowledge(scope, { receiverId: "old", deliveryId: delivery.deliveryId, messageIds: [user.id] });
+  advance(90 * 24 * 60 * 60_000);
+  const input = { receiverId: "new", messageKey: "answer", replyTo: [user.id], body: "The requested result" };
+  const reply = await mailbox.reply(scope, input);
+  assert.equal(reply.replayed, false, "unanswered user input remains replyable for long-running work");
+  advance(90 * 24 * 60 * 60_000);
+  await assert.rejects(mailbox.reply(scope, { ...input, messageKey: "unsolicited-followup" }),
+    { code: "TASK_MAILBOX_REPLY_TURN_CLOSED", effect: "not_started" });
+  assert.equal((await mailbox.reply(scope, input)).message.id, reply.message.id);
+  const next = (await mailbox.enqueue(scope, { messageKey: "followup", body: "Please check one more thing" })).message;
+  const nextDelivery = offered(await mailbox.claim(scope, { receiverId: "new", requestKey: "read-followup" }));
+  await mailbox.acknowledge(scope, { receiverId: "new", deliveryId: nextDelivery.deliveryId, messageIds: [next.id] });
+  const nextReply = await mailbox.reply(scope, { ...input, messageKey: "new-answer", replyTo: [next.id], body: "The new requested result" });
+  assert.notEqual(nextReply.message.id, reply.message.id);
+  assert.deepEqual(mailbox.inspect(scope), { sequence: 4, pending: 0 });
+});
+
+test("混合已答与未答目标整体拒绝，未答回合不被消耗且精确重试的目标保持不可变", async t => {
+  const { scope, mailbox, db } = fixture(t);
+  const users: TaskMailboxMessage[] = [];
+  for (const key of ["one", "two", "three"]) users.push((await mailbox.enqueue(scope, { messageKey: key, body: key })).message);
+  const delivery = offered(await mailbox.claim(scope, { receiverId: "receiver", requestKey: "read" }));
+  await mailbox.acknowledge(scope, { receiverId: "receiver", deliveryId: delivery.deliveryId, messageIds: users.map(row => row.id) });
+  await mailbox.reply(scope, { receiverId: "receiver", messageKey: "first", replyTo: [users[0].id], body: "First response" });
+  const rows = () => db.prepare("SELECT * FROM qm_task_messages WHERE task_id=? ORDER BY sequence").all(scope.taskId);
+  const before = rows();
+  const input = { receiverId: "new", messageKey: "combined", replyTo: [users[0].id, users[1].id], body: "Combined response" };
+  await assert.rejects(mailbox.reply(scope, input), { code: "TASK_MAILBOX_REPLY_TURN_CLOSED" });
+  assert.deepEqual(rows(), before);
+  assert.deepEqual(mailbox.list(scope, { filter: "awaiting_reply" }).messages.map(row => row.id), [users[1].id, users[2].id]);
+  const valid = { ...input, replyTo: [users[1].id, users[2].id] };
+  const saved = await mailbox.reply(scope, valid);
+  assert.equal((await mailbox.reply(scope, { ...valid, replyTo: [...valid.replyTo].reverse() })).message.id, saved.message.id);
+  await assert.rejects(mailbox.reply(scope, { ...valid, replyTo: [users[2].id] }), { code: "TASK_MAILBOX_IDEMPOTENCY_CONFLICT" });
+  assert.equal(mailbox.list(scope, { filter: "awaiting_reply" }).messages.length, 0);
+  assert.deepEqual(mailbox.inspect(scope), { sequence: 5, pending: 0 });
+});
+
+test("历史多回复原样保留且各自精确重放，不再允许新key扩展旧用户回合", async t => {
+  const { scope, mailbox, db } = fixture(t);
+  const user = (await mailbox.enqueue(scope, { messageKey: "question", body: "Historic request" })).message;
+  const delivery = offered(await mailbox.claim(scope, { receiverId: "old", requestKey: "read" }));
+  await mailbox.acknowledge(scope, { receiverId: "old", deliveryId: delivery.deliveryId, messageIds: [user.id] });
+  const input = { receiverId: "old", messageKey: "original", replyTo: [user.id], body: "First saved response" };
+  const original = (await mailbox.reply(scope, input)).message;
+  db.prepare(`INSERT INTO qm_task_messages
+    (id,task_id,sequence,message_key,body,role,reply_to_json,sender_receiver_id,created_at)
+    SELECT 'legacy-answer',task_id,3,'legacy-key','Historic additional response',role,reply_to_json,'new',created_at
+    FROM qm_task_messages WHERE id=?`).run(original.id);
+  const before = db.prepare("SELECT * FROM qm_task_messages ORDER BY sequence").all();
+  assert.equal((await mailbox.reply(scope, input)).message.id, original.id);
+  assert.equal((await mailbox.reply(scope, { ...input, receiverId: "new", messageKey: "legacy-key", body: "Historic additional response" })).message.id, "legacy-answer");
+  await assert.rejects(mailbox.reply(scope, { ...input, messageKey: "new-third" }), { code: "TASK_MAILBOX_REPLY_TURN_CLOSED" });
+  assert.deepEqual(db.prepare("SELECT * FROM qm_task_messages ORDER BY sequence").all(), before);
+});
+
+test("回复仍检查收尾门禁和当前接收者权限，已撤销入口不能重放保存回复", async t => {
+  const { scope, mailbox, db } = fixture(t);
+  const user = (await mailbox.enqueue(scope, { messageKey: "question", body: "Please check" })).message;
+  const delivery = offered(await mailbox.claim(scope, { receiverId: "old", requestKey: "read" }));
+  await mailbox.acknowledge(scope, { receiverId: "old", deliveryId: delivery.deliveryId, messageIds: [user.id] });
+  const input = { receiverId: "old", messageKey: "answer", replyTo: [user.id], body: "Requested response" };
+  db.prepare("INSERT INTO qm_task_finalizations(task_id) VALUES(?)").run(scope.taskId);
+  await assert.rejects(mailbox.reply(scope, input), { code: "TASK_MAILBOX_TASK_FINISHING" });
+  assert.deepEqual(mailbox.inspect(scope), { sequence: 1, pending: 0 });
+  db.prepare("UPDATE qm_task_finalizations SET error='archive failed' WHERE task_id=?").run(scope.taskId);
+  const saved = await mailbox.reply(scope, input);
+  db.prepare("UPDATE qm_task_message_receivers SET revoked_at='2026-10-31T00:00:00Z' WHERE id='old'").run();
+  await assert.rejects(mailbox.reply(scope, input), { code: "TASK_MAILBOX_RECEIVER_MISMATCH" });
+  await assert.rejects(mailbox.reply({ ...scope, principal: taskPrincipalFromAuthInfo({ extra: { owner_id: "owner-b" } }) }, input),
+    { code: "TASK_ACCESS_DENIED" });
+  assert.equal((await mailbox.reply(scope, { ...input, receiverId: "new" })).message.id, saved.message.id);
+  assert.deepEqual(mailbox.inspect(scope), { sequence: 2, pending: 0 });
 });
 
 test("其他Task消息不能成为回复目标，列表按完整消息的两份输出预算分页", async t => {

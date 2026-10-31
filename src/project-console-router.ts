@@ -18,6 +18,8 @@ import { getLocalConsoleOverview } from "./console-overview.js";
 import { mountConsoleWorkbench, workbenchSession } from "./console-workbench/router.js";
 import type { ProcessSessionManager } from "./process-sessions.js";
 import type { SessionRuntime } from "./session/runtime.js";
+import type {LocalUserApiService} from "./local-user-api/service.js";
+import {mountLocalClientOwnerRoutes} from "./local-user-api/owner-router.js";
 
 interface SessionRow { token_hash: string; csrf: string; expires_at: number; created_at: string; last_used_at: string }
 const hash = (value: string) => createHash("sha256").update(value).digest();
@@ -37,6 +39,7 @@ export function createProjectConsoleRouter(config: ServerConfig, options: {
   assetDirectory: string; providerFactory?: () => ThreadControl; clock?: () => number;
   agentClient?: Pick<LocalAgentClient, "get" | "control">;
   sessionRuntime?: SessionRuntime; processSessions?: ProcessSessionManager; relayConsoleEnabled?: boolean;
+  localUserApi?: LocalUserApiService;
 }) {
   const router = express.Router();
   const operations = new ConsoleOperations(router);
@@ -167,6 +170,7 @@ export function createProjectConsoleRouter(config: ServerConfig, options: {
   });
 
   mountFleetApi(router, options.federation);
+  if (options.localUserApi) mountLocalClientOwnerRoutes(router, options.localUserApi);
 
   const withLedger = (fn: (req: Request, ledger: WorkLedger) => unknown | Promise<unknown>) => async (req: Request, res: Response) => {
     const ledger = new WorkLedger(config.stateDir);
