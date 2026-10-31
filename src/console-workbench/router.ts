@@ -17,7 +17,7 @@ import type { TaskLifecycle } from "../console-task-state.js";
 import { activeExecution, relevantExecution, observeSourceStates } from "../console-task-state.js";
 import type { SessionRuntime } from "../session/runtime.js";
 import { mapConcurrent } from "../concurrency.js";
-import { WorkbenchFeed } from "./feed.js";
+import { WorkbenchFeed, mergeSources } from "./feed.js";
 import { aggregateTasks, parseTaskReference, parseSessionReference } from "./task-aggregation.js";
 import { LocalActions } from "./actions.js";
 import { readLocalActivity, permitted } from "./local.js";
@@ -128,23 +128,44 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
     }
     return { task, owner };
   };
-  const taskMessagesFor = async (taskId: string): Promise<TaskMessageConfirmation> => {
+  type MessageObservation={confirmation:TaskMessageConfirmation;sources:SourceState[]};
+  const taskMessagesFor = async (taskId: string,fresh=false): Promise<MessageObservation> => {
     let authority: string | null = null;
+    let source: SourceState | undefined;
     try {
       authority = taskAuthority();
-      const state = taskMessageConfirmationSchema.parse(await call(authority,`/workbench/tasks/${encodeURIComponent(taskId)}/messages-state`));
+      const path=`/workbench/tasks/${encodeURIComponent(taskId)}/messages-state`;
+      const resource=await feed.readNode<unknown>(authority,path,()=>call(authority!,path),{fresh});
+      source=resource.source;
+      if(!resource.data||source.state!=='ready'||source.error)return {
+        confirmation:{available:false,taskId,ownerNodeId:authority,
+          error:source.error??'任务消息状态正在读取，尚不能确认是否有待处理消息'},sources:[source],
+      };
+      const state = taskMessageConfirmationSchema.parse(resource.data);
       if (state.taskId !== taskId || state.ownerNodeId !== authority) throw new Error('任务消息状态与权威身份不一致');
-      return state;
+      return {confirmation:state,sources:[source]};
     } catch (error) {
-      return { available: false, taskId, ownerNodeId: authority, error: error instanceof Error ? error.message : String(error) };
+      const message=error instanceof Error?error.message:String(error);
+      return {confirmation:{available:false,taskId,ownerNodeId:authority,error:message},
+        sources:source?[{...source,state:'error',stale:true,error:message}]:[]};
     }
   };
-  const withTaskMessages = async (detail: RunDetail): Promise<RunDetail> => detail.run.taskId
-    ? { ...detail, taskMessages: await taskMessagesFor(detail.run.taskId) } : detail;
+  const withTaskMessages = async (detail:RunDetail,fresh=false,pending?:Promise<MessageObservation>):Promise<RunDetail> => {
+    if(!detail.run.taskId)return detail;
+    const {confirmation,sources}=await (pending??taskMessagesFor(detail.run.taskId,fresh));
+    return {...detail,taskMessages:confirmation,complete:detail.complete&&confirmation.available,
+      sources:mergeSources(detail.sources,sources),
+      run:{...detail.run,actions:{...detail.run.actions,complete:confirmation.available&&detail.run.actions.complete===true}}};
+  };
   const routeRun = (req: Request) => decode(text(req.params.id));
   const rawRunDetail = async (reference: string) => {
     const target = decode(reference);
     return call<Awaited<ReturnType<typeof readRunDetail>>>(target.node, `/workbench/runs/${encodeURIComponent(target.local)}`);
+  };
+  const readPhaseDetail = async (reference:string,fresh:boolean,deadline:number) => {
+    const target=decode(reference),path=`/workbench/runs/${encodeURIComponent(target.local)}`;
+    const resource=await feed.readNode<RunDetail>(target.node,path,()=>rawRunDetail(reference),{fresh,deadline});
+    return {phase:reference,detail:resource.data,source:resource.source};
   };
   type TaskPhases={task:Run;phases:Run[];complete:boolean;sources:SourceState[];lifecycle?:TaskLifecycle;missingNodes:string[]};
   const taskPhases=async(reference:string,fresh=false):Promise<TaskPhases>=>{
@@ -167,24 +188,51 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
     return {task:detail.run,phases:[detail.run],complete:true,sources:[],missingNodes:[]};
   };
   const aggregateRunDetail=async(reference:string,fresh=false)=>{
-    if(!parseTaskReference(reference)&&!parseSessionReference(reference))return withTaskMessages(await rawRunDetail(reference));
+    if(!parseTaskReference(reference)&&!parseSessionReference(reference)){
+      const observed=await readPhaseDetail(reference,fresh,Date.now()+1200);
+      if(!observed.detail){
+        const summary=await feed.phaseSummary(reference,fresh);
+        if(!summary.run)throw new WorkbenchError(observed.source.error??'执行详情正在读取，请稍后重试',503,
+          observed.source.error?'detail_unavailable':'detail_pending','none');
+        return withTaskMessages(mergeTaskDetails(summary.run,[],{complete:false,
+          sources:mergeSources(summary.sources,[observed.source]),missing:[{id:reference,nodeId:observed.source.nodeId,
+            error:observed.source.error??'阶段详情正在读取',pending:observed.source.online&&!observed.source.error}]}),fresh);
+      }
+      const detail=observed.detail,complete=detail.complete&&observed.source.online&&!observed.source.error;
+      const confirmed=complete&&observed.source.state==='ready'&&!observed.source.stale;
+      return withTaskMessages({...detail,complete,sources:mergeSources(detail.sources,[observed.source]),
+        run:{...detail.run,actions:{...detail.run.actions,review:confirmed&&detail.run.actions.review,
+          complete:confirmed&&detail.run.actions.complete===true,revert:confirmed&&detail.run.actions.revert,
+          patch:confirmed&&detail.run.actions.patch!==false}}},fresh);
+    }
+    const taskId=parseTaskReference(reference);
+    const messages=taskId?taskMessagesFor(taskId,fresh):undefined;
     const related=await taskPhases(reference,fresh);
-    const observed=await mapConcurrent(related.task.phaseRefs??related.phases.map(phase=>phase.id),4,async phase=>{
-      try{return {phase,detail:await rawRunDetail(phase)};}
-      catch(error){return {phase,error:error instanceof Error?error.message:String(error)};}
-    });
-    const details=observed.filter((value):value is RoutedTaskDetail=>'detail' in value&&value.detail!==undefined);
-    const missing=observed.filter(value=>'error' in value).map(value=>({id:value.phase,nodeId:decode(value.phase).node,error:value.error!}));
+    const byNode=new Map<string,string[]>();
+    for(const phase of related.task.phaseRefs??related.phases.map(value=>value.id)){
+      const node=decode(phase).node,phases=byNode.get(node)??[];
+      phases.push(phase);byNode.set(node,phases);
+    }
+    // Share one screen deadline across all phases, with independent node lanes.
+    // A sleeping node must not hold a healthy node behind another RPC window.
+    const deadline=Date.now()+1200;
+    const observed=(await mapConcurrent([...byNode],8,([node,phases])=>{
+      const priority=(phase:string)=>feed.nodeReadPriority(node,`/workbench/runs/${encodeURIComponent(decode(phase).local)}`);
+      // Start previously unread phases before refreshing a successful prefix.
+      // The shared node budget still caps actual in-flight detail reads.
+      phases.sort((left,right)=>priority(left)-priority(right));
+      return mapConcurrent(phases,4,phase=>readPhaseDetail(phase,fresh,deadline));
+    })).flat();
+    const details:RoutedTaskDetail[]=observed.flatMap(value=>value.detail?[{phase:value.phase,detail:value.detail}]:[]);
+    const missing=observed.filter(value=>!value.detail||value.source.error||!value.source.online).map(value=>({
+      id:value.phase,nodeId:value.source.nodeId,error:value.source.error??'阶段详情正在读取',
+      pending:value.source.online&&!value.source.error,
+    }));
     const byPhase=new Map(details.map(value=>[value.phase,value.detail.run]));
-    const sources=related.sources.map(source=>{
-      const failure=missing.find(value=>value.nodeId===source.nodeId);
-      return failure?{...source,state:'error' as const,stale:true,error:failure.error}:source;
-    });
-    const evidence=sources.map(source=>details.some(value=>value.detail.run.nodeId===source.nodeId)&&!missing.some(value=>value.nodeId===source.nodeId)
-      ?{...source,online:true,state:'ready' as const,observedAt:Date.now(),stale:false,error:null}:source);
-    const phases=observeSourceStates(related.phases.map(phase=>byPhase.get(phase.id)??phase),evidence);
+    const sources=mergeSources(related.sources,observed.map(value=>value.source));
+    const phases=observeSourceStates(related.phases.map(phase=>byPhase.get(phase.id)??phase),sources);
     const task=feed.taskFromPhases(phases,related.lifecycle)??related.task;
-    return withTaskMessages(mergeTaskDetails(task,details,{complete:related.complete&&missing.length===0,sources,missing}));
+    return withTaskMessages(mergeTaskDetails(task,details,{complete:related.complete&&missing.length===0,sources,missing}),fresh,messages);
   };
   const search = (req: Request): Query => querySchema.parse(req.query);
   const queryString = (req: Request) => new URLSearchParams(Object.entries(search(req)).filter((pair): pair is [string, string] => pair[1] !== undefined)).toString();
@@ -681,7 +729,8 @@ function decodeTaskPart(value: string): { run: string; id: string } | null {
   }
 }
 
-function mergeTaskDetails(task: Run, phases: RoutedTaskDetail[], observation:{complete:boolean;sources:SourceState[];missing:Array<{id:string;nodeId:string;error:string}>}): RunDetail {
+function mergeTaskDetails(task: Run, phases: RoutedTaskDetail[], observation:{complete:boolean;sources:SourceState[];missing:Array<{id:string;nodeId:string;error:string;pending?:boolean}>}): RunDetail {
+  const confirmed=observation.complete&&observation.sources.every(source=>source.online&&source.state==='ready'&&!source.stale&&!source.error);
   const currentRefs = new Set(task.currentPhaseRefs ?? task.phaseRefs ?? phases.map((item) => item.phase));
   const current = phases.filter((item) => currentRefs.has(item.phase));
   const singleCurrentPhase = current.length === 1;
@@ -703,7 +752,11 @@ function mergeTaskDetails(task: Run, phases: RoutedTaskDetail[], observation:{co
   const timeline = phases.flatMap(({ detail }) => detail.timeline).sort((a, b) => a.time - b.time);
   const instructions = uniqueBy(phases.flatMap(({ detail }) => detail.instructions), (item) => item.path);
   const skills = uniqueBy(phases.flatMap(({ detail }) => detail.skills), (item) => `${item.name}:${item.path}`);
-  const warnings = [...new Set([...task.warnings, ...phases.flatMap(({ detail }) => detail.warnings),...observation.missing.map(value=>`${value.nodeId} 阶段读取失败：${value.error}`)])];
+  const pendingOnly=observation.sources.some(source=>source.state==='loading'||source.state==='refreshing')
+    &&!observation.sources.some(source=>source.error||!source.online);
+  const warnings = [...new Set([...task.warnings.filter(value=>!pendingOnly||value!=='部分节点详情暂未取得'),
+    ...phases.flatMap(({ detail }) => detail.warnings),
+    ...observation.missing.filter(value=>!value.pending).map(value=>`${value.nodeId} 阶段读取失败：${value.error}`)])];
   const saved=current.map(({detail})=>detail.summary.trim()).filter(Boolean);
   const summary=saved.length===1?saved[0]:saved.length?saved.join('\n\n'):task.reason??'任务已创建，尚未登记执行阶段';
   return {
@@ -712,10 +765,10 @@ function mergeTaskDetails(task: Run, phases: RoutedTaskDetail[], observation:{co
       actions: {
         interrupt: task.actions.interrupt,
         resume: task.actions.resume,
-        review: !captureBlocked && task.actions.review,
-        complete: !captureBlocked && task.actions.complete,
-        revert: !captureBlocked && singleCurrentPhase && task.actions.revert,
-        patch: !captureBlocked && singleCurrentPhase && task.actions.patch !== false,
+        review: confirmed && !captureBlocked && task.actions.review,
+        complete: confirmed && !captureBlocked && task.actions.complete,
+        revert: confirmed && !captureBlocked && singleCurrentPhase && task.actions.revert,
+        patch: confirmed && !captureBlocked && singleCurrentPhase && task.actions.patch !== false,
       },
     },
     summary,

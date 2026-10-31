@@ -59,10 +59,28 @@ export class WorkbenchFeed {
     return reply.body as T;
   }
 
-  private async load<T>(node: NodeIdentity, path: string, local: () => T|Promise<T>, ttl: number, fresh=false, waitForFresh=false): Promise<NodeResource<T>> {
+  /** Owner Console reads share the existing cache, pending RPC and retry backoff. */
+  readNode<T>(nodeId:string,path:string,local:()=>T|Promise<T>,options:{fresh?:boolean;deadline?:number}={}) {
+    const node=this.nodes().find(value=>value.id===nodeId)
+      ?? {id:nodeId,nickname:nodeId,online:nodeId===this.localId};
+    return this.load(node,path,local,1000,options.fresh,false,options.deadline);
+  }
+
+  nodeReadPriority(nodeId:string,path:string):number {
+    const key=nodeId+':'+path;
+    return this.cache.get(key)?.data!=null ? 2 : this.pending.has(key) ? 1 : 0;
+  }
+
+  private async load<T>(node: NodeIdentity, path: string, local: () => T|Promise<T>, ttl: number, fresh=false, waitForFresh=false, deadline=Infinity): Promise<NodeResource<T>> {
     const key = node.id + ":" + path;
     const cached = this.cache.get(key);
-    if (fresh && cached) { cached.wait = true; cached.retryAt = 0; }
+    const existing = this.pending.get(key);
+    const capacity=!path.startsWith('/workbench/runs/')
+      || [...this.pending.keys()].filter(value=>value.startsWith(node.id+':')).length<4;
+    const canStart=Date.now()<deadline&&capacity;
+    // An unscheduled explicit refresh must not invalidate a successful cached
+    // read forever. A write invalidation's existing wait flag is retained.
+    if (fresh && cached && (existing||canStart)) { cached.wait = true; cached.retryAt = 0; }
     const effectiveTtl = Math.max(ttl, 12_000);
     const recent = Boolean(cached?.loadedAt && Date.now()-cached.loadedAt <= SOURCE_FRESHNESS_MS);
     const previous = (state: SourceReadState, error: string | null): NodeResource<T> => ({ data: cached?.data as T ?? null,
@@ -75,26 +93,31 @@ export class WorkbenchFeed {
     // merely opening a page or by a slow refresh.
     const bounded = async (job: Promise<NodeResource<T>>): Promise<NodeResource<T>> => {
       if (waitForFresh) return job;
+      const wait=Math.min(1200,Math.max(0,deadline-Date.now()));
+      if(!wait)return pendingState();
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         return await Promise.race([job, new Promise<NodeResource<T>>(resolve => {
-          timer = setTimeout(() => resolve(pendingState()), 1200);
+          timer = setTimeout(() => resolve(pendingState()), wait);
         })]);
       } finally { if (timer) clearTimeout(timer); }
     };
     if (!node.online) return previous("offline", "节点离线");
     if (cached?.error && !cached.wait && Date.now() < cached.retryAt) return previous("error", cached.error);
-    if (cached && !cached.wait && !cached.error && Date.now() - cached.loadedAt < effectiveTtl) return previous("ready", null);
-    const existing = this.pending.get(key);
+    if (cached && !fresh && !cached.wait && !cached.error && Date.now() - cached.loadedAt < effectiveTtl) return previous("ready", null);
     if (existing) {
       if (existing.generation !== this.generation) {
         // A pre-write observation must finish before the replacement starts,
         // but it cannot hold a whole screen open or overwrite the new generation.
-        return bounded(existing.promise.then(() => this.load(node,path,local,ttl,fresh,waitForFresh)));
+        return bounded(existing.promise.then(() => this.load(node,path,local,ttl,fresh,waitForFresh,deadline)));
       }
       return cached?.data != null && !cached.wait && !fresh
         ? pendingState() : bounded(existing.promise as Promise<NodeResource<T>>);
     }
+    // A detail can contain many historical phases. Once its shared screen
+    // budget is exhausted, leave the remaining reads for the next poll instead
+    // of starting another wave of RPCs after the response is already partial.
+    if(!canStart)return pendingState();
     const generation = this.generation;
     const job: Promise<NodeResource<T>> = Promise.resolve().then(async () => {
       try {
@@ -360,6 +383,11 @@ export class WorkbenchFeed {
       sources: results.map((result) => result.source),
       complete: results.every((result) => result.complete),
     };
+  }
+
+  async phaseSummary(reference:string,fresh=false) {
+    const group=await this.runSummaries([reference],fresh);
+    return {run:group.values.find(value=>value.id===reference),sources:group.sources};
   }
 
   async sessionRuns(sessionId:string,fresh=false) {

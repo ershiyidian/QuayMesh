@@ -232,6 +232,42 @@ test('详情首次失败保留任务上下文，重试和后续失败不清空�
   expect(await retained!.evaluate(element=>element.isConnected)).toBe(true);
 });
 
+test('详情部分读取不把未知显示为零，消息确认后自动收敛',async({page})=>{
+  await page.clock.install();
+  await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
+  const reference='qmtask:'+f.waiting.task_id,ready=await f.get('runs/'+encodeURIComponent(reference)+'?fresh=1');
+  expect(ready.complete).toBe(true);expect(ready.taskMessages.available).toBe(true);
+  expect(ready.files).toHaveLength(0);expect(ready.commands).toHaveLength(0);expect(ready.agents).toHaveLength(0);
+  const partial={...ready,complete:false,run:{...ready.run,actions:{...ready.run.actions,complete:false}},
+    taskMessages:{available:false,taskId:ready.run.taskId,ownerNodeId:ready.taskMessages.ownerNodeId,error:'任务消息状态仍待确认'},
+    sources:[{nodeId:ready.run.nodeId,name:'任务详情来源',online:true,observedAt:null,state:'loading',stale:false,error:null}]};
+  let resolved=false,reads=0;
+  await page.route(url=>url.pathname.endsWith('/api/v4/runs/'+encodeURIComponent(reference)),route=>{
+    reads++;return route.fulfill({json:resolved?ready:partial});
+  });
+  await login(page);
+  await page.goto(f.server.baseUrl+'/console/#/tasks?days=0&scope=all&run='+encodeURIComponent(reference)+'&tab=diff');
+  await expect(page.locator('#inspector .session-heading h2')).toHaveText(ready.run.title);
+  await expect(page.locator('#inspector .resource-update.pending')).toContainText('部分数据仍在读取');
+  await expect(page.locator('#inspector [data-action=detail-tab] .count')).toHaveCount(0);
+  await expect(page.locator('#inspector [data-action=finish-task]')).toHaveCount(0);
+  for(const [tab,unconfirmed] of [['diff','文件改动'],['commands','命令记录'],['agents','代理记录']]){
+    await page.locator('#inspector [data-action=detail-tab][data-value='+tab+']').click();
+    await expect(page.locator('#inspector .empty h3')).toHaveText('任务详情尚未完整确认');
+    await expect(page.locator('#inspector .empty p')).toContainText('暂未显示'+unconfirmed);
+    await expect(page.locator('#inspector .empty')).toContainText('部分记录或消息状态仍待确认');
+    await expect(page.locator('#inspector .empty')).not.toContainText('失败');
+  }
+  const pendingReads=reads;resolved=true;
+  await page.clock.fastForward(6_000);
+  await expect(page.locator('#inspector [data-action=detail-tab][data-value=agents] .count')).toHaveText('0');
+  await expect(page.locator('#inspector .empty h3')).toHaveText('暂无代理');
+  await expect(page.locator('#inspector .resource-update.pending')).toHaveCount(0);
+  await expect(page.locator('#inspector [data-action=finish-task]')).toBeVisible();
+  expect(reads).toBeGreaterThan(pendingReads);
+  const completedReads=reads;await page.clock.fastForward(46_000);expect(reads).toBe(completedReads);
+});
+
 test('总览首次失败继续显示独立节点与已读任务，恢复后再显示完整统计',async({page})=>{
   await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
   let failed=true,overviewReads=0;
