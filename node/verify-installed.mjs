@@ -6,6 +6,8 @@ import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { createHash } from "node:crypto";
+import { platformName } from "./compile.mjs";
+import { verifyComponentBinaries } from "./component-binaries.mjs";
 
 if (typeof globalThis.gc !== "function") {
   const child=spawnSync(process.execPath,["--expose-gc",process.argv[1]],{stdio:"inherit",env:process.env});
@@ -17,6 +19,7 @@ if (typeof globalThis.gc !== "function") {
 // 从发行包自己的 package.json 解析依赖，验证解压后的依赖入口真实可用。
 const here = dirname(fileURLToPath(import.meta.url));
 const bundle = resolve(here, "..");
+const componentVersions = await verifyComponentBinaries(join(bundle, "components", platformName()));
 const require = createRequire(join(bundle, "package.json"));
 const packageJson=JSON.parse(await readFile(join(bundle,"package.json"),"utf8"));
 const lock=JSON.parse(await readFile(join(bundle,"components.lock.json"),"utf8"));
@@ -99,6 +102,7 @@ try {
       databaseVersion: version,
       dependenciesResolved: true,
       nativeDependencies:{"better-sqlite3":nativeVersion},
+      componentVersions,
       nodeVersion:process.versions.node,nodeModuleAbi:process.versions.modules,nativeGcCycles:500,
       runtime:{nodeSha256,packageLockSha256},sqliteNativeSha256,
       result: "PASS",

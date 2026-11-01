@@ -47,6 +47,8 @@ pnpm build:components --easytier /path/easytier-core --tunnel /path/tunnel-clien
 pnpm build:bundle
 ```
 
+EasyTier imports also copy its CLI and known Windows DLL and driver companions when they are present beside the selected executable. Component preparation and final bundle verification run `--version` from the packaged component directory; a missing runtime dependency fails verification before installation.
+
 The output directory is `releases/quaymesh-<version>-<commit>-<platform>/`. It contains `release.json`, the runtime, application files, production dependencies, and component sources.
 
 ### Linux SQLite compatibility builds

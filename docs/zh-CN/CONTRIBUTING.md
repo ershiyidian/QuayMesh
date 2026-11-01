@@ -47,6 +47,8 @@ pnpm build:components --easytier /path/easytier-core --tunnel /path/tunnel-clien
 pnpm build:bundle
 ```
 
+导入 EasyTier 时，同时复制所选可执行文件旁已有的 CLI、已知 Windows DLL 和配套驱动。组件准备和最终验包都会从包内组件目录实际执行 `--version`；缺少启动依赖时，验证会在安装前失败。
+
 输出目录为 `releases/quaymesh-<version>-<commit>-<platform>/`，包含 `release.json`、运行时、程序文件、运行依赖和组件源码。
 
 ### Linux SQLite 兼容构建

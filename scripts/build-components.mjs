@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { resolve,join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { platformName } from "../node/compile.mjs";
+import { copyEasyTierCompanions, verifyComponentBinaries } from "../node/component-binaries.mjs";
 
 const root=fileURLToPath(new URL("..",import.meta.url));
 const {values}=parseArgs({options:{
@@ -25,6 +26,7 @@ const imports=[["easytier","easytier-core"],["easytier-cli","easytier-cli"],["tu
 for(const [key,name] of imports)if(values[key]){
   await cp(resolve(values[key]),join(target,exe(name)));
   if(process.platform!=="win32")await chmod(join(target,exe(name)),0o755);
+  if(key==="easytier")await copyEasyTierCompanions(resolve(values[key]),target);
 }
 if(values.source){
   const build=join(root,".build","components");
@@ -38,10 +40,10 @@ if(values.source){
   for(const name of ["easytier-core","easytier-cli"]){
     await cp(join(build,metadata.easytier.directory,"target","release",exe(name)),join(target,exe(name)));
   }
+  await copyEasyTierCompanions(join(build,metadata.easytier.directory,"target","release",exe("easytier-core")),target);
   await run("go",["build","-trimpath","-o",join(target,exe("tunnel-client")),"./cmd/client"],
     join(build,metadata.tunnel.directory),{...process.env,GOTOOLCHAIN:"auto"});
 }
 if(!values.source&&!values.easytier&&!values.tunnel&&!values.egress)throw new Error("请指定 --source 或组件的本机可执行文件路径");
-await run(join(target,exe("easytier-core")),["--version"]);
-await run(join(target,exe("tunnel-client")),["--version"]);
+console.log(JSON.stringify(await verifyComponentBinaries(target)));
 console.log(`组件目录：${target}`);
