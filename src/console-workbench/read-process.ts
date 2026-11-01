@@ -64,7 +64,9 @@ export class ConsoleReadProcessPool {
   private sequence = 0;
   constructor(private readonly worker = new URL('./read-worker.js', import.meta.url),
     private readonly timeoutMs = CONSOLE_READ_TIMEOUT_MS,
-    private readonly report:(event:ConsoleReadDiagnostic)=>void = event=>console.info(JSON.stringify(event))) {}
+    private readonly report:(event:ConsoleReadDiagnostic)=>void = event=>console.info(JSON.stringify({
+      ts:new Date().toISOString(),pid:process.pid,...event,
+    }))) {}
 
   read<T>(request: unknown, signal?: AbortSignal): Promise<T> {
     if (this.closed || signal?.aborted) return Promise.reject(new ConsoleReadError('console_read_aborted'));

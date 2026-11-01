@@ -2,6 +2,7 @@ import { join } from "node:path";
 import type Database from "better-sqlite3";
 import { openDatabase } from "../db/client.js";
 import { runSqliteWrite } from "../db/async-write.js";
+import type { SqliteWriteReporter } from "../db/write-diagnostics.js";
 import { logEvent } from "../logger.js";
 import { diagnosticError, type ServerDiagnostics } from "../server-diagnostics.js";
 import type { ServerConfig } from "../config.js";
@@ -75,8 +76,8 @@ export function sessionDatabasePath(stateDir: string): string {
   return join(stateDir, "quaymesh.sqlite");
 }
 
-export function openSessionDatabase(stateDir: string): SessionStore {
-  return new SessionStore(openDatabase(stateDir).sqlite, true);
+export function openSessionDatabase(stateDir: string, writeDiagnostics?: SqliteWriteReporter): SessionStore {
+  return new SessionStore(openDatabase(stateDir).sqlite, true, writeDiagnostics);
 }
 
 export function openSessionStore(stateDir: string): { store: SessionStore; database: SessionDatabase } {
@@ -85,8 +86,9 @@ export function openSessionStore(stateDir: string): { store: SessionStore; datab
 }
 
 export function createSessionRuntime(options: SessionRuntimeOptions): SessionRuntime {
-  const { config, workspaces, ledger, agents } = options;
-  const store = openSessionDatabase(config.stateDir);
+  const { config, workspaces, ledger, agents, diagnostics } = options;
+  const store = openSessionDatabase(config.stateDir, diagnostics
+    ? event => diagnostics("sqlite_write", { ...event }, "info") : undefined);
   const allowMaintenance = options.allowBackgroundMaintenance ?? (() => true);
   let startupMaintenancePending = true;
   const startupMaintenance = () => {
@@ -224,7 +226,7 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
         if (!allowMaintenance()) return;
         startupMaintenance();
         store.reconcileFinishedInvocations();
-      }, { signal: maintenance.signal });
+      }, { signal: maintenance.signal, diagnosticSource: "session_reconcile" });
       await runSqliteWrite(ledger.db, () => {
         if (!allowMaintenance()) return;
         ledger.observeOperations([...recorder.activeOperationIds(),...options.processSessions?.activeOperationIds()??[]]);

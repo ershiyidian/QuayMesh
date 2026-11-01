@@ -135,6 +135,16 @@ QuayMesh 能观察自己的工具调用、进程、持久记录和 App 桥接。
 | E03 | 网关选择无法迁移既有 TCP/TLS | 已建流保留原 owner，禁止盲重放模型请求；透明恢复依赖提供商应用协议支持。 |
 | E04 | 泛化探针和 503 隐藏故障层 | 用安全错误码分别报告代理连接、隧道、目标 TLS、HTTP 探针阶段；泛化连通不证明提供商业务健康。 |
 
+### 慢 SQLite 写入诊断
+
+`SessionStore.writeAsync` 在某个同步阶段达到 50 ms，或整次调用达到 250 ms 时发出 `sqlite_write` info 事件。固定来源区分 `session_feed_update`、`session_reconcile` 和其他 `session_store` 写入。每条事件分别记录准备、`BEGIN IMMEDIATE`、事务体、`COMMIT`、回滚、恢复连接超时设置的次数、总耗时和单次最大耗时；另列重试次数、计划等待与实际异步等待。实际等待包含调度延迟，不代表 CPU 时间或持有写事务的时间。
+
+事务结束且连接清理已尝试完成后，事件才交给既有的有界异步刷新诊断缓冲。`cleanupFailed` 标明清理失败；连接仍有事务时不调用记录器。成功、失败和取消使用相同阈值。字段不包含 SQL、参数、数据库路径、任务正文或原始错误消息，错误码仅保留已知 SQLite 类别及选定的扩展码。记录器失败不改变原写入结果。
+
+此范围只覆盖已接线的 SessionStore 异步写入入口，不代表全部 SQLite 语句、WorkLedger 写入或启动核对。计时用于定位慢阶段，本身不能区分其中的存储 I/O、调度延迟或 WAL checkpoint 工作。原有重试、取消、事务与 checkpoint 行为保持不变。
+
+Console 读取池的默认日志包含 UTC `ts` 和 Core `pid`，便于关联同一进程代次、同一时间窗口的事件。定时器触发的超时耗时本身可能被事件循环延迟拉长，不等同于 SQL 执行耗时。
+
 ## 激活与验收
 
 使用 Node 24.21.0、冻结的依赖锁和干净 Git 提交构建平台发行包。`release.json` 标识实际打包的 Node 与原生依赖字节；`verify-installed.mjs` 在改变服务前运行真实 SQLite/GC 和 schema 检查。

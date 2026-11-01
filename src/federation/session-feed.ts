@@ -496,7 +496,7 @@ export class SessionFeed {
       const current=this.store.getMember(session.id,member.id);
       this.store.setMemberPresence(member.id,true,new Date(Math.max(Date.parse(current.last_observed_at),Date.parse(received.observed_at))).toISOString());
       return true;
-    },{timeoutMs:remaining,signal:this.refreshController.signal});
+    },{timeoutMs:remaining,signal:this.refreshController.signal,diagnosticSource:"session_feed_update"});
     if(!saved||this.closed||this.subscriptions.get(key)!==subscription)return;
     subscription.lastRevision=Math.max(subscription.lastRevision,received.revision);
     subscription.confirmedAt=Date.now();

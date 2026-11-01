@@ -135,6 +135,16 @@ This register retains all 42 findings from the lifecycle investigation and adds 
 | E03 | Gateway selection cannot migrate existing TCP/TLS sessions | Keep established streams with their owner; never blindly replay a model request. Transparent recovery requires support from that provider's application protocol. |
 | E04 | A generic probe or 503 hides the failure layer | Report proxy connection, tunnel, target TLS, and HTTP probe stages with safe error codes; generic reachability does not establish provider business health. |
 
+### Slow SQLite write diagnostics
+
+`SessionStore.writeAsync` emits a `sqlite_write` info event when one synchronous phase takes at least 50 ms or the whole call takes at least 250 ms. Fixed sources identify `session_feed_update`, `session_reconcile`, or other `session_store` writes. Each event separates setup, `BEGIN IMMEDIATE`, transaction body, `COMMIT`, rollback, and timeout-restoration counts, totals, and maxima. Retry count, scheduled delay, and actual asynchronous wait are separate; actual wait includes scheduler delays and is neither CPU time nor time holding the write transaction.
+
+The event is handed to the existing bounded, asynchronously flushed diagnostics buffer after the transaction ends and connection cleanup has been attempted. `cleanupFailed` identifies a failed cleanup; a connection still in a transaction does not invoke the reporter. Success, failure, and cancellation use the same thresholds. The fields contain no SQL, parameters, database paths, task text, or raw error messages; error codes are restricted to known SQLite families and selected extended codes. A reporter failure does not change the original write result.
+
+This covers the instrumented SessionStore asynchronous-write entry, not every SQLite statement, WorkLedger write, or startup reconciliation. The timings locate a slow phase but do not by themselves distinguish storage I/O, scheduler delay, or WAL checkpoint work inside it. Existing retry, cancellation, transaction, and checkpoint behavior is unchanged.
+
+Default Console read-pool logs include UTC `ts` and the Core `pid` for correlation within the same process generation and time window. A timer-driven timeout's elapsed time can itself be extended by event-loop delay; it does not measure SQL execution time.
+
 ## Activation and verification
 
 Maintenance preserves the existing responses from the two OAuth metadata endpoints and the root metadata fallback candidate. Unauthenticated GET/POST `/mcp` startup probes receive only a local authentication challenge; no upstream execution starts. Discovery can therefore initialize while business admission remains paused, without a circular dependency in installation verification. An absent root metadata route still returns 404 rather than fabricated metadata. The external tunnel component can retain other one-time discovery failures; verification of every required component prevents committing that state as a successful upgrade.

@@ -2,6 +2,7 @@ import { finalizationBlocksNewWork } from "./task-finalization.js";
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { runSqliteWrite, type SqliteWriteOptions } from "../db/async-write.js";
+import type { SqliteWriteReporter } from "../db/write-diagnostics.js";
 import { canonicalWorkspaceRoot, canonicalPathIdentity } from "../roots.js";
 import { samePhysicalPath } from "../physical-paths.js";
 import { resolve } from "node:path";
@@ -119,7 +120,7 @@ export class SessionStore {
   private readonly ownedDatabase: boolean;
   private readonly changeListeners = new Set<(change: { sessionId: SessionId; memberId: string; ownerId: string; revision: number; sequence: number; taskId?: string }) => void>();
 
-  constructor(private readonly db: Database.Database, owned = false) {
+  constructor(private readonly db: Database.Database, owned = false, private readonly writeDiagnostics?: SqliteWriteReporter) {
     this.ownedDatabase = owned;
     this.taskData = new TaskDataStore(db);
   }
@@ -142,7 +143,7 @@ export class SessionStore {
 
   // 回调只允许同步 SQL；通知、文件和进程操作放在 await 之后。
   writeAsync<T>(write: () => T, options?: SqliteWriteOptions): Promise<T> {
-    return runSqliteWrite(this.db, write, options);
+    return runSqliteWrite(this.db, write, { ...options, diagnostics: options?.diagnostics ?? this.writeDiagnostics });
   }
 
   findSession(sessionId: SessionId): SessionRecord | null {
