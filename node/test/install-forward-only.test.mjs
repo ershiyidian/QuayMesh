@@ -4,7 +4,7 @@ import http from "node:http";
 import { mkdir, readFile, readdir, writeFile, symlink, chmod, copyFile, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 import { migrateDatabase } from "../../dist/db/migrations.js";
 import { quiescenceSubject, recordExecutionQuiescence, unresolvedSubjects, retainableCommandClaims,
@@ -15,7 +15,7 @@ import { activateInstallation, databaseMigration, databaseSnapshot, enforceInsta
 import { main } from "../cli.mjs";
 import { cluster, freePort, token } from "./helpers.mjs";
 
-const repository=fileURLToPath(new URL("../../",import.meta.url)),commit="a".repeat(40);
+const repository=fileURLToPath(new URL("../../",import.meta.url)),commit="a".repeat(40),previousCommit="c".repeat(40);
 const exactColumns=["execution_id","execution_generation","owner_process_start"];
 const newTables=["qm_task_peer_messages","qm_task_peer_deliveries","qm_local_api_grants","qm_local_api_dispatches","qm_local_api_verifiers"];
 const legacyColumns=["effort","task_name","error_code","error_retryable","context_key","context_signature",
@@ -183,7 +183,7 @@ async function activationFixture(t){
     requests.push(req.url);res.setHeader("content-type","application/json");
     if(req.url==="/status"){
       const down=await readFile(stopped).then(()=>true,()=>false);
-      res.end(JSON.stringify(down?null:{nodeId:"edge",release:"old-schema-16",components:[]}));return;
+      res.end(JSON.stringify(down?null:{nodeId:"edge",release:previousCommit,components:[]}));return;
     }
     assert.equal(req.headers.authorization,`Bearer ${secret}`);
     if(req.url==="/maintenance/begin"||req.url==="/maintenance/resume"){res.end('{}');return;}
@@ -197,7 +197,7 @@ async function activationFixture(t){
   const configuration=JSON.stringify({schemaVersion:1,id:"edge",stateDir:f.stateDir,adminPort:port,capabilities:{worker:true},
     mesh:{enabled:false,address:"127.0.0.2"},clusterFile:join(f.root,"cluster.json"),secretsFile:join(f.root,"secrets.env")});
   await writeFile(config,configuration);await writeFile(stagedConfig,configuration);await writeFile(unitFile,"old-unit");
-  const previous={...f.manifest,version:1,nodeId:"edge",sourceCommit:"old-schema-16",adminPort:port,unitFile,platform:"linux",user:true};
+  const previous={...f.manifest,version:1,nodeId:"edge",sourceCommit:previousCommit,adminPort:port,unitFile,platform:"linux",user:true};
   await writeFile(join(f.root,"installation.json"),JSON.stringify(previous));
   const prepared={...previous,...f.manifest,configDir:f.root,config,stagedConfig,
     entrypoint:join(f.candidate,"bin","quaymesh.js")};
@@ -243,7 +243,45 @@ if(action==='enable')process.exitCode=1;
   assert.equal(transition.database.backup,null);assert.equal(transition.currentDatabaseVersion,19);
   assert.equal(transition.databaseMigration.verified,true);
   assert.equal(f.requests.includes("/maintenance/resume"),false);
-  assert.equal(JSON.parse(await readFile(join(f.root,"installation.json"),"utf8")).sourceCommit,"old-schema-16");
+  assert.equal(JSON.parse(await readFile(join(f.root,"installation.json"),"utf8")).sourceCommit,previousCommit);
+});
+
+test("forward-only提交后的启动标记通过398实际启动预算检查，恢复仍以原16为边界",{skip:process.platform!=="linux"},async t=>{
+  const f=await activationFixture(t),bin=join(f.root,"fake-service-manager");await mkdir(bin);
+  const transitionFile=join(f.stateDir,"installation-transition.json"),executable=join(bin,"systemctl");
+  await writeFile(executable,`#!${process.execPath}
+import {appendFileSync,readFileSync,writeFileSync} from 'node:fs';import {createRequire} from 'node:module';
+import {installationStartupBudget} from ${JSON.stringify(pathToFileURL(join(repository,"node","app.mjs")).href)};
+const Database=createRequire(${JSON.stringify(join(repository,"package.json"))})('better-sqlite3');
+const db=new Database(${JSON.stringify(f.file)},{readonly:true});
+const version=db.prepare('SELECT max(version) FROM qm_schema_migrations').pluck().get();db.close();
+const action=process.argv.slice(2).find(value=>['stop','daemon-reload','enable'].includes(value));
+const observation={action,version};
+if(action==='daemon-reload'){
+  const marker=JSON.parse(readFileSync(${JSON.stringify(transitionFile)},'utf8'));
+  observation.startupVersion=marker.database?.version;
+  observation.beforeVersion=marker.databaseBeforeMigration?.version;
+  try{observation.budget=await installationStartupBudget(${JSON.stringify(f.candidate)},marker,${JSON.stringify(commit)});}
+  catch(error){observation.startupError=error.message;process.exitCode=1;}
+}
+appendFileSync(${JSON.stringify(f.trace)},JSON.stringify(observation)+'\\n');
+if(action==='stop')writeFileSync(${JSON.stringify(f.stopped)},'stopped');
+if(action==='enable')process.exitCode=1;
+`);await chmod(executable,0o755);
+  const oldPath=process.env.PATH;process.env.PATH=bin+":"+oldPath;
+  t.after(()=>{process.env.PATH=oldPath;});
+  await assert.rejects(activateInstallation(f.manifestFile,{backup:false,migrationPolicy:"forward-only"}),/发行切换失败/);
+  const trace=(await readFile(f.trace,"utf8")).trim().split("\n").map(value=>JSON.parse(value));
+  const startup=trace.find(value=>value.action==="daemon-reload");
+  assert.equal(startup?.startupError,undefined,"the unchanged 398 startup check must accept the post-migration marker");
+  assert.deepEqual(trace,[{action:"stop",version:16},{action:"daemon-reload",version:19,
+    startupVersion:19,beforeVersion:16,budget:{coreReadinessMs:30000}},{action:"enable",version:19}]);
+  const recovery=JSON.parse(await readFile(transitionFile,"utf8"));
+  assert.equal(recovery.phase,"recovery_required");assert.equal(recovery.database.version,16);
+  assert.equal(recovery.database.backup,null);assert.equal(recovery.currentDatabaseVersion,19);
+  assert.equal(recovery.databaseBeforeMigration.version,16);assert.equal(recovery.databaseMigration.version,19);
+  assert.equal(f.requests.includes("/maintenance/resume"),false);
+  assert.equal(JSON.parse(await readFile(join(f.root,"installation.json"),"utf8")).sourceCommit,previousCommit);
 });
 
 test("迁移提交后的回执丢失不是回滚证明，读取真实19后拒绝旧版恢复",{skip:process.platform!=="linux"},async t=>{

@@ -445,7 +445,11 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
     }
     if(migrationPolicy==="forward-only"){
       const migrated=await databaseMigration(manifest,{apply:true});
-      transition={...transition,databaseMigration:migrated};
+      // The immutable candidate reads database.version for its startup budget.
+      // Migration has already committed; keep the original plan separately and
+      // leave snapshot unchanged for the rollback boundary below.
+      transition={...transition,databaseBeforeMigration:snapshot,
+        database:{exists:migrated.exists,version:migrated.version,backup:migrated.backup},databaseMigration:migrated};
       await writeJson(transitionFile,transition);
     }
     await atomicWrite(manifest.config,await readFile(manifest.stagedConfig));

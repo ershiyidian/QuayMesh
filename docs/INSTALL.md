@@ -153,6 +153,8 @@ The read-only plan rejects existing foreign-key violations before stopping the s
 
 After the ordinary service stop and the existing maintenance checks, the operator opens the existing database with the candidate's SQLite addon, starts one outer `IMMEDIATE` transaction, calls the candidate's actual migration function, and validates the result before committing. Validation checks the old schema objects and table row counts, migration history, nullable identity additions, empty new tables, legacy repair, and foreign keys. It creates no database copy or replacement tables and does not hash all business rows. Row counts and foreign-key checks can read substantial data; the helper has a three-minute execution budget and the operator waits for it to exit. A timeout or lost receipt does **not** prove rollback: failure recovery reads the actual schema version. Once schema 19 has committed, any activation failure preserves the database and `recovery_required` marker and does not automatically restart the incompatible schema-16 binary. Admission, stop-domain review, all four maintenance lease stages, and the stability window are unchanged.
 
+After the verified commit, the validating transition's `database` field records the current schema 19 so the immutable candidate can apply its ordinary startup budget. `databaseBeforeMigration` retains the original schema-16 plan. The installer still uses that original version for its rollback decision; a later `recovery_required` marker keeps schema 16 in `database` and reports the actual schema separately as `currentDatabaseVersion`.
+
 An independent reviewed operator can activate an already prepared immutable release using that release's runtime:
 
 ```bash
