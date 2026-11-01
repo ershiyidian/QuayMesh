@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import * as schema from "./schema.js";
 import { migrateDatabase } from "./migrations.js";
+import { trackDatabaseWriter } from "./wal-checkpoint.js";
 
 export type SqliteDatabase = Database.Database;
 export type AppDatabase = ReturnType<typeof createDrizzleDatabase>;
@@ -47,10 +48,11 @@ export function openDatabase(stateDir: string): DatabaseHandle {
     sqlite.pragma("busy_timeout = 5000");
     sqlite.pragma("foreign_keys = ON");
     migrateDatabase(sqlite);
+    const release = trackDatabaseWriter(path, sqlite);
     return {
       sqlite,
       db: createDrizzleDatabase(sqlite),
-      close: () => sqlite.close(),
+      close: () => { sqlite.close(); release(); },
     };
   } catch(error) {
     try {sqlite.close();} finally {throw error;}

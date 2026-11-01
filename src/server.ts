@@ -4,6 +4,8 @@ import { CARD_RESOURCES, type CardVersion, snapshotForCard } from './session/car
 import { registerOperationTools } from "./tool-surfaces/operations.js";
 import { createFederation } from "./federation/integration.js";
 import { WorkRunReconciler } from "./work-run-reconciler.js";
+import { databasePath } from "./db/client.js";
+import { startDatabaseCheckpoints } from "./db/wal-checkpoint.js";
 import { federatedTools, registerFederationTools } from "./federation/mcp.js";
 import { proxyEnvironment } from "./federation/egress.js";
 import type { FederationRuntime } from "./federation/runtime.js";
@@ -1478,6 +1480,9 @@ export function createServer(
     }
   });
 
+  const databaseCheckpoints = startDatabaseCheckpoints(databasePath(config.stateDir), {
+    report: event => options.diagnostics?.record("sqlite_checkpoint", { ...event }, "info"),
+  });
   let closePromise: Promise<void> | undefined;
   return {
     app,
@@ -1489,25 +1494,31 @@ export function createServer(
     execution: processSessions.executionCoordinator!,
     close: () => {
       closePromise ??= (async () => {
-        await processSessions.executionCoordinator!.pauseAsync("服务正在退出");
         try {
-          await mcpHandler.close();
-        } catch (error) {
-          logEvent(config.logging, "warn", "mcp_handler_close_failed", {
-            error: error instanceof Error ? error.message : String(error),
-          });
+          await processSessions.executionCoordinator!.pauseAsync("服务正在退出");
+          try {
+            await mcpHandler.close();
+          } catch (error) {
+            logEvent(config.logging, "warn", "mcp_handler_close_failed", {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+          await workRunReconciler.close();
+          await localUserApi?.close();
+          await federation?.close();
+          await toolActivities.waitForIdle();
+          await processSessions.shutdown();
+          await sessionRuntime.close();
+          localAgentStore.close();
+          sessionLedger.close();
+          projectConsole.close();
+          oauthProvider.close();
+          workspaceStore.close?.();
+        } finally {
+          // A failed business close must still restore automatic checkpoints
+          // on any surviving writers and release this Core's maintenance owner.
+          await databaseCheckpoints.close();
         }
-        await workRunReconciler.close();
-        await localUserApi?.close();
-        await federation?.close();
-        await toolActivities.waitForIdle();
-        await processSessions.shutdown();
-        await sessionRuntime.close();
-        localAgentStore.close();
-        sessionLedger.close();
-        projectConsole.close();
-        oauthProvider.close();
-        workspaceStore.close?.();
       })();
       return closePromise;
     },
