@@ -129,15 +129,25 @@ Use the installed `node.json`, or pass its original `--config-dir` when using an
 
 Activation pauses admission and waits for accepted commands, agent turns, transfers, and open egress tunnels to close. A tunnel remains active until its client closes it; an idle period does not authorize terminating a model connection. If drain times out, the current service remains running.
 
-The prepared release is verified with its own Node runtime and installed SQLite dependency, including 500 native close/garbage-collection cycles. Activation takes a consistent SQLite backup, records `installation-transition.json`, and requires the same Core process to remain ready for 60 seconds before resuming work. A manager restart preserves this pause. `status` shows an unfinished transition so it can be recovered deliberately.
+The prepared release is verified with its own Node runtime and installed SQLite dependency, including 500 native close/garbage-collection cycles. Activation takes a consistent SQLite backup by default, records `installation-transition.json`, and requires the same Core process to remain ready for 60 seconds before resuming work. A manager restart preserves this pause. `status` shows an unfinished transition so it can be recovered deliberately.
+
+When a database copy is explicitly unwanted, select `--no-backup` for the activation:
+
+```bash
+./runtime/node bin/quaymesh.js activate --prepared /path/returned/prepared.json --no-backup
+```
+
+`install --config /path/to/current/node.json --no-backup` also supports this option when preparing and activating together. With `--no-start`, specify `--no-backup` again on the later `activate` command; preparation does not save an activation policy. The programmatic equivalent is `activateInstallation(manifestFile, { backup: false })`.
+
+This mode opens the existing database read-only with the candidate's SQLite runtime and requires its recorded version to equal the candidate's required version, with no pending legacy Agent repair. A missing database, version mismatch, or required repair rejects activation before stopping the old service and releases this attempt's maintenance pause. It creates no database backup; admission drain, maintenance lease checks, rollback boundaries, and the 60-second stability window remain in effect. Release preparation still writes the selected installation directory; use `--prefix` to choose a drive with space. Ordinary state and configuration updates continue in their configured locations.
 
 The backup uses a fixed read snapshot so background bookkeeping cannot restart the copy. It aborts after 60 seconds without copied-page progress; the total budget is 60 seconds plus the snapshot size at 4 MiB/s, capped at 30 minutes. A failed backup stops only its own child process and waits for it to exit before abandoning activation; the current service remains running and no migration begins.
 
 When the recorded backup requires a schema upgrade to the matching target release, Core startup receives 30 seconds plus the actual backup size at 4 MiB/s, capped at 30 minutes. Activation adds the unchanged 60-second stability check and 30 seconds for service startup. Ordinary startup, reinstalls without a schema change, downgrades, and recovery markers retain the normal 30-second Core deadline. Node status reports the selected startup budget.
 
-For the default `prove` policy, rollback is automatic only while the database schema remains compatible. If a failed upgrade has changed the schema, the installer preserves the new database, backup, and transition record instead of starting an incompatible previous binary. Check the recorded backup and every process using the state directory before restoring data. Existing command pipes, PTYs, and model streams remain owned by their original processes; upgrade waits for them to finish.
+For the default `prove` policy, rollback is automatic only while the database schema remains compatible. If a failed upgrade has changed the schema, the installer preserves the new database, any created backup, and transition record instead of starting an incompatible previous binary. Check any recorded backup and every process using the state directory before restoring data. Existing command pipes, PTYs, and model streams remain owned by their original processes; upgrade waits for them to finish.
 
-With `historyPolicy: "preserve"`, activation requires a reviewed external maintenance provider and retains unresolved execution history and claims without declaring them physically complete or idle. After any stop attempt, failure keeps `recovery_required`, the database, backup, and lease; it does not automatically start the previous binary even when the schema is compatible. Review the retained state and current process identities before further recovery. See [upgrading while preserving unresolved history](operations/PRESERVE-HISTORY-UPGRADES.md).
+With `historyPolicy: "preserve"`, activation requires a reviewed external maintenance provider and retains unresolved execution history and claims without declaring them physically complete or idle. After any stop attempt, failure keeps `recovery_required`, the database, any created backup, and lease; it does not automatically start the previous binary even when the schema is compatible. Review the retained state and current process identities before further recovery. See [upgrading while preserving unresolved history](operations/PRESERVE-HISTORY-UPGRADES.md).
 
 When initiating a Windows upgrade from a QuayMesh command, prepare the release first, then start the independent activation task:
 

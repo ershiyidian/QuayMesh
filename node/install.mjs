@@ -265,11 +265,14 @@ export async function waitRunning(manifest,token,timeoutMs,{stableMs=60000,resum
 }
 
 export function databaseSnapshot(manifest,target,{stallTimeoutMs=60000,maxTimeoutMs=1800000,
-  minimumBytesPerSecond=4*1024*1024,killGraceMs=1000}={}) {
+  minimumBytesPerSecond=4*1024*1024,killGraceMs=1000,requireCurrentSchema=false}={}) {
   if([stallTimeoutMs,maxTimeoutMs,minimumBytesPerSecond,killGraceMs].some(value=>!Number.isSafeInteger(value)||value<1))
     throw new Error("数据库快照时限必须是正整数");
   return new Promise((resolveSnapshot,reject)=>{
-    const child=spawn(manifest.nodeExecutable,[join(manifest.directory,"node","database-snapshot.mjs"),manifest.stateDir,...(target?[target]:[])],
+    // Keep the optional target position empty for a read-only check. An older
+    // helper must not mistake the new check flag for a backup filename.
+    const child=spawn(manifest.nodeExecutable,[join(manifest.directory,"node","database-snapshot.mjs"),manifest.stateDir,
+      ...(target?[target]:requireCurrentSchema?[""]:[]),...(requireCurrentSchema?["--require-current-schema"]:[])],
       {stdio:["ignore","pipe","inherit","ipc"],shell:false,windowsHide:true,env:restrictedEnvironment(process.env)});
     const started=performance.now();
     let output="",failure,force,timer,progress,completedPages=0,lastProgress=started,deadline=started+maxTimeoutMs;
@@ -316,12 +319,18 @@ export function databaseSnapshot(manifest,target,{stallTimeoutMs=60000,maxTimeou
     child.once("close",code=>{
       clearTimeout(timer);clearTimeout(force);
       if(failure){reject(failure);return;}
-      if(code!==0){reject(new Error(`数据库升级前检查失败，退出码 ${code}`));return;}
+      if(code!==0){
+        let detail;
+        if(requireCurrentSchema){try{detail=JSON.parse(output).error;}catch{}}
+        reject(new Error(`${requireCurrentSchema?"无备份升级检查失败":"数据库升级前检查失败"}，退出码 ${code}${typeof detail==="string"?`：${detail}`:""}`));return;
+      }
       try{
         const result=JSON.parse(output);
         if(typeof result.exists!=="boolean"||!Number.isSafeInteger(result.version)||result.version<0||
             (target&&result.exists&&(result.backup!==resolve(target)||progress?.remainingPages!==0)))
           throw new Error("数据库快照完成回执未通过验证");
+        if(requireCurrentSchema&&(result.exists!==true||result.backup!==null||result.verifiedCurrentSchema!==true))
+          throw new Error("目标发行未确认无备份升级的数据库版本及旧结构检查；保留当前服务。");
         resolveSnapshot(result);
       }catch(error){reject(error);}
     });
@@ -340,11 +349,12 @@ export async function enforceInstallationRollbackBoundary({manifest,previous,tra
     database:snapshot,currentDatabaseVersion:current.version,phase:"recovery_required",error:String(error),
   });
   if(schemaChanged)
-    throw new Error(`数据库已从 ${snapshot.version} 升级到 ${current.version}，保留新版数据和备份 ${snapshot.backup}；旧版本无法自动启动，请完成升级恢复。`);
-  throw new Error(`保留历史执行的发行切换失败；保留维护租约、当前数据库和备份 ${snapshot?.backup??"待核对"}，不自动启动未证明支持保留协议的旧发行。`);
+    throw new Error(`数据库已从 ${snapshot.version} 升级到 ${current.version}，保留新版数据${snapshot.backup?`和备份 ${snapshot.backup}`:"（本次未创建备份）"}；旧版本无法自动启动，请完成升级恢复。`);
+  throw new Error(`保留历史执行的发行切换失败；保留维护租约、当前数据库${snapshot?.backup?`和备份 ${snapshot.backup}`:"（本次未创建备份）"}，不自动启动未证明支持保留协议的旧发行。`);
 }
 
-export async function activateInstallation(manifestFile,{timeoutMs=180000,maintenanceLease,historyPolicy="prove"}={}) {
+export async function activateInstallation(manifestFile,{timeoutMs=180000,maintenanceLease,historyPolicy="prove",backup=true}={}) {
+  if(typeof backup!=="boolean")throw new Error("backup 必须是布尔值；无备份升级须显式设置 backup:false。");
   historyPolicy=installationHistoryPolicy(historyPolicy);
   if(historyPolicy==="preserve"&&!maintenanceLease)
     throw new Error("保留历史执行必须显式提供受审维护租约；普通升级不能自动选择该模式");
@@ -376,8 +386,9 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
       maintenanceBegun = true;
       await externalLease?.assertHeld("before_backup");
     }
-    snapshot=await databaseSnapshot(manifest,join(dirname(resolve(manifestFile)),
-      externalLease?`rollback-core-${externalLease.context.attemptId}.sqlite`:"rollback-core.sqlite"));
+    snapshot=await databaseSnapshot(manifest,backup?join(dirname(resolve(manifestFile)),
+      externalLease?`rollback-core-${externalLease.context.attemptId}.sqlite`:"rollback-core.sqlite"):undefined,
+      {requireCurrentSchema:!backup});
     await externalLease?.assertHeld("after_backup");
     transition={id:externalLease?.context.attemptId??randomUUID(),sourceCommit:manifest.sourceCommit,previousCommit:previous?.sourceCommit??null,
       startedAt:new Date().toISOString(),ownerPid:process.pid,database:snapshot,phase:"validating",
@@ -430,7 +441,7 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
         retainedClaims:(externalLease.lease.claims??[]).length}: {})};
   } catch (error) {
     if(activationCommitted)throw new Error("发行已经验证并提交，恢复准入尚待确认；保留当前服务，请查询管理端状态。",{cause:error});
-    if (stopAttempted || stopped || !running) {
+    if (stopAttempted || stopped || (!running && snapshot)) {
       try {
         const active = await runningStatus(manifest.adminPort);
         if (active?.nodeId === manifest.nodeId) await stopService(manifest);
@@ -465,5 +476,5 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
 export async function installNode(file,options={}) {
   const prepared = await prepareInstallation(file,options);
   if (options.start===false) return {...prepared,activated:false};
-  return activateInstallation(prepared.manifestFile);
+  return activateInstallation(prepared.manifestFile,{backup:options.backup});
 }

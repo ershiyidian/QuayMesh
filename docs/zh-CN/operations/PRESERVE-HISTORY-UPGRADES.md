@@ -25,7 +25,7 @@ await activateInstallation(preparedManifest, {
 ## 必须保持的边界
 
 1. **取得准确的维护窗口。** 核实 prepared manifest、旧发行、节点、manager/Core 进程代次、准入暂停归属、完整执行对象及完整 claim 集合，并关闭相关入口。当前服务工作、队列、等待者及持久化 runtime work 必须排空；保留历史 claim 本身不代表满足这一条件。
-2. **保留全部四次检查。** provider 必须在 `before_backup`、`after_backup`、`before_stop`、`after_stop` 提供新鲜的进程清点证据。官方数据库备份及每项身份、计数检查均不可省略。历史身份变化、减少或增加都会拒绝本次操作。域外受保护进程不属于停机范围。
+2. **保留全部四次检查。** provider 必须在 `before_backup`、`after_backup`、`before_stop`、`after_stop` 提供新鲜的进程清点证据。安装器默认创建数据库备份；显式 `backup: false` 会改用[同版本只读检查](../INSTALL.md#升级)，四个阶段名称及每项身份、计数检查仍不可省略。历史身份变化、减少或增加都会拒绝本次操作。域外受保护进程不属于停机范围。
 3. **在暂停状态验证新代次。** installation transition 保持准入关闭。保留模式会延后启动核对和会话后台维护，避免验证之前改写受审历史。新 Core 必须报告正确的发行及运行时身份，并通过原有的连续稳定窗口。
 4. **只验证保留，不记录完成。** 独立的 `verify-retained` 以只读方式打开 SQLite，将完整执行对象、claim 指纹及历史不确定状态计数，与安装器固定的身份进行比对。它不会调用物理收尾回执写入器，也不会删除 claim。`quiescent`、`idle` 的原有含义不变；即使升级成功，未知物理执行或 claim 仍可能使它们为 false。
 5. **只释放自己持有的维护暂停。** 恢复准入前再次核对保留集合及受保护进程，确认准确的 transition 已释放、准入已恢复。随后继续正常核对；没有证明的 claim 不会仅因旧 owner 退出而释放。
@@ -38,9 +38,9 @@ preserve-v2 inspection 返回 `protocolVersion: 2` 和 `claimFingerprintVersion:
 
 ## 失败与后续恢复
 
-尚未尝试停机时，补偿只能释放本次操作已经核实归属的 pause 和 transition。尝试停机后，`preserve` 激活失败会保留数据库、备份、租约及 `recovery_required` 记录。即使 schema version 相同，也**不会自动启动旧二进制**，因为它可能不认识保留模式的保护。若激活已经提交、只是恢复准入失败，则保留已验证的新服务，等待明确核对。
+尚未尝试停机时，补偿只能释放本次操作已经核实归属的 pause 和 transition。尝试停机后，`preserve` 激活失败会保留数据库、已创建的备份、租约及 `recovery_required` 记录。即使 schema version 相同，也**不会自动启动旧二进制**，因为它可能不认识保留模式的保护。若激活已经提交、只是恢复准入失败，则保留已验证的新服务，等待明确核对。
 
-恢复必须依据保存的 attempt、manifest、数据库版本、备份及当前进程代次。重启服务或释放暂停之前，应重新审核状态；维护记录不会自动过期。
+恢复必须依据保存的 attempt、manifest、数据库版本、已记录的备份及当前进程代次。重启服务或释放暂停之前，应重新审核状态；维护记录不会自动过期。
 
 升级成功后，按原 Task、operation/execution、执行代次和物理证据逐条核对保留的 claim。仍然存活但安静的进程必须继续受到保护。业务结果、旧 owner 退出、Task 超过 30 分钟没有活动，都不是物理完成证明。30 分钟展示规则不会关闭 Task、停止进程或让资源占用过期。在准确的物理边界得到证明之前，保留的 claim 仍可能阻挡冲突工作。
 
