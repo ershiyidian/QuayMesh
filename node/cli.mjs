@@ -11,8 +11,8 @@ import { createSite } from "./site.mjs";
 const usage=`QuayMesh
   quaymesh init-site --directory ./site --peer udp://公网地址:11010 --resource-url https://隧道资源地址
   quaymesh run --config ./site/desktop.json
-  quaymesh install --config ./site/desktop.json [--no-backup]
-  quaymesh activate --prepared <准备结果中的manifestFile> [--no-backup]
+  quaymesh install --config ./site/desktop.json [--no-backup [--forward-only]]
+  quaymesh activate --prepared <准备结果中的manifestFile> [--no-backup [--forward-only]]
   quaymesh doctor --config ./site/desktop.json
   quaymesh status --config ./site/desktop.json
   quaymesh restart --config ./site/desktop.json --component discovery
@@ -49,10 +49,14 @@ export async function main(argv=process.argv.slice(2)) {
   const {values}=parseArgs({args,options:{
     config:{type:"string"},directory:{type:"string"},peer:{type:"string"},"resource-url":{type:"string"},
     prefix:{type:"string"},system:{type:"boolean"},"no-start":{type:"boolean",default:false},"no-backup":{type:"boolean",default:false},
+    "forward-only":{type:"boolean",default:false},
     component:{type:"string"},cluster:{type:"string"},offline:{type:"boolean",default:false},
     inventory:{type:"string"},"existing-network":{type:"boolean",default:false},
     "service-user":{type:"string"},"service-name":{type:"string"},"config-dir":{type:"string"},prepared:{type:"string"},
   }});
+  if(values["forward-only"]&&(!values["no-backup"]||!["install","activate"].includes(command)))
+    throw new Error("--forward-only 仅用于 install/activate，必须同时选择 --no-backup。");
+  const migrationPolicy=values["forward-only"]?"forward-only":"same-schema";
   if(command==="init-site"){
     if(!values.directory||(!values.peer&&!values.inventory))throw new Error("需要 --directory，并通过 --inventory 或 --peer 指定站点");
     const result=await createSite({directory:values.directory,peer:values.peer,resourceUrl:values["resource-url"],
@@ -65,7 +69,7 @@ export async function main(argv=process.argv.slice(2)) {
   if(command==="activate"){
     if(!values.prepared)throw new Error("需要 --prepared 指定准备完成的安装记录");
     const {activateInstallation}=await import("./install.mjs");
-    console.log(JSON.stringify(await activateInstallation(values.prepared,{backup:!values["no-backup"]}),null,2));return;
+    console.log(JSON.stringify(await activateInstallation(values.prepared,{backup:!values["no-backup"],migrationPolicy}),null,2));return;
   }
   if(!values.config)throw new Error("需要 --config 指定节点配置");
   const loaded=await loadNodeConfig(values.config);
@@ -86,7 +90,7 @@ export async function main(argv=process.argv.slice(2)) {
   if(command==="install"){
     const {installNode}=await import("./install.mjs");
     const result=await installNode(values.config,{prefix:values.prefix,user:values.system === undefined ? undefined : !values.system,
-      serviceUser:values["service-user"],serviceName:values["service-name"],configDir:values["config-dir"],start:!values["no-start"],backup:!values["no-backup"]});
+      serviceUser:values["service-user"],serviceName:values["service-name"],configDir:values["config-dir"],start:!values["no-start"],backup:!values["no-backup"],migrationPolicy});
     console.log(JSON.stringify(result,null,2));return;
   }
   if(command==="status"){

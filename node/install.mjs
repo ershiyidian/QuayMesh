@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { join, resolve, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { loadNodeConfig, defaultConfigDir, secret } from "./config.mjs";
 import { writeJson, atomicWrite, readOptionalJson } from "./files.mjs";
 import { requestJson } from "./network.mjs";
@@ -337,6 +338,42 @@ export function databaseSnapshot(manifest,target,{stallTimeoutMs=60000,maxTimeou
   });
 }
 
+export function databaseMigration(manifest,{apply=false,timeoutMs=180000,killGraceMs=1000}={}) {
+  if(typeof apply!=="boolean")throw new Error("迁移 apply 选项必须是显式布尔值。");
+  if([timeoutMs,killGraceMs].some(value=>!Number.isSafeInteger(value)||value<1))throw new Error("数据库迁移时限必须是正整数");
+  return new Promise((resolveMigration,reject)=>{
+    // This helper belongs to the reviewed operator, not the immutable prepared
+    // release. It imports migrations/native SQLite from manifest.directory.
+    const child=spawn(manifest.nodeExecutable,[fileURLToPath(new URL("./database-migration.mjs",import.meta.url)),
+      apply?"apply":"plan",manifest.directory,manifest.stateDir,manifest.sourceCommit],
+      {stdio:["ignore","pipe","pipe"],shell:false,windowsHide:true,env:restrictedEnvironment(process.env)});
+    let output="",stderr="",failure,force;
+    const abort=error=>{
+      if(failure)return;
+      failure=error;child.kill();force=setTimeout(()=>child.kill("SIGKILL"),killGraceMs);
+    };
+    const timer=setTimeout(()=>abort(Object.assign(new Error("数据库向前迁移达到时限；等待自有进程退出后核对实际版本，不能据超时判断已经回滚。"),
+      {code:"DATABASE_MIGRATION_DEADLINE"})),timeoutMs);
+    child.stdout.on("data",chunk=>{output+=chunk;if(output.length>65536)abort(new Error("数据库迁移回执超过大小限制"));});
+    child.stderr.on("data",chunk=>{if(stderr.length<16000)stderr+=chunk;});
+    child.once("error",error=>{failure??=error;});
+    child.once("close",code=>{
+      clearTimeout(timer);clearTimeout(force);
+      if(failure){reject(failure);return;}
+      try{
+        const result=JSON.parse(output);
+        if(code!==0)throw new Error(`无备份向前迁移${apply?"执行":"计划"}失败：${result.error??stderr??code}`);
+        if(result.exists!==true||result.backup!==null||result.migrationPolicy!=="forward-only"
+            ||result.fromVersion!==16||result.targetVersion!==19||result.targetCommit!==manifest.sourceCommit
+            ||result.version!==(apply?19:16)||result.verifiedForwardOnlyPlan!==true
+            ||(apply&&(result.migrated!==true||result.verified!==true)))
+          throw new Error("数据库向前迁移回执未通过验证；必须核对实际数据库版本。");
+        resolveMigration(result);
+      }catch(error){reject(error);}
+    });
+  });
+}
+
 /** A previous binary may reconcile historical rows before it understands the
  * preserve fence. After any attempted stop, only the verified candidate may be
  * recovered automatically; a previous binary requires an explicit new review. */
@@ -353,8 +390,10 @@ export async function enforceInstallationRollbackBoundary({manifest,previous,tra
   throw new Error(`保留历史执行的发行切换失败；保留维护租约、当前数据库${snapshot?.backup?`和备份 ${snapshot.backup}`:"（本次未创建备份）"}，不自动启动未证明支持保留协议的旧发行。`);
 }
 
-export async function activateInstallation(manifestFile,{timeoutMs=180000,maintenanceLease,historyPolicy="prove",backup=true}={}) {
+export async function activateInstallation(manifestFile,{timeoutMs=180000,maintenanceLease,historyPolicy="prove",backup=true,migrationPolicy="same-schema"}={}) {
   if(typeof backup!=="boolean")throw new Error("backup 必须是布尔值；无备份升级须显式设置 backup:false。");
+  if(!["same-schema","forward-only"].includes(migrationPolicy))throw new Error("migrationPolicy 仅支持 same-schema 或 forward-only。");
+  if(migrationPolicy==="forward-only"&&backup)throw new Error("forward-only 必须与显式 backup:false 一起选择。");
   historyPolicy=installationHistoryPolicy(historyPolicy);
   if(historyPolicy==="preserve"&&!maintenanceLease)
     throw new Error("保留历史执行必须显式提供受审维护租约；普通升级不能自动选择该模式");
@@ -386,12 +425,13 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
       maintenanceBegun = true;
       await externalLease?.assertHeld("before_backup");
     }
-    snapshot=await databaseSnapshot(manifest,backup?join(dirname(resolve(manifestFile)),
+    snapshot=migrationPolicy==="forward-only"?await databaseMigration(manifest):await databaseSnapshot(manifest,backup?join(dirname(resolve(manifestFile)),
       externalLease?`rollback-core-${externalLease.context.attemptId}.sqlite`:"rollback-core.sqlite"):undefined,
       {requireCurrentSchema:!backup});
     await externalLease?.assertHeld("after_backup");
     transition={id:externalLease?.context.attemptId??randomUUID(),sourceCommit:manifest.sourceCommit,previousCommit:previous?.sourceCommit??null,
       startedAt:new Date().toISOString(),ownerPid:process.pid,database:snapshot,phase:"validating",
+      ...(migrationPolicy==="forward-only"?{migrationPolicy}:{}),
       ...(externalLease?{maintenanceLease:{version:externalLease.context.version,historyPolicy,
         ...(externalLease.context.retainedHistory?{retainedHistory:externalLease.context.retainedHistory}:{}),
         attemptId:externalLease.context.attemptId,pause:externalLease.lease.pause,
@@ -402,6 +442,11 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
       stopAttempted = true;
       await stopService(previous); stopped = true;
       await externalLease?.assertHeld("after_stop");
+    }
+    if(migrationPolicy==="forward-only"){
+      const migrated=await databaseMigration(manifest,{apply:true});
+      transition={...transition,databaseMigration:migrated};
+      await writeJson(transitionFile,transition);
     }
     await atomicWrite(manifest.config,await readFile(manifest.stagedConfig));
     await registeredService(manifest,true);
@@ -476,5 +521,5 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
 export async function installNode(file,options={}) {
   const prepared = await prepareInstallation(file,options);
   if (options.start===false) return {...prepared,activated:false};
-  return activateInstallation(prepared.manifestFile,{backup:options.backup});
+  return activateInstallation(prepared.manifestFile,{backup:options.backup,migrationPolicy:options.migrationPolicy});
 }

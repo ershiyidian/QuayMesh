@@ -141,6 +141,27 @@ sudo ./runtime/node bin/quaymesh.js install \
 
 该模式用候选发行的 SQLite 运行时只读打开现有数据库，要求记录的版本与候选要求的版本相同，且没有待执行的旧 Agent 修复。数据库不存在、版本不同或需要修复时，会在停止旧服务前拒绝激活，并释放本次维护暂停。该模式不创建数据库备份；准入排空、维护租约检查、回退边界和 60 秒连续稳定检查继续生效。准备发行包仍会写入选定的安装目录，可用 `--prefix` 选择有空间的磁盘；日常状态与配置更新继续使用其配置位置。
 
+对于另外审核过的**统一数据库结构 16 → 19** 迁移，明确不需要数据库备份时，显式选择仅向前迁移：
+
+```bash
+./runtime/node bin/quaymesh.js activate --prepared /path/returned/prepared.json --no-backup --forward-only
+```
+
+代码调用形式为 `activateInstallation(manifestFile, { backup: false, migrationPolicy: "forward-only" })`。该策略只接受完整的统一数据库 1–16 迁移记录和要求结构版本 19 的目标发行；数据库不存在、结构混杂、版本未知或源版本不同都会拒绝。单独使用 `--no-backup` 仍要求结构版本相同，有备份激活保留原有行为。准备阶段不保存激活策略，因此使用 `--no-start` 后仍需在激活时再次显式选择相应选项。
+
+只读计划会在停止服务前拒绝已有外键违例，并列明版本 17 增加的 3 个索引；版本 18 在 `execution_claims` 和 `execution_waiters` 中各增加的 3 个可空 `TEXT` 列及 1 个索引；版本 19 增加的 5 张表及 6 个索引。计划同时列明候选发行末尾的旧 Agent 修复：存在 `thinking` 时，可能补齐最多 13 个缺失字段及 `local_agent_turns`，并且仅在 `effort IS NULL AND thinking IS NOT NULL` 时用 `thinking` 填充 `effort`。已有非空 effort 值保留。
+
+正规停止服务、完成既有维护检查后，operator 使用候选发行的 SQLite 依赖打开原数据库，在一个外层 `IMMEDIATE` 事务中调用候选发行真实迁移函数，验证后才提交。验证覆盖原结构对象和旧表行数、迁移记录、新增可空身份列、新表为空、旧 Agent 修复及外键。过程不复制数据库、不创建旧表副本，也不对全部业务行计算哈希。行数及外键检查可能读取较多数据；助手执行时限为 3 分钟，operator 会等待其退出。超时或回执丢失**不代表已经回滚**：失败恢复会读取实际结构版本。一旦版本 19 已提交，激活的任何后续失败都会保留数据库和 `recovery_required` 标记，不会自动启动不兼容的旧版本 16 二进制。准入、停止范围审核、维护租约的全部四个阶段和稳定检查均保持原样。
+
+独立受审的 operator 可以使用已准备发行的运行时，激活该不可变发行：
+
+```bash
+/path/to/prepared/runtime/node /path/to/reviewed-operator/bin/quaymesh.js \
+  activate --prepared /path/returned/prepared.json --no-backup --forward-only
+```
+
+迁移助手来自 operator 的 `node/` 目录，真实迁移函数及 SQLite 依赖来自准备记录 `directory` 指向的发行。已准备的发行不需要包含新助手，也不会被改写。已有外部维护 provider 仍通过代码传给 `activateInstallation`；本选项不替代或绕过这些检查。
+
 备份固定同一读取快照，后台状态写入不会让复制反复重启。连续 60 秒没有复制页数进展时中止；总时限按 60 秒加上快照大小以 4 MiB/s 换算的时间计算，最多 30 分钟。备份失败只终止自有备份子进程，等待它退出后才放弃激活；当前服务继续运行，数据库迁移尚未开始。
 
 切换记录中的备份需要升级到相匹配的目标发行结构版本时，Core 启动时限为 30 秒加上备份实际大小以 4 MiB/s 换算的时间，最多 30 分钟。激活另保留 60 秒连续稳定检查和 30 秒服务启动余量。普通启动、结构版本不变的重装、降级和恢复标记仍使用原来的 30 秒 Core 时限；节点状态会显示本次采用的启动预算。

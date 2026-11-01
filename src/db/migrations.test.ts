@@ -13,7 +13,13 @@ import { resourceSchema } from "./resource-schema.js";
 import { reliabilitySchema } from "./reliability-schema.js";
 
 function removeExactExecutionClaims(db: Database.Database) {
-  db.exec(`DROP INDEX execution_claims_execution;
+  db.exec(`DROP TABLE qm_local_api_dispatches;
+    DROP TABLE qm_local_api_verifiers;
+    DROP TABLE qm_local_api_grants;
+    DROP TABLE qm_task_peer_deliveries;
+    DROP TABLE qm_task_peer_messages;
+    DROP INDEX qm_tasks_local_api_created;
+    DROP INDEX execution_claims_execution;
     ALTER TABLE execution_claims DROP COLUMN execution_id;
     ALTER TABLE execution_claims DROP COLUMN execution_generation;
     ALTER TABLE execution_claims DROP COLUMN owner_process_start;
@@ -82,7 +88,7 @@ test("初始数据库创建全部工作区、任务和认证表", () => {
         {version:14,name:"quaymesh-task-member-index"},{version:15,name:"quaymesh-invocation-payload-sharing"},
         {version:16,name:"quaymesh-task-creation-receipts"},
         {version:17,name:"quaymesh-bounded-diagnostic-queries"},
-        {version:18,name:"quaymesh-exact-execution-claims"}]);
+        {version:18,name:"quaymesh-exact-execution-claims"},{version:19,name:"quaymesh-local-user-api"}]);
     for (const name of ["workspace_sessions","oauth_clients","console_work_runs","execution_claims",
       "local_agent_sessions","qm_sessions","qm_tasks","qm_task_members","qm_task_snapshots","qm_task_context",
       "qm_runtime_work","qm_runtime_admission","qm_transfers","qm_task_change_baselines","qm_task_file_changes","qm_task_finalizations",
