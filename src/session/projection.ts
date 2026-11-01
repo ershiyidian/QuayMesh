@@ -150,7 +150,8 @@ export class SessionProjector {
     const task = taskId ? this.store.getTask(taskId) : null;
     if (task && task.session_id !== sessionId) throw new Error(`TASK_SESSION_MISMATCH: ${task.id}`);
     const revisionBefore = task?.revision ?? member.revision;
-    const events = task ? this.store.eventsForTask(task.id) : this.store.eventsForSession(sessionId);
+    // 成员投影只解析本成员事件，避免每个详情重复读取其他节点的整段历史。
+    const events = task ? this.store.eventsForTask(task.id, member.id) : this.store.eventsForSession(sessionId, undefined, member.id);
     const metadata = this.store.openingMetadata(sessionId,memberId);
     const files = this.store.fileSummaries(sessionId, memberId, task?.id).map(({ patchRef: _patchRef, versionRef: _versionRef, ...file }) => file);
     const commands = this.commands(events, member.id);

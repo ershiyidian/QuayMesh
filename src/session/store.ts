@@ -2119,13 +2119,15 @@ export class SessionStore {
     return rows.map((row) => String(row.owner_id));
   }
 
-  eventsForSession(sessionId: SessionId, limit?: number): SessionEvent[] {
+  eventsForSession(sessionId: SessionId, limit?: number, memberId?: string): SessionEvent[] {
+    const member = memberId === undefined ? "" : " AND member_id = ?";
+    const parameters = memberId === undefined ? [sessionId] : [sessionId, memberId];
     const rows = limit === undefined
       ? this.db.prepare(`SELECT sequence, session_id, task_id, member_id, event_type, source_id, data_json, created_at
-          FROM qm_events WHERE session_id = ? ORDER BY sequence ASC`).all(sessionId) as Record<string, unknown>[]
+          FROM qm_events WHERE session_id = ?${member} ORDER BY sequence ASC`).all(...parameters) as Record<string, unknown>[]
       : this.db.prepare(`SELECT sequence, session_id, task_id, member_id, event_type, source_id, data_json, created_at
-          FROM qm_events WHERE session_id = ? ORDER BY sequence DESC LIMIT ?`)
-          .all(sessionId, Math.max(1, Math.min(10_000, limit))) as Record<string, unknown>[];
+          FROM qm_events WHERE session_id = ?${member} ORDER BY sequence DESC LIMIT ?`)
+          .all(...parameters, Math.max(1, Math.min(10_000, limit))) as Record<string, unknown>[];
     if (limit !== undefined) rows.reverse();
     return rows.map((row) => ({
       sequence: Number(row.sequence),
@@ -2139,9 +2141,11 @@ export class SessionStore {
     }));
   }
 
-  eventsForTask(taskId: string): SessionEvent[] {
+  eventsForTask(taskId: string, memberId?: string): SessionEvent[] {
+    const member = memberId === undefined ? "" : " AND member_id = ?";
     const rows = this.db.prepare(`SELECT sequence, session_id, task_id, member_id, event_type, source_id, data_json, created_at
-      FROM qm_events WHERE task_id=? ORDER BY sequence ASC`).all(taskId) as Record<string, unknown>[];
+      FROM qm_events WHERE task_id=?${member} ORDER BY sequence ASC`)
+      .all(...(memberId === undefined ? [taskId] : [taskId, memberId])) as Record<string, unknown>[];
     return rows.map((row) => ({
       sequence: Number(row.sequence), session_id: String(row.session_id), task_id: String(row.task_id), member_id: String(row.member_id),
       type: row.event_type as SessionEvent["type"], source_id: String(row.source_id), timestamp: String(row.created_at),
