@@ -38,7 +38,7 @@ export function pickResponseHeaders(headers: Record<string, unknown>): Record<st
 
 // Coordinator 收到浏览器经 Relay 转发来的 Console 请求后，直接调用本地 HTTP 入口。
 // 请求的真实身份来自已经通过集群密钥认证的 federation 连接，而不是转发头。
-export async function dispatchConsoleRequest(httpPort: number, relayNodeId: string, params: JsonRecord): Promise<ConsoleReply> {
+export async function dispatchConsoleRequest(httpPort: number, relayNodeId: string, params: JsonRecord, signal?: AbortSignal): Promise<ConsoleReply> {
   const method = typeof params.method === "string" ? params.method.toUpperCase() : "";
   const path = typeof params.path === "string" ? params.path : "";
   if (!["GET", "HEAD", "POST"].includes(method)) return { status: 405, body: { code: "CONSOLE_METHOD_REJECTED" } };
@@ -62,7 +62,8 @@ export async function dispatchConsoleRequest(httpPort: number, relayNodeId: stri
   let response: Response;
   try {
     // 显式重验证，避免 fetch 为条件请求补上 no-cache 并使服务端忽略 ETag。
-    response = await fetch(`http://127.0.0.1:${httpPort}${path}`, { method, headers: headerList, body: body ? new Uint8Array(body) : undefined, redirect: "manual", cache: "no-cache" });
+    response = await fetch(`http://127.0.0.1:${httpPort}${path}`, { method, headers: headerList, body: body ? new Uint8Array(body) : undefined,
+      redirect: "manual", cache: "no-cache", signal: method === "GET" || method === "HEAD" ? signal : undefined });
   } catch (error) {
     return { status: 503, body: { code: "CONSOLE_UPSTREAM_UNAVAILABLE", message: error instanceof Error ? error.message : String(error) } };
   }

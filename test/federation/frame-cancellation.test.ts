@@ -49,6 +49,7 @@ async function stalledPeer(handler:RpcHandler) {
   await transport.start();await until(()=>Boolean(transport.links.get("target")?.connected&&control),"control connects");
   const link=transport.links.get("target")!;
   return {link,frames,replies,send:(frame:unknown)=>control!.write(JSON.stringify(frame)+"\n"),
+    pauseControl:()=>control!.pause(),resumeControl:()=>control!.resume(),
     close:async()=>{await transport.close();for(const session of sessions)session.destroy();await new Promise<void>(resolve=>server.close(()=>resolve()));}};
 }
 
@@ -78,5 +79,31 @@ test("cancelling completed work releases its blocked reply without disconnecting
     peer.send({id:"after",method:"small",params:{}});
     await until(()=>peer.replies.some(frame=>frame.id==="after"&&frame.result==="ready"),"small replies remain available");
     assert.equal(peer.link.connected,true);
+  }finally{await peer.close();}
+});
+
+test("cancelling small replies releases request slots while preserving queued-byte accounting",{timeout:8000},async()=>{
+  let completed=0;
+  const peer=await stalledPeer(method=>{if(method==="small-bulk"){completed++;return "x".repeat(60*1024);}return "ready";});
+  try{
+    peer.pauseControl();
+    const ids=Array.from({length:8},(_,n)=>"small-reply-"+n);
+    for(const id of ids)peer.send({id,method:"small-bulk",params:{}});
+    await until(()=>completed===ids.length&&Number(peer.link.diagnostics().queuedControlBytes)>0,"small replies fill the real control-stream window");
+    await delay(100);
+    assert.ok(Number(peer.link.diagnostics().incomingRpc)>0,"completed replies remain blocked by flow control");
+    const beforeCancel=peer.link.diagnostics();
+    for(const id of ids)peer.send({method:"$cancel",params:{id}});
+    await until(()=>peer.link.diagnostics().incomingRpc===0,"cancelled small replies must release request slots");
+    assert.ok(Number(peer.link.diagnostics().queuedControlBytes)>0,"cancellation does not discard bytes already queued on the shared stream");
+    assert.equal(peer.link.diagnostics().outgoingLargeFrames,0);
+    assert.equal(peer.link.connected,true);
+    assert.equal(completed,ids.length,"delivery cancellation cannot repeat already completed work");
+    assert.ok(Number(beforeCancel.queuedControlBytes)>0);
+
+    peer.resumeControl();
+    await until(()=>peer.link.diagnostics().queuedControlBytes===0,"queued bytes are released only after actual delivery");
+    peer.send({id:"after-small-cancel",method:"small",params:{}});
+    await until(()=>peer.replies.some(frame=>frame.id==="after-small-cancel"&&frame.result==="ready"),"control remains usable after the peer resumes reading");
   }finally{await peer.close();}
 });

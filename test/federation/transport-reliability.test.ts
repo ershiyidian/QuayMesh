@@ -45,6 +45,34 @@ test("协商的大正文在 NAT 双向连接上保留完整 8 MiB 图片编码",
   } finally { await p.close(); }
 });
 
+test("concurrent MiB replies preserve request identity across both directions and idle link reuse",{timeout:15000},async()=>{
+  const payload="x".repeat(1024*1024);
+  let completed=0;
+  const p=await pair((_method,value)=>{completed++;return {key:value.key,body:value.key+payload};});
+  try{
+    const links=[p.caller.links.get("target")!,p.target.links.get("caller")!];
+    for(let round=0;round<3;round++){
+      await Promise.all(links.flatMap((link,direction)=>Array.from({length:3},async(_,index)=>{
+        const key=`${round}:${direction}:${index}`;
+        const reply=await link.call<{key:string;body:string}>("snapshot",{key},3000);
+        assert.equal(reply.key,key);
+        assert.equal(reply.body,key+payload);
+      })));
+      await until(()=>links.every(link=>link.diagnostics().incomingRpc===0&&link.diagnostics().outgoingLargeFrames===0));
+      for(const link of links){
+        assert.equal(link.pending.size,0);
+        assert.equal(link.diagnostics().queuedControlBytes,0);
+        assert.equal(link.connected,true);
+      }
+      // Let several actual heartbeats run before reusing the same idle session.
+      await delay(300);
+      assert.equal(p.caller.links.get("target"),links[0]);
+      assert.equal(p.target.links.get("caller"),links[1]);
+    }
+    assert.equal(completed,18);
+  }finally{await p.close();}
+});
+
 test("真实限速链路中大正文传输期间小响应可独立完成", { timeout: 20_000 }, async () => {
   const sockets = new Set<Socket>(); let bulkStarted = false; let throttled = false;
   const targetConfig = config("target"); targetConfig.peers = [{ id: "caller", url: "" }];

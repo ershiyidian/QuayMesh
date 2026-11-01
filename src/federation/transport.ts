@@ -334,8 +334,21 @@ export class PeerLink extends EventEmitter {
     if (bytes > MAX_FRAME) throw unsentError("PEER_PAYLOAD_TOO_LARGE", "目标节点仍使用 8 MiB 消息协议，请更新节点或使用文件传输接口。");
     if (this.queuedControlBytes + bytes > Math.max(MAX_QUEUED_CONTROL_BYTES, bytes)) throw unsentError("PEER_BUSY", "节点控制消息队列已满，请稍后重试。");
     this.queuedControlBytes += bytes;
-    try { await new Promise<void>((resolve, reject) => this.control.write(text, (error) => error ? reject(error) : resolve())); }
-    finally { this.queuedControlBytes -= bytes; }
+    const written = new Promise<void>((resolve, reject) => this.control.write(text, (error) => error ? reject(error) : resolve()))
+      .finally(() => { this.queuedControlBytes -= bytes; });
+    if (!signal) return written;
+    // Cancellation ends this request's delivery wait, not the shared stream.
+    // Already queued bytes still count toward the limit until write completes.
+    await new Promise<void>((resolve, reject) => {
+      const aborted = () => {
+        signal.removeEventListener("abort", aborted);
+        reject(interruptedStream("节点正文交付已取消"));
+      };
+      signal.addEventListener("abort", aborted, { once: true });
+      void written.then(() => { signal.removeEventListener("abort", aborted); resolve(); },
+        error => { signal.removeEventListener("abort", aborted); reject(error); });
+      if (signal.aborted) aborted();
+    });
   }
   call<T = unknown>(method: string, params: unknown, timeoutMs = this.owner.config.rpcTimeoutMs,
     onProgress?: (notification: PeerProgressNotification) => void | Promise<void>, signal?: AbortSignal): Promise<T> {

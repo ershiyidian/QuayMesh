@@ -31,6 +31,7 @@ import { errorCode, toolErrorResult } from "../session/outcome.js";
 import { WorkspaceAccessError } from "../workspaces.js";
 import { dispatchPeerRequest, isTransientPeerFailure, isIdempotentPeerRequest, isCancellableToolObservation } from "./read-retry.js";
 import { dispatchConsoleRequest } from "./console-request.js";
+import { withConsoleReadSignal } from "../console-workbench/isolated-queries.js";
 import type {LocalApiPeerHooks} from "../local-user-api/service.js";
 
 export interface ArtifactWriteLifecycle {
@@ -348,13 +349,14 @@ export class FederationRuntime extends EventEmitter {
       }
       case "console": {
         const request = () => this.hooks.console(params.method, params.path, params.body);
-        return ["GET", "HEAD"].includes(String(params.method ?? "GET").toUpperCase())
-          ? request() : this.execution.withWork({kind: "console"}, request);
+        if (["GET", "HEAD"].includes(String(params.method ?? "GET").toUpperCase()))
+          return signal ? withConsoleReadSignal(signal, request) : request();
+        return this.execution.withWork({kind: "console"}, request);
       }
       case "console.request": {
         const manifest = this.known.get(peer);
         if (!manifest?.capabilities?.consoleRelay) throw new Error("CONSOLE_RELAY_CAPABILITY_REQUIRED");
-        const request = () => dispatchConsoleRequest(this.hooks.httpPort, peer, params ?? {});
+        const request = () => dispatchConsoleRequest(this.hooks.httpPort, peer, params ?? {}, signal);
         return ["GET", "HEAD"].includes(String(params.method ?? "GET").toUpperCase())
           ? request() : this.execution.withWork({kind: "console"}, request);
       }

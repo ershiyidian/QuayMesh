@@ -46,9 +46,15 @@ export function isIdempotentPeerRequest(method: string, params: unknown): boolea
     if (toolName === "attach_workspace") {
       return input.create_directory !== true && (input.mode === undefined || input.mode === "checkout");
     }
+    if (toolName === "workspace_context") {
+      // Recovery release/stop change durable execution state. A lost reply
+      // must retain that invocation, not replay it as a cancellable read.
+      return ["list", "capture", "search", "status"].includes(String(input.action))
+        || input.action === "recovery" && (input.recovery_action === undefined || input.recovery_action === "inspect");
+    }
     // Read-only surface. Snapshot, detail, list and status queries may be retried inside the read budget.
     if (toolName === "read" || toolName === "read_output" || toolName === "list_directory" || toolName === "search_files" ||
-        toolName === "workspace_context" || toolName === "wait_agent" || toolName === "list_agents" ||
+        toolName === "wait_agent" || toolName === "list_agents" ||
         toolName === "qm_session" || toolName === "qm_file_diff" ||
         toolName === "qm_command_output" || toolName === "qm_command_outputs" || toolName === "qm_instruction" ||
         toolName === "qm_patch" || toolName === "qm_file_url" ||
