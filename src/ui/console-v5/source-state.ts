@@ -1,5 +1,9 @@
 import type { CacheEntry, SourceState } from './contracts.js';
 
+export function hasPendingSourceRead(sources: readonly SourceState[]): boolean {
+  return sources.some(source => source.online && (source.state === 'loading' || source.state === 'refreshing'));
+}
+
 export function sourceWarning(source: SourceState, now = Date.now()): string | null {
   if (source.error) return source.state === 'refreshing' ? `正在重试，上次读取失败：${source.error}` : source.error;
   if (source.state === 'error' || source.state === 'offline') return '当前无法读取，保留最近确认的数据';

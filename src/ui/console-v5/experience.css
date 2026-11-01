@@ -41,6 +41,8 @@
 .phase-card,.receipt-row { padding:14px;border:1px solid var(--border);border-radius:8px;display:grid;gap:10px;min-width:0; }
 .phase-card code { font-size:11px; }
 .phase-card p { margin:0;color:var(--muted); }
+.phase-pagination { flex-wrap:wrap;gap:8px;flex-shrink:0; }
+.phase-pagination>span:first-child { min-width:0; }
 .evidence-actions { grid-column:2/-1;display:flex;gap:6px;align-items:center; }
 .receipt-row { border-width:0 0 1px;border-radius:0; }
 .receipt-row pre { max-height:360px;overflow:auto; }

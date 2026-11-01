@@ -12,7 +12,8 @@ import type { FederationRuntime } from '../../src/federation/runtime.js';
 function phase(taskId:string,nodeId='a',status='waiting',tokens=1):Run {
   const localId=taskId+'-'+nodeId,id=workspaceHandle(nodeId,localId),at=Date.now()-1000;
   return {id,localId,title:taskId,nodeId,projectId:workspaceHandle(nodeId,'project'),projectLocalId:'project',projectName:'project',root:'/project',
-    executionStatus:status,acceptanceStatus:'pending',startedAt:at,finishedAt:null,lastActivityAt:at,revision:1,workspaceRevision:1,
+    executionStatus:status,acceptanceStatus:'pending',startedAt:at,finishedAt:null,lastActivityAt:at,lastProgressAt:at,
+    executionObservedAt:['running','queued','stopping'].includes(status)?at:null,revision:1,workspaceRevision:1,
     sessionId:'session',taskId,memberId:nodeId,usage:{total:tokens,input:tokens,cached:0,output:0,reasoning:0,quality:'complete'},diff:null,
     origin:'chatgpt_mcp',branch:null,baseSha:null,command:null,agent:null,reason:null,warnings:[],currentPhase:true,phaseRefs:[id],
     actions:{interrupt:status==='running',resume:false,review:status==='completed',revert:false,complete:status!=='running'}};
@@ -20,23 +21,32 @@ function phase(taskId:string,nodeId='a',status='waiting',tokens=1):Run {
 function index(run:Run):TaskPhaseIndex {
   return {...run,tokens:run.usage.total,changed:Boolean(run.diff),currentPhase:run.currentPhase!==false,actionableInterruption:run.actionableInterruption===true};
 }
-function fixture(runs:Run[],tasks:TaskLifecycle[]=[]) {
-  const nodes=[{id:'a',nickname:'A',online:true},{id:'b',nickname:'B',online:true},{id:'c',nickname:'C',online:false}];
+function fixture(runs:Run[],tasks?:TaskLifecycle[]) {
+  const nodes=[{id:'a',nickname:'A',online:true,capabilities:{coordinator:true}},{id:'b',nickname:'B',online:true},{id:'c',nickname:'C',online:false}];
   const calls:Array<{node:string;path:string}>=[];
   const usageIds=new Set<string>();
   const runtime={nodes:()=>nodes,request:async(node:string,method:string,args:{path:string})=>{
-    assert.equal(method,'console');calls.push({node,path:args.path});
-    const url=new URL(args.path,'http://test.invalid'),own=runs.filter(run=>run.nodeId===node);
+    assert.equal(method,'console');assert.ok(args.path.startsWith('/workbench/isolated-v1/'));
+    const path=args.path.replace('/isolated-v1','');calls.push({node,path});
+    const url=new URL(path,'http://test.invalid');
+    const matches=(value:{taskId:string|null;sessionId:string|null})=>(!url.searchParams.has('taskIds')||url.searchParams.get('taskIds')!.split(',').includes(value.taskId??''))
+      &&(!url.searchParams.has('sessionId')||value.sessionId===url.searchParams.get('sessionId'));
+    const own=runs.filter(run=>run.nodeId===node&&matches(run));
+    const lifecycles=tasks??[...new Set(runs.map(run=>run.taskId!))].map(id=>lifecycle(id,[...new Set(runs.filter(run=>run.taskId===id).map(run=>run.nodeId))]));
+    const titles={items:[{id:'session',title:'conversation',revision:1,lastActivityAt:Date.now()}],
+      tasks:node==='a'?lifecycles.filter(task=>matches({taskId:task.id,sessionId:task.sessionId})):[],authoritative:node==='a'};
     let body:unknown;
-    if(url.pathname==='/workbench/task-index')body={items:own.map(index),observedAt:Date.now()};
-    else if(url.pathname==='/workbench/session-titles')body={items:[{id:'session',title:'conversation',revision:1,lastActivityAt:Date.now()}],tasks:node==='a'?tasks:[],authoritative:node==='a'};
+    if(['/workbench/task-index','/workbench/task-index-scoped'].includes(url.pathname))body={items:own.map(index),observedAt:Date.now()};
+    else if(['/workbench/session-titles','/workbench/session-titles-scoped'].includes(url.pathname))body=titles;
+    else if(url.pathname==='/workbench/task-state-index')body={projection:'state',phases:own.map(index).map(({tokens:_tokens,changed:_changed,...state})=>state),
+      sessions:titles.items,tasks:titles.tasks,authoritative:titles.authoritative,observedAt:Date.now()};
     else if(url.pathname==='/workbench/run-summaries')body={items:own.filter(run=>url.searchParams.get('ids')!.split(',').includes(run.localId))};
     else if(url.pathname==='/workbench/overview-usage')body={todayUsage:totals([]),projects:[]};
     else if(url.pathname==='/workbench/usage')body={...totals([]),daily:[],top:[],projects:[],pendingUsage:totals([]),undatedUsage:totals([]),runIds:own.filter(run=>usageIds.has(run.id)).map(run=>run.id)};
     else throw new Error('Unexpected path '+args.path);
     return {status:200,body};
   }} as unknown as FederationRuntime;
-  const feed=new WorkbenchFeed({federation:{nodeId:'controller'}} as ServerConfig,runtime);
+  const feed=new WorkbenchFeed({federation:{nodeId:'controller',coordinatorId:'a'}} as ServerConfig,runtime);
   return {feed,runs,nodes,calls,usageIds};
 }
 function lifecycle(id:string,nodes=['a']):TaskLifecycle {
@@ -54,7 +64,7 @@ function metadataFixture() {
   const body={projects:[{id:'project',localId:'project',nodeId:'a',name:'Project',path:'/project',rootId:null,active:0,review:0,total:0,updatedAt:1}],roots:[]};
   const remote={calls:0,read:async()=>body};
   const runtime={nodes:()=>[node],request:async(nodeId:string,method:string,args:{path:string})=>{
-    assert.equal(nodeId,node.id); assert.equal(method,'console'); assert.equal(args.path,'/workbench/metadata');
+    assert.equal(nodeId,node.id); assert.equal(method,'console'); assert.equal(args.path,'/workbench/isolated-v1/metadata');
     remote.calls++; return {status:200,body:await remote.read()};
   }} as unknown as FederationRuntime;
   return {feed:new WorkbenchFeed({federation:{nodeId:'controller'}} as ServerConfig,runtime),node,remote,body};
@@ -65,7 +75,7 @@ test('slow metadata polls await a shared fresh read and unchanged content advanc
   const f=metadataFixture(), first=await f.feed.metadata(), result=deferred<typeof f.body>();
   f.remote.read=()=>result.promise; t.mock.timers.tick(60_000);
   let settled=false;
-  const reading=f.feed.metadata().then(value=>{settled=true;return value;}), concurrent=f.feed.metadata();
+  const reading=f.feed.metadata(true).then(value=>{settled=true;return value;}), concurrent=f.feed.metadata(true);
   await new Promise<void>(resolve=>setImmediate(resolve));
   assert.equal(f.remote.calls,2); assert.equal(settled,false);
   result.resolve(f.body); const [fresh,same]=await Promise.all([reading,concurrent]);
@@ -75,7 +85,7 @@ test('slow metadata polls await a shared fresh read and unchanged content advanc
   assert.deepEqual(same.sources,fresh.sources); assert.equal(f.remote.calls,2);
 });
 
-test('recent background refresh stays usable while an expired observer joins the same read',async t=>{
+test('recent background refresh stays usable while a manual refresh joins the same read',async t=>{
   t.mock.timers.enable({apis:['Date'],now:1_000_000});
   const f=metadataFixture(), first=await f.feed.metadata(), result=deferred<typeof f.body>();
   f.remote.read=()=>result.promise; t.mock.timers.tick(12_000);
@@ -84,7 +94,7 @@ test('recent background refresh stays usable while an expired observer joins the
   assert.equal(refreshing.sources[0].observedAt,first.sources[0].observedAt); assert.equal(refreshing.complete,true);
   await f.feed.metadata(); assert.equal(f.remote.calls,2);
   t.mock.timers.tick(18_001); let settled=false;
-  const expired=f.feed.metadata().then(value=>{settled=true;return value;});
+  const expired=f.feed.metadata(true).then(value=>{settled=true;return value;});
   await new Promise<void>(resolve=>setImmediate(resolve));
   assert.equal(settled,false); assert.equal(f.remote.calls,2);
   result.resolve(f.body); const fresh=await expired;
@@ -95,14 +105,14 @@ test('metadata failures retain real errors and data, back off, and recover only 
   t.mock.timers.enable({apis:['Date'],now:1_000_000});
   const f=metadataFixture(), first=await f.feed.metadata();
   f.remote.read=async()=>{throw new Error('RPC_TIMEOUT');}; t.mock.timers.tick(60_000);
-  const failed=await f.feed.metadata();
+  const failed=await f.feed.metadata(true);
   assert.equal(failed.sources[0].state,'error'); assert.equal(failed.sources[0].error,'RPC_TIMEOUT');
   assert.equal(failed.sources[0].observedAt,first.sources[0].observedAt); assert.equal(failed.complete,false);
   assert.deepEqual(failed.projects,first.projects); assert.equal(f.remote.calls,2);
   await f.feed.metadata(); t.mock.timers.tick(2_999); await f.feed.metadata(); assert.equal(f.remote.calls,2);
-  t.mock.timers.tick(1); const second=await f.feed.metadata(); assert.equal(second.sources[0].error,'RPC_TIMEOUT');
+  t.mock.timers.tick(1); const second=await f.feed.metadata(true); assert.equal(second.sources[0].error,'RPC_TIMEOUT');
   assert.equal(f.remote.calls,3); t.mock.timers.tick(5_999); await f.feed.metadata(); assert.equal(f.remote.calls,3);
-  f.remote.read=async()=>f.body; t.mock.timers.tick(1); const recovered=await f.feed.metadata();
+  f.remote.read=async()=>f.body; t.mock.timers.tick(1); const recovered=await f.feed.metadata(true);
   assert.equal(f.remote.calls,4); assert.equal(recovered.sources[0].error,null);
   assert.equal(recovered.sources[0].observedAt,Date.now()); assert.equal(recovered.complete,true);
   f.node.online=false; const offline=await f.feed.metadata();
@@ -113,7 +123,7 @@ test('metadata failures retain real errors and data, back off, and recover only 
 test('task pagination freezes ordering while tokens and new tasks change, then expires explicitly',async t=>{
   t.mock.timers.enable({apis:['Date'],now:Date.now()});
   const f=fixture([phase('one','a','waiting',10),phase('two','a','waiting',9),phase('three','a','waiting',8),phase('four','a','waiting',7)]);
-  const query={days:'0',sort:'tokens',limit:'2'};
+  const query={node:'a',days:'0',sort:'tokens',limit:'2'};
   const first=await f.feed.runs(query);assert.deepEqual(first.items.map(run=>run.taskId),['one','two']);
   f.runs[2].usage.total=100;f.runs.push(phase('new','a','waiting',200));f.feed.invalidate();
   const next=await f.feed.runs({...query,cursor:first.nextCursor!});
@@ -134,6 +144,53 @@ test('node counts use local phases and scoped reads expand only to related task 
   assert.equal(overview.nodeCounts.a.running,1);assert.equal(overview.nodeCounts.b.running,0);assert.equal(overview.nodeCounts.b.waiting,1);
   assert.equal(overview.nodeCounts.c.running,null);assert.equal(overview.activeCount,null);assert.equal(overview.knownCounts.active,1);
   const related=await f.feed.taskRuns('shared');assert.equal(related.complete,true);assert.deepEqual(related.missingNodes,[]);
+});
+
+test('ordinary lists use state only, detail reads stay on the selected page, and explicit change or token queries use full fields',async()=>{
+  const runs=['first','second','third'].map((id,index)=>({...phase(id,'a','waiting',30-index),diff:{files:1,add:0,del:0}}));
+  const f=fixture(runs);
+  const state=await f.feed.runs({node:'a',days:'0',limit:'1'});
+  assert.equal(state.projection,'state');assert.equal(state.coverage.tasks,true);assert.equal(state.total,3);
+  assert.equal(f.calls.some(call=>call.path==='/workbench/task-index'||call.path.startsWith('/workbench/session-titles')),false);
+  const summaries=f.calls.filter(call=>call.path.startsWith('/workbench/run-summaries?'));
+  assert.equal(summaries.length,1);
+  assert.deepEqual(new URL(summaries[0]!.path,'http://test.invalid').searchParams.get('ids')!.split(','),[state.items[0]!.phaseRefs![0]!.split(':').at(-1)]);
+  const full=await f.feed.runs({node:'a',days:'0',limit:'1',changed:'1'});
+  assert.equal(full.projection,'full');assert.equal(full.total,state.total);assert.deepEqual(full.counts,state.counts);
+  assert.deepEqual(full.items.map(task=>({taskId:task.taskId,execution:task.executionStatus,request:task.requestState})),
+    state.items.map(task=>({taskId:task.taskId,execution:task.executionStatus,request:task.requestState})));
+  assert.ok(f.calls.some(call=>call.path==='/workbench/task-index'));
+  const tokens=await f.feed.runs({node:'a',days:'0',sort:'tokens'});
+  assert.equal(tokens.projection,'full');assert.deepEqual(tokens.items.map(task=>task.taskId),['first','second','third']);
+});
+
+test('a Home-only project reads its Coordinator and owner while unrelated unavailable workers do not affect its coverage',async()=>{
+  const task=lifecycle('home',['b']),unrelated=lifecycle('other',['b','c']);
+  unrelated.workspaces=unrelated.workspaces!.map(workspace=>({...workspace,projectId:workspaceHandle(workspace.nodeId,'other'),root:'/other'}));
+  const otherPhase={...phase('other','b'),projectId:workspaceHandle('b','other'),root:'/other'};
+  const f=fixture([phase('home','b'),otherPhase],[task,unrelated]),project=workspaceHandle('b','project');
+  const page=await f.feed.runs({project,days:'0'});
+  assert.equal(page.complete,true);assert.deepEqual(page.sources.map(source=>source.nodeId).sort(),['a','b']);
+  assert.equal(page.items[0]?.taskId,'home');
+  const before=f.calls.length;
+  const conversations=await f.feed.conversations({project});
+  assert.equal(conversations.complete,true);assert.equal(conversations.items[0]?.tasks[0]?.taskId,'home');
+  const empty=await f.feed.projectConversations({projectId:project,conversations:[],items:[],batches:[],claims:[],executionClaims:[]});
+  assert.equal(empty.complete,true);assert.deepEqual(empty.sources.map(source=>source.nodeId).sort(),['a','b']);
+  assert.ok(f.calls.slice(before).every(call=>call.path==='/workbench/task-state-index'));
+  assert.ok(f.calls.every(call=>['a','b'].includes(call.node)));
+});
+
+test('a selected Task without authority or with a missing member remains incomplete even if its owner read succeeds',async()=>{
+  const project=workspaceHandle('b','project');
+  const noAuthority=fixture([phase('unconfirmed','b')],[]);
+  const page=await noAuthority.feed.runs({project,days:'0'});
+  assert.equal(page.items[0]?.taskId,'unconfirmed');assert.equal(page.coverage.tasks,false);assert.equal(page.complete,false);
+  assert.ok(page.sources.every(source=>source.online&&source.observedAt!==null&&!source.error));
+  const task=lifecycle('missing',['b','removed-node']),missing=fixture([phase('missing','b')],[task]);
+  const partial=await missing.feed.runs({project,days:'0'});
+  assert.equal(partial.coverage.tasks,false);assert.equal(partial.complete,false);
+  assert.equal(partial.sources.find(source=>source.nodeId==='removed-node')?.state,'offline');
 });
 
 test('navigation groups use request execution facts while review remains an independent facet',async()=>{

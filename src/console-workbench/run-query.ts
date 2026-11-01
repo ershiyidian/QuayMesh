@@ -6,6 +6,7 @@ import { WorkbenchError, type Run } from "./types.js";
 
 import { runExecutionStatus } from "../task-view.js";
 import { executionTimeEnd } from "../console-task-state.js";
+import {parseTaskReadScope,type TaskReadScope} from './task-read-scope.js';
 
 export interface PageBoundary {
   value: number;
@@ -46,7 +47,7 @@ export function pageCursor(run: Run, query: Query, at: number, offset: number, d
   return Buffer.from(JSON.stringify({ value: runSortValue(run, query, at), id: run.id, at, offset, direction })).toString("base64url");
 }
 
-export interface RunQueryOptions { ids?: readonly string[]; counts?: boolean }
+export interface RunQueryOptions { ids?: readonly string[]; counts?: boolean; taskScope?: TaskReadScope; fields?: 'full' | 'state' }
 interface RunSelection { sql: string; params: Array<string | number> }
 interface CountedRunSelection extends RunSelection { total: number; counts: Record<string, number> }
 
@@ -58,15 +59,24 @@ export function runQuery(ledger: WorkLedger, nodeId: string, projectIds: string[
 export function runQuery(ledger: WorkLedger, nodeId: string, projectIds: string[], query: Query, at: number,
   options: RunQueryOptions = {}): RunSelection | CountedRunSelection {
   const db = ledger.db;
+  const stateOnly=options.fields==='state';
+  if(stateOnly&&(query.changed||query.sort==='tokens'))
+    throw new WorkbenchError('状态读取不包含用量和改动筛选',400,'invalid_read','none');
   db.function("quaymesh_execution_status", {deterministic:true},
     (state: unknown, result: unknown, status: unknown, working: unknown, queued: unknown, unresolved: unknown,progress:unknown,finalizing:unknown,lastOutcome:unknown) =>
       runExecutionStatus(state as string|null, result as string|null, String(status), working === 1, queued === 1, unresolved === 1,
         typeof progress==='string'?Date.parse(progress):null,at,finalizing===1,typeof lastOutcome==='string'?lastOutcome:null));
   const allowed = projectIds.length ? `r.project_id IN (${projectIds.map(() => "?").join(",")})` : "0";
   const requested = options.ids === undefined ? "1" : options.ids.length ? "r.id IN (SELECT value FROM json_each(?))" : "0";
+  const taskScope=options.taskScope===undefined?undefined:parseTaskReadScope(options.taskScope);
+  // Select run IDs through the indexed ownership link before classifying any
+  // operation history; a Task/Session detail must not scan unrelated Tasks.
+  const taskSelected=!taskScope?'1':taskScope.taskIds
+    ? 'r.id IN (SELECT run_id FROM qm_run_links WHERE task_id IN (SELECT value FROM json_each(?)))'
+    : 'r.id IN (SELECT run_id FROM qm_run_links WHERE session_id=?)';
   const prefix = workspaceHandle(nodeId, "");
   const sql = `WITH base AS (
-    SELECT r.*,COALESCE(t.title,s.title,i.title) title,p.root,p.name project_name,?||r.id reference,
+    SELECT ${stateOnly?'r.id,r.project_id,r.item_id,r.status,r.acceptance,r.created_at,r.finished_at,r.last_activity_at':'r.*'},COALESCE(t.title,s.title,i.title) title,p.root,p.name project_name,?||r.id reference,
       l.session_id,l.task_id,l.member_id,
       t.state task_state,t.result_status task_result,t.finished_at task_finished_at,
       f.requested_at finalization_requested_at,f.error finalization_error,
@@ -76,13 +86,16 @@ export function runQuery(ledger: WorkLedger, nodeId: string, projectIds: string[
         OR EXISTS(SELECT 1 FROM console_executions e WHERE e.run_id=r.id AND e.status IN ('running','starting') AND e.observed_at>='${new Date(at-30_000).toISOString()}') THEN 1 ELSE 0 END working,
       CASE WHEN EXISTS(SELECT 1 FROM console_operations o WHERE o.run_id=r.id AND o.status='queued' AND o.observed_at>='${new Date(at-30_000).toISOString()}')
         OR EXISTS(SELECT 1 FROM console_executions e WHERE e.run_id=r.id AND e.status='queued' AND e.observed_at>='${new Date(at-30_000).toISOString()}') THEN 1 ELSE 0 END queued,
-      CASE WHEN r.status='reconciliation_required' OR EXISTS(SELECT 1 FROM console_operations o WHERE o.run_id=r.id AND (o.status IN ('unknown','reconciliation_required')
-          OR (o.status IN ('running','starting','queued') AND (o.observed_at IS NULL OR o.observed_at<'${new Date(at-30_000).toISOString()}'))))
-        OR EXISTS(SELECT 1 FROM console_executions e WHERE e.run_id=r.id AND (e.status IN ('unknown','reconciliation_required')
-          OR (e.status IN ('running','starting','queued') AND (e.observed_at IS NULL OR e.observed_at<'${new Date(at-30_000).toISOString()}')))) THEN 1 ELSE 0 END unresolved,
-      ${LAST_RUN_OUTCOME_SQL} last_outcome,
+      CASE WHEN r.status='reconciliation_required'
+        OR EXISTS(SELECT 1 FROM console_operations o WHERE o.run_id=r.id AND o.status IN ('unknown','reconciliation_required'))
+        OR EXISTS(SELECT 1 FROM console_operations o WHERE o.run_id=r.id AND o.status IN ('running','starting','queued')
+          AND (o.observed_at IS NULL OR o.observed_at<'${new Date(at-30_000).toISOString()}'))
+        OR EXISTS(SELECT 1 FROM console_executions e WHERE e.run_id=r.id AND e.status IN ('unknown','reconciliation_required'))
+        OR EXISTS(SELECT 1 FROM console_executions e WHERE e.run_id=r.id AND e.status IN ('running','starting','queued')
+          AND (e.observed_at IS NULL OR e.observed_at<'${new Date(at-30_000).toISOString()}')) THEN 1 ELSE 0 END unresolved,
+      ${LAST_RUN_OUTCOME_SQL} last_outcome${stateOnly?'':`,
       (SELECT SUM(json_extract(e.delta,'$.totalTokens')) FROM console_executions e WHERE e.run_id=r.id) tokens,
-      k.files_json archived_files
+      k.files_json archived_files`}
     FROM console_work_runs r JOIN console_work_items i ON i.id=r.item_id
       JOIN console_projects p ON p.id=r.project_id
       LEFT JOIN qm_run_links l ON l.run_id=r.id
@@ -90,11 +103,11 @@ export function runQuery(ledger: WorkLedger, nodeId: string, projectIds: string[
       LEFT JOIN qm_sessions s ON s.id=l.session_id
       LEFT JOIN qm_tasks t ON t.id=l.task_id
       LEFT JOIN qm_task_finalizations f ON f.task_id=t.id
-      LEFT JOIN qm_run_checkpoints k ON k.run_id=r.id
-    WHERE ${allowed} AND (l.run_id IS NULL OR m.node_id=?) AND ${requested}
+      ${stateOnly?'':'LEFT JOIN qm_run_checkpoints k ON k.run_id=r.id'}
+    WHERE ${allowed} AND (l.run_id IS NULL OR m.node_id=?) AND ${requested} AND ${taskSelected}
   ), classified AS (
     SELECT *,quaymesh_execution_status(task_state,task_result,status,working,queued,unresolved,last_activity_at,finalizing,last_outcome) execution,
-      CASE WHEN last_outcome IN ('failed','stopped','cancelled') THEN 1 ELSE 0 END failed_child,
+      CASE WHEN last_outcome IN ('failed','stopped','cancelled') THEN 1 ELSE 0 END failed_child${stateOnly?'':`,
       CASE WHEN task_state='closed' AND EXISTS(
         SELECT 1 FROM qm_task_snapshots snap WHERE snap.task_id=base.task_id AND snap.member_id=base.member_id AND json_array_length(snap.files_json)>0
       ) THEN 1 WHEN task_id IS NOT NULL AND EXISTS(
@@ -107,7 +120,7 @@ export function runQuery(ledger: WorkLedger, nodeId: string, projectIds: string[
         WHERE f.member_id=base.member_id
       ) THEN 1
         WHEN json_array_length(archived_files)>0 THEN 1
-        WHEN EXISTS(SELECT 1 FROM console_operations o,json_each(o.evidence) j WHERE o.run_id=base.id AND json_extract(j.value,'$.label')='console.changes') THEN 1 ELSE 0 END changed
+        WHEN EXISTS(SELECT 1 FROM console_operations o,json_each(o.evidence) j WHERE o.run_id=base.id AND json_extract(j.value,'$.label')='console.changes') THEN 1 ELSE 0 END changed`}
     FROM base
   ), states AS (
     SELECT *,CASE WHEN execution='interrupted_recoverable' THEN 'interrupted'
@@ -120,7 +133,8 @@ export function runQuery(ledger: WorkLedger, nodeId: string, projectIds: string[
     FROM classified
   )`;
   // 占位参数按照 SQL 中出现的顺序排列。
-  const ordered = [prefix, ...projectIds, nodeId, ...(options.ids?.length ? [JSON.stringify(options.ids)] : [])];
+  const ordered = [prefix, ...projectIds, nodeId, ...(options.ids?.length ? [JSON.stringify(options.ids)] : []),
+    ...(taskScope ? [taskScope.taskIds ? JSON.stringify(taskScope.taskIds) : taskScope.sessionId] : [])];
   const where: string[] = [];
   const filters: Array<string | number> = [];
   const condition = (expression: string, value?: string | number) => { where.push(expression); if (value !== undefined) filters.push(value); };

@@ -7,18 +7,21 @@ import { workspaceHandle } from "../federation/routing.js";
 import type { TaskLifecycle } from "../console-task-state.js";
 import { basename } from "node:path";
 import { placeholderTaskTitle, resolveTaskTitle, taskTitleMessage, type TaskTitleSource } from '../task-title.js';
+import {parseTaskReadScope,type TaskReadScope} from './task-read-scope.js';
+import {openReadonlyDatabase} from '../db/client.js';
 
 const latestTimestamp=(values: Array<string|null|undefined>): number|null => {
   const times=values.map(value=>value ? Date.parse(value) : NaN).filter(Number.isFinite);
   return times.length ? Math.max(...times) : null;
 };
 
-export interface TaskPhaseIndex {
+export interface TaskPhaseStateIndex {
   id: string;
   localId: string;
   nodeId: string;
   sessionId: string | null;
   taskId: string | null;
+  memberId?: string | null;
   title: string;
   titleSource?: TaskTitleSource;
   lastProgressAt?: number | null;
@@ -31,8 +34,6 @@ export interface TaskPhaseIndex {
   startedAt: number;
   finishedAt: number | null;
   lastActivityAt: number;
-  tokens: number | null;
-  changed: boolean;
   actionableInterruption: boolean;
   currentPhase: boolean;
   requestState?: string;
@@ -42,11 +43,25 @@ export interface TaskPhaseIndex {
   stale?: boolean;
 }
 
+export interface TaskPhaseIndex extends TaskPhaseStateIndex {
+  tokens: number | null;
+  changed: boolean;
+}
+
 export interface SessionTitleIndex {
   id: string;
   title: string;
   revision: number;
   lastActivityAt: number;
+}
+
+export interface TaskStateIndexRead {
+  projection: 'state';
+  phases: TaskPhaseStateIndex[];
+  sessions: SessionTitleIndex[];
+  tasks: TaskLifecycle[];
+  authoritative: boolean;
+  observedAt: number;
 }
 
 function scope(config: ServerConfig, ledger: WorkLedger) {
@@ -83,14 +98,28 @@ export function readLocalPage(config: ServerConfig, query: Query) {
 }
 
 /** Small task-phase index used by the controller for exact cross-node task paging. */
-export function readLocalTaskIndex(config: ServerConfig, at = Date.now()): { items: TaskPhaseIndex[]; observedAt: number } {
+export function readLocalTaskIndex(config: ServerConfig, at = Date.now(), readScope?: TaskReadScope): { items: TaskPhaseIndex[]; observedAt: number } {
+  const taskScope=readScope===undefined?undefined:parseTaskReadScope(readScope);
   const ledger = new WorkLedger(config.stateDir);
   try {
+    return {items:readTaskPhases(config,ledger,at,'full',taskScope),observedAt:Date.now()};
+  } finally { ledger.close(); }
+}
+
+/** Reuse the caller's readonly snapshot and restrict candidates before reading history. */
+export function readProjectTaskState(config:ServerConfig,ledger:WorkLedger,projectId:string,at=Date.now()):TaskPhaseStateIndex[] {
+  return readTaskPhases(config,ledger,at,'state',undefined,projectId);
+}
+
+function readTaskPhases(config:ServerConfig,ledger:WorkLedger,at:number,fields:'full',taskScope?:TaskReadScope,projectId?:string):TaskPhaseIndex[];
+function readTaskPhases(config:ServerConfig,ledger:WorkLedger,at:number,fields:'state',taskScope?:TaskReadScope,projectId?:string):TaskPhaseStateIndex[];
+function readTaskPhases(config:ServerConfig,ledger:WorkLedger,at:number,fields:'full'|'state',taskScope?:TaskReadScope,projectId?:string):TaskPhaseStateIndex[] {
     const own = scope(config, ledger);
-    const base = runQuery(ledger, own.node, own.projects, { days: "0" }, at, { counts: false });
+    const projects=projectId===undefined?own.projects:own.projects.filter(id=>id===projectId);
+    const base = runQuery(ledger, own.node, projects, { days: "0" }, at, { counts: false,taskScope,fields });
     // Keep every phase for exact cross-node grouping; summary bodies belong to detail reads.
-    const rows = ledger.db.prepare(`${base.sql} SELECT id,reference,session_id,task_id,title,project_id,project_name,root,execution,acceptance,status,task_result,
-      started_ms,finished_ms,last_activity_at,tokens,changed,unresolved,failed_child,latest,task_state,
+    const rows = ledger.db.prepare(`${base.sql} SELECT id,reference,session_id,task_id,member_id,title,project_id,project_name,root,execution,acceptance,status,task_result,
+      started_ms,finished_ms,last_activity_at,${fields==='full'?'tokens,changed,':''}unresolved,failed_child,latest,task_state,
       finalizing,finalization_requested_at,finalization_error,
       (SELECT title FROM qm_tasks WHERE id=selected.task_id) task_title,
       (SELECT title FROM qm_sessions WHERE id=selected.session_id) session_title,
@@ -107,12 +136,13 @@ export function readLocalTaskIndex(config: ServerConfig, at = Date.now()): { ite
       )) progress_at
       FROM selected ORDER BY started_ms DESC,reference`)
       .all(...base.params) as Array<Record<string, unknown>>;
-    return { items: rows.map((row) => ({
+    return rows.map((row) => ({
       id: String(row.reference),
       localId: String(row.id),
       nodeId: own.node,
       sessionId: row.session_id === null ? null : String(row.session_id),
       taskId: row.task_id === null ? null : String(row.task_id),
+      memberId: row.member_id == null ? null : String(row.member_id),
       ...resolveTaskTitle({title:typeof row.task_title==='string'?row.task_title:null,
         sessionTitle:typeof row.session_title==='string'?row.session_title:null,
         workItemTitle:typeof row.work_item_title==='string'?row.work_item_title:null,
@@ -129,28 +159,37 @@ export function readLocalTaskIndex(config: ServerConfig, at = Date.now()): { ite
       lastProgressAt:latestTimestamp([typeof row.progress_at==='string'?row.progress_at:null,
         typeof row.finalization_requested_at==='string'?row.finalization_requested_at:null]) ?? Number(row.started_ms),
       executionObservedAt: row.execution_observed_at == null ? null : Date.parse(String(row.execution_observed_at)),
-      tokens: row.tokens === null ? null : Number(row.tokens),
-      changed: Number(row.changed) === 1,
+      ...(fields==='full'?{tokens:row.tokens===null?null:Number(row.tokens),changed:Number(row.changed)===1}:{}),
       actionableInterruption: Number(row.unresolved) === 1 || ['failed','interrupted_recoverable'].includes(String(row.execution)) && Number(row.failed_child) === 1,
       currentPhase: row.session_id === null || Number(row.latest) === 1,
       requestState: row.task_state === null ? undefined : String(row.task_state),
       resultStatus: row.task_result === null ? null : String(row.task_result),
       finalization: Number(row.finalizing) === 1 ? {status: row.finalization_error ? 'failed' as const : 'pending' as const,
         requestedAt: Date.parse(String(row.finalization_requested_at)), error: row.finalization_error === null ? null : String(row.finalization_error)} : null,
-    })), observedAt: Date.now() };
+    }));
+}
+
+export function readLocalSessionTitles(config: ServerConfig, readScope?: TaskReadScope): { items: SessionTitleIndex[]; tasks: TaskLifecycle[]; authoritative:boolean; observedAt: number } {
+  const taskScope=readScope===undefined?undefined:parseTaskReadScope(readScope);
+  const ledger = new WorkLedger(config.stateDir);
+  try {
+    return {...readSessionTitles(config,ledger,taskScope),observedAt:Date.now()};
   } finally { ledger.close(); }
 }
 
-export function readLocalSessionTitles(config: ServerConfig): { items: SessionTitleIndex[]; tasks: TaskLifecycle[]; authoritative:boolean; observedAt: number } {
-  const ledger = new WorkLedger(config.stateDir);
-  try {
-    const rows = ledger.db.prepare(`SELECT id,title,revision,last_activity_at FROM qm_sessions ORDER BY last_activity_at DESC,id`)
-      .all() as Array<{ id: string; title: string; revision: number; last_activity_at: string }>;
+function readSessionTitles(config:ServerConfig,ledger:WorkLedger,taskScope?:TaskReadScope):Omit<ReturnType<typeof readLocalSessionTitles>,'observedAt'> {
+    const taskWhere=!taskScope?'1':taskScope.taskIds?'t.id IN (SELECT value FROM json_each(?))':'t.session_id=?';
+    const selected=taskScope?[taskScope.taskIds?JSON.stringify(taskScope.taskIds):taskScope.sessionId]:[];
+    const sessionWhere=!taskScope?'1':taskScope.taskIds
+      ? 'id IN (SELECT session_id FROM qm_tasks t WHERE '+taskWhere+')':'id=?';
+    const rows = ledger.db.prepare(`SELECT id,title,revision,last_activity_at FROM qm_sessions WHERE ${sessionWhere} ORDER BY last_activity_at DESC,id`)
+      .all(...selected) as Array<{ id: string; title: string; revision: number; last_activity_at: string }>;
     const nodeId = config.federation?.nodeId ?? 'local';
     const tasks = ledger.db.prepare(`SELECT t.id,t.session_id,t.title,t.state,t.result_status,t.revision,t.created_at,t.finished_at,t.delivery_ended_at,t.last_activity_at,t.source_task_id,
       f.requested_at,f.completed_at,f.error,s.title session_title,
       (SELECT created_at FROM qm_task_messages WHERE task_id=t.id ORDER BY sequence DESC LIMIT 1) message_at
-      FROM qm_tasks t LEFT JOIN qm_task_finalizations f ON f.task_id=t.id LEFT JOIN qm_sessions s ON s.id=t.session_id`).all() as Array<{
+      FROM qm_tasks t LEFT JOIN qm_task_finalizations f ON f.task_id=t.id LEFT JOIN qm_sessions s ON s.id=t.session_id
+      WHERE ${taskWhere}`).all(...selected) as Array<{
       id:string; session_id:string; source_task_id:string|null; title:string; state:string; result_status:string|null; revision:number;
       created_at:string; finished_at:string|null; delivery_ended_at:string|null; last_activity_at:string; requested_at:string|null; completed_at:string|null; error:string|null;
       session_title:string|null;
@@ -158,7 +197,8 @@ export function readLocalSessionTitles(config: ServerConfig): { items: SessionTi
     }>;
     const members = ledger.db.prepare(`SELECT tm.task_id,m.id member_id,m.node_id,m.root,p.id project_id,p.name
       FROM qm_task_members tm JOIN qm_session_members m ON m.id=tm.member_id
-      LEFT JOIN console_projects p ON p.root=m.root`).all() as Array<{
+      LEFT JOIN console_projects p ON p.root=m.root
+      ${taskScope?'WHERE tm.task_id IN (SELECT t.id FROM qm_tasks t WHERE '+taskWhere+')':''}`).all(...selected) as Array<{
         task_id:string; member_id:string; node_id:string; root:string; project_id:string|null; name:string|null;
       }>;
     const byTask = new Map<string, typeof members>();
@@ -175,7 +215,7 @@ export function readLocalSessionTitles(config: ServerConfig): { items: SessionTi
     // Only a few Task-scoped user messages; never scan invocation payloads/results.
     const titleMessages=ledger.db.prepare(`SELECT substr(body,1,1024) body FROM qm_task_messages
       WHERE task_id=? AND role='user' ORDER BY sequence LIMIT 3`);
-    return { authoritative:config.federation?.capabilities.coordinator ?? true,
+    return { authoritative:!config.federation?.enabled || config.federation.capabilities.coordinator,
       tasks:visibleTasks.map(row=>{
         const own = (byTask.get(row.id) ?? []).filter(member => member.node_id !== nodeId || permitted(config, member.root));
         const finishedAt = row.result_status && row.delivery_ended_at ? row.delivery_ended_at : row.finished_at;
@@ -195,7 +235,20 @@ export function readLocalSessionTitles(config: ServerConfig): { items: SessionTi
           revision:row.revision,finishedAt:finishedAt ? Date.parse(finishedAt) : null,lastActivityAt:Date.parse(row.last_activity_at)};
       }),
       items: rows.filter(row=>visibleSessions.has(row.id) || !taskSessions.has(row.id)).map((row) => ({ id: row.id, title: row.title, revision: row.revision,
-      lastActivityAt: Date.parse(row.last_activity_at) })), observedAt: Date.now() };
+      lastActivityAt: Date.parse(row.last_activity_at) })) };
+}
+
+/** One node observation for the homepage: lifecycle and phase state share the
+ * same read snapshot, without usage, change evidence, or detail projections. */
+export function readLocalTaskStateIndex(config:ServerConfig,at=Date.now()):TaskStateIndexRead {
+  const ledger=new WorkLedger(config.stateDir,openReadonlyDatabase(config.stateDir));
+  try {
+    return ledger.db.transaction(()=>{
+      const phases=readTaskPhases(config,ledger,at,'state');
+      const titles=readSessionTitles(config,ledger);
+      return {projection:'state' as const,phases,sessions:titles.items,tasks:titles.tasks,
+        authoritative:titles.authoritative,observedAt:Date.now()};
+    }).deferred();
   } finally { ledger.close(); }
 }
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { aggregateTaskIndex, aggregateTasks, filterTaskIndex, taskReference } from "./task-aggregation.js";
+import { aggregateTaskIndex, aggregateTaskStateIndex, aggregateTasks, compareTaskIndex, filterTaskIndex, taskReference } from "./task-aggregation.js";
 import type { TaskPhaseIndex } from "./local-queries.js";
 import type { Run } from "./types.js";
 import { lastObservedExecutingTasks, selectOverviewTasks } from './overview-tasks.js';
@@ -27,6 +27,13 @@ function phase(id: string, taskId: string, nodeId: string): TaskPhaseIndex {
     changed: false, actionableInterruption: false, currentPhase: true,
   };
 }
+
+test('state-only filtering never treats unavailable change or token fields as observed zero',()=>{
+  const [state]=aggregateTaskStateIndex([phase('one','task','node')]);
+  assert.deepEqual(filterTaskIndex([state!],{days:'0'},10),[state]);
+  assert.throws(()=>filterTaskIndex([state!],{changed:'1',days:'0'},10),{code:'incomplete_task_projection'});
+  assert.throws(()=>compareTaskIndex(state!,state!,{sort:'tokens'},10),{code:'incomplete_task_projection'});
+});
 
 test("tasks aggregate across nodes by task_id and keep later user requests separate", () => {
   const tasks = aggregateTasks([

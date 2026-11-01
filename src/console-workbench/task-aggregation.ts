@@ -1,8 +1,8 @@
 import { parseWorkspaceHandle } from "../federation/routing.js";
 import { dayAt, type Query } from "./query.js";
-import type { TaskPhaseIndex } from "./local-queries.js";
+import type { TaskPhaseIndex, TaskPhaseStateIndex } from "./local-queries.js";
 import type { SessionTitleIndex } from "./local-queries.js";
-import type { Run, Usage } from "./types.js";
+import { WorkbenchError, type Run, type Usage } from "./types.js";
 import { relevantExecution, taskStage, withTaskLifecycle, taskTimeEnd, type TaskLifecycle } from '../console-task-state.js';
 import { taskView } from '../task-view.js';
 import { placeholderTaskTitle, resolveTaskTitle } from '../task-title.js';
@@ -45,11 +45,14 @@ export interface TaskIndex {
   taskRevision?: number;
   resultStatus?: string | null;
   finalization?: TaskLifecycle['finalization'];
-  workspaces?: NonNullable<TaskLifecycle['workspaces']>;
+  workspaces?: NonNullable<Run['workspaces']>;
   reason?: string | null;
   observedAt?: number | null;
   stale?: boolean;
 }
+
+/** State observations deliberately have no usage or change coverage. */
+export type TaskStateIndex = Omit<TaskIndex, 'tokens' | 'changed'>;
 
 export function taskReference(taskId: string): string {
   return TASK_REFERENCE_PREFIX + taskId;
@@ -71,6 +74,10 @@ export function parseSessionReference(value: string): string | null {
 }
 
 export function taskOnlyIndex(task: TaskLifecycle, at = Date.now()): TaskIndex {
+  return {...taskOnlyStateIndex(task,at),tokens:0,changed:false};
+}
+
+export function taskOnlyStateIndex(task: TaskLifecycle, at = Date.now()): TaskStateIndex {
   const workspaces = task.workspaces ?? [];
   return withTaskLifecycle({
     key: `task:${task.id}`, sessionId:task.sessionId, taskId:task.id, title:task.title,
@@ -81,7 +88,7 @@ export function taskOnlyIndex(task: TaskLifecycle, at = Date.now()): TaskIndex {
     executionStatus:taskView({requestState:task.state,result:task.resultStatus,execution:'waiting',
       finalizing:Boolean(task.finalization),lastProgressAt:task.lastActivityAt,now:at}).status,
     acceptanceStatus:'not_required', startedAt:task.createdAt ?? task.lastActivityAt, finishedAt:task.finishedAt,
-    lastActivityAt:task.lastActivityAt, tokens:0, changed:false, actionableInterruption:false,
+    lastActivityAt:task.lastActivityAt, actionableInterruption:false,
     reason:task.state==='active' ? '任务已创建，尚未登记后台执行；请求仍然开放' : null,
   },task);
 }
@@ -92,7 +99,7 @@ export function mergeTaskWorkspaces<T extends {nodeId:string;root:string}>(left:
 
 /** Task membership also includes observed workspaces without an execution.
  * Keep their navigation metadata without inventing another phase or outcome. */
-export function withTaskMembership(task:TaskIndex,lifecycle?:TaskLifecycle):TaskIndex {
+export function withTaskMembership<T extends TaskStateIndex>(task:T,lifecycle?:TaskLifecycle):T {
   if(!lifecycle||lifecycle.id!==task.taskId)return task;
   const workspaces=mergeTaskWorkspaces(task.workspaces,lifecycle.workspaces);
   return {...task,workspaces,
@@ -113,20 +120,35 @@ export function aggregateTasks(runs: Run[], at = Date.now()): Run[] {
   return [...groups.values()].map(group => mergeTask(group, at));
 }
 
-export function aggregateTaskIndex(phases: TaskPhaseIndex[], at = Date.now()): TaskIndex[] {
-  const groups = new Map<string, TaskPhaseIndex[]>();
+function groupTaskPhases<T extends TaskPhaseStateIndex>(phases:readonly T[]):Map<string,T[]> {
+  const groups = new Map<string, T[]>();
   for (const phase of phases) {
     const key = phase.taskId ? `task:${phase.taskId}` : phase.sessionId ? `session:${phase.sessionId}` : `run:${phase.id}`;
     const values = groups.get(key) ?? [];
     values.push(phase);
     groups.set(key, values);
   }
-  return [...groups.entries()].map(([key, values]) => {
+  return groups;
+}
+
+export function aggregateTaskIndex(phases: TaskPhaseIndex[], at = Date.now()): TaskIndex[] {
+  return [...groupTaskPhases(phases)].map(([key,values])=>{
+    const tokenValues=values.map(value=>value.tokens).filter((value):value is number=>value!==null);
+    return {...mergeTaskState(key,values,at),
+      tokens:tokenValues.length?tokenValues.reduce((sum,value)=>sum+value,0):null,
+      changed:values.some(value=>value.changed)};
+  });
+}
+
+export function aggregateTaskStateIndex(phases:TaskPhaseStateIndex[],at=Date.now()):TaskStateIndex[] {
+  return [...groupTaskPhases(phases)].map(([key,values])=>mergeTaskState(key,values,at));
+}
+
+function mergeTaskState(key:string,values:TaskPhaseStateIndex[],at:number):TaskStateIndex {
     const sessionId = values.find((value) => value.sessionId)?.sessionId ?? null;
     const taskId = values.find((value) => value.taskId)?.taskId ?? null;
     const current = values.filter((value) => value.currentPhase);
     const stateValues = current.length ? values.filter(relevantExecution) : values;
-    const tokenValues = values.map((value) => value.tokens).filter((value): value is number => value !== null);
     const lastActivityAt = Math.max(...values.map(value => value.lastActivityAt));
     const title = chooseIndexTitle(values);
     return {
@@ -143,6 +165,8 @@ export function aggregateTaskIndex(phases: TaskPhaseIndex[], at = Date.now()): T
       projectIds: [...new Set(values.map((value) => value.projectId))],
       projectNames: [...new Set(values.map((value) => value.projectName))],
       roots: [...new Set(values.map((value) => value.root))],
+      workspaces:mergeTaskWorkspaces([],values.map(value=>({nodeId:value.nodeId,projectId:value.projectId,
+        memberId:value.memberId??null,name:value.projectName,root:value.root}))),
       executionStatus: aggregateExecution(stateValues, lastActivityAt, at),
       acceptanceStatus: aggregateAcceptance(stateValues.map((value) => value.acceptanceStatus)),
       startedAt: Math.min(...values.map((value) => value.startedAt)),
@@ -150,15 +174,12 @@ export function aggregateTaskIndex(phases: TaskPhaseIndex[], at = Date.now()): T
       lastActivityAt,
       observedAt: stateValues.every(value => value.observedAt != null) ? Math.min(...stateValues.map(value => value.observedAt!)) : null,
       stale: stateValues.some(value => value.stale),
-      tokens: tokenValues.length ? tokenValues.reduce((sum, value) => sum + value, 0) : null,
-      changed: values.some((value) => value.changed),
       actionableInterruption: stateValues.some((value) => value.actionableInterruption),
       currentPhaseRefs: stateValues.map((value) => value.id),
       requestState:stateValues.find(value=>value.requestState)?.requestState,
       resultStatus:stateValues.find(value=>value.resultStatus)?.resultStatus ?? null,
       finalization:stateValues.find(value=>value.finalization)?.finalization ?? null,
     };
-  });
 }
 
 export function resolveSessionTitles(rows: SessionTitleIndex[]): Map<string, string> {
@@ -177,7 +198,7 @@ export function resolveSessionTitles(rows: SessionTitleIndex[]): Map<string, str
   return result;
 }
 
-export function applyTaskTitles(tasks: TaskIndex[], titles: ReadonlyMap<string, string>): TaskIndex[] {
+export function applyTaskTitles<T extends TaskStateIndex>(tasks:T[], titles: ReadonlyMap<string, string>):T[] {
   return tasks.map((task) => !task.taskId && task.sessionId && titles.has(task.sessionId) ? { ...task, title: titles.get(task.sessionId)! } : task);
 }
 
@@ -185,7 +206,11 @@ export function applyRunTitles(runs: Run[], titles: ReadonlyMap<string, string>)
   return runs.map((run) => !run.taskId && run.sessionId && titles.has(run.sessionId) ? { ...run, title: titles.get(run.sessionId)! } : run);
 }
 
-export function filterTaskIndex(tasks: TaskIndex[], query: Query, at: number, lastObservedExecuting: ReadonlySet<string> = new Set()): TaskIndex[] {
+type FilterableTaskIndex = TaskStateIndex & {tokens?:number|null;changed?:boolean};
+
+export function filterTaskIndex<T extends FilterableTaskIndex>(tasks: T[], query: Query, at: number, lastObservedExecuting: ReadonlySet<string> = new Set()): T[] {
+  if(query.changed&&tasks.some(task=>typeof task.changed!=='boolean'))
+    throw new WorkbenchError('改动筛选需要完整任务索引',500,'incomplete_task_projection','none');
   const search = (query.q ?? "").trim().toLocaleLowerCase();
   const days = Number(query.days ?? 7);
   const zone = query.tz || "UTC";
@@ -212,8 +237,10 @@ export function filterTaskIndex(tasks: TaskIndex[], query: Query, at: number, la
       || taskAttention(task) !== null));
 }
 
-export function compareTaskIndex(left: TaskIndex, right: TaskIndex, query: Query, at: number): number {
-  const value = (task: TaskIndex) => {
+export function compareTaskIndex(left: FilterableTaskIndex, right: FilterableTaskIndex, query: Query, at: number): number {
+  if(query.sort==='tokens'&&[left,right].some(task=>task.tokens===undefined))
+    throw new WorkbenchError('用量排序需要完整任务索引',500,'incomplete_task_projection','none');
+  const value = (task: FilterableTaskIndex) => {
     const end = taskTimeEnd(task, at);
     return query.sort === "tokens" ? task.tokens ?? -1
       : query.sort === "duration" ? end === null ? -1 : Math.max(0, end - task.startedAt) : task.startedAt;
@@ -226,11 +253,12 @@ export function taskKey(run: Run): string {
   return run.taskId ? `task:${run.taskId}` : run.sessionId ? `session:${run.sessionId}` : `run:${run.id}`;
 }
 
-export function fallbackTask(task: TaskIndex): Run {
+export function fallbackTask(task: TaskStateIndex & {tokens?:number|null}): Run {
   const reference = task.phaseRefs[0] ?? taskReference(task.taskId ?? task.sessionId ?? task.key);
   const parsed = parseWorkspaceHandle(reference);
   const project = task.projectIds[0] ?? "";
   const projectParsed = parseWorkspaceHandle(project);
+  const tokens=task.tokens??null;
   return {
     id: task.taskId ? taskReference(task.taskId) : task.sessionId ? sessionReference(task.sessionId) : reference,
     localId: task.taskId ?? task.sessionId ?? parsed?.local ?? reference,
@@ -261,7 +289,8 @@ export function fallbackTask(task: TaskIndex): Run {
     finalization:task.finalization,
     actionableInterruption:task.actionableInterruption,
     memberId: null,
-    usage: task.phaseRefs.length ? { total: task.tokens, input: null, cached: null, output: null, reasoning: null, quality: task.tokens === null ? "unavailable" : "partial" }
+    usage: !Object.hasOwn(task,'tokens') ? {total:null,input:null,cached:null,output:null,reasoning:null,quality:'unavailable'}
+      : task.phaseRefs.length ? { total: tokens, input: null, cached: null, output: null, reasoning: null, quality: tokens === null ? "unavailable" : "partial" }
       : {total:0,input:0,cached:0,output:0,reasoning:0,quality:'not_used'},
     diff: null,
     origin: "session_index",
@@ -360,7 +389,7 @@ function chooseTaskTitle(group: Run[]): string {
   return meaningful ?? resolveTaskTitle({workspaceNames:group.map(run=>run.projectName),createdAt:Math.min(...group.map(run=>run.startedAt))}).title;
 }
 
-function chooseIndexTitle(values: TaskPhaseIndex[]): string {
+function chooseIndexTitle(values: TaskPhaseStateIndex[]): string {
   const titles = values.map((value) => value.title.trim()).filter(Boolean);
   return titles.find(isTaskTitle) ?? resolveTaskTitle({workspaceNames:values.map(value=>value.projectName),createdAt:Math.min(...values.map(value=>value.startedAt))}).title;
 }

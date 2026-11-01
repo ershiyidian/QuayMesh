@@ -11,23 +11,35 @@ import type {readProjectSessions} from './project-sessions-read.js';
 import {AsyncLocalStorage} from 'node:async_hooks';
 import {ConsoleReadProcessPool} from './read-process.js';
 import {consoleReadConfig,parseConsoleReadRequest,type ConsoleReadRequest} from './read-protocol.js';
+import type {TaskReadScope} from './task-read-scope.js';
 
 const readers=new ConsoleReadProcessPool();
+// Usage scans have one separate owned reader so they cannot occupy the
+// interactive queue. Each lane keeps the existing process and queue bounds.
+const analysisReaders=new ConsoleReadProcessPool();
 const requestSignal=new AsyncLocalStorage<AbortSignal>();
-export function withConsoleReadSignal<T>(signal:AbortSignal,fn:()=>T):T{return requestSignal.run(signal,fn);}
-process.once('exit',()=>readers.close());
-export const closeConsoleReaders=()=>readers.close();
+export function withConsoleReadSignal<T>(signal:AbortSignal,fn:()=>T):T{
+  const inherited=requestSignal.getStore();
+  // A local route's controller must retain the enclosing node RPC cancellation.
+  return requestSignal.run(inherited&&inherited!==signal?AbortSignal.any([inherited,signal]):signal,fn);
+}
+export const closeConsoleReaders=()=>{readers.close();analysisReaders.close();};
+process.once('exit',closeConsoleReaders);
 function read<T>(config:ServerConfig,request:Omit<ConsoleReadRequest,'config'>,signal?:AbortSignal):Promise<T> {
-  return readers.read<T>(parseConsoleReadRequest({...request,config:consoleReadConfig(config)}),signal??requestSignal.getStore());
+  const input=parseConsoleReadRequest({...request,config:consoleReadConfig(config)});
+  const pool=input.operation==='usage'||input.operation==='overview-usage'||input.operation==='overview'?analysisReaders:readers;
+  return pool.read<T>(input,signal??requestSignal.getStore());
 }
 export const readLocalMetadata=(config:ServerConfig,signal?:AbortSignal)=>
   read<ReturnType<typeof Local.readLocalMetadata>>(config,{operation:'metadata'},signal);
 export const readLocalPage=(config:ServerConfig,query:Query,signal?:AbortSignal)=>
   read<ReturnType<typeof Local.readLocalPage>>(config,{operation:'page',query},signal);
-export const readLocalTaskIndex=(config:ServerConfig,at?:number,signal?:AbortSignal)=>
-  read<ReturnType<typeof Local.readLocalTaskIndex>>(config,{operation:'task-index',at},signal);
-export const readLocalSessionTitles=(config:ServerConfig,signal?:AbortSignal)=>
-  read<ReturnType<typeof Local.readLocalSessionTitles>>(config,{operation:'session-titles'},signal);
+export const readLocalTaskIndex=(config:ServerConfig,at?:number,scope?:TaskReadScope,signal?:AbortSignal)=>
+  read<ReturnType<typeof Local.readLocalTaskIndex>>(config,{operation:'task-index',at,scope},signal);
+export const readLocalTaskStateIndex=(config:ServerConfig,at?:number,signal?:AbortSignal)=>
+  read<ReturnType<typeof Local.readLocalTaskStateIndex>>(config,{operation:'task-state-index',at},signal);
+export const readLocalSessionTitles=(config:ServerConfig,scope?:TaskReadScope,signal?:AbortSignal)=>
+  read<ReturnType<typeof Local.readLocalSessionTitles>>(config,{operation:'session-titles',scope},signal);
 export const readLocalRunSummaries=(config:ServerConfig,ids:readonly string[],signal?:AbortSignal)=>
   read<ReturnType<typeof Local.readLocalRunSummaries>>(config,{operation:'run-summaries',ids:[...ids]},signal);
 export const readLocalUsage=(config:ServerConfig,query:Query,signal?:AbortSignal)=>

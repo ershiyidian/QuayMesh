@@ -13,6 +13,12 @@ export class Resources {
   data<T>(path: string): T | undefined { return this.entries.get(path)?.data as T | undefined; }
 
   async load(path: string, force = false): Promise<unknown> {
+    const base=path.split('?')[0]!,detailPath=/^runs\/[^/]+$/.test(base);
+    // Keep only the selected content page. Browser navigation fetches another
+    // bounded page instead of accumulating every historical full detail.
+    if(detailPath)for(const [key,entry] of this.entries)if(key!==path&&key.split('?')[0]===base){
+      entry.ctl?.abort();this.entries.delete(key);
+    }
     let entry = this.entries.get(path);
     if (entry?.promise && !force) return entry.promise;
     if (entry?.promise || force && entry?.loading) {
@@ -30,19 +36,21 @@ export class Resources {
     current.promise = this.api.get<unknown>(requestPath, controller.signal).then((value) => {
       if (controller.signal.aborted || this.entries.get(path) !== current) return;
       this.validate(path, value);
-      if (/^runs\/[^/?]+$/.test(path)) {
+      if (detailPath) {
         const detail = value as RunDetail;
         const previous = current.data as RunDetail | null;
         current.retained=retainDetail(previous,detail,current.receivedAt??current.time,current.retained as RetainedDetail|undefined);
         if (previous?.run.workspaceRevision !== detail.run.workspaceRevision) {
-          for (const [key, file] of this.entries) if (key.startsWith(path + "/files/")) {
+          for (const [key, file] of this.entries) if (key.startsWith(base + "/files/")) {
             file.ctl?.abort(); this.entries.delete(key);
           }
         }
       }
       if (path.startsWith("runs?")) for (const run of (value as RunPage).items) {
-        const detail = this.entries.get("runs/" + encodeURIComponent(run.id)) as CacheEntry<RunDetail> | undefined;
-        if (detail?.data && (detail.data.run.revision !== run.revision || detail.data.run.workspaceRevision !== run.workspaceRevision)) detail.time = 0;
+        for(const [key,entry] of this.entries)if(key.split('?')[0]==="runs/"+encodeURIComponent(run.id)){
+          const detail=entry as CacheEntry<RunDetail>;
+          if (detail.data && (detail.data.run.revision !== run.revision || detail.data.run.workspaceRevision !== run.workspaceRevision)) detail.time = 0;
+        }
       }
       current.data = value; current.time = Date.now(); current.error = null; current.retryAt = 0; current.failures = 0;
       current.receivedAt=current.time;
@@ -114,8 +122,8 @@ export class Resources {
       return !['disks', 'gpus', 'components'].every(key => Array.isArray(n[key])) || !n.egress || !n.capabilities;
     }))) throw new Error("节点详情结构不完整");
     if (base === "overview") {
-      if (!arrays(['active', 'waiting', 'current', 'olderOpen', 'recent', 'attention', 'projects', 'sources', 'taskSources', 'usageSources']) || !data.todayUsage) throw new Error("总览响应结构不完整");
-      const sources = ['sources', 'taskSources', 'usageSources'].flatMap(key => data[key] as unknown[]);
+      if (!arrays(['active', 'waiting', 'current', 'olderOpen', 'recent', 'attention', 'sources', 'taskSources'])) throw new Error("总览响应结构不完整");
+      const sources = ['sources', 'taskSources'].flatMap(key => data[key] as unknown[]);
       if (sources.some(item => {
         if (!item || typeof item !== 'object') return true;
         const source = item as Record<string, unknown>;
@@ -133,7 +141,18 @@ export class Resources {
       }) || (data.attention as unknown[]).some(item => !item || typeof item !== 'object'
         || typeof (item as Record<string, unknown>).actionLabel !== 'string')) throw new Error("总览任务进展结构不完整");
     }
-    if (/^runs\/[^/]+$/.test(base) && (!data.run || !arrays(['files', 'commands', 'agents', 'evidence', 'timeline']))) throw new Error("执行详情结构不完整");
+    if (/^runs\/[^/]+$/.test(base)) {
+      if(!data.run || !arrays(['files', 'commands', 'agents', 'evidence', 'timeline'])) throw new Error("执行详情结构不完整");
+      if(data.phasePage!==undefined){
+        const page=data.phasePage as RunDetail['phasePage'];
+        if(!page||!Array.isArray(page.references)||page.references.some(id=>typeof id!=='string')
+          ||!Number.isInteger(page.offset)||page.offset<0||!Number.isInteger(page.limit)||page.limit<1||page.limit>50
+          ||!Number.isInteger(page.total)||page.total<page.references.length||page.references.length>page.limit
+          ||typeof page.complete!=='boolean'||typeof data.taskComplete!=='boolean'
+          ||![page.previousCursor,page.nextCursor].every(value=>value===null||typeof value==='string'))
+          throw new Error('阶段分页响应结构不完整');
+      }
+    }
     if (/^runs\/[^/]+\/files\//.test(base) && (!data.file || !Array.isArray((data.file as FileDiff['file']).rows))) throw new Error("文件响应结构不完整");
     if (/^projects\/[^/]+\/sessions$/.test(base) && !arrays(['items', 'conversations', 'batches', 'executionClaims'])) throw new Error("会话响应结构不完整");
     if (base === "usage" && !arrays(['daily', 'projects', 'top'])) throw new Error("用量响应结构不完整");

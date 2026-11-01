@@ -6,7 +6,7 @@ import { mergeFields } from '../../src/ui/console-v5/settings-form.js';
 import { elapsed, esc, percent, resultExplanation, changeCaptureBlockReason, changeCaptureNotice, dedupeCaptureWarnings, acceptanceBadge, lifecycleBadges, executionObservationForRun, status, transferPercent } from '../../src/ui/console-v5/presentation.js';
 import { fullTime, setDisplayTimeZone, day, timestamp } from '../../src/ui/console-v5/format.js';
 import { taskStages, taskStage } from '../../src/console-task-state.js';
-import { resourceHealth, resourceObservation, sourceWarning, sourceWarnings } from '../../src/ui/console-v5/source-state.js';
+import { resourceHealth, resourceObservation, sourceWarning, sourceWarnings, hasPendingSourceRead } from '../../src/ui/console-v5/source-state.js';
 import { CommandOutputs } from '../../src/ui/console-v5/command-output.js';
 import type { Run, ActionReceipt, ChangeCapture, CacheEntry, SourceState } from '../../src/ui/console-v5/contracts.js';
 import { EventNotifications, type NotificationMemory, type NotificationPage } from '../../src/ui/console-v5/notifications.js';
@@ -66,20 +66,18 @@ test('不完整的总览被资源层拒绝，读取中或陈旧来源不会显�
   const pending={data:null,time:0,error:null,loading:true};
   assert.equal(resourceHealth([pending]).label,'正在读取当前页面');
   const stale={data:{sources:[{nodeId:'n',name:'n',state:'refreshing',stale:true,online:true,observedAt:1,error:null}]},time:2,error:null,loading:false};
-  assert.equal(resourceHealth([stale]).tone,'amber');
+  assert.equal(resourceHealth([stale]).tone,'muted');
 });
 
-test('总览缺失分组、进展或来源字段时保留已验证缓存，用量失败不改变任务来源', async () => {
+test('总览只要求任务字段，缺失分组、进展或来源时保留已验证缓存', async () => {
   const taskSource:SourceState={nodeId:'a',name:'A',online:true,state:'ready',observedAt:Date.now(),stale:false,error:null};
-  const usageSource:SourceState={...taskSource,state:'error',stale:true,error:'USAGE_TIMEOUT'};
-  const valid={active:[],waiting:[],current:[{progressLabel:'仍在处理',progressSummary:null}],olderOpen:[],recent:[],attention:[{actionLabel:'查看失败'}],projects:[],todayUsage:{},
-    sources:[usageSource],taskSources:[taskSource],usageSources:[usageSource]};
+  const valid={active:[],waiting:[],current:[{progressLabel:'仍在处理',progressSummary:null}],olderOpen:[],recent:[],attention:[{actionLabel:'查看失败'}],
+    sources:[taskSource],taskSources:[taskSource]};
   let response:unknown=valid;
   const {resources}=resourceFixture(async()=>response);
   await resources.load('overview'); assert.equal(resources.data('overview'),valid);
   assert.equal(resources.data<typeof valid>('overview')!.taskSources[0].error,null);
-  assert.equal(resources.data<typeof valid>('overview')!.usageSources[0].error,'USAGE_TIMEOUT');
-  response={active:[],waiting:[],recent:[],attention:[],projects:[],todayUsage:{}};
+  response={active:[],waiting:[],recent:[],attention:[]};
   await resources.load('overview',true);
   assert.equal(resources.data('overview'),valid); assert.match(resources.entries.get('overview')!.error!.message,/总览响应结构不完整/);
   response={...valid,current:[{}]}; await resources.load('overview',true);
@@ -90,6 +88,15 @@ test('总览缺失分组、进展或来源字段时保留已验证缓存，用�
   assert.equal(resources.data('overview'),valid); assert.match(resources.entries.get('overview')!.error!.message,/总览响应结构不完整/);
   response={...valid,taskSources:[{...taskSource,observedAt:'unknown'}]}; await resources.load('overview',true);
   assert.equal(resources.data('overview'),valid); assert.match(resources.entries.get('overview')!.error!.message,/总览数据来源结构不完整/);
+});
+
+test('一个节点失败不阻止其他节点补齐正在读取的数据', () => {
+  const failed:SourceState={nodeId:'old',name:'Old',online:true,state:'error',observedAt:null,stale:true,error:'node_read_upgrade_required'};
+  const pending:SourceState={nodeId:'desktop',name:'Desktop',online:true,state:'loading',observedAt:null,stale:false,error:null};
+  assert.equal(hasPendingSourceRead([failed,pending]),true);
+  assert.equal(hasPendingSourceRead([failed,{...pending,state:'ready',observedAt:Date.now()}]),false);
+  assert.equal(hasPendingSourceRead([failed,{...pending,online:false,state:'offline'}]),false);
+  assert.equal(hasPendingSourceRead([{...pending,state:'refreshing',error:'previous timeout'}]),true);
 });
 
 test('正常刷新和首次读取保持中性，同一节点的重复异常只保留一条', () => {

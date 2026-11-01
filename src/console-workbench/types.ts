@@ -62,6 +62,17 @@ export interface Run {
   workspaces?: Array<{nodeId: string; projectId: string; memberId: string | null; name: string; root: string}>;
 }
 
+/** Bounded content page; Task identity, state and revision remain task-wide. */
+export interface PhaseDetailPage {
+  references: string[];
+  offset: number;
+  limit: number;
+  total: number;
+  previousCursor: string | null;
+  nextCursor: string | null;
+  complete: boolean;
+}
+
 export interface Project {
   id: string;
   localId: string;

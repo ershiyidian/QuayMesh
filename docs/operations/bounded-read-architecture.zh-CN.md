@@ -6,15 +6,22 @@
 
 ## 所有权与容量
 
-三个读取器共用 `src/console-workbench/read-process.ts`。进程生命周期规则集中在这里，各路由不再各自管理一套子进程。
+四个固定读取池共用 `src/console-workbench/read-process.ts`。进程生命周期规则集中在这里，各路由不再各自管理一套子进程。
 
 | 所有者 | 读取器与固定 worker | Runtime 诊断分类 |
 | --- | --- | --- |
-| Console 模块级池 | `isolated-queries.ts` → `read-worker.ts` | `console_read` |
+| Console 交互读取池 | `isolated-queries.ts` → `read-worker.ts` | `console_read` |
+| Console 分析读取池 | `isolated-queries.ts` → `read-worker.ts` | `console_read` |
 | SessionRuntime | `session/status-reader.ts` → `status-read-worker.ts` | `mcp_status_read` |
 | 按需创建的 SessionProjector | `session/projection-reader.ts` → `projection-read-worker.ts` | `session_projection_read` |
 
-每个池最多执行一个请求、排队八个请求。从入队开始计时，等待、进程启动、查询和结果交付合计不超过 5,000 ms。请求 JSON 最多 64 KiB，响应信封最多 8 MiB，子进程堆上限为 192 MiB。三个池的容量互相独立；正常单个 Core 最多同时有三个活动读取进程。
+每个池最多执行一个请求、排队八个请求。从入队开始计时，等待、进程启动、查询和结果交付共用 5,000 ms 预算。请求 JSON 最多 64 KiB，响应信封最多 8 MiB，每个子进程的 V8 老生代堆限额为 192 MiB。四个池的容量互相独立；正常单个 Core 最多持有四个读取子进程，其中 Console 最多两个。子进程在实际需要读取时启动，创建池本身不会启动进程。
+
+Console 将本地 `usage`、`overview-usage`、`overview` 操作分配到分析池，其他 Console 读取使用交互池。联邦首页通过交互池读取 `task-state-index`。慢用量查询不会占住任务索引、标题或预览的队列。两个池都沿用原有的排队上限、期限和取消规则。它们仍读取同一个 SQLite 数据库，因此数据库级排他锁可能使两个池都读取失败；队列隔离不会绕过数据库锁。
+
+在 feed 层，每个节点最多准入四个待完成的运行摘要或阶段详情读取；该节点的其他待完成读取也占用新摘要/详情请求的准入额度。这与各子进程池的排队上限分开计算。成功观测与失败读取记录共用 160 条资源缓存硬上限。重复预览复用待完成请求，尚未读取的详情批次优先于刷新已读前缀。
+
+任务列表的索引、成员和摘要读取共用 1,200 ms 前台等待预算。Task 详情请求的任务状态/摘要与所选内容页分别使用有时限的预览窗口。这些是等待预算，不是整个请求的响应时间承诺：序列化、调度和有时限的后台读取仍有各自成本。预览等待到期后保留共享后台请求及原观测时间，不继续启动无界批次，也不取消其他读取者的工作。
 
 健康子进程按帧顺序复用，响应必须匹配请求 ID。空闲 30 秒后退出；空闲句柄不阻止所有者结束。超时、取消、协议错误或崩溃只终止该池持有的读取进程。即使调用者已收到错误，也要等操作系统发出 `close` 才释放活动名额。取消排队请求不会终止其他请求。
 
@@ -23,6 +30,12 @@ worker 仅继承固定系统环境白名单，不继承凭据或 `NODE_OPTIONS`�
 ## 读取与发布合同
 
 控制台详情、文件、补丁、命令输出、工作区会话和审计均使用专门的只读实现。父进程继续核对 Owner、Task、成员、工作区和变更捕获身份。写授权与写回执仍由原写入路径处理。旧节点缺少所需隔离路由时，返回升级或读取错误，不退回会阻塞的同步路由。
+
+`task-state-index` 操作在同一个只读 SQLite 事务、同一次节点响应中合并阶段状态、已保存的 Task 生命周期、标题和成员。它与完整索引共用执行及验收分类，包括当前阶段、执行结果待核对、收尾状态和最后一次有效结果；不读取用量增量、改动证据和检查点 JSON。明确的状态投影不含 `tokens` 或 `changed` 字段，不把未读取的指标写成零或 false。该隔离路由是独立能力，旧节点不会悄悄退回完整历史索引。
+
+首页、普通任务列表和会话列表使用这份合并状态。只有改动筛选、Token 排序等确实需要相应字段的查询才取完整索引，列表随后只读所选页的任务摘要。节点/项目范围先读取所属节点及配置或能力声明确认的 Coordinator，再补齐匹配 Task 的已登记成员。同一所属节点上无关项目的远端成员不会扩大当前范围；缺少权威记录或已登记成员时保持覆盖不完整。单机模式使用本机权威。项目会话预览在状态分类前通过 SQL 限定项目候选，同时保留原会话、线程、占用及待验收保护字段。
+
+经过认证的 Console GET/HEAD RPC 通过现有 `withConsoleReadSignal` 异步上下文，将取消传递到所属读取进程。嵌套路由的控制器合并自身与上层 RPC 的信号；HTTP 中继也将读取取消传给 `fetch`，包括响应正文读取。调用者结束等待后，已受理 POST 的持久执行与回执继续保留，传输取消不会撤销该写入。共享 feed 刷新仍拥有自己的有限生命周期，不由某一次浏览器等待持有。
 
 MCP 工作区状态先选定有界的最终事件窗口，再序列化结果；保留原操作身份、重试状态和当前进程句柄。成员活动使用限定范围的 SQL 查询，替代先扫描完整历史、再逐执行查询的做法。
 
@@ -33,6 +46,10 @@ MCP 工作区状态先选定有界的最终事件窗口，再序列化结果；�
 正常加载和刷新属于进度状态；失败或过期证据才需要关注。页面成功取到数据，不代表节点的旧观测时间被刷新，也不证明任务仍在执行。
 
 部分详情保留上次读取的记录、原读取时间和明确的历史标记。未知数量保持未知，未经确认的证据不能启用验收、还原或结束动作。待补齐的详情会在有限时间内补读，手动刷新模式也适用。详情标题栏提供独立刷新入口，窄窗口无需先关闭详情。
+
+Task 和旧会话详情 GET 默认每页读取 20 个阶段正文，最多 50 个。当前阶段优先；任务标题区保留完整索引中的阶段引用、成员、状态和版本。游标绑定外层 Task/会话引用、阶段锚点和方向。来源覆盖不完整时不发下一页游标；锚点缺失时，覆盖不完整则返回来源待确认，完整索引确认锚点已消失才返回游标过期。单阶段详情及写操作/摘要 API 保留原范围。
+
+`phasePage.complete` 确认所选页内容；`taskComplete` 表示完整 Task 权威、索引及摘要覆盖；原有 `complete` 只有在本次响应包含全部历史时才可能为 true。所属节点尚未确认的空页不能当成已确认空记录。界面展示所选页的记录及数量，并且只保留这一页正文；未选历史通过分页读取，不显示成待补齐工作。验收、结束、补丁和还原资格仍要求完整任务证据、全部当前阶段的实际详情、新鲜来源和已确认的改动捕获；单页内容读取完成不能单独启用这些动作。
 
 命令输出区分读取失败、不完整、已过期和已确认的空输出。重试保留字节游标合同与已读取内容，不把错误转换为空成功。
 
@@ -46,10 +63,24 @@ MCP 工作区状态先选定有界的最终事件窗口，再序列化结果；�
 
 相关回归组：
 
-- `test/console-v5/console-read-process.test.ts`、`console-read-worker.test.ts`、`isolated-read-routing.test.ts`：生命周期、只读和混合版本路由。
+- `test/console-v5/console-read-process.test.ts`、`console-read-worker.test.ts`、`console-read-lanes.test.ts`、`isolated-read-routing.test.ts`：生命周期、只读、分析与交互隔离及混合版本路由。
+- `src/console-workbench/task-state-index.test.ts`、`task-aggregation.test.ts`、`overview-sources.test.ts`：状态/完整读取分类一致、同一快照、进展观测、跳过历史 JSON 及未读取指标。
+- `src/console-workbench/task-read-scope.test.ts`、`test/console-v5/feed-consistency.test.ts`、`readonly-project-sessions.test.ts`：Task/成员/项目候选范围、权威及缺成员覆盖、所选页摘要，以及超出 feed 缓存容量的阶段分页。
+- `test/console-v5/detail-read-budget.test.ts`、`detail-retention.test.ts`：真实待完成/失败的详情读取、完整任务标题区、所选页保留及未知空页。
+- `test/federation/console-cancellation.test.ts`、`console-request-retry.test.ts`：真实 RPC/HTTP 读取取消、同一连接恢复及已受理 POST 的持久语义。
 - `test/console-v5/readonly-*.test.ts`、`console-read-detail.test.ts`：详情、已存文件、审计和工作区会话。
 - `test/session-card/status-read.test.ts`、`projection-read.test.ts`：真实 SQLite 阻塞、父进程响应、取消、范围及发布竞争。
 - `src/session/session-store.test.ts`、`finalization-budget.test.ts`：快照、远端成员和收尾预算。
 - `test/console-v5/experience.browser.spec.ts`：真实浏览器的部分详情保留、补读、重试和窄窗口交互。
 
 使用仓库固定的 Node/pnpm 完成类型检查和构建，再运行依赖编译后 worker 的检查。集成验证使用真实临时数据库、文件、子进程和本地连接。隔离边界限制慢读取的影响，并不单独证明每次历史冻结的原因。
+
+2026-11-01 的本地回归使用 Node 24.22.1 和临时数据。以下是测试夹具的观测，不是已部署节点的性能或升级验收结果：
+
+| 测试夹具 | 实测结果 |
+| --- | --- |
+| 99.4 MiB SQLite，3,072 条历史 JSON | 一次运行中，完整索引为 104.3 ms，状态读取为 51.3 ms。无效但未使用的历史/检查点 JSON 不影响状态读取，数据库字节保持不变。 |
+| 编译后的只读 worker，四条路由 | 首轮 474 ms，复用 worker 为 14 ms；针对性的七文件回归共 43 项全部通过。 |
+| 真实 181 阶段 Task，经 SQLite 与本机回环 HTTP | 十个内容页跨过 160 条缓存边界；返回第一页只重读该页 20 个阶段正文，不积累全部历史详情。 |
+
+状态读取仍需分类相关的已保存阶段；移除大块 JSON 重建不代表历史规模不再影响成本。阶段分页限制完整详情正文，不截断完整任务引用列表。这些检查不测量生产网络延迟、不证明正在运行的桌面程序已切换版本，也不构成重启活跃工作节点的授权。

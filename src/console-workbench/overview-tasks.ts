@@ -1,4 +1,4 @@
-import type { TaskIndex } from './task-aggregation.js';
+import type { TaskStateIndex } from './task-aggregation.js';
 import { taskActivityView, TASK_EXECUTION_FRESHNESS_MS, TASK_SILENCE_MS } from '../task-view.js';
 
 // A display grouping, never a Task timeout or a lifecycle transition.
@@ -18,7 +18,7 @@ export interface TaskAttention {
 }
 
 /** A saved execution anomaly is not, by itself, an action for the user. */
-export function taskAttention(task: Pick<TaskIndex, 'taskId' | 'requestState' | 'executionStatus'
+export function taskAttention(task: Pick<TaskStateIndex, 'taskId' | 'requestState' | 'executionStatus'
   | 'phaseExecutionStatus' | 'acceptanceStatus' | 'actionableInterruption' | 'finalization'>): TaskAttention | null {
   if (!task.taskId || !['active', 'closed'].includes(task.requestState ?? '')) return null;
   const settled = ['completed', 'waiting'].includes(task.executionStatus);
@@ -36,21 +36,21 @@ export function taskAttention(task: Pick<TaskIndex, 'taskId' | 'requestState' | 
   return null;
 }
 
-export function selectOverviewTasks(
-  tasks: readonly TaskIndex[],
+export function selectOverviewTasks<T extends TaskStateIndex>(
+  tasks: readonly T[],
   at: number,
   isToday: (time: number) => boolean,
   _lastObservedExecuting: ReadonlySet<string> = new Set(),
 ) {
   const realTasks = tasks.filter(task => Boolean(task.taskId));
   const open = realTasks.filter(task => task.requestState === 'active');
-  const activity = (task: TaskIndex) => taskActivityView({requestState:task.requestState,result:task.resultStatus,
+  const activity = (task: TaskStateIndex) => taskActivityView({requestState:task.requestState,result:task.resultStatus,
     execution:task.executionStatus,lastProgressAt:task.lastProgressAt ?? task.lastActivityAt,
     executionObservedAt:task.executionObservedAt,stale:task.stale,now:at});
-  const byActivity = (left: TaskIndex, right: TaskIndex) => (right.lastProgressAt ?? right.lastActivityAt) - (left.lastProgressAt ?? left.lastActivityAt)
+  const byActivity = (left: TaskStateIndex, right: TaskStateIndex) => (right.lastProgressAt ?? right.lastActivityAt) - (left.lastProgressAt ?? left.lastActivityAt)
     || left.key.localeCompare(right.key);
   const current = open.filter(task=>activity(task).current).sort((left, right) => {
-    const rank = (task: TaskIndex) => activity(task).state==='executing' ? 0 : 1;
+    const rank = (task: TaskStateIndex) => activity(task).state==='executing' ? 0 : 1;
     return rank(left) - rank(right) || byActivity(left, right);
   });
   const currentKeys = new Set(current.map(task => task.key));
@@ -74,7 +74,7 @@ export interface OverviewTaskProgress {
   progressSummary: string | null;
 }
 
-export function overviewTaskProgress(task: TaskIndex, _group: 'current' | 'older' | 'recent', at=Date.now()): OverviewTaskProgress {
+export function overviewTaskProgress(task: TaskStateIndex, _group: 'current' | 'older' | 'recent', at=Date.now()): OverviewTaskProgress {
   const activity=taskActivityView({requestState:task.requestState,result:task.resultStatus,execution:task.executionStatus,
     lastProgressAt:task.lastProgressAt ?? task.lastActivityAt,executionObservedAt:task.executionObservedAt,stale:task.stale,now:at});
   if(activity.state==='ended')return {progressLabel:activity.label,progressSummary:activity.detail};

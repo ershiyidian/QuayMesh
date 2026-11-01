@@ -58,6 +58,36 @@ test("invalid cursors always reject before dispatch with a stable 400 outcome", 
   }
 });
 
+test("execution reconciliation reads use active-state indexes and preserve stale and unknown observations", t => {
+  const directory = mkdtempSync(join(tmpdir(), "qm-reconciliation-read-")), root = join(directory, "project");
+  mkdirSync(root);
+  const ledger = new WorkLedger(join(directory, "state")), at = Date.now();
+  t.after(() => { ledger.close(); rmSync(directory, { recursive: true, force: true }); });
+  const run = ledger.begin({ root, workItemId: "history", runKey: "one", title: "History with a current operation",
+    origin: { entryPoint: "console", evidence: "server_entry" } });
+  const operation = ledger.operation({runId:run.id,requestKey:"observation",kind:"command",label:"Observation",status:"completed"});
+  const selected = runQuery(ledger,"local",ledger.projects().map(project=>project.id),{days:"0"},at,{counts:false});
+  const sql = `${selected.sql} SELECT id,unresolved FROM selected`;
+  const statement = ledger.db.prepare(sql);
+  const observed = (status:string,observation:string|null) => {
+    ledger.db.prepare("UPDATE console_operations SET status=?,observed_at=? WHERE id=?").run(status,observation,operation);
+    return (statement.get(...selected.params) as {unresolved:number}).unresolved;
+  };
+  const fresh = new Date(at).toISOString(), stale = new Date(at-60_000).toISOString();
+  for(const status of ["running","starting","queued"]) {
+    assert.equal(observed(status,fresh),0,`${status} with a current observation`);
+    assert.equal(observed(status,stale),1,`${status} with a stale observation`);
+    assert.equal(observed(status,null),1,`${status} with no observation`);
+  }
+  for(const status of ["unknown","reconciliation_required"])assert.equal(observed(status,fresh),1);
+  for(const status of ["completed","failed","stopped","cancelled"])assert.equal(observed(status,null),0);
+  const plan = ledger.db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...selected.params) as Array<{detail:string}>;
+  const childSearches = plan.filter(row=>/SEARCH [oe] USING/.test(row.detail));
+  assert.equal(childSearches.length,4);
+  assert.ok(childSearches.every(row=>/\(run_id=\? AND status=\?\)/.test(row.detail)),
+    "checking current execution must skip completed command history on both operation tables");
+});
+
 test("task duration sorting preserves the oldest member observation and freezes unknown execution", () => {
   const at = 1_000_000;
   const phase = (id: string, observedAt: number | null, stale: boolean): TaskPhaseIndex => ({ id, localId: id, nodeId: id,

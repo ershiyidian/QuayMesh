@@ -6,7 +6,7 @@ import {WorkbenchFeed} from '../../src/console-workbench/feed.js';
 import {isolatedConsoleReadPath,isolatedReadUpgradeRequired,READ_UPGRADE_MESSAGE} from '../../src/console-workbench/isolated-routes.js';
 
 test('Console read routes use the versioned isolation boundary and leave write reconciliation outside it',()=>{
-  for(const path of ['/metadata','/runs','/task-index','/session-titles','/run-summaries','/overview','/overview-usage','/usage','/activity',
+  for(const path of ['/metadata','/runs','/task-index','/task-state-index','/session-titles','/task-index-scoped','/session-titles-scoped','/run-summaries','/overview','/overview-usage','/usage','/activity',
     '/runs/run1','/runs/run1/files/file1','/runs/run1/commands/command1','/runs/run1/patch','/projects/project1/sessions','/tasks/task1/messages-state']) {
     assert.equal(isolatedConsoleReadPath('/workbench'+path+'?limit=2'),'/workbench/isolated-v1'+path+'?limit=2');
   }

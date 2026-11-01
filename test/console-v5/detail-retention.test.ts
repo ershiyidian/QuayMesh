@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {Resources} from '../../src/ui/console-v5/resources.js';
-import {retainDetail,retainedDetailView,pendingDetailRead} from '../../src/ui/console-v5/retained-detail.js';
+import {retainDetail,retainedDetailView,pendingDetailRead,detailRecordsComplete} from '../../src/ui/console-v5/retained-detail.js';
 import type {RunDetail,CacheEntry} from '../../src/ui/console-v5/contracts.js';
 import type {createApi} from '../../src/ui/console-v5/client.js';
 
@@ -45,4 +45,23 @@ test('partial success after invalidation retains the actual older read time and 
   await resources.load(path,true);
   assert.equal(resources.entries.get(path)!.retained,undefined);
   resources.entries.clear();assert.equal(resources.data(path),undefined);
+});
+
+test('completed phase pages do not become pending history or accumulate full detail across navigation',async()=>{
+  const page=(offset:number):RunDetail=>({...fixture(false),taskComplete:true,
+    phasePage:{references:['phase-'+offset],offset,limit:1,total:200,previousCursor:offset?'before-'+offset:null,
+      nextCursor:offset<199?'after-'+offset:null,complete:true}});
+  const api={get:async(path:string)=>page(Number(new URLSearchParams(path.split('?')[1]).get('phaseCursor')??0))} as unknown as ReturnType<typeof createApi>;
+  const resources=new Resources(api,{freshness:()=>0,paint(){},loaded(){}});
+  for(let offset=0;offset<200;offset++){
+    const path='runs/task'+(offset?'?phaseCursor='+offset:'');
+    await resources.load(path);
+    assert.equal(resources.entries.size,1,'each Task keeps only its selected page body');
+    const detail=resources.data<RunDetail>(path)!;
+    assert.equal(detailRecordsComplete(detail),true);assert.equal(detail.complete,false);
+    assert.equal(pendingDetailRead(detail),false);assert.equal(detail.run.actions.complete,false);
+    assert.equal(retainDetail(page(0),detail,1000),undefined,'a complete page must not inherit another page as stale evidence');
+  }
+  const unknown={...page(0),taskComplete:false,phasePage:{...page(0).phasePage!,references:[],total:0,complete:false}};
+  assert.equal(detailRecordsComplete(unknown),false,'missing owner data is not an empty confirmed page');
 });

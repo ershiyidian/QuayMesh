@@ -2,9 +2,13 @@ import assert from "node:assert/strict";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
+import Database from "better-sqlite3";
 import { ExecutionCoordinator } from "../../src/execution-coordinator.js";
 import { LocalAgentStore } from "../../src/local-agent-store.js";
 import { readProjectSessions } from "../../src/console-workbench/project-sessions-read.js";
+import { readLocalIndex } from "../../src/console-workbench/local.js";
+import { aggregateTasks } from "../../src/console-workbench/task-aggregation.js";
+import { stage } from "../../src/console-workbench/query.js";
 import { WorkbenchError } from "../../src/console-workbench/types.js";
 import { readonlyDetailFixture } from "./readonly-detail-fixture.js";
 
@@ -33,6 +37,47 @@ test("project sessions read preserves tasks without executions in a readonly sna
     assert.throws(() => readProjectSessions(f.config, ""),
       error => error instanceof WorkbenchError && error.code === "invalid_read");
   } finally { await f.close(); }
+});
+
+test('project previews retain the former Task shape without parsing history JSON or classifying other projects',async t=>{
+  const f=await readonlyDetailFixture();t.after(f.close);
+  const projectId=f.ledger.run(f.run.id).project_id;
+  const otherRoot=join(f.directory,'other-history');await mkdir(otherRoot);
+  const config={...f.config,allowedRoots:[f.root,otherRoot]};
+  f.ledger.db.transaction(()=>{
+    for(let index=0;index<80;index++){
+      const run=f.ledger.begin({root:otherRoot,workItemId:'other-'+index,runKey:'one',title:'Other history',
+        origin:{entryPoint:'console',evidence:'server_entry'}});
+      f.ledger.db.prepare("UPDATE console_work_runs SET status='failed' WHERE id=?").run(run.id);
+    }
+  })();
+  const expected=aggregateTasks(readLocalIndex(config,[f.run.id]).runs).map(task=>({id:task.id,taskId:task.taskId,title:task.title,
+    status:stage(task),root:task.root,workspaces:task.workspaces,executionStatus:task.executionStatus,acceptanceStatus:task.acceptanceStatus,
+    lastActivityAt:task.lastActivityAt,requestState:task.requestState,resultStatus:task.resultStatus,phaseExecutionStatus:task.phaseExecutionStatus,
+    finalization:task.finalization,startedAt:task.startedAt,finishedAt:task.finishedAt,hasRun:true}));
+  const baseline=readProjectSessions(config,projectId);
+  assert.deepEqual(baseline.conversations[0]?.tasks,expected);
+  f.ledger.db.prepare("UPDATE console_work_runs SET evidence='unneeded invalid history' WHERE id=?").run(f.run.id);
+  f.ledger.db.prepare(`INSERT INTO qm_run_checkpoints(run_id,session_id,member_id,revision,snapshot_json,files_json,captured_at)
+    VALUES(?,?,?,1,'unneeded invalid snapshot','unneeded invalid files',?)`).run(f.run.id,f.session.id,f.member.id,new Date().toISOString());
+  const statements:string[]=[],prepare=Database.prototype.prepare,register=Database.prototype.function;
+  let classified=0;
+  t.mock.method(Database.prototype,'prepare',function(this:Database.Database,sql:string){
+    if(this.readonly)statements.push(sql);return prepare.call(this,sql);
+  });
+  t.mock.method(Database.prototype,'function',function(this:Database.Database,name:string,...args:unknown[]){
+    if(name==='quaymesh_execution_status'){
+      const classify=args.at(-1) as (...input:unknown[])=>unknown;
+      const wrapped=(...input:unknown[])=>{classified++;assert.notEqual(input[2],'failed','unrelated project history reached the classifier');return classify(...input);};
+      Object.defineProperty(wrapped,'length',{value:classify.length});
+      args[args.length-1]=wrapped;
+    }
+    return Reflect.apply(register,this,[name,...args]);
+  });
+  assert.deepEqual(readProjectSessions(config,projectId),baseline);
+  assert.ok(classified>0&&classified<5,`only the selected project phase is classified, got ${classified}`);
+  assert.ok(statements.every(sql=>!/(?:json_extract|json_each|json_array_length)\s*\(/i.test(sql)));
+  assert.ok(statements.every(sql=>!sql.includes('qm_run_checkpoints')));
 });
 
 test("project claim inspection keeps expired waiters and interrupted owners unchanged", async () => {
@@ -98,5 +143,13 @@ test("project thread controls use saved metadata without materializing agent res
     assert.equal(page.claims.length, 1);
     assert.equal(JSON.stringify(page).includes("Private response body"), false);
     assert.equal(f.ledger.db.pragma("data_version", { simple: true }), version);
+    const finished=new Date().toISOString();
+    f.ledger.db.prepare("UPDATE local_agent_sessions SET control_state='idle' WHERE id=?").run(agent.id);
+    f.ledger.db.prepare("UPDATE console_executions SET status='completed',finished_at=? WHERE id=?").run(finished,executionId);
+    f.ledger.db.prepare("UPDATE console_work_runs SET status='completed',acceptance='pending',finished_at=? WHERE id=?").run(finished,f.run.id);
+    f.ledger.db.prepare("UPDATE qm_tasks SET state='closed',result_status='completed',finished_at=? WHERE id=?").run(finished,f.task.id);
+    const awaitingReview=readProjectSessions(f.config,f.ledger.run(f.run.id).project_id).items.find(value=>value.localId===threadId);
+    assert.equal(awaitingReview?.control,'idle');assert.equal(awaitingReview?.runs[0]?.status,'review');
+    assert.equal(awaitingReview?.skipReason,'执行结果待验收');
   } finally { agents.close(); await f.close(); }
 });

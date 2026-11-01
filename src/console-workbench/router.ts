@@ -16,7 +16,7 @@ import { WorkLedger } from "../work-ledger.js";
 import { LocalAgentStore } from "../local-agent-store.js";
 import type { ProcessSessionManager } from "../process-sessions.js";
 import type { TaskLifecycle } from "../console-task-state.js";
-import { activeExecution, relevantExecution, observeSourceStates } from "../console-task-state.js";
+import { activeExecution, relevantExecution } from "../console-task-state.js";
 import type { SessionRuntime } from "../session/runtime.js";
 import { mapConcurrent } from "../concurrency.js";
 import { WorkbenchFeed, mergeSources } from "./feed.js";
@@ -24,13 +24,15 @@ import { aggregateTasks, parseTaskReference, parseSessionReference } from "./tas
 import { LocalActions } from "./actions.js";
 import { permitted } from "./local.js";
 import {readLocalActivity,readLocalAudit,readLocalProjectSessions,readLocalTaskMessageState,withConsoleReadSignal} from "./isolated-queries.js";
-import { readLocalMetadata, readLocalPage, readLocalOverview, readLocalOverviewUsage, readLocalRunSummaries, readLocalSessionTitles, readLocalTaskIndex, readLocalUsage } from "./isolated-queries.js";
+import { readLocalMetadata, readLocalPage, readLocalOverview, readLocalOverviewUsage, readLocalRunSummaries, readLocalSessionTitles, readLocalTaskIndex, readLocalTaskStateIndex, readLocalUsage } from "./isolated-queries.js";
 import type {readRunDetail} from "./detail.js";
 import {readIsolatedRunDetail,readIsolatedArtifact} from "./read-detail.js";
 import type { Query } from "./query.js";
-import type { Run, SourceState, TaskMessageConfirmation } from "./types.js";
+import type { Run, SourceState, TaskMessageConfirmation, PhaseDetailPage } from "./types.js";
 import { WorkbenchError } from "./types.js";
 import { HANDOFF_FINALIZATION_CODE } from "../session/task-completion.js";
+import {parseTaskReadScopeQuery} from './task-read-scope.js';
+import {selectPhaseDetailPage} from './phase-detail-page.js';
 import { WriteReceipts, writeEffect, type WriteReceipt, type VerifiedReceipt, type WriteEffect } from "./receipts.js";
 
 const id = z.string().min(1).max(2048);
@@ -51,6 +53,8 @@ const querySchema = z.object({
   days: z.coerce.number().int().min(0).max(36500).optional().transform((value) => value === undefined ? undefined : String(value)),
   stage: z.string().max(300).optional(), status: z.string().optional(), sort: z.enum(["newest", "oldest", "tokens", "duration"]).optional(),
   cursor: z.string().max(8192).optional(),
+  phaseCursor: z.string().max(8192).optional(),
+  phaseLimit: z.coerce.number().int().min(1).max(50).optional().transform(value=>value===undefined?undefined:String(value)),
   limit: z.coerce.number().int().min(1).max(100).optional().transform((value) => value === undefined ? undefined : String(value)),
   changed: z.string().optional(), execution: z.string().optional(), date: z.string().optional(), finishedDay: z.string().optional(),
   usageDate:z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
@@ -209,18 +213,20 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
       // 旧版会话链接曾使用 Task 前缀，仅在没有同名 Task 时查旧会话。
       const legacy=await feed.sessionRuns(taskId,fresh);
       const phases=legacy.runs.filter(run=>run.taskId===null);
-      if(phases.length)return {task:aggregateTasks(phases)[0]!,phases,complete:legacy.complete,sources:legacy.sources,missingNodes:legacy.missingNodes};
+      const legacyTask=legacy.task?.taskId===null&&legacy.task.sessionId===taskId?legacy.task:phases.length?aggregateTasks(phases)[0]:undefined;
+      if(legacyTask)return {task:legacyTask,phases,complete:legacy.complete,sources:legacy.sources,missingNodes:legacy.missingNodes};
       throw new WorkbenchError('任务不存在',404,'task_not_found','none');
     }
     if(sessionId){
       const result=await feed.sessionRuns(sessionId,fresh),phases=result.runs.filter(run=>run.taskId===null);
-      if(!phases.length)throw new WorkbenchError('历史会话执行不存在',404,'session_run_not_found','none');
-      return {task:aggregateTasks(phases)[0]!,phases,complete:result.complete,sources:result.sources,missingNodes:result.missingNodes};
+      const task=result.task?.taskId===null&&result.task.sessionId===sessionId?result.task:phases.length?aggregateTasks(phases)[0]:undefined;
+      if(!task)throw new WorkbenchError('历史会话执行不存在',404,'session_run_not_found','none');
+      return {task,phases,complete:result.complete,sources:result.sources,missingNodes:result.missingNodes};
     }
     const detail=await rawRunDetail(reference);
     return {task:detail.run,phases:[detail.run],complete:true,sources:[],missingNodes:[]};
   };
-  const aggregateRunDetail=async(reference:string,fresh=false)=>{
+  const aggregateRunDetail=async(reference:string,fresh=false,pageInput:{cursor?:string;limit?:number}={})=>{
     if(!parseTaskReference(reference)&&!parseSessionReference(reference)){
       const observed=await readPhaseDetail(reference,fresh,Date.now()+1200);
       if(!observed.detail){
@@ -241,8 +247,9 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
     const taskId=parseTaskReference(reference);
     const messages=taskId?taskMessagesFor(taskId,fresh):undefined;
     const related=await taskPhases(reference,fresh);
+    const page=selectPhaseDetailPage(reference,related.task,related.complete,pageInput);
     const byNode=new Map<string,string[]>();
-    for(const phase of related.task.phaseRefs??related.phases.map(value=>value.id)){
+    for(const phase of page.references){
       const node=decode(phase).node,phases=byNode.get(node)??[];
       phases.push(phase);byNode.set(node,phases);
     }
@@ -261,11 +268,13 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
       id:value.phase,nodeId:value.source.nodeId,error:value.source.error??'阶段详情正在读取',
       pending:value.source.online&&!value.source.error,
     }));
-    const byPhase=new Map(details.map(value=>[value.phase,value.detail.run]));
     const sources=mergeSources(related.sources,observed.map(value=>value.source));
-    const phases=observeSourceStates(related.phases.map(phase=>byPhase.get(phase.id)??phase),sources);
-    const task=feed.taskFromPhases(phases,related.lifecycle)??related.task;
-    return withTaskMessages(mergeTaskDetails(task,details,{complete:related.complete&&missing.length===0,sources,missing}),fresh,messages);
+    page.complete=(page.references.length>0||related.complete)&&observed.every(value=>value.detail?.complete&&value.source.online&&value.source.state==='ready'
+      &&!value.source.stale&&!value.source.error);
+    // The content page never replaces the full index/summary Task, including
+    // its revision used by the separate mutation confirmation path.
+    return withTaskMessages(mergeTaskDetails(related.task,details,{complete:related.complete&&missing.length===0,
+      taskComplete:related.complete,page,sources,missing}),fresh,messages);
   };
   const search = (req: Request): Query => querySchema.parse(req.query);
   const queryString = (req: Request) => new URLSearchParams(Object.entries(search(req)).filter((pair): pair is [string, string] => pair[1] !== undefined)).toString();
@@ -273,7 +282,10 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
   localGet("/metadata", () => readWorkbenchMetadata(config,runtime));
   localGet("/runs", (req) => readLocalPage(config, search(req)));
   localGet("/task-index", () => readLocalTaskIndex(config));
+  localGet("/task-state-index", () => readLocalTaskStateIndex(config));
   localGet("/session-titles", () => readLocalSessionTitles(config));
+  localGet('/task-index-scoped', req => readLocalTaskIndex(config, undefined, parseTaskReadScopeQuery(req.query)));
+  localGet('/session-titles-scoped', req => readLocalSessionTitles(config, parseTaskReadScopeQuery(req.query)));
   localGet("/run-summaries", (req) => {
     const raw = text(req.query.ids);
     const ids = raw ? raw.split(",").map((value) => decodeURIComponent(value)).filter(Boolean) : [];
@@ -505,7 +517,8 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
   get("/roots", async req => { const value = await feed.metadata(search(req).fresh==='1'); return { items: value.roots, sources: value.sources, complete: value.complete }; });
   get("/runs", (req) => feed.runs(search(req)));
   get("/usage", (req) => feed.usage(search(req)));
-  get("/runs/:id", (req) => aggregateRunDetail(text(req.params.id),search(req).fresh==='1'));
+  get("/runs/:id", req => {const query=search(req);return aggregateRunDetail(text(req.params.id),query.fresh==='1',
+    {cursor:query.phaseCursor,limit:query.phaseLimit===undefined?undefined:Number(query.phaseLimit)});});
   get("/runs/:id/files/:file", async (req) => {
     const {target,id:file,scope}=artifactTarget(req,text(req.params.file));
     const cursor = z.string().max(8192).optional().parse(req.query.cursor);
@@ -744,7 +757,9 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
   return { feed };
 }
 
-type RunDetail = Awaited<ReturnType<typeof readRunDetail>> & { taskMessages?: TaskMessageConfirmation };
+type RunDetail = Awaited<ReturnType<typeof readRunDetail>> & {
+  taskMessages?: TaskMessageConfirmation; taskComplete?: boolean; phasePage?: PhaseDetailPage;
+};
 type RoutedTaskDetail = { phase: string; detail: RunDetail };
 
 const TASK_PART_PREFIX = "tqpart:";
@@ -766,14 +781,19 @@ function decodeTaskPart(value: string): { run: string; id: string } | null {
   }
 }
 
-function mergeTaskDetails(task: Run, phases: RoutedTaskDetail[], observation:{complete:boolean;sources:SourceState[];missing:Array<{id:string;nodeId:string;error:string;pending?:boolean}>}): RunDetail {
-  const complete=observation.complete&&phases.every(({detail})=>detail.complete);
+function mergeTaskDetails(task: Run, phases: RoutedTaskDetail[], observation:{complete:boolean;taskComplete?:boolean;page?:PhaseDetailPage;sources:SourceState[];missing:Array<{id:string;nodeId:string;error:string;pending?:boolean}>}): RunDetail {
+  const complete=observation.complete&&phases.every(({detail})=>detail.complete)
+    &&(!observation.page||observation.page.offset===0&&observation.page.references.length===observation.page.total);
   const missing=uniqueBy([...observation.missing,...phases.flatMap(({phase,detail})=>detail.complete?[]:
     detail.missingPhases.length?detail.missingPhases:[{id:phase,nodeId:detail.run.nodeId,error:'阶段记录尚未完整读取',pending:true}])],value=>value.id);
-  const confirmed=complete&&observation.sources.every(source=>source.online&&source.state==='ready'&&!source.stale&&!source.error);
   const currentRefs = new Set(task.currentPhaseRefs ?? task.phaseRefs ?? phases.map((item) => item.phase));
   const current = phases.filter((item) => currentRefs.has(item.phase));
-  const singleCurrentPhase = current.length === 1;
+  // Page completion is content coverage only. Actions require the full Task
+  // summary proof plus every current phase's actual detail/capture evidence.
+  const confirmed=(observation.taskComplete??observation.complete)&&currentRefs.size===current.length
+    &&current.every(({detail})=>detail.complete)
+    &&observation.sources.every(source=>source.online&&source.state==='ready'&&!source.stale&&!source.error);
+  const singleCurrentPhase = currentRefs.size === 1 && current.length === 1;
   const changeCaptures = current.flatMap(({phase,detail}) => (detail.changeCaptures ?? [])
     .map(capture => ({...capture,runId:phase})));
   const captureBlocked = changeCaptures.some(capture => capture.state === 'pending' || capture.state === 'failed');
@@ -798,7 +818,8 @@ function mergeTaskDetails(task: Run, phases: RoutedTaskDetail[], observation:{co
     ...phases.flatMap(({ detail }) => detail.warnings),
     ...observation.missing.filter(value=>!value.pending).map(value=>`${value.nodeId} 阶段读取失败：${value.error}`)])];
   const saved=current.map(({detail})=>detail.summary.trim()).filter(Boolean);
-  const summary=saved.length===1?saved[0]:saved.length?saved.join('\n\n'):task.reason??'任务已创建，尚未登记执行阶段';
+  const summary=saved.length===1?saved[0]:saved.length?saved.join('\n\n'):task.reason
+    ??(task.phaseRefs?.length?'本页执行记录见下方阶段详情':'任务已创建，尚未登记执行阶段');
   return {
     run: {
       ...task,
@@ -815,6 +836,7 @@ function mergeTaskDetails(task: Run, phases: RoutedTaskDetail[], observation:{co
     changeCaptures,
     phases:phases.map(({phase,detail})=>({id:phase,run:detail.run,summary:detail.summary})),
     complete,sources:observation.sources,missingPhases:missing,
+    ...(observation.page?{phasePage:observation.page,taskComplete:observation.taskComplete===true}:{}),
     evidence,
     files,
     commands,

@@ -1,7 +1,7 @@
 import type { WorkbenchFeed } from "../../console-workbench/feed.js";
 import type { LocalActions } from "../../console-workbench/actions.js";
 import type { readRunDetail, readFileDiff, readRunPatch, readCommandOutput } from "../../console-workbench/detail.js";
-import type { Run, Project, Root, SourceState, TaskMessageConfirmation } from "../../console-workbench/types.js";
+import type { Run, Project, Root, SourceState, TaskMessageConfirmation, PhaseDetailPage } from "../../console-workbench/types.js";
 import type { ConsoleSession } from "./client.js";
 
 export type { Run, Project, Root, SourceState, ConsoleSession };
@@ -18,6 +18,8 @@ export interface ChangeCapture {
 }
 export type RunDetail = Omit<BaseRunDetail, 'files' | 'changeCaptures'> & {
   taskMessages?: TaskMessageConfirmation;
+  taskComplete?: boolean;
+  phasePage?: PhaseDetailPage;
   changeCaptures?: ChangeCapture[];
   phases?: Array<{ id: string; run: Run; summary: string }>;
   files: Array<BaseRunDetail['files'][number] & { source?: { runId: string; nodeId: string; projectName: string; root: string } }>;

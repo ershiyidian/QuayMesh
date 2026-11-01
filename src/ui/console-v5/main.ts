@@ -3,7 +3,7 @@ import { taskStages } from '../../console-task-state.js';
 import { taskActivityView, TASK_EXECUTION_FRESHNESS_MS, TASK_SILENCE_MS } from '../../task-view.js';
 import { brand,workspaceSummary,conversationCards } from './workspace-presentation.js';
 import { Resources } from "./resources.js";
-import {retainedDetailView,pendingDetailRead,type DetailRecordKey} from './retained-detail.js';
+import {retainedDetailView,pendingDetailRead,detailRecordsComplete,type DetailRecordKey} from './retained-detail.js';
 import { $, $$, updateHTML } from "./dom.js";
 import { dialog, formObject } from "./dialogs.js";
 import { consoleError, validateSession, WriteIntent, type ConsoleError, type ConsoleSession } from "./client.js";
@@ -17,7 +17,7 @@ import "prismjs/components/prism-python.js";
 import { createApi, ApiError } from "./client.js";
 import { cacheRatio, noncachedInput, usageParts } from "./usage.js";
 import { CommandOutputs,commandOutputNotice,commandOutputNeedsRetry } from "./command-output.js";
-import { sourceWarning, sourceWarnings, sourceNeedsAttention, resourceHealth, resourceObservation } from './source-state.js';
+import { sourceWarning, sourceWarnings, sourceNeedsAttention, resourceHealth, resourceObservation, hasPendingSourceRead } from './source-state.js';
 import { readFailureMessage, readWarningMessage } from './read-state.js';
 import { readFields, fieldsFromHTML, refreshFields, type FieldValues } from './settings-form.js';
 import { EventNotifications, type NotificationMemory, type NotificationPage } from './notifications.js';
@@ -92,6 +92,9 @@ const resources = new Resources(API, { freshness, paint: schedulePaint, loaded(p
     if (path === runPath() && route.p.cursor && CACHE.get(path)?.error?.code === 'cursor_expired') {
         toast('列表快照已到期，已重新读取第一页。','warn'); param({cursor:null}); return;
     }
+    if(path===detailPath()&&route.p.phaseCursor&&CACHE.get(path)?.error?.code==='phase_cursor_expired'){
+        toast('阶段记录已变化，已重新读取第一页。','warn');navigate(route.view,{phaseCursor:null,file:null},true,true);return;
+    }
     if (path === 'projects' || path.startsWith('runs')) ensureRoute();
     if (path === 'fleet/status') pollNotifications();
     schedulePendingRead(path);
@@ -122,6 +125,10 @@ function queryString(parameters: Record<string, string | number | boolean | null
   return new URLSearchParams(Object.entries(parameters).flatMap(([key, value]): Array<[string,string]> => value === undefined || value === null || value === '' ? [] : [[key,String(value)]])).toString();
 }
 const runPath = () => 'runs?' + currentQuery();
+const detailPath = (id=route.p.run) => {
+    const query=id===route.p.run?queryString({phaseCursor:route.p.phaseCursor,phaseLimit:route.p.phaseLimit}):'';
+    return 'runs/'+enc(id)+(query?'?'+query:'');
+};
 const activityPath = () => route.p.kind === 'receipts' ? 'receipts?limit=50' : 'activity?' + new URLSearchParams(Object.fromEntries(Object.entries({ kind: route.p.kind || 'events', q: route.p.q || '', node: route.p.node || '', level: route.p.level || '', cursor: route.p.cursor || '', hour: route.p.hour || '' }).filter(([, v]) => v)));
 const conversationPath = () => 'conversations?' + queryString({q:route.p.q,node:route.p.node});
 const usagePath = () => 'usage?' + currentQuery({ days: route.p.days || '14', cursor: null, limit: null, status: null });
@@ -167,7 +174,7 @@ const taskScope = (run: Run, short = true) => run.nodeIds && run.nodeIds.length 
   : nodeTag(run.nodeId, short);
 const canWrite = (cap = 'write') => !booting && !bootstrapError && !!API.session?.capabilities?.write && API.session.capabilities[cap] !== false;
 const writeAttrs = (cap = 'write') => canWrite(cap) ? '' : 'disabled title="当前接口或凭据不允许此操作"';
-const selectedRun = () => data<RunDetail>('runs/' + enc(route.p.run || ''))?.run;
+const selectedRun = () => data<RunDetail>(detailPath())?.run;
 function resourceName(path: string) {
     return path.startsWith('overview') ? '任务数据' : path === 'fleet/status' ? '节点状态' : path === 'projects' ? '工作区目录' : path.startsWith('runs?') ? '任务列表' : path.startsWith('runs/') ? '任务详情' : path.includes('/sessions') ? '会话' : path.startsWith('usage') ? '用量' : path.startsWith('activity') ? '活动' : path === 'roots' ? '工作空间' : '数据';
 }
@@ -234,13 +241,13 @@ function routePaths() {
     if (['tasks', 'changes'].includes(route.view)) {
         list.push(runPath());
         if (route.p.run) {
-            const path = 'runs/' + enc(route.p.run);
+            const path = detailPath();
             list.push(path);
             const detail = data<RunDetail>(path);
             if ((route.p.tab || (route.view === 'changes' ? 'diff' : 'summary')) === 'diff' && detail?.files?.length)
                 for (const f of visibleFiles(detail))
                     if (openFiles(detail).has(f.id) && (!f.generated || loadedBigFiles.has(route.p.run + ':' + f.id)))
-                        list.push(path + '/files/' + enc(f.id));
+                        list.push('runs/'+enc(route.p.run)+'/files/' + enc(f.id));
         }
     }
     else if (route.view === 'sessions')
@@ -262,7 +269,7 @@ function freshness(path: string) {
         return 30000;
     if (path.includes('/files/'))
         return Infinity;
-    if (/^runs\/[^/?]+$/.test(path)) {
+    if (/^runs\/[^/]+$/.test(path.split('?')[0]!)) {
         const detail = data<RunDetail>(path), r = detail?.run;
         if (r && !changeCaptureBlockReason(detail?.changeCaptures) && !['running', 'queued', 'stopping', 'waiting'].includes(r.executionStatus))
             return Math.max(30000, (pref.poll || 8) * 1000);
@@ -277,8 +284,7 @@ function pausePendingReads() {
 function schedulePendingRead(path: string) {
     const entry = renderedResourceEntry(path), sources = (entry?.data as {sources?:SourceState[]} | undefined)?.sources || [];
     const pending = pendingReads.get(path);
-    const awaitingResult = !entry?.error && (sources.some(source => ['loading','refreshing'].includes(source.state)) || pendingDetailRead(entry?.data))
-        && !sources.some(source => source.error || source.state === 'error' || source.state === 'offline');
+    const awaitingResult = !entry?.error && (hasPendingSourceRead(sources) || pendingDetailRead(entry?.data));
     if (!activePaths.has(path) || !awaitingResult) {
         clearTimeout(pending?.timer); pendingReads.delete(path); return;
     }
@@ -323,7 +329,7 @@ function ensureRoute() {
         }
     }
 }
-function navigate(view: string, patch: Record<string, string | number | boolean | null | undefined> = {}, replace = false, keep = false) { const oldView = route.view, oldRun = route.p.run, p = keep ? { ...route.p } : {}; Object.entries(patch).forEach(([k, v]) => v == null || v === '' ? delete p[k] : p[k] = String(v)); taskRouteDefaults(view,p); route = { view, p }; const qs = queryString(p), hash = '#/' + view + (qs ? '?' + qs : ''); try {
+function navigate(view: string, patch: Record<string, string | number | boolean | null | undefined> = {}, replace = false, keep = false) { const oldView = route.view, oldRun = route.p.run, p = keep ? { ...route.p } : {}; Object.entries(patch).forEach(([k, v]) => v == null || v === '' ? delete p[k] : p[k] = String(v)); if(p.run!==oldRun){delete p.phaseCursor;delete p.phaseLimit;} taskRouteDefaults(view,p); route = { view, p }; const qs = queryString(p), hash = '#/' + view + (qs ? '?' + qs : ''); try {
     history[replace ? 'replaceState' : 'pushState'](null, '', hash);
 }
 catch {
@@ -501,7 +507,7 @@ async function loadCommand(path: string, force = false) {
 }
 function visibleCommandPaths() {
   if (!route.p.run || route.p.tab !== 'commands') return [];
-  const detail = data<RunDetail>('runs/' + enc(route.p.run));
+  const detail = data<RunDetail>(detailPath());
   return (detail?.commands || []).filter(command => command.outputAvailable && (document.getElementById('command-' + command.id) as HTMLDetailsElement | null)?.open)
     .map(command => 'runs/' + enc(route.p.run) + '/commands/' + enc(command.id));
 }
@@ -526,7 +532,7 @@ document.addEventListener('toggle', event => {
   }
   if (target instanceof HTMLDetailsElement && target.open && target.id.startsWith('command-') && route.p.run) {
     const commandId = target.id.slice('command-'.length);
-    const command = data<RunDetail>('runs/' + enc(route.p.run))?.commands.find(command => command.id === commandId);
+    const command = data<RunDetail>(detailPath())?.commands.find(command => command.id === commandId);
     if (command?.outputAvailable) void loadCommand('runs/' + enc(route.p.run) + '/commands/' + enc(commandId));
   }
 }, true);
@@ -567,6 +573,10 @@ function overviewPage() {
     }
     const groups = overviewTaskGroups(o);
     const shown = (value: number | null | undefined) => value == null ? '待确认' : value;
+    const hasTaskObservation = o.taskSources.some(source => source.observedAt !== null);
+    const summaryValue = (value: number | null | undefined, known: number | undefined) => value == null
+        && typeof known === 'number' && (known > 0 || hasTaskObservation)
+        ? `<strong>${fmt(known)}</strong><span>项已读取</span>` : `<strong>${shown(value)}</strong>`;
     const groupCount = (value: number | null | undefined) => (groups.complete || value == null ? '' : '上次读取 ') + shown(value);
     const compactEmpty = (title: string) => `<div class="overview-empty">${icon('tasks',18)}<p>${esc(title)}</p></div>`;
     const current = panel('当前任务', `<div class="overview-task-list overview-current" role="list" aria-label="当前任务">${groups.current.map(r => overviewTaskRow(r,'current')).join('') || compactEmpty(groups.complete ? '暂无当前任务' : '已读记录中暂无当前任务，完整结果待更新')}</div>`, badge(groupCount(groups.currentCount)), !groups.complete ? `<span class="small muted">已读记录中 ${groups.current.length} 项当前 · 完整数量待更新</span>${btn('查看全部当前任务','current-task-queue','','small ghost')}` : '', 'overview-current-panel');
@@ -576,7 +586,7 @@ function overviewPage() {
     const fleetBody = f ? `<div class="fleet-labels"><span>节点</span><span>CPU</span><span>内存</span></div>${f.nodes.map(n => `<div class="fleet-row" data-key="fleet-${esc(n.id)}"><button class="run-title" data-action="node" data-id="${esc(n.id)}">${nodeTag(n.id)}<span class="small muted fleet-description">${n.id === f.gatewayId ? fleetObservation().current ? '当前出口' : '上次出口' : n.online ? n.gpuSampled === false ? 'GPU 尚未采集' : n.gpus.length + ' GPU' : '离线'}</span></button><div class="reading">${n.online && n.cpu != null ? fmt(n.cpu) + '%' : '—'}${meter(n.online ? n.cpu : null)}</div><div class="reading">${n.online && percent(n.memoryUsed,n.memoryTotal) !== null ? Math.round(percent(n.memoryUsed,n.memoryTotal)!) + '%' : '—'}${meter(n.online ? percent(n.memoryUsed,n.memoryTotal) : null)}</div></div>`).join('')}` : resourceState('fleet/status');
     const machines = panel('机器', fleetBody, f ? `<button class="link-btn small" data-action="nav" data-view="machines">${fleetOnlineLabel()} ${icon('chevron', 12)}</button>` : '', '', 'overview-machines-panel');
     const gateway = f ? panel('连接', `<div class="connection-grid"><span class="muted">入口</span><span>${esc(node(f.ingressNodeId)?.short || '尚未配置')}</span>${f.ingressNodeId ? badge((fleetObservation().current ? '' : '上次确认') + (node(f.ingressNodeId)?.online ? '在线' : '未连接'), fleetObservation().current ? node(f.ingressNodeId)?.online ? 'good' : 'warn' : '') : badge('入口未配置')}<span class="muted">出网</span><span>${esc(node(f.gatewayId)?.short || '—')} · ${esc(node(f.gatewayId)?.egress?.region || '—')}</span><span class="num small">${node(f.gatewayId)?.egress?.latency ?? '—'} ms</span></div><div class="endpoint"><code>${esc(f.mcpUrl || f.ingressLabel || (f.ingressNodeId ? '由该节点的托管 MCP 隧道提供' : '尚未配置 MCP 入口'))}</code>${ib('copy', 'copy', '复制 MCP 地址', `data-text="${esc(f.mcpUrl || '')}" ${f.mcpUrl ? '' : 'disabled'}`)}</div>`, '', '', 'overview-connection-panel') : '';
-    const summary = `<section class="overview-summary" aria-label="任务统计"><div><span>当前任务${groups.complete || groups.currentCount == null ? '' : ' · 上次读取'}</span><strong>${shown(groups.currentCount)}</strong></div><button type="button" data-action="attention-queue"><span>需要处理</span><strong>${shown(o.attentionCount)}</strong></button><button type="button" data-action="completed-queue"><span>今日完成</span><strong>${shown(o.completedToday)}</strong></button></section>`;
+    const summary = `<section class="overview-summary" aria-label="任务统计"><div><span>当前任务${groups.complete || groups.currentCount == null ? '' : ' · 上次读取'}</span>${summaryValue(groups.currentCount,o.knownCounts.current)}</div><button type="button" data-action="attention-queue"><span>需要处理</span>${summaryValue(o.attentionCount,o.knownCounts.attention)}</button><button type="button" data-action="completed-queue"><span>今日完成</span>${summaryValue(o.completedToday,o.knownCounts.completedToday)}</button></section>`;
     return `<div class="page overview-page">${pageHead('任务总览', day(Date.now()), btn(icon('tasks',14)+'全部任务','all-task-queue','','small'))}${staleNotice(overviewPath())}${summary}<div class="overview-grid"><div class="stack overview-primary">${current}${older}${recent}</div><aside class="stack overview-secondary" aria-label="待办与节点">${attention}${machines}${gateway}</aside></div></div>`;
 }
 function taskRow(r: Run) {
@@ -614,16 +624,27 @@ function runBadges(run: Run): string {
 
 function phaseCards(detail: RunDetail): string {
     const phases = (detail.phases || []).filter(phase => phase.id !== detail.run.id);
-    const references = (detail.run.phaseRefs || []).filter(id => id !== detail.run.id);
+    const references = (detail.phasePage?.references ?? detail.run.phaseRefs ?? []).filter(id => id !== detail.run.id);
     if (!phases.length && !references.length) return '';
-    const rows = phases.length ? phases.map(phase => `<article class="phase-card"><div class="inline"><b>${esc(phase.run.projectName)}</b>${nodeTag(phase.run.nodeId,true)}<span class="spacer"></span>${status(stage(phase.run))}</div><code class="break">${esc(phase.run.root)}</code><p>${esc(phase.summary || phase.run.reason || '暂无结果总结')}</p><div class="inline"><span class="small muted">${esc(phase.run.branch || '')} · ${esc(phase.run.baseSha?.slice(0,12) || '')}</span><span class="spacer"></span>${btn('查看执行与改动','open-run',`data-id="${esc(phase.id)}"`,'small')}</div></article>`).join('')
-        : references.map(id => `<div class="phase-card"><code>${esc(id)}</code>${btn('查看执行与改动','open-run',`data-id="${esc(id)}"`,'small')}</div>`).join('');
+    const byId=new Map(phases.map(phase=>[phase.id,phase]));
+    const rows=(references.length?references:phases.map(phase=>phase.id)).map(id=>{
+        const phase=byId.get(id);
+        return phase?`<article class="phase-card"><div class="inline"><b>${esc(phase.run.projectName)}</b>${nodeTag(phase.run.nodeId,true)}<span class="spacer"></span>${status(stage(phase.run))}</div><code class="break">${esc(phase.run.root)}</code><p>${esc(phase.summary || phase.run.reason || '暂无结果总结')}</p><div class="inline"><span class="small muted">${esc(phase.run.branch || '')} · ${esc(phase.run.baseSha?.slice(0,12) || '')}</span><span class="spacer"></span>${btn('查看执行与改动','open-run',`data-id="${esc(phase.id)}"`,'small')}</div></article>`
+          :`<div class="phase-card"><code>${esc(id)}</code>${btn('查看执行与改动','open-run',`data-id="${esc(id)}"`,'small')}</div>`;
+    }).join('');
     return `<section class="phase-list"><h3>工作区与执行阶段</h3>${rows}</section>`;
+}
+
+function phasePagination(detail:RunDetail):string {
+    const page=detail.phasePage;
+    if(!page||page.total<=page.limit&&!page.offset)return '';
+    const pageNumber=Math.floor(page.offset/page.limit)+1,totalPages=Math.max(1,Math.ceil(page.total/page.limit));
+    return `<div class="panel-foot phase-pagination" aria-label="执行阶段分页"><span>第 ${pageNumber} / ${totalPages} 页 · ${detail.taskComplete?'共':'已知'} ${page.total} 个阶段<br><span class="small muted">${page.complete?'本页记录已读取':'本页记录仍在读取'} · 当前工作区优先</span></span><span class="spacer"></span>${btn('上一页','phase-page',`data-cursor="${esc(page.previousCursor??'')}" ${page.previousCursor?'':'disabled'}`,'small')}${btn('下一页','phase-page',`data-cursor="${esc(page.nextCursor??'')}" ${page.nextCursor?'':'disabled'}`,'small')}</div>`;
 }
 
 function tasksPage() {
     const path = runPath(), d = data<RunPage>(path), projection = taskPageProjection(d), review = route.view === 'changes', sel = route.p.run, counts = taskCountsComplete(d) ? d!.counts : {};
-    const chosen = projection.items.filter(r => selectedRuns.has(r.id)), blocked = chosen.filter(r => changeCaptureBlockReason(data<RunDetail>('runs/' + enc(r.id))?.changeCaptures)), eligible = chosen.filter(r => r.actions.review && !blocked.includes(r));
+    const chosen = projection.items.filter(r => selectedRuns.has(r.id)), blocked = chosen.filter(r => changeCaptureBlockReason(data<RunDetail>(detailPath(r.id))?.changeCaptures)), eligible = chosen.filter(r => r.actions.review && !blocked.includes(r));
     const states: Array<[string,string,number?]> = [['', '全部', counts.all], ...taskStages.map(([key,label]):[string,string,number?]=>[key,label,counts[key]])];
     const bulk = selectedRuns.size ? `<div class="bulkbar"><span>${selectedRuns.size} 项已选</span>${blocked.length ? `<span class="amber">${blocked.length} 项文件证据待确认</span>` : ''}<span class="spacer"></span>${btn('验收' + (eligible.length ? ' ' + eligible.length : ''), 'bulk-accept', !eligible.length || !canWrite() ? 'disabled' : '', 'small')}${btn('驳回', 'bulk-reject', !eligible.length || !canWrite() ? 'disabled' : '', 'small')}${ib('copy', 'bulk-copy', '复制所选任务引用')}${ib('close', 'clear-selection', '取消选择')}</div>` : '';
     const scopeValue = route.p.overviewGroup === 'current' ? 'current' : route.p.overviewGroup === 'olderOpen' ? 'older' : route.p.requestState === 'active' ? 'open' : route.p.requestState === 'closed' ? 'ended' : '';
@@ -664,10 +685,11 @@ function commandStatus(c: Command, r: Run) {
     return ['running', 'stopping'].includes(r.executionStatus) ? 'running' : 'interrupted';
 }
 function detailEmpty(detail: RunDetail, confirmedTitle: string, records: string) {
-    return detail.complete === false ? empty('任务详情尚未完整确认', `暂未显示${records}；部分记录或消息状态仍待确认。`) : empty(confirmedTitle);
+    return !detailRecordsComplete(detail) ? empty('本页详情尚未完整确认', `暂未显示${records}；部分记录仍待确认。`)
+      : empty(detail.phasePage&&detail.phasePage.total>detail.phasePage.references.length?'本页'+confirmedTitle:confirmedTitle);
 }
 function inspector() {
-    const id = route.p.run, path = 'runs/' + enc(id), d = data<RunDetail>(path), tab = route.p.tab || (route.view === 'changes' ? 'diff' : 'summary');
+    const id = route.p.run, path = detailPath(), d = data<RunDetail>(path), tab = route.p.tab || (route.view === 'changes' ? 'diff' : 'summary');
     if (!d) {
         const known = id ? findLoadedRun(id) : undefined;
         return `<aside class="inspector" id="inspector" aria-label="任务详情" tabindex="-1"><header class="session-card-head"><div class="session-heading"><h2>${esc(known ? known.title : '任务详情')}</h2>${known ? `<div class="session-meta">${taskScope(known)}${workspaceSummary(known)}</div>` : ''}</div><span class="spacer"></span>${ib('refresh', 'refresh', '刷新任务详情')}${ib('close', 'close-inspector', '关闭详情', 'id="inspector-close"')}</header><div class="inspector-body">${resourceState(path)}<p class="detail-read-help">任务列表仍可使用，可选择其他任务或稍后重试此详情。</p></div></aside>`;
@@ -684,7 +706,7 @@ function inspector() {
     const state = stage(r), running = d.commands.find(c => commandStatus(c, r) === 'running'), latest = d.commands.filter(c => !c.supersededBy).at(-1), failed = !['completed','ended','cancelled','handed_off'].includes(r.executionStatus) && latest && commandStatus(latest, r) === 'failed' ? latest : undefined, live = running || failed;
     const head = `<header class="session-card-head"><span class="session-symbol">${icon('changes', 17)}<i class="session-dot ${taskActivityTone(r) || 'ended'}"></i></span><div class="session-heading"><h2 title="${esc(r.title)}">${esc(r.title)}</h2><div class="session-meta">${nodeTag(r.nodeId, true)}<span class="project-name">${esc(r.projectName)}</span><span class="branch-meta">${icon('changes', 12)}<code title="${esc(r.branch)}">${esc(r.branch)}</code></span></div></div><div class="session-stats">${r.diff ? diffStat(r) : ''}<span class="card-elapsed">${taskActivityTime(r)}</span></div>${ib('refresh', 'refresh', '刷新任务详情')}${ib('external', 'focus-detail', route.p.focus === '1' ? '恢复分栏' : '展开详情', '', 'desktop-only')}${ib('close', 'close-inspector', '关闭详情（Esc）', 'id="inspector-close"')}</header>`;
     const strip = live ? `<button class="session-live ${running ? '' : 'failed'}" data-action="live-command" data-id="${esc(live.id)}">${running ? '<span class="spinner"></span>' : icon('failed', 14)}<span class="agent-label">${esc(live.agent)}</span><code>${esc(live.command)}</code><span class="live-meta">${running ? '运行中' : live.exit == null ? '最近执行失败' : '最近退出码 ' + live.exit}</span>${icon('chevron', 12)}</button>` : '';
-    const confirmedCount = (count: number) => d.complete === false ? undefined : count;
+    const confirmedCount = (count: number) => detailRecordsComplete(d) ? count : undefined;
     const tabsHTML = tabs([['summary', icon('file', 14) + '概要'], ['diff', icon('changes', 14) + '改动', confirmedCount(d.files.length)], ['commands', icon('terminal', 14) + '命令', confirmedCount(d.commands.length)], ['agents', icon('bot', 14) + '代理', confirmedCount(d.agents.length)], ['context', icon('workspaces', 14) + '上下文']], tab, 'detail-tab');
     let body = '';
     if (tab === 'summary') {
@@ -703,9 +725,9 @@ function inspector() {
     else if (tab === 'agents')
         body = records.agents.length ? `<div class="agent-list">${records.agents.map(a => `<article class="agent-card"><span class="agent-avatar">${icon('bot', 17)}</span><div class="agent-main"><div class="section-line"><h3>${esc(a.name)}</h3>${historical('agents')?badge('上次记录：'+(stages[a.status]||a.status)):status(a.status)}</div><p>${esc(a.role)}</p><div class="small muted">${a.tokens == null ? '用量未上报' : compact(a.tokens) + ' Token'}</div></div></article>`).join('')}</div>` : detailEmpty(d,'暂无代理','代理记录');
     else
-        body = `${phaseCards(d)}<section class="detail-section"><h3>${r.phaseRefs && r.phaseRefs.length > 1 ? '任务汇总与主记录' : '工作区'}</h3><dl class="context-table">${[['项目', r.projectName], ['路径', r.root], ['节点', node(r.nodeId)?.name || r.nodeId], ['分支', r.branch], ['基线', r.baseSha], ['执行 ID', r.id], ['来源', r.origin], ['创建于', fullTime(r.startedAt)], ['结束', r.finishedAt ? fullTime(r.finishedAt) : '—'], ['执行状态', r.executionStatus], ['验收状态', r.acceptanceStatus]].map(([k, v]) => `<div><dt>${k}</dt><dd title="${esc(v)}">${esc(v)}</dd></div>`).join('')}</dl></section><section class="detail-section"><h3>项目指令</h3><dl class="context-table">${(records.instructions || []).map(item => '<div><dt>' + esc(item.status === 'loaded' ? '已读取' : '可读取') + '</dt><dd>' + esc(item.path) + '</dd></div>').join('') || '<div class="muted">' + (d.complete === false ? '项目指令尚未完整读取' : '未发现项目指令') + '</div>'}</dl><h3 class="section-gap">技能</h3><dl class="context-table">${(records.skills || []).map(item => '<div><dt>' + esc(item.state === 'read' ? '已使用' : '可使用') + '</dt><dd>' + esc(item.name) + '</dd></div>').join('') || '<div class="muted">' + (d.complete === false ? '技能记录尚未完整读取' : '未发现技能') + '</div>'}</dl></section>`;
+        body = `${phaseCards(d)}<section class="detail-section"><h3>${r.phaseRefs && r.phaseRefs.length > 1 ? '任务汇总与主记录' : '工作区'}</h3><dl class="context-table">${[['项目', r.projectName], ['路径', r.root], ['节点', node(r.nodeId)?.name || r.nodeId], ['分支', r.branch], ['基线', r.baseSha], ['执行 ID', r.id], ['来源', r.origin], ['创建于', fullTime(r.startedAt)], ['结束', r.finishedAt ? fullTime(r.finishedAt) : '—'], ['执行状态', r.executionStatus], ['验收状态', r.acceptanceStatus]].map(([k, v]) => `<div><dt>${k}</dt><dd title="${esc(v)}">${esc(v)}</dd></div>`).join('')}</dl></section><section class="detail-section"><h3>项目指令</h3><dl class="context-table">${(records.instructions || []).map(item => '<div><dt>' + esc(item.status === 'loaded' ? '已读取' : '可读取') + '</dt><dd>' + esc(item.path) + '</dd></div>').join('') || '<div class="muted">' + (!detailRecordsComplete(d) ? '项目指令尚未完整读取' : '未发现项目指令') + '</div>'}</dl><h3 class="section-gap">技能</h3><dl class="context-table">${(records.skills || []).map(item => '<div><dt>' + esc(item.state === 'read' ? '已使用' : '可使用') + '</dt><dd>' + esc(item.name) + '</dd></div>').join('') || '<div class="muted">' + (!detailRecordsComplete(d) ? '技能记录尚未完整读取' : '未发现技能') + '</div>'}</dl></section>`;
     const footer = `<span class="card-footer-state">${runBadges(r)}<span class="revision" title="回执版本">r${r.revision}</span></span><span class="spacer"></span>${['running', 'queued', 'stopping'].includes(state) ? btn(icon('stopping', 13) + (state === 'queued' ? '取消排队' : '中断'), 'run-control', `data-id="${esc(id)}" data-value="interrupt" ${r.actions?.interrupt ? writeAttrs() : 'disabled title="当前节点没有可控制的后台执行句柄"'}`, 'danger small') : state === 'interrupted' ? btn(icon('running', 13) + '恢复', 'run-control', `data-id="${esc(id)}" data-value="resume" ${r.actions?.resume ? writeAttrs() : 'disabled title="需要从原工作入口继续"'}`, 'primary small') : ''}${r.actions.complete ? btn('结束任务', 'finish-task', `data-id="${esc(id)}" ${writeAttrs()}`, 'primary small') : ''}${r.actions.review ? btn('驳回', 'single-reject', `data-id="${esc(id)}" ${captureAttrs || writeAttrs()}`, 'small') + btn(icon('check', 13) + '验收', 'single-accept', `data-id="${esc(id)}" ${captureAttrs || writeAttrs()}`, 'primary small') : ''}${d.files.length && r.actions?.patch !== false ? btn(icon('download', 13) + '补丁', 'patch', `data-id="${esc(id)}" ${captureAttrs}`, 'small') : ''}${d.files.length && r.actions?.revert && !['running', 'queued', 'stopping'].includes(state) ? ib('undo', 'revert', '还原文件', `data-id="${esc(id)}" ${captureAttrs || writeAttrs('revert')}`) : ''}`;
-    return `<aside class="inspector" id="inspector" aria-label="执行详情" tabindex="-1"><button class="resize-handle" role="separator" aria-label="调整列表宽度" aria-orientation="vertical" aria-valuemin="270" aria-valuemax="520" aria-valuenow="${pref.listWidth}" title="拖动调整列表宽度"></button>${head}${strip}${tabsHTML}<div class="inspector-body" data-key="body-${esc(id)}-${tab}">${staleNotice(path, shownCaptures)}${runWarnings.length ? `<div class="notice warn">${runWarnings.map(readWarningMessage).map(esc).join('<br>')}</div>` : ''}${tab !== 'diff' && captureBlocked ? changeCaptureNotice(d.changeCaptures) : ''}${detailPendingNotice}${historyNotice}${body}</div><footer class="inspector-footer">${footer}</footer></aside>`;
+    return `<aside class="inspector" id="inspector" aria-label="执行详情" tabindex="-1"><button class="resize-handle" role="separator" aria-label="调整列表宽度" aria-orientation="vertical" aria-valuemin="270" aria-valuemax="520" aria-valuenow="${pref.listWidth}" title="拖动调整列表宽度"></button>${head}${strip}${tabsHTML}${phasePagination(d)}<div class="inspector-body" data-key="body-${esc(id)}-${tab}">${staleNotice(path, shownCaptures)}${runWarnings.length ? `<div class="notice warn">${runWarnings.map(readWarningMessage).map(esc).join('<br>')}</div>` : ''}${tab !== 'diff' && captureBlocked ? changeCaptureNotice(d.changeCaptures) : ''}${detailPendingNotice}${historyNotice}${body}</div><footer class="inspector-footer">${footer}</footer></aside>`;
 }
 
 const highlightCache = new Map<string, string>(), diffOpen = new Map<string, Set<string>>();
@@ -769,6 +791,9 @@ function diffFile(d: RunDetail, f: ChangeFile) {
 }
 function diffView(d: RunDetail) {
     const captureNotice = changeCaptureNotice(d.changeCaptures);
+    if(!d.files.length&&d.phasePage?.references.length
+      &&!d.phasePage.references.some(reference=>d.run.currentPhaseRefs?.includes(reference)))
+        return captureNotice+empty('本页为历史执行','可在阶段卡片查看该阶段改动。')+phaseCards(d);
     if (!d.files.length)
         return captureNotice + (changeCaptureBlockReason(d.changeCaptures) ? '' : detailEmpty(d,'暂无已记录的文件改动','文件改动'));
     const files = visibleFiles(d), opened = openFiles(d);
@@ -960,7 +985,7 @@ finally {
 } }
 function findLoadedRun(id: string) {
     const o = overview();
-    return data<RunDetail>('runs/' + enc(id))?.run || data<RunPage>(runPath())?.items?.find(r => r.id === id)
+    return data<RunDetail>(detailPath(id))?.run || data<RunPage>(runPath())?.items?.find(r => r.id === id)
         || (o ? [...o.current, ...o.olderOpen, ...o.recent, ...o.active].find(r => r.id === id) : undefined);
 }
 async function reviewRuns(ids: string[], verdict: 'accept' | 'reject') {
@@ -1300,8 +1325,8 @@ const ACTIONS = {
         command.open = true;
         command.scrollIntoView({ block: 'nearest' });
     } }); },
-    'toggle-file': (el: HTMLElement) => { const d = data<RunDetail>('runs/' + enc(route.p.run))!, opened = openFiles(d); opened.has(el.dataset.id!) ? opened.delete(el.dataset.id!) : opened.add(el.dataset.id!); ensureRoute(); schedulePaint(); },
-    'files-toggle-all': () => { const d = data<RunDetail>('runs/' + enc(route.p.run))!, opened = openFiles(d), files = visibleFiles(d), expand = files.some(f => !opened.has(f.id)); files.forEach(f => expand ? opened.add(f.id) : opened.delete(f.id)); ensureRoute(); schedulePaint(); },
+    'toggle-file': (el: HTMLElement) => { const d = data<RunDetail>(detailPath())!, opened = openFiles(d); opened.has(el.dataset.id!) ? opened.delete(el.dataset.id!) : opened.add(el.dataset.id!); ensureRoute(); schedulePaint(); },
+    'files-toggle-all': () => { const d = data<RunDetail>(detailPath())!, opened = openFiles(d), files = visibleFiles(d), expand = files.some(f => !opened.has(f.id)); files.forEach(f => expand ? opened.add(f.id) : opened.delete(f.id)); ensureRoute(); schedulePaint(); },
     'skip-content': () => $('#view')!.focus(), nav: (el: HTMLElement) => navigate(el.dataset.view!), 'nav-dialog': (el: HTMLElement) => { closeTopDialog(); navigate(el.dataset.view!); }, more: navigationDialog,
     'open-run': (el: HTMLElement) => { if (route.p.run !== el.dataset.id!)
         fileSearch = ''; navigate(route.view === 'changes' ? 'changes' : 'tasks', {run:el.dataset.id!,tab:route.view === 'changes' ? 'diff' : 'summary',file:null,...(route.view === 'usage' ? {days:'0',usageDays:route.p.days || '14',node:route.p.node,project:route.p.project} : route.view === 'sessions' ? {project:route.p.project,node:route.p.node} : {})}, false, route.view === 'tasks' || route.view === 'changes'); },
@@ -1309,6 +1334,7 @@ const ACTIONS = {
         lastFocus.focus({ preventScroll: true });
     else
         ((id ? $('.list-pane [data-action="open-run"][data-id="' + CSS.escape(id) + '"]') : null) || $('#view'))?.focus({ preventScroll: true }); }, 30); },
+    'phase-page': (el:HTMLElement) => navigate(route.view,{phaseCursor:el.dataset.cursor||null,file:null},false,true),
     'detail-tab': (el: HTMLElement) => navigate(route.view, { tab: el.dataset.value! }, true, true), file: (el: HTMLElement) => navigate(route.view, { file: el.dataset.id! }, true, true),
     'load-big': (el: HTMLElement) => { loadedBigFiles.add(el.dataset.run! + ':' + el.dataset.id!); ensureRoute(); schedulePaint(); }, 'copy-path': (el: HTMLElement) => copy(el.dataset.text!), 'copy-link': () => copy(location.href), copy: (el: HTMLElement) => copy(el.dataset.text!),
     'more-diff': (el: HTMLElement) => { const key = el.dataset.run! + ':' + el.dataset.id!; diffLimits.set(key, (diffLimits.get(key) || 400) + 400); schedulePaint(); }, 'diff-mode': (el: HTMLElement) => { diffMode = el.dataset.value!; savePref({diffMode}); schedulePaint(); }, layout: (el: HTMLElement) => { sortLayout = el.dataset.value!; savePref({taskLayout:sortLayout}); schedulePaint(); }, 'machine-layout': (el: HTMLElement) => { machineLayout = el.dataset.value!; savePref({machineLayout}); schedulePaint(); },
@@ -1684,7 +1710,7 @@ function attachClock() {
     const taskRows = [...activePaths].flatMap((path): Run[] => {
         if (path.startsWith('overview')) { const value=data<Overview>(path);return value ? [...value.current,...value.olderOpen,...value.recent] : []; }
         if (path.startsWith('runs?')) return data<RunPage>(path)?.items || [];
-        if (/^runs\/[^/?]+$/.test(path)) { const value=data<RunDetail>(path);return value ? [value.run] : []; }
+        if (/^runs\/[^/]+$/.test(path.split('?')[0]!)) { const value=data<RunDetail>(path);return value ? [value.run] : []; }
         return [];
     }).filter(run => run.requestState !== 'closed');
     const activityDeadlines = taskRows.flatMap(run => {

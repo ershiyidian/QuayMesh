@@ -14,8 +14,9 @@ async function indexRead(input:ConsoleReadRequest):Promise<unknown> {
   switch(input.operation) {
     case 'metadata': return local.readLocalMetadata(input.config);
     case 'page': return local.readLocalPage(input.config,input.query??{});
-    case 'task-index': return local.readLocalTaskIndex(input.config,input.at);
-    case 'session-titles': return local.readLocalSessionTitles(input.config);
+    case 'task-index': return local.readLocalTaskIndex(input.config,input.at,input.scope);
+    case 'task-state-index': return local.readLocalTaskStateIndex(input.config,input.at);
+    case 'session-titles': return local.readLocalSessionTitles(input.config,input.scope);
     case 'run-summaries': return local.readLocalRunSummaries(input.config,input.ids??[]);
     case 'usage': return local.readLocalUsage(input.config,input.query??{},input.at);
     case 'overview-usage': return local.readLocalOverviewUsage(input.config,input.zone,input.at);

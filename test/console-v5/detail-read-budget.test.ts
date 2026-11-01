@@ -7,7 +7,8 @@ import {setTimeout as delay} from 'node:timers/promises';
 import express from 'express';
 import {createRealTestServer,structured,waitForRecordedTool} from '../session-card/server-fixture.js';
 import {createProjectConsoleRouter} from '../../src/project-console-router.js';
-import {readLocalRunSummaries,readLocalSessionTitles,readLocalTaskIndex} from '../../src/console-workbench/local-queries.js';
+import {readLocalRunSummaries,readLocalSessionTitles,readLocalTaskIndex,readLocalTaskStateIndex} from '../../src/console-workbench/local-queries.js';
+import {parseTaskReadScopeQuery} from '../../src/console-workbench/task-read-scope.js';
 import {WorkbenchFeed} from '../../src/console-workbench/feed.js';
 import {openDatabase} from '../../src/db/client.js';
 import {SessionStore} from '../../src/session/store.js';
@@ -80,13 +81,16 @@ async function fixture(t:TestContext) {
     waiting.delete(path);
   };
   const peer=createHttpServer((request,response)=>{void(async()=>{
-    const url=new URL(request.url!,'http://127.0.0.1'),path=url.pathname;
+    const url=new URL(request.url!,'http://127.0.0.1'),path=url.pathname.replace('/isolated-v1','');
     requests.push(request.url!);
     counts.set(path,(counts.get(path)??0)+1);
     if(failed.has(path)){send(response,{message:'peer detail read failed',code:'peer_read_failed'},503);return;}
     let body:unknown;
     if(path==='/workbench/task-index')body=readLocalTaskIndex(server.config);
     else if(path==='/workbench/session-titles')body=readLocalSessionTitles(server.config);
+    else if(path==='/workbench/task-state-index')body=readLocalTaskStateIndex(server.config);
+    else if(path==='/workbench/task-index-scoped')body=readLocalTaskIndex(server.config,undefined,parseTaskReadScopeQuery(Object.fromEntries(url.searchParams)));
+    else if(path==='/workbench/session-titles-scoped')body=readLocalSessionTitles(server.config,parseTaskReadScopeQuery(Object.fromEntries(url.searchParams)));
     else if(path==='/workbench/run-summaries')body=readLocalRunSummaries(server.config,(url.searchParams.get('ids')??'').split(',').filter(Boolean));
     else if(path===`/workbench/tasks/${task.task_id}/messages-state`){
       body={available:true,ownerNodeId:ownerNode,observedAt:Date.now(),...store.taskMessageState(String(task.task_id))};
@@ -128,8 +132,26 @@ async function fixture(t:TestContext) {
   };
   const slowPath='/workbench/runs/'+encodeURIComponent(parseWorkspaceHandle(slow.id)!.local);
   const messagesPath=`/workbench/tasks/${task.task_id}/messages-state`;
-  return {get,held,failed,invalid,counts,requests,waiting,release,slow,slowPath,messagesPath,ownerNode,config,runtime};
+  return {get,held,failed,invalid,counts,requests,waiting,release,slow,slowPath,messagesPath,ownerNode,config,runtime,phases};
 }
+
+test('the final Task detail keeps its complete indexed seed while summaries and one phase are pending',{timeout:30_000},async t=>{
+  const f=await fixture(t);f.held.add('/workbench/run-summaries');f.held.add(f.slowPath);
+  const detail=await f.get();
+  assert.equal(detail.complete,false);
+  assert.deepEqual(new Set(detail.run.phaseRefs),new Set(f.phases.map(phase=>phase.id)));
+  assert.deepEqual(new Set(detail.run.currentPhaseRefs),new Set(f.phases.map(phase=>phase.id)));
+  assert.deepEqual(detail.run.nodeIds,[f.ownerNode]);
+  assert.equal(detail.run.workspaceCount,2,'a loaded detail cannot replace the complete membership with its subset');
+  assert.ok(detail.files.some((file:any)=>file.path==='first.txt'),'detail content is usable before its summary batch finishes');
+  assert.ok(detail.missingPhases.some((phase:any)=>phase.id===f.slow.id&&phase.pending));
+  assert.equal(detail.run.actions.patch,false);assert.equal(detail.run.actions.revert,false);
+  assert.equal(detail.run.actions.review,false);assert.equal(detail.run.actions.complete,false);
+  f.release('/workbench/run-summaries');f.release(f.slowPath);
+  const complete=await f.get();assert.equal(complete.complete,true);
+  assert.deepEqual(new Set(complete.run.phaseRefs),new Set(f.phases.map(phase=>phase.id)));
+  assert.deepEqual(complete.files.map((file:any)=>file.path).sort(),['first.txt','second.txt']);
+});
 
 test('a real slow phase returns partial detail promptly, shares the pending HTTP read, then fills the same Task',{timeout:30_000},async t=>{
   const f=await fixture(t);f.held.add(f.slowPath);

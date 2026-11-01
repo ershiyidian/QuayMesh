@@ -8,6 +8,10 @@ import {consoleExperienceFixture,liveCaptureFixture} from './experience-fixture.
 import {freePort,structured} from '../session-card/server-fixture.js';
 import {canonicalWorkspaceRoot} from '../../src/roots.js';
 import {WorkLedger} from '../../src/work-ledger.js';
+import {SessionStore} from '../../src/session/store.js';
+import {SessionProjector} from '../../src/session/projection.js';
+import {saveRunCheckpoint} from '../../src/session/run-checkpoints.js';
+import {readLocalTaskIndex} from '../../src/console-workbench/local-queries.js';
 // @ts-expect-error 节点管理器使用ESM脚本。
 import {McpRelay} from '../../node/relay.mjs';
 
@@ -15,9 +19,9 @@ let f:Awaited<ReturnType<typeof consoleExperienceFixture>>;
 const screenshots='releases/console-experience';
 test.beforeAll(async()=>{f=await consoleExperienceFixture();await mkdir(screenshots,{recursive:true});});
 test.afterAll(async()=>{await f?.server.dispose();});
-async function login(page:Page,base=f.server.baseUrl,initialView:'overview'|'tasks'='overview'){
+async function login(page:Page,base=f.server.baseUrl,initialView:'overview'|'tasks'='overview',password=f.server.config.oauth.ownerToken!){
   await page.goto(base+'/console/'+(initialView==='tasks'?'#/tasks?days=0&scope=all&requestState=active':''));
-  await page.locator('#login-form input[name=password]').fill(f.server.config.oauth.ownerToken!);
+  await page.locator('#login-form input[name=password]').fill(password);
   const sent=page.waitForResponse(response=>response.url()===base+'/console/api/login');
   await page.locator('#login-form [type=submit]').click();
   const reply=await sent;expect(reply.status(),await reply.text()).toBe(200);
@@ -151,9 +155,10 @@ test('手动模式的一次部分读取会补齐，完成后不继续轮询',asy
   await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
   const snapshot=await f.get('overview?fresh=1');
   const partial={...snapshot,current:[],currentCount:null,recent:[],olderOpen:[],olderOpenCount:null,
+    knownCounts:{...snapshot.knownCounts,current:0,attention:0,completedToday:0},
     coverage:{...snapshot.coverage,tasks:false},taskSources:snapshot.taskSources.map((source:any)=>({...source,state:'loading',observedAt:null,stale:false,error:null}))};
-  partial.sources=[...partial.taskSources,...partial.usageSources];
-  for(const key of ['sources','taskSources','usageSources'])snapshot[key]=snapshot[key].map((source:any)=>({...source,state:'ready',stale:false,observedAt:Date.now(),error:null}));
+  partial.sources=partial.taskSources;
+  for(const key of ['sources','taskSources'])snapshot[key]=snapshot[key].map((source:any)=>({...source,state:'ready',stale:false,observedAt:Date.now(),error:null}));
   let reads=0;
   await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>{reads++;return route.fulfill({json:reads===1?partial:snapshot});});
   await login(page);
@@ -164,6 +169,37 @@ test('手动模式的一次部分读取会补齐，完成后不继续轮询',asy
   await expect(page.locator('.overview-current')).toContainText('等待下一步的工作');
   await expect(page.locator('.overview-page .resource-update.pending')).toHaveCount(0);
   expect(reads).toBe(2);
+  await page.clock.fastForward(46_000);
+  expect(reads).toBe(2);
+});
+
+test('旧节点读取失败时，手动预览仍会补齐其他节点的任务',async({page})=>{
+  await page.clock.install();
+  await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
+  const snapshot=await f.get('overview?fresh=1');
+  const failed={nodeId:'older-node',name:'Older node',online:true,state:'error',stale:true,observedAt:null,error:'node_read_upgrade_required'};
+  snapshot.taskSources=[...snapshot.taskSources.map((source:any)=>({...source,state:'ready',stale:false,observedAt:Date.now(),error:null})),failed];
+  snapshot.sources=snapshot.taskSources;
+  snapshot.complete=false;snapshot.coverage.tasks=false;snapshot.currentCount=null;snapshot.attentionCount=null;snapshot.completedToday=null;
+  const partial={...snapshot,current:[],recent:[],olderOpen:[],knownCounts:{...snapshot.knownCounts,current:0,attention:0,completedToday:0},
+    taskSources:snapshot.taskSources.map((source:any)=>source.nodeId===failed.nodeId?source:{...source,state:'loading',observedAt:null})};
+  partial.sources=partial.taskSources;
+  let reads=0;
+  await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>route.fulfill({json:++reads===1?partial:snapshot}));
+  await login(page);
+  await expect(page.locator('#global-notice .notice')).toContainText('Older node');
+  await expect(page.locator('.overview-current')).not.toContainText('等待下一步的工作');
+  await expect(page.locator('.overview-summary strong')).toHaveText(['待确认','待确认','待确认']);
+  await page.clock.fastForward(1_100);
+  await expect(page.locator('.overview-current')).toContainText('等待下一步的工作');
+  await expect(page.locator('#global-notice .notice')).toContainText('Older node');
+  await expect(page.locator('.overview-summary strong')).toHaveText([String(snapshot.knownCounts.current),String(snapshot.knownCounts.attention),String(snapshot.knownCounts.completedToday)]);
+  await expect(page.locator('.overview-summary').getByText('项已读取',{exact:true})).toHaveCount(3);
+  expect(reads).toBe(2);
+  await page.screenshot({path:screenshots+'/overview-mixed-read-recovery.png',fullPage:true});
+  await page.setViewportSize({width:390,height:844});
+  expect(await page.locator('#view').evaluate(el=>el.scrollWidth<=el.clientWidth)).toBe(true);
+  await page.screenshot({path:screenshots+'/overview-mixed-read-recovery-narrow.png',fullPage:true});
   await page.clock.fastForward(46_000);
   expect(reads).toBe(2);
 });
@@ -520,8 +556,8 @@ test('首页只观察任务来源，命令面板按需读取完整工作区目�
   await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
   const snapshot=await f.get('overview?fresh=1'),directory=await f.get('projects?fresh=1'),requests:string[]=[];
   expect(directory.items.length).toBeGreaterThan(0);
-  snapshot.usageSources=snapshot.usageSources.map((source:any)=>({...source,state:'error',stale:true,error:'用量统计暂时失败'}));
-  snapshot.sources=snapshot.usageSources;
+  expect(snapshot).not.toHaveProperty('usageSources');
+  expect(snapshot).not.toHaveProperty('todayUsage');
   await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>route.fulfill({json:snapshot}));
   page.on('request',request=>{if(new URL(request.url()).pathname.endsWith('/api/v4/projects'))requests.push(request.url());});
   let reads=0;
@@ -568,7 +604,8 @@ test('当前任务失效后保留记录，空态紧凑且今日完成按Task结�
   await expect(page.locator('.overview-current')).toContainText(current.title);
   await expect(page.locator('.overview-current')).toContainText('状态待更新');
   await expect(page.locator('.overview-current')).toContainText('上次确认');
-  await expect(page.locator('.overview-summary>div strong')).toHaveText('待确认');
+  await expect(page.locator('.overview-summary>div strong')).toHaveText(String(snapshot.knownCounts.current));
+  await expect(page.locator('.overview-summary>div')).toContainText('项已读取');
   await page.locator('#global-notice summary').click();
   await expect(page.locator('#global-notice .source-details')).toContainText('任务数据');
   await expect(page.locator('#global-notice .source-details')).toContainText('读取用时较长');
@@ -1032,4 +1069,61 @@ test('后端连接中断时不要求重新输入口令，真实HTTP恢复后继�
     await page.close();await relay.close();backend.closeAllConnections();
     await new Promise<void>(resolve=>backend.close(()=>resolve()));
   }
+});
+
+test('Task历史阶段按页读取，前后页和窄屏预览保持完整Task身份',async({page})=>{
+  const local=await consoleExperienceFixture();
+  try{
+    const ledger=new WorkLedger(local.server.config.stateDir),store=new SessionStore(ledger.db);
+    let phaseCount=0;
+    try{
+      const taskId=String(local.waiting.task_id),sessionId=String(local.waiting.session_id);
+      const member=store.getMember(sessionId,store.taskMemberIds(taskId)[0]!);
+      for(let index=0;index<41;index++){
+        const run=ledger.begin({root:member.root,workspaceId:member.id,workItemId:taskId,runKey:'browser-history-'+index,
+          title:'历史执行 '+index,origin:{entryPoint:'console',evidence:'server_entry'}});
+        store.linkRun(sessionId,member.id,run.id,taskId);
+        ledger.db.prepare('UPDATE console_work_runs SET summary=? WHERE id=?').run('已保存的历史阶段 '+index,run.id);
+      }
+      const snapshot=await new SessionProjector(store,local.server.config.stateDir,null,undefined,member.node_id)
+        .readSnapshot(sessionId,member.id,taskId);
+      const phases=readLocalTaskIndex(local.server.config,undefined,{taskIds:[taskId]}).items;
+      phaseCount=phases.length;expect(phaseCount).toBeGreaterThan(40);
+      for(const phase of phases)saveRunCheckpoint(ledger.db,phase.localId,{revision:1,snapshot,files:[]});
+    }finally{ledger.close();}
+    const errors:string[]=[];page.on('pageerror',error=>errors.push(error.message));
+    await login(page,local.server.baseUrl,'tasks',local.server.config.oauth.ownerToken!);
+    const reference='qmtask:'+local.waiting.task_id,path='/console/api/v4/runs/'+encodeURIComponent(reference);
+    const response=page.waitForResponse(reply=>new URL(reply.url()).pathname===path&&reply.status()===200);
+    await page.locator('.run-title[data-id="'+reference+'"]').first().click();
+    const first=await (await response).json();
+    expect(first.run.phaseRefs).toHaveLength(phaseCount);expect(first.phasePage.references).toHaveLength(20);
+    await expect(page.locator('.phase-pagination')).toContainText('第 1 / 3 页');
+    await expect(page.locator('.phase-pagination')).toContainText('本页记录已读取');
+    await expect(page.locator('.phase-card')).toHaveCount(20);
+    await page.screenshot({path:screenshots+'/phase-pagination-desktop.png',fullPage:true});
+    const next=page.waitForResponse(reply=>new URL(reply.url()).pathname===path&&new URL(reply.url()).searchParams.has('phaseCursor')&&reply.status()===200);
+    await page.locator('.phase-pagination').getByRole('button',{name:'下一页',exact:true}).click();
+    const second=await (await next).json();
+    expect(second.run.phaseRefs).toEqual(first.run.phaseRefs);expect(second.run.revision).toBe(first.run.revision);
+    expect(second.complete).toBe(false);expect(second.phasePage.complete).toBe(true);expect(second.missingPhases).toEqual([]);
+    await expect(page.locator('.phase-pagination')).toContainText('第 2 / 3 页');
+    await expect(page.locator('.phase-card')).toHaveCount(20);
+    await page.locator('[data-action=detail-tab][data-value=diff]').click();
+    await expect(page.locator('.inspector')).toContainText('本页为历史执行');
+    await expect(page.locator('.inspector')).toContainText('可在阶段卡片查看该阶段改动');
+    await expect(page.locator('.phase-card')).toHaveCount(20);
+    await page.locator('[data-action=detail-tab][data-value=summary]').click();
+    await page.setViewportSize({width:390,height:844});
+    await expect(page.locator('.phase-pagination').getByRole('button',{name:'上一页',exact:true})).toBeInViewport();
+    await expect(page.locator('.phase-pagination').getByRole('button',{name:'下一页',exact:true})).toBeInViewport();
+    await page.screenshot({path:screenshots+'/phase-pagination-narrow.png',fullPage:true});
+    await page.locator('.phase-pagination').getByRole('button',{name:'上一页',exact:true}).click();
+    await expect(page.locator('.phase-pagination')).toContainText('第 1 / 3 页');
+    await page.locator('.phase-card [data-action=open-run]').first().click();
+    await expect(page.locator('.inspector')).toBeVisible();
+    await expect(page.locator('.phase-pagination')).toHaveCount(0);
+    expect(new URLSearchParams(new URL(page.url()).hash.split('?')[1]).has('phaseCursor')).toBe(false);
+    expect(errors).toEqual([]);
+  }finally{await local.server.dispose();}
 });

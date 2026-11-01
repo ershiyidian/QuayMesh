@@ -7,7 +7,7 @@ export function isolatedConsoleReadPath(path:string):string {
   const queryAt=path.indexOf('?');
   const pathname=queryAt<0?path:path.slice(0,queryAt),query=queryAt<0?'':path.slice(queryAt);
   if(pathname.startsWith(ISOLATED_READ_PREFIX+'/'))return path;
-  const match=/^\/workbench(\/(?:metadata|runs|task-index|session-titles|run-summaries|overview|overview-usage|usage|activity)|\/runs\/[^/]+(?:\/patch|\/(?:files|commands)\/[^/]+)?|\/projects\/[^/]+\/sessions|\/tasks\/[^/]+\/messages-state)$/.exec(pathname);
+  const match=/^\/workbench(\/(?:metadata|runs|task-index(?:-scoped)?|task-state-index|session-titles(?:-scoped)?|run-summaries|overview|overview-usage|usage|activity)|\/runs\/[^/]+(?:\/patch|\/(?:files|commands)\/[^/]+)?|\/projects\/[^/]+\/sessions|\/tasks\/[^/]+\/messages-state)$/.exec(pathname);
   return match?ISOLATED_READ_PREFIX+match[1]+query:path;
 }
 

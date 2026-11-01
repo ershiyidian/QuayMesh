@@ -5,8 +5,9 @@ import { workspaceHandle } from "../federation/routing.js";
 import { readExecutionClaims, readExecutionWaitingState } from "../execution-inspection.js";
 import { activeExecution } from "../console-task-state.js";
 import { taskView } from "../task-view.js";
-import { permitted, readLocalIndex } from "./local.js";
-import { aggregateTasks, taskReference } from "./task-aggregation.js";
+import { permitted } from "./local.js";
+import { readProjectTaskState } from "./local-queries.js";
+import { aggregateTaskStateIndex, fallbackTask, taskReference } from "./task-aggregation.js";
 import { stage } from "./query.js";
 import { WorkbenchError } from "./types.js";
 
@@ -23,15 +24,14 @@ export function readProjectSessions(config: ServerConfig, projectId: string) {
     const project = ledger.getProject(projectId);
     if (!permitted(config, project.root)) throw new WorkbenchError("项目不在允许访问的范围内", 403, "project_scope", "none");
     const node = config.federation?.nodeId ?? "local";
-    const projectRunIds = (ledger.db.prepare("SELECT id FROM console_work_runs WHERE project_id=?").all(projectId) as Array<{ id: string }>).map((row) => row.id);
-    const runs = readLocalIndex(config, projectRunIds, ledger).runs;
+    const runs = readProjectTaskState(config,ledger,projectId);
     const sessionRows = ledger.db.prepare(`SELECT DISTINCT s.id,s.title,s.last_activity_at,s.created_at FROM qm_sessions s
       JOIN qm_session_members m ON m.session_id=s.id
       WHERE m.node_id=? AND m.root=? ORDER BY s.last_activity_at DESC,s.id`).all(node,project.root) as Array<{
         id:string;title:string;last_activity_at:string;created_at:string;
       }>;
     const conversations=sessionRows.map(row=>{
-      const actual=aggregateTasks(runs.filter(run=>run.sessionId===row.id));
+      const actual=aggregateTaskStateIndex(runs.filter(run=>run.sessionId===row.id)).map(fallbackTask);
       const taskRows=ledger.db.prepare(`SELECT DISTINCT t.id,t.title,t.state,t.result_status,t.created_at,t.finished_at,t.last_activity_at
         FROM qm_tasks t JOIN qm_task_members tm ON tm.task_id=t.id JOIN qm_session_members m ON m.id=tm.member_id
         WHERE t.session_id=? AND m.node_id=? AND m.root=?`).all(row.id,node,project.root) as Array<{
@@ -78,7 +78,7 @@ export function readProjectSessions(config: ServerConfig, projectId: string) {
     const executionClaims = readExecutionClaims(ledger.db, project.root).map(claim => ({ ...claim,
       ...(claim.state === "queued" && claim.agentId
         ? { waiting: readExecutionWaitingState(ledger.db, project.root, claim.agentId) } : {}) }));
-    return { conversations,executionClaims,items, batches: batches.map((batch) => ({ id: workspaceHandle(node, batch.id), mode: batch.mode,
+    return { projectId:workspaceHandle(node,projectId),conversations,executionClaims,items, batches: batches.map((batch) => ({ id: workspaceHandle(node, batch.id), mode: batch.mode,
       status: batch.status === "succeeded" ? "completed" : batch.status, createdAt: Date.parse(batch.created_at) })),
       claims: items.filter((thread) => thread.control !== "idle").map((thread) => ({ id: thread.id, owner: thread.control, turnId: thread.turnId, updatedAt: thread.updatedAt })) };
   } finally {
