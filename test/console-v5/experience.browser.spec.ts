@@ -173,6 +173,50 @@ test('手动模式的一次部分读取会补齐，完成后不继续轮询',asy
   expect(reads).toBe(2);
 });
 
+for(const resume of ['切回任务','恢复可见'] as const)test(`待完成详情在${resume}命中缓存后继续补读，成功后停止`,async({page})=>{
+  await page.clock.install();
+  await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
+  const reference='qmtask:'+f.completed.task_id,path='runs/'+encodeURIComponent(reference);
+  let ready:any;
+  await expect.poll(async()=>{ready=await f.get(path+'?fresh=1');return ready.phasePage?.complete;}).toBe(true);
+  const partial={...ready,complete:false,phasePage:{...ready.phasePage,complete:false},files:[],commands:[],agents:[],
+    missingPhases:[{id:ready.run.phaseRefs[0],nodeId:ready.run.nodeId,error:'阶段详情正在读取',pending:true}],
+    sources:[{nodeId:ready.run.nodeId,name:'任务详情来源',online:true,state:'loading',stale:false,error:null,observedAt:null}]};
+  const requests:string[]=[];
+  await page.route(url=>url.pathname.endsWith('/api/v4/'+path),route=>{
+    requests.push(route.request().url());return route.fulfill({json:requests.length===1?partial:ready});
+  });
+  await login(page);
+  await page.goto(f.server.baseUrl+'/console/#/tasks?days=0&scope=all&run='+encodeURIComponent(reference));
+  await expect(page.locator('#inspector .resource-update.pending')).toBeVisible();
+  await expect(page.locator('.run-table .run-title[data-action=open-run][data-id="'+reference+'"]')).toBeVisible();
+  expect(requests).toHaveLength(1);
+  const cacheAge=await page.evaluate(({path,reference,resume})=>{
+    const state=(window as unknown as {QuayMesh:{getState():{cache:Array<{path:string;time:number}>}}}).QuayMesh.getState();
+    const age=Date.now()-state.cache.find(entry=>entry.path===path)!.time;
+    if(resume==='切回任务'){
+      document.querySelector<HTMLButtonElement>('#inspector [data-action=close-inspector]')!.click();
+      document.querySelector<HTMLButtonElement>('.run-table .run-title[data-action=open-run][data-id="'+reference+'"]')!.click();
+    }else{
+      // Drive the real page visibility handlers without changing a user's window.
+      for(const hidden of [true,false]){
+        Object.defineProperty(document,'hidden',{configurable:true,value:hidden});
+        document.dispatchEvent(new Event('visibilitychange'));
+      }
+    }
+    return age;
+  },{path,reference,resume});
+  expect(cacheAge).toBeLessThan(1_000);
+  expect(requests).toHaveLength(1);
+  await page.clock.fastForward(1_100);
+  await expect(page.locator('#inspector .resource-update.pending')).toHaveCount(0,{timeout:2_000});
+  await expect(page.locator('#inspector [data-action=detail-tab][data-value=commands] .count')).toHaveText(String(ready.commands.length));
+  expect(requests).toHaveLength(2);
+  expect(requests.every(url=>!new URL(url).searchParams.has('fresh'))).toBe(true);
+  await page.clock.fastForward(46_000);
+  expect(requests).toHaveLength(2);
+});
+
 test('旧节点读取失败时，手动预览仍会补齐其他节点的任务',async({page})=>{
   await page.clock.install();
   await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));

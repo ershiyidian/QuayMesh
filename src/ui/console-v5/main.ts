@@ -97,7 +97,6 @@ const resources = new Resources(API, { freshness, paint: schedulePaint, loaded(p
     }
     if (path === 'projects' || path.startsWith('runs')) ensureRoute();
     if (path === 'fleet/status') pollNotifications();
-    schedulePendingRead(path);
 } });
 const CACHE = resources.entries, selectedRuns = new Set<string>(), selectedThreads = new Set<string>(), expandedRoots = new Set<string>(), loadedBigFiles = new Set<string>(), expandedGroups = new Set<string>();
 const localReadFailures = new Set<string>();
@@ -302,7 +301,12 @@ function schedulePendingRead(path: string) {
 }
 async function load(path: string, force = false): Promise<unknown> {
     if(force){clearTimeout(pendingReads.get(path)?.timer);pendingReads.delete(path);}
-    return resources.load(path, force);
+    try {
+        return await resources.load(path, force);
+    } finally {
+        // Returning to a cached pending snapshot must also resume its reads.
+        schedulePendingRead(path);
+    }
 }
 function ensureRoute() {
     if (authRequired || booting || document.hidden || backgroundPaused)
