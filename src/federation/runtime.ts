@@ -708,7 +708,11 @@ export class FederationRuntime extends EventEmitter {
         throw Object.assign(new Error("本机 mihomo 出口当前不可用"), { code: "EGRESS_CAPABILITY_UNAVAILABLE", phase: "gateway_admission" });
       const lease=this.execution.beginWork({kind:"egress"});
       this.trackStream(stream,lease,true);
-      try { bridge(stream,await lease.run(()=>connectProxy(this.proxyUrl))); }
+      try {
+        const proxy=await lease.run(()=>connectProxy(this.proxyUrl));
+        if (stream.destroyed) { proxy.destroy(); return; }
+        bridge(stream,proxy);
+      }
       catch(error) {
         lease.release();
         this.event("egress_connect_error", this.localId, "出口代理连接失败", {
