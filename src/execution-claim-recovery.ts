@@ -35,7 +35,6 @@ export interface ExecutionClaimRecovery {
   receiptId?: string;
   reason?: string;
 }
-const terminal = (status: string) => ["completed", "failed", "cancelled"].includes(status);
 const atOrBefore = (a: string, b: string) => Number.isFinite(Date.parse(a)) && Date.parse(a) <= Date.parse(b);
 
 /** Legacy agents are linked only when one saved attempt spans claim acquisition.
@@ -85,9 +84,10 @@ function inspect(db: Database.Database, claimId: string): {
       WHERE domain=? AND object_id=? AND generation=? AND fingerprint=? AND invalidated_at IS NULL LIMIT 1`)
       .get(subject.domain, subject.id, subject.generation, subject.fingerprint) as { receipt_id: string } | undefined)?.receipt_id;
   }
-  const terminalReceipt = Boolean(target && !ownerAlive && terminal(target.row.status) &&
-    target.row.finished_at && atOrBefore(claim.acquired_at, target.row.finished_at));
-  const releasable = Boolean(receiptId || terminalReceipt);
+  // A business result and an absent owner do not prove that its children or
+  // provider turn stopped. Local joined handlers produce the same explicit
+  // generation-bound proof as process/agent completion.
+  const releasable = Boolean(receiptId);
   const active = ownerAlive && target && ["starting", "queued", "running"].includes(target.row.status);
   const physicalState = releasable ? "quiescent" : active ? "active" : "unknown";
   return { claim, target, releasable, result: {
@@ -97,7 +97,7 @@ function inspect(db: Database.Database, claimId: string): {
     generation: target?.owner?.generation ?? claim.execution_generation,
     runId: target?.row.run_id ?? null, executionStatus: target?.row.status ?? null,
     ownerAlive, physicalState, ...(receiptId ? { receiptId } : {}),
-    reason: receiptId ? "physical_completion_receipt" : terminalReceipt ? "terminal_execution_receipt"
+    reason: receiptId ? "physical_completion_receipt"
       : !target ? "execution_identity_unresolved" : ownerAlive ? "execution_owner_present" : "physical_completion_unconfirmed",
   } };
 }

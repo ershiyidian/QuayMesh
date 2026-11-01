@@ -56,7 +56,7 @@ $trigger = @(
     (New-ScheduledTaskTrigger -AtLogOn -User ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name))
 )
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
-Register-ScheduledTask -TaskName 'QuayMesh' -Action $action -Trigger $trigger -Settings $settings -RunLevel $runLevel -Force | Out-Null
+Register-ScheduledTask -TaskName 'QuayMesh' -TaskPath '\' -Action $action -Trigger $trigger -Settings $settings -RunLevel $runLevel -Force | Out-Null
 
 # 托盘界面和节点统一使用同一个计划任务，移除历史注册表启动项。
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
@@ -65,5 +65,5 @@ foreach ($name in @('QuayMeshHost', 'QuayMesh')) {
         Remove-ItemProperty -Path $runKey -Name $name
     }
 }
-if ($Start) { Start-ScheduledTask -TaskName 'QuayMesh' }
+if ($Start) { Start-ScheduledTask -TaskName 'QuayMesh' -TaskPath '\' }
 Write-Output 'QuayMesh 已安装。'

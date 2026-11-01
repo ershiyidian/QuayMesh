@@ -1,5 +1,6 @@
 import { consoleError, type createApi } from "./client.js";
 import type { CacheEntry, RunDetail, RunPage, FileDiff, SourceState } from "./contracts.js";
+import {retainDetail,pendingDetailRead,type RetainedDetail} from './retained-detail.js';
 
 export class Resources {
   readonly entries = new Map<string, CacheEntry>();
@@ -32,6 +33,7 @@ export class Resources {
       if (/^runs\/[^/?]+$/.test(path)) {
         const detail = value as RunDetail;
         const previous = current.data as RunDetail | null;
+        current.retained=retainDetail(previous,detail,current.receivedAt??current.time,current.retained as RetainedDetail|undefined);
         if (previous?.run.workspaceRevision !== detail.run.workspaceRevision) {
           for (const [key, file] of this.entries) if (key.startsWith(path + "/files/")) {
             file.ctl?.abort(); this.entries.delete(key);
@@ -43,6 +45,7 @@ export class Resources {
         if (detail?.data && (detail.data.run.revision !== run.revision || detail.data.run.workspaceRevision !== run.workspaceRevision)) detail.time = 0;
       }
       current.data = value; current.time = Date.now(); current.error = null; current.retryAt = 0; current.failures = 0;
+      current.receivedAt=current.time;
       current.duration = current.time - current.startedAt!;
       return value;
     }).catch((failure: unknown) => {
@@ -66,6 +69,7 @@ export class Resources {
 
   private freshness(path: string, value: unknown): number {
     const ttl = this.options.freshness(path);
+    if(pendingDetailRead(value))return Math.min(ttl,1_000);
     const sources = (value as { sources?: SourceState[] })?.sources;
     if (!Array.isArray(sources)) return ttl;
     // 过渡快照须能在下一轮读取到后台结果；保留短缓存，避免 loaded 回调立即重复请求。

@@ -17,8 +17,9 @@ export function isIsolatedConsoleRead(path:string):boolean {
 
 export function isolatedReadUpgradeRequired(path:string,status:number,body:unknown):boolean {
   if(status!==404||!isIsolatedConsoleRead(path))return false;
-  const code=body&&typeof body==='object'?(body as {code?:unknown}).code:undefined;
-  // An implemented endpoint may still report a missing domain object. Keep
-  // those business failures intact instead of claiming the endpoint is absent.
-  return !['run_not_found','task_not_found','session_run_not_found','file_not_found','command_not_found'].includes(String(code));
+  const error=body&&typeof body==='object'?body as {code?:unknown;message?:unknown}:null;
+  // ConsoleOperations on older releases has this exact unmatched-route reply.
+  // A domain 404 from an implemented endpoint retains its actual business code.
+  return error?.code==='route_not_found'||error?.code==='console_route_not_found'
+    ||error?.code===undefined&&error?.message==='找不到管理操作';
 }

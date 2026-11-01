@@ -21,7 +21,8 @@ import {
 } from "./types.js";
 import { SessionStore } from "./store.js";
 import type { WorkspaceRegistry, Workspace } from "../workspaces.js";
-import type { WorkLedger } from "../work-ledger.js";
+import { EXECUTION_OBSERVATION_MS, type WorkLedger } from "../work-ledger.js";
+import { memberRunActivity } from "./member-run-activity.js";
 import type { LocalAgentStore } from "../local-agent-store.js";
 import type { RecoveryService } from "./recovery.js";
 import type { WorkspaceMetadata } from "./workspace-metadata.js";
@@ -932,7 +933,7 @@ export class SessionService {
       || context.member_id !== ticket.member_id || context.run_id !== ticket.run_id)
       throw new Error("LOCAL_COMPLETION_IDENTITY_MISMATCH");
     const db = this.requireLedger().db, store = new SessionStore(db);
-    const subject = quiescenceSubject(db, "operation", ticket.operation_id);
+    const subject = quiescenceSubject(db, "operation", ticket.operation_id, {allowTerminal:true});
     await runSqliteWrite(db, () => {
       const invocation = store.findInvocationSummaryByOperationId(ticket.operation_id);
       const member = store.findMember(ticket.session_id, ticket.member_id);
@@ -953,10 +954,19 @@ export class SessionService {
         || owned.owner_token !== processOwner.token || owned.owner_pid !== processOwner.pid
         || owned.process_start !== processOwner.start)
         throw new Error("LOCAL_COMPLETION_IDENTITY_MISMATCH");
-      if (!["unknown", "reconciliation_required"].includes(owned.status)) return;
-      if (invocation.state !== OperationState.unknown || invocation.effect !== "unknown" || !invocation.result_ready
+      const unresolved = invocation.state === OperationState.unknown && invocation.effect === "unknown"
+        && ["unknown", "reconciliation_required"].includes(owned.status);
+      const terminalStatus = invocation.state === OperationState.succeeded ? "completed"
+        : invocation.state === OperationState.failed ? "failed"
+          : invocation.state === OperationState.cancelled ? "cancelled" : null;
+      const terminal = terminalStatus !== null && owned.status === terminalStatus
+        && invocation.finished_at !== null && Number.isFinite(Date.parse(invocation.finished_at));
+      if ((!unresolved && !terminal) || !invocation.result_ready
         || !store.hasOperationFinished(ticket.operation_id, ticket.invocation_id))
         throw new Error("LOCAL_COMPLETION_RECEIPT_NOT_READY");
+      // This internal handshake is assigned only to handlers which join all
+      // owned work. Revalidate the captured fingerprint after acquiring the
+      // write lock; later evidence or another attempt must reject this callback.
       recordExecutionQuiescence(db, [subject], {
         id: `local-handler:${ticket.invocation_id}:${processOwner.token}`, verifiedAt: new Date().toISOString(),
         evidence: {version: 1, boundary: "local_handler_settled", operationId: ticket.operation_id,
@@ -964,7 +974,7 @@ export class SessionService {
           memberId: ticket.member_id, runId: ticket.run_id, nodeId: this.nodeId,
           workspaceId: context.workspace_id, ownerToken: processOwner.token, ownerPid: processOwner.pid,
           processStart: processOwner.start, settledAt},
-      });
+      }, {allowTerminal:true});
       for (const claim of db.prepare("SELECT id FROM execution_claims WHERE operation_id=?").all(ticket.operation_id) as Array<{id:string}>)
         this.requireLedger().recoverClaim(claim.id);
     });
@@ -1054,12 +1064,13 @@ export class SessionService {
     const ledger = this.requireLedger();
     const session = this.store.getSession(sessionId);
     let state = ExecutionState.idle;
+    const after = new Date(Date.now() - EXECUTION_OBSERVATION_MS).toISOString();
     for (const member of session.members) {
-      const linkedRuns = this.store.runIdsForMember(sessionId, member.id);
-      const currentRunId = linkedRuns[0];
-      if (!currentRunId) continue;
+      const activity = memberRunActivity(ledger.db, sessionId, member.id, after);
+      if (!activity) continue;
+      const currentRunId = activity.runId;
       // 旧阶段的后台工作继续参与活性汇总；旧失败记录不污染当前请求。
-      if (linkedRuns.some(runId => ledger.hasConfirmedChild(runId))) state = ExecutionState.active;
+      if (activity.confirmed) state = ExecutionState.active;
       const linkedAgentIds = new Set(ledger.executions(currentRunId).map((execution) => execution.agent_id));
       const activeAgent = [...linkedAgentIds].some((agentId) => {
         const agent = this.agents?.getById(agentId);

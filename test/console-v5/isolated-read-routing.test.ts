@@ -13,6 +13,8 @@ test('Console read routes use the versioned isolation boundary and leave write r
   assert.equal(isolatedConsoleReadPath('/workbench/receipts/key'),'/workbench/receipts/key');
   assert.equal(isolatedConsoleReadPath('/workbench/settings'),'/workbench/settings');
   assert.equal(isolatedReadUpgradeRequired('/workbench/isolated-v1/runs/absent',404,{code:'run_not_found'}),false);
+  assert.equal(isolatedReadUpgradeRequired('/workbench/isolated-v1/runs/r/patch',404,{code:'artifact_scope'}),false);
+  assert.equal(isolatedReadUpgradeRequired('/workbench/isolated-v1/task-index',404,{message:'找不到管理操作'}),true);
 });
 
 test('an older node is never retried through the synchronous route and confirmed cached data is retained',async()=>{

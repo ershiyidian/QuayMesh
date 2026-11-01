@@ -358,3 +358,69 @@ process.on('SIGTERM',()=>{server.closeAllConnections();server.close(()=>process.
   assert.equal(node.maintenance,false);assert.equal(relayAccepting,true);
   assert.equal((await node.admissionState()).accepting,true);
 });
+
+
+async function preservedLeaseFixture(t) {
+  const f=await leaseFixture(t,[oldClaim]),acquire=f.provider.acquire;
+  Object.assign(f.state,{historyPolicy:"preserve",protocolVersion:2,claimFingerprintVersion:2});
+  Object.assign(f.state.admission,{unresolvedOperations:1,unresolvedExecutions:0,physicalUnknown:1,
+    reconciledPhysicalBoundaries:0,quiescent:false,idle:false});
+  f.options.historyPolicy="preserve";
+  f.provider.acquire=async context=>({...await acquire(context),version:context.version,historyPolicy:context.historyPolicy});
+  return f;
+}
+
+test("preserve 必须由installer显式选择，旧prove provider不能单方降级或伪造v2",async t=>{
+  await assert.rejects(beginInstallationMaintenance({historyPolicy:"preserve"}),/explicit external maintenance provider/);
+  await assert.rejects(activateInstallation("not-read.json",{historyPolicy:"preserve"}),/显式提供/);
+  await assert.rejects(activateInstallation("not-read.json",{historyPolicy:"force"}),/Invalid installation history policy/);
+  for(const mode of ["old-version","missing-policy","unsolicited"]){
+    const f=await preservedLeaseFixture(t),acquire=f.provider.acquire;
+    if(mode==="unsolicited")f.options.historyPolicy="prove";
+    f.provider.acquire=async context=>{
+      const lease=await acquire(context);
+      if(mode==="old-version")lease.version=1;
+      if(mode==="missing-policy")delete lease.historyPolicy;
+      if(mode==="unsolicited")lease.historyPolicy="preserve";
+      return lease;
+    };
+    await assert.rejects(beginInstallationMaintenance(f.options),error=>
+      /acquisition is unconfirmed/.test(error.message)&&/ownership does not match/.test(error.cause?.message));
+    assert.equal(f.state.admission.claims,1);assert.deepEqual(f.state.claims,[oldClaim]);
+  }
+});
+
+test("preserve v2保留完整历史和四阶段证据，physicalUnknown与claim不归零",async t=>{
+  const f=await preservedLeaseFixture(t),lease=await beginInstallationMaintenance(f.options);
+  assert.equal(lease.context.version,2);assert.equal(lease.context.historyPolicy,"preserve");
+  assert.equal(lease.lease.version,2);assert.equal(lease.receipt.version,2);
+  assert.ok(Object.isFrozen(lease.context.retainedHistory));
+  assert.ok(Object.isFrozen(lease.context.retainedHistory.counters));
+  for(const stage of ["before_backup","after_backup","before_stop"])await lease.assertHeld(stage);
+  f.state.processes=f.state.processes.map(value=>({...value,alive:false,start:null}));
+  f.state.admission.reason="服务正在退出";
+  await lease.assertHeld("after_stop");
+  assert.equal(f.state.admission.physicalUnknown,1);assert.equal(f.state.admission.claims,1);
+  assert.equal(f.state.admission.quiescent,false);assert.deepEqual(f.state.claims,[oldClaim]);
+  assert.deepEqual(lease.receipt.stages.map(value=>value.stage),["before_backup","after_backup","before_stop","after_stop"]);
+  await lease.release({outcome:"aborted-before-stop",transition:null,activeStatus:f.running});
+});
+
+test("preserve不能清空、漏掉同数量历史、改变证据计数或混入实际服务工作",async t=>{
+  const f=await preservedLeaseFixture(t),lease=await beginInstallationMaintenance(f.options);
+  const original=structuredClone(f.state);
+  const changes=[
+    state=>{state.subjects=[];},state=>{state.claims=[];state.admission.claims=0;},
+    state=>{state.subjects[0].generation="new-attempt";},state=>{state.claims[0].fingerprint="b".repeat(64);},
+    state=>{state.admission.physicalUnknown=0;},state=>{state.admission.reconciledPhysicalBoundaries=1;},
+    state=>{state.admission.persistedRuntimeWork=1;},state=>{state.admission.executions=1;},
+    state=>{state.protocolVersion=1;},state=>{state.claimFingerprintVersion=1;},
+  ];
+  for(const change of changes){
+    Object.assign(f.state,structuredClone(original));change(f.state);
+    await assert.rejects(lease.assertHeld("before_backup"),/Preserved histor|version 2|no current service work/);
+  }
+  Object.assign(f.state,structuredClone(original));
+  assert.equal(lease.receipt.stages.length,0);
+  await lease.release({outcome:"aborted-before-stop",transition:null,activeStatus:f.running});
+});

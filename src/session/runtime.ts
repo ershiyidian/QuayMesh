@@ -21,6 +21,7 @@ import { SessionService } from "./service.js";
 import { SessionToolRecorder } from "./tool-recording.js";
 import { AgentOperationTracker } from "./agent-operations.js";
 import { SessionStore } from "./store.js";
+import { SessionStatusReader } from "./status-reader.js";
 import { registerSessionAppTools } from "./application-tools.js";
 import {
   ExecutionState,
@@ -49,10 +50,12 @@ export interface SessionRuntimeOptions {
   processSessions?: ProcessSessionManager;
   consoleUrl?: string | null;
   diagnostics?: ServerDiagnostics["record"];
+  allowBackgroundMaintenance?: () => boolean;
 }
 
 export interface SessionRuntime {
   store: SessionStore;
+  statusReader: SessionStatusReader;
   output: SessionOutputStore;
   changes: SessionChangeCollector;
   context: ContextReadRecorder;
@@ -84,10 +87,19 @@ export function openSessionStore(stateDir: string): { store: SessionStore; datab
 export function createSessionRuntime(options: SessionRuntimeOptions): SessionRuntime {
   const { config, workspaces, ledger, agents } = options;
   const store = openSessionDatabase(config.stateDir);
-  store.reconcileFinishedInvocations();
-  // Old handoff intents must not close a goal or block its inbox after upgrade.
-  store.taskData.rejectLegacyHandoffFinalizations();
+  const allowMaintenance = options.allowBackgroundMaintenance ?? (() => true);
+  let startupMaintenancePending = true;
+  const startupMaintenance = () => {
+    if (!startupMaintenancePending || !allowMaintenance()) return;
+    store.reconcileFinishedInvocations();
+    // Old handoff intents must not close a goal or block its inbox after upgrade.
+    store.taskData.rejectLegacyHandoffFinalizations();
+    startupMaintenancePending = false;
+  };
+  startupMaintenance();
   const output = new SessionOutputStore(config.stateDir);
+  const statusReader = new SessionStatusReader(config.stateDir, config.federation?.nodeId ?? "local",
+    event => options.diagnostics ? options.diagnostics("mcp_status_read", {...event}) : console.info(JSON.stringify(event)));
   options.processSessions?.setHandleStore({
     allocate: id => store.writeAsync(() => store.allocateProcessHandle(id)), resolve: handle => store.operationForHandle(handle),
   });
@@ -100,19 +112,10 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
     store,
     config.stateDir,
     options.consoleUrl ?? null,
-    async (sessionId, memberId, taskId) => {
-      const session = store.getSession(sessionId);
-      if (session.execution_state === ExecutionState.active) {
-        return { allowed: false, reason: "session_active", revision: store.getMember(sessionId, memberId).revision };
-      }
-      const eligibility = await reverter.eligibility(session.owner_id, sessionId, memberId, undefined, taskId);
-      return {
-        allowed: eligibility.allowed,
-        reason: eligibility.reason,
-        revision: eligibility.revision,
-      };
-    },
+    undefined,
     config.federation?.nodeId ?? "local",
+    {capture:changes,report:event=>options.diagnostics
+      ? options.diagnostics("session_projection_read",{...event}) : console.info(JSON.stringify(event))},
   );
   const recovery = new RecoveryService(store, config.stateDir);
   reverter = new SessionReverter(store, config.stateDir, execution, changes, agents);
@@ -203,24 +206,33 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
   };
   let retentionWork: Promise<void> | undefined;
   const expireResults = () => {
-    if (closed || retentionWork) return;
+    if (closed || retentionWork || !allowMaintenance()) return;
     retentionWork = (async () => {
-      await store.writeAsync(() => store.pruneContextResults(), { signal: maintenance.signal });
-      for (const row of store.expiredCommandOutputs()) await output.expire(row.operation_id,row.retained_until);
+      await store.writeAsync(() => { if (allowMaintenance()) store.pruneContextResults(); }, { signal: maintenance.signal });
+      for (const row of store.expiredCommandOutputs()) {
+        if (!allowMaintenance()) break;
+        await output.expire(row.operation_id,row.retained_until);
+      }
     })().catch(error => reportMaintenance("QuayMesh 输出清理失败", error))
       .finally(() => { retentionWork = undefined; });
   };
   let observationWork: Promise<void> | undefined;
   const observationTimer=setInterval(()=>{
-    if(closed || observationWork)return;
+    if(closed || observationWork || !allowMaintenance())return;
     observationWork = (async () => {
-      await store.writeAsync(() => store.reconcileFinishedInvocations(), { signal: maintenance.signal });
+      await store.writeAsync(() => {
+        if (!allowMaintenance()) return;
+        startupMaintenance();
+        store.reconcileFinishedInvocations();
+      }, { signal: maintenance.signal });
       await runSqliteWrite(ledger.db, () => {
+        if (!allowMaintenance()) return;
         ledger.observeOperations([...recorder.activeOperationIds(),...options.processSessions?.activeOperationIds()??[]]);
         ledger.reconcileTerminalOperations();
         ledger.reconcileArchivedTaskRuns();
       }, { signal: maintenance.signal });
       for(const finish of unfinishedProcesses.values()){
+        if (!allowMaintenance()) break;
         const pending=closeProcessOperation(finish);
         if(pending)void pending.catch(error=>reportMaintenance("QuayMesh 进程收尾重试失败",error));
       }
@@ -229,7 +241,7 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
   },5000);
   observationTimer.unref();
   const finalizationTimer=setInterval(()=>{
-    if(!closed)void service.retryFinalizations().catch(error=>reportMaintenance("QuayMesh 收尾协调失败",error));
+    if(!closed && allowMaintenance())void service.retryFinalizations().catch(error=>reportMaintenance("QuayMesh 收尾协调失败",error));
   },30_000);
   finalizationTimer.unref();
   const retentionTimer = setInterval(expireResults, 3600_000);
@@ -246,6 +258,7 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
     changes,
     context,
     projector,
+    statusReader,
     recovery,
     service,
     recorder,
@@ -270,6 +283,7 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
     async close() {
       if (closed) return;
       closed = true;
+      statusReader.close();
       clearInterval(observationTimer);
       clearInterval(finalizationTimer);
       clearInterval(retentionTimer);

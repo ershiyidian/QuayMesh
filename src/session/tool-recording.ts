@@ -417,7 +417,7 @@ export class SessionToolRecorder {
         ? input.knownPaths?.(envelope.value as T) ?? []
         : [],
     });
-    if (completion && recorded.state === OperationState.unknown) {
+    if (completion && [OperationState.unknown, OperationState.succeeded, OperationState.failed, OperationState.cancelled].includes(recorded.state)) {
       // Save only after operationFinished: its business-row update revokes any
       // earlier proof. A failed proof write must not replace the first receipt.
       try { await this.service.recordLocalOperationCompletion(completion.context, ticket, completion.settledAt); }

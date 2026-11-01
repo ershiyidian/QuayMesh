@@ -232,6 +232,110 @@ test('详情首次失败保留任务上下文，重试和后续失败不清空�
   expect(await retained!.evaluate(element=>element.isConnected)).toBe(true);
 });
 
+test('详情返回部分成功时保留上次记录，恢复后移除历史标记',async({page})=>{
+  await page.clock.install();
+  await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
+  const reference='qmtask:'+f.completed.task_id,path='runs/'+encodeURIComponent(reference);
+  let ready:any;
+  await expect.poll(async()=>{ready=await f.get(path+'?fresh=1');return ready.complete;}).toBe(true);
+  expect(ready.commands.length).toBeGreaterThan(0);
+  const partial={...ready,complete:false,files:[],commands:[],agents:[],evidence:[],timeline:[],instructions:[],skills:[],
+    run:{...ready.run,actions:{...ready.run.actions,review:false,complete:false,revert:false,patch:false}},
+    missingPhases:[{id:ready.run.id,nodeId:ready.run.nodeId,error:'记录仍在读取',pending:true}],
+    sources:ready.sources.map((source:any)=>({...source,state:'ready',stale:false,error:null,observedAt:Date.now()}))};
+  let response=ready;
+  await page.route(url=>url.pathname.endsWith('/api/v4/'+path),route=>route.fulfill({json:response}));
+  await login(page,f.server.baseUrl,'tasks');
+  await page.goto(f.server.baseUrl+'/console/#/tasks?days=0&scope=all&run='+encodeURIComponent(reference)+'&tab=commands');
+  await expect(page.locator('#inspector .command-card')).toHaveCount(ready.commands.length);
+  response=partial;
+  await page.locator('#topbar [data-action=refresh]').click();
+  await expect(page.locator('#inspector .detail-history-note')).toContainText('上次读取的记录');
+  await expect(page.locator('#inspector .detail-history-note')).toContainText('当前状态尚未确认');
+  await expect(page.locator('#inspector .command-card')).toHaveCount(ready.commands.length);
+  await expect(page.locator('#inspector .command-card').first()).toContainText(ready.commands[0].command);
+  await expect(page.locator('#inspector .command-result').first()).toContainText('上次记录');
+  await expect(page.locator('#inspector .session-live,#inspector .command-card .spinner')).toHaveCount(0);
+  await expect(page.locator('#inspector [data-action=detail-tab] .count')).toHaveCount(0);
+  await expect(page.locator('#inspector [data-action=finish-task],#inspector [data-action=single-accept],#inspector [data-action=revert],#inspector [data-action=patch]')).toHaveCount(0);
+  await page.setViewportSize({width:390,height:844});
+  await page.screenshot({path:screenshots+'/detail-history-retained-narrow.png',fullPage:true});
+  expect(await page.locator('#inspector').evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
+  response=ready;
+  await page.locator('#inspector [data-action=refresh]').click();
+  await expect(page.locator('#inspector .detail-history-note')).toHaveCount(0);
+  await expect(page.locator('#inspector .command-card')).toHaveCount(ready.commands.length);
+  await expect(page.locator('#inspector .command-result').first()).not.toContainText('上次记录');
+});
+
+test('来源已读取但捕获仍待确认的详情会在手动模式补齐，成功后停止补读',async({page})=>{
+  await page.clock.install();
+  await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
+  const reference='qmtask:'+f.waiting.task_id,path='runs/'+encodeURIComponent(reference);
+  let ready:any;
+  await expect.poll(async()=>{ready=await f.get(path+'?fresh=1');return ready.complete;}).toBe(true);
+  const partial={...ready,complete:false,run:{...ready.run,actions:{...ready.run.actions,review:false,complete:false,revert:false,patch:false}},
+    missingPhases:[{id:ready.run.id,nodeId:ready.run.nodeId,error:'文件改动仍在整理',pending:true}],
+    sources:[{nodeId:ready.run.nodeId,name:'任务详情来源',online:true,state:'ready',stale:false,error:null,observedAt:Date.now()}]};
+  let resolved=false,reads=0;
+  await page.route(url=>url.pathname.endsWith('/api/v4/'+path),route=>{
+    reads++;return route.fulfill({json:resolved?ready:partial});
+  });
+  await login(page,f.server.baseUrl,'tasks');
+  await page.goto(f.server.baseUrl+'/console/#/tasks?days=0&scope=all&run='+encodeURIComponent(reference)+'&tab=commands');
+  await expect(page.locator('#inspector h2')).toHaveText(ready.run.title);
+  await expect(page.locator('#inspector .resource-update.pending')).toContainText('部分详情状态尚未确认');
+  await expect(page.locator('#inspector [data-action=finish-task]')).toHaveCount(0);
+  await expect(page.locator('#inspector [data-action=detail-tab] .count')).toHaveCount(0);
+  const before=reads;resolved=true;
+  await page.clock.fastForward(6_000);
+  await expect(page.locator('#inspector [data-action=detail-tab][data-value=commands] .count')).toHaveText(String(ready.commands.length));
+  await expect(page.locator('#inspector .resource-update.pending')).toHaveCount(0);
+  expect(reads).toBeGreaterThan(before);
+  const finished=reads;await page.clock.fastForward(46_000);expect(reads).toBe(finished);
+});
+
+
+test('命令输出读取失败或不完整时提供手动重读，恢复后保留全部已读片段',async({page})=>{
+  await page.clock.install();
+  await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
+  const reference='qmtask:'+f.completed.task_id,path='runs/'+encodeURIComponent(reference);
+  let ready:any;
+  await expect.poll(async()=>{ready=await f.get(path+'?fresh=1');return ready.complete;}).toBe(true);
+  expect(ready.commands.length).toBeGreaterThan(0);
+  // Keep an actual Task/command identity; control only the output-read states.
+  const command={...ready.commands[0],outputAvailable:true,output:''};
+  await page.route(url=>url.pathname.endsWith('/api/v4/'+path),route=>route.fulfill({json:{...ready,commands:[command]}}));
+  let reads=0;
+  const cursors:string[]=[];
+  await page.route(url=>url.pathname.endsWith('/api/v4/'+path+'/commands/'+encodeURIComponent(command.id)),route=>{
+    reads++;cursors.push(new URL(route.request().url()).searchParams.get('cursor')||'');
+    if(reads===1)return route.fulfill({status:503,json:{code:'console_read_timeout',message:'请求 /internal/quaymesh/console 超时'}});
+    return route.fulfill({json:reads===2
+      ?{chunk:'saved\n',cursor:6,totalBytes:6,done:false,hasMore:false,truncated:false,retainedFrom:0,outputState:'incomplete',errorCode:'synthetic_output_tail_missing'}
+      :{chunk:'complete\n',cursor:15,totalBytes:15,done:true,hasMore:false,truncated:false,retainedFrom:0,outputState:'ready',errorCode:null}});
+  });
+  await login(page,f.server.baseUrl,'tasks');
+  await page.goto(f.server.baseUrl+'/console/#/tasks?days=0&scope=all&run='+encodeURIComponent(reference)+'&tab=commands');
+  const card=page.locator('#inspector .command-card').first();
+  await card.locator('summary').click();
+  await expect(card.locator('pre')).toContainText('读取失败');
+  await expect(card.locator('pre')).not.toContainText('/internal/');
+  await page.clock.fastForward(10_000);expect(reads).toBe(1);
+  await card.getByRole('button',{name:'重新读取输出',exact:true}).click();
+  await expect(card.locator('pre')).toContainText('输出记录不完整');
+  await expect(card.locator('pre')).toContainText('saved');
+  await expect(card.locator('pre')).not.toContainText('synthetic_output_tail_missing');
+  await expect(card.locator('pre')).not.toContainText('等待输出');
+  await page.clock.fastForward(10_000);expect(reads).toBe(2);
+  await card.getByRole('button',{name:'重新读取输出',exact:true}).click();
+  await expect(card.locator('pre')).toContainText('saved\ncomplete');
+  await expect(card.locator('pre')).not.toContainText('记录不完整');
+  await expect(card.getByRole('button',{name:'重新读取输出',exact:true})).toHaveCount(0);
+  expect(cursors).toEqual(['0','0','6']);
+});
+
+
 test('详情部分读取不把未知显示为零，消息确认后自动收敛',async({page})=>{
   await page.clock.install();
   await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));

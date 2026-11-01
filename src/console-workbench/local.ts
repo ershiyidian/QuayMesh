@@ -64,8 +64,8 @@ function group<T>(rows: T[], key: (row: T) => string): Map<string, T[]> {
   return result;
 }
 
-export function readLocalIndex(config: ServerConfig, runIds?: readonly string[]): LocalIndex {
-  const ledger = new WorkLedger(config.stateDir);
+export function readLocalIndex(config: ServerConfig, runIds?: readonly string[], sharedLedger?: WorkLedger): LocalIndex {
+  const ledger = sharedLedger ?? new WorkLedger(config.stateDir);
   try {
     const nodeId = config.federation?.nodeId ?? "local";
     const projects = ledger.projects().filter((project) => permitted(config, project.root));
@@ -205,7 +205,7 @@ export function readLocalIndex(config: ServerConfig, runIds?: readonly string[])
           port: Number(new URL(federation.egress.proxyUrl).port) || 80, probe: federation.egress.probeUrl,
           recovery: federation.egress.recoveryDelayMs / 1000, inherit: federation.egress.inheritProxy } } } : {}),
     };
-  } finally { ledger.close(); }
+  } finally { if (!sharedLedger) ledger.close(); }
 }
 
 export { readLocalActivity } from "./activity.js";

@@ -23,7 +23,7 @@ import { admittedTools } from "./tool-admission.js";
 import { localAgentProviderEnvironment } from "./local-agent-config.js";
 import type { ExecutionCoordinator, RuntimeWorkLease } from "./execution-coordinator.js";
 import { readFileSync } from "node:fs";
-import { installationTransitionPending } from "./installation-transition.js";
+import { installationTransitionPending, installationBackgroundMaintenanceAllowed } from "./installation-transition.js";
 import { isAdmissionPrecondition, sameAdmissionInstance } from "./admission-state.js";
 import { processOwner } from "./process-identity.js";
 import { realpath } from "node:fs/promises";
@@ -1166,11 +1166,14 @@ export function createServer(
   });
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
+  const installationTransitionFile = process.env.QUAYMESH_INSTALL_TRANSITION_FILE;
+  const installationPending = () => installationTransitionPending(installationTransitionFile);
+  const allowBackgroundMaintenance = () => installationBackgroundMaintenanceAllowed(installationTransitionFile);
   const workspaceStore = createWorkspaceStore(config.stateDir);
   const workRunReconciler = new WorkRunReconciler(config.stateDir, 60_000, error => {
     if (options.diagnostics) options.diagnostics.record("work_run_reconcile_failed", diagnosticError(error), "error");
     else logEvent(config.logging, "error", "work_run_reconcile_failed", diagnosticError(error));
-  });
+  }, allowBackgroundMaintenance);
   workRunReconciler.start();
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
@@ -1181,8 +1184,6 @@ export function createServer(
       ? proxyEnvironment(config.federation.egress.listenPort, { NO_PROXY: process.env.NO_PROXY ?? process.env.no_proxy }, config.federation.peers.filter((peer) => peer.url).map((peer) => new URL(peer.url).hostname)) : {},
     diagnostics: (event, fields, level) => options.diagnostics
       ? options.diagnostics.record(event, fields, level) : logEvent(config.logging, level, event, fields) });
-  const installationTransitionFile = process.env.QUAYMESH_INSTALL_TRANSITION_FILE;
-  const installationPending = () => installationTransitionPending(installationTransitionFile);
   const admissionInstance = Object.freeze({ pid: processOwner.pid, processStart: processOwner.start, token: processOwner.token });
   // A first install or an externally stopped old Core may have no persisted
   // pause. Keep direct peer calls and egress frozen during release validation,
@@ -1198,6 +1199,7 @@ export function createServer(
     agents: localAgentStore,
     execution: processSessions.executionCoordinator,
     processSessions,
+    allowBackgroundMaintenance,
     diagnostics: (event, fields, level) => options.diagnostics
       ? options.diagnostics.record(event, fields, level) : logEvent(config.logging, level ?? "info", event, fields),
   });

@@ -3,6 +3,11 @@ import type {Query} from './query.js';
 import type * as Local from './local-queries.js';
 import type {ActivityQuery,readLocalActivity as localActivity} from './activity.js';
 import type {readTaskMessageState as localTaskMessageState} from './read-task-state.js';
+import type {CaptureReadFence} from '../session/capture-read-observation.js';
+import type {ConsoleDetailRead} from './detail-read-model.js';
+import type {ConsoleArtifactRequest,ConsoleArtifactRead} from './detail-read-artifacts.js';
+import type {readConsoleAudit} from './audit-read.js';
+import type {readProjectSessions} from './project-sessions-read.js';
 import {AsyncLocalStorage} from 'node:async_hooks';
 import {ConsoleReadProcessPool} from './read-process.js';
 import {consoleReadConfig,parseConsoleReadRequest,type ConsoleReadRequest} from './read-protocol.js';
@@ -36,3 +41,13 @@ export const readLocalActivity=(config:ServerConfig,kind:string,query:ActivityQu
     query:{...query,limit:String(query.limit)}},signal);
 export const readLocalTaskMessageState=(config:ServerConfig,taskId:string,signal?:AbortSignal)=>
   read<ReturnType<typeof localTaskMessageState>>(config,{operation:'task-message-state',ids:[taskId]},signal);
+export const readLocalAudit=(config:ServerConfig,query:Pick<ActivityQuery,'q'|'limit'>,signal?:AbortSignal)=>
+  read<Awaited<ReturnType<typeof readConsoleAudit>>>(config,{operation:'audit',query:{q:query.q,limit:String(query.limit)}},signal);
+export const readLocalProjectSessions=(config:ServerConfig,projectId:string,signal?:AbortSignal)=>
+  read<ReturnType<typeof readProjectSessions>>(config,{operation:'project-sessions',ids:[projectId]},signal);
+export const readLocalDetail=(config:ServerConfig,runId:string,fence?:CaptureReadFence,signal?:AbortSignal)=>
+  read<ConsoleDetailRead>(config,{operation:'detail',ids:[runId],fence},signal);
+export const readLocalArtifact=<T extends ConsoleArtifactRequest>(config:ServerConfig,request:T,fence?:CaptureReadFence,signal?:AbortSignal)=>
+  read<Extract<ConsoleArtifactRead,{kind:T['kind']}>>(config,{operation:request.kind,ids:[request.runId],cursor:request.cursor,fence,
+    expectedTaskId:request.expectedTaskId,expectedSessionId:request.expectedSessionId,
+    ...(request.kind==='file-diff'?{fileId:request.fileId}:request.kind==='command-output'?{commandId:request.commandId}:{})},signal);

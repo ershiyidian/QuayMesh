@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
-import { canonicalResourcePath,resourcesConflict,type ExecutionResource } from "../execution-resources.js";
+import { type ExecutionResource } from "../execution-resources.js";
 import { ExecutionCoordinator } from "../execution-coordinator.js";
 import type { LocalAgentStore } from "../local-agent-store.js";
 import type { SessionChangeCollector } from "./changes.js";
@@ -8,14 +8,8 @@ import type { SessionStore } from "./store.js";
 import type { FileSummary, SessionMember } from "./types.js";
 import { memberFile, ownershipPath, readFileState, readOwnedFiles, restoreFileState, sameFileState, writeOwnedFiles } from "./write-evidence.js";
 
-export interface RevertEligibility {
-  allowed: boolean;
-  reason: string | null;
-  session_id: string;
-  member_id: string;
-  revision: number;
-  paths: string[];
-}
+export type { RevertEligibility } from "./revert-read.js";
+import { readRevertEligibility, type RevertEligibility } from "./revert-read.js";
 
 export interface RevertResult {
   ok: true;
@@ -151,23 +145,9 @@ export class SessionReverter {
   }
 
   private async eligibilityForMember(sessionId: string, member: SessionMember, ignored: Set<string>, fileIds?: readonly string[], taskId?: string): Promise<RevertEligibility> {
-    let blocked = this.captureBlock(member.id, taskId);
-    if (blocked) return { allowed: false, reason: blocked.message, session_id: sessionId, member_id: member.id, revision: member.revision, paths: [] };
-    const workspace = await stat(member.root).then(info=>info.isDirectory(),(error:NodeJS.ErrnoException)=>{
-      if(error.code==="ENOENT")return false;
-      throw error;
-    });
-    if(!workspace)return {allowed:false,reason:"workspace_missing",session_id:sessionId,member_id:member.id,revision:member.revision,paths:[]};
-    member = this.store.getMember(sessionId, member.id);
-    blocked = this.captureBlock(member.id, taskId);
-    if (blocked) return { allowed: false, reason: blocked.message, session_id: sessionId, member_id: member.id, revision: member.revision, paths: [] };
-    const owned = this.files(sessionId, member.id, taskId);
-    const selected = fileIds ? owned.filter((file) => fileIds.includes(file.id)) : owned;
-    if (fileIds && (fileIds.length === 0 || new Set(fileIds).size !== selected.length)) throw new Error("REVERT_FILE_SELECTION_INVALID");
-    const paths = [...new Set(selected.flatMap((file) => file.from ? [file.from, file.path] : [file.path]))];
-    let reason: string | null = paths.length ? null : "no_owned_changes";
-    const requested:ExecutionResource[]=paths.map(path=>({kind:"file",path:canonicalResourcePath(memberFile(member.root,path).absolute),access:"write"}));
-    if (this.execution.inspect(member.root).some(claim=>!ignored.has(claim.id)&&claim.scopes.some(scope=>requested.some(target=>resourcesConflict(scope,target))))) reason="active_writer";
-    return { allowed: reason === null, reason, session_id: sessionId, member_id: member.id, revision: member.revision, paths };
+    return readRevertEligibility(this.store,sessionId,member, {
+      captureBlock:(id,task)=>this.captureBlock(id,task)?.message??null,
+      inspect:root=>this.execution.inspect(root),
+    },ignored,fileIds,taskId);
   }
 }

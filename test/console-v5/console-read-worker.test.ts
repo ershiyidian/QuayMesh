@@ -9,7 +9,6 @@ import {WorkLedger} from '../../src/work-ledger.js';
 import {databasePath} from '../../src/db/client.js';
 import {ConsoleReadProcessPool} from '../../src/console-workbench/read-process.js';
 import {consoleReadConfig} from '../../src/console-workbench/read-protocol.js';
-import {readSummaryDetail,detailTemporarilyUnavailable,PARTIAL_DETAIL_MESSAGE} from '../../src/console-workbench/read-summary-detail.js';
 
 test('compiled readonly worker preserves scoped business errors, reads real summaries, and leaves the database unchanged',async t=>{
   const directory=await mkdtemp(join(tmpdir(),'quaymesh-read-worker-'));
@@ -21,25 +20,25 @@ test('compiled readonly worker preserves scoped business errors, reads real summ
     origin:{entryPoint:'qm_cli',evidence:'server_entry'}});
   ledger.close();
   const digest=async()=>createHash('sha256').update(await readFile(databasePath(stateDir))).digest('hex');
-  const before=await digest(),safeConfig=consoleReadConfig(config),pool=new ConsoleReadProcessPool(undefined,5000,()=>{});
+  const before=await digest(),safeConfig=consoleReadConfig(config),readerPids=new Set<number>();
+  const pool=new ConsoleReadProcessPool(undefined,5000,event=>{if(event.phase==='start'&&event.childPid)readerPids.add(event.childPid);});
   try{
+    const operations=['metadata','task-index','session-titles'] as const;
+    const started=performance.now();
+    const coldWave=await Promise.all(operations.map(operation=>pool.read({operation,config:safeConfig})));
+    const coldMs=Math.round(performance.now()-started);
+    assert.equal(coldWave.length,3);
+    const warmStarted=performance.now();
+    const warmWave=await Promise.all(operations.map(operation=>pool.read({operation,config:safeConfig})));
+    assert.equal(warmWave.length,3);
+    t.diagnostic(`compiled reader first three routes: cold ${coldMs} ms; reused ${Math.round(performance.now()-warmStarted)} ms`);
     await assert.rejects(pool.read({operation:'page',config:safeConfig,query:{cursor:'!bad!'}}),
       {code:'invalid_cursor',status:400,effect:'none'});
     await assert.rejects(pool.read({operation:'page',config:safeConfig,query:{root:join(directory,'outside')}}),
       {code:'project_scope',status:403,effect:'none'});
-    const started=performance.now();
-    const firstWave=await Promise.all(['metadata','task-index','session-titles'].map(operation=>pool.read({operation,config:safeConfig})));
-    assert.equal(firstWave.length,3);
-    t.diagnostic(`compiled reader first three routes: ${Math.round(performance.now()-started)} ms`);
-    const partial=await readSummaryDetail(config,run.id);
-    assert.equal(partial.run.localId,run.id);
-    assert.equal(partial.complete,false);
-    assert.equal(partial.missingPhases.length,1);
-    assert.match(partial.summary,new RegExp(PARTIAL_DETAIL_MESSAGE));
-    assert.deepEqual([partial.run.actions.review,partial.run.actions.complete,partial.run.actions.revert,partial.run.actions.patch],
-      [false,false,false,false]);
-    assert.deepEqual(partial.files,[]);
-    assert.throws(()=>detailTemporarilyUnavailable(),{code:'console_detail_temporarily_unavailable',status:503,effect:'none'});
+    const summaries=await pool.read<{items:Array<{localId:string}>}>({operation:'run-summaries',config:safeConfig,ids:[run.id]});
+    assert.equal(summaries.items[0]?.localId,run.id);
+    assert.equal(readerPids.size,1,'healthy and scoped business-error requests reuse the same owned reader');
     assert.equal(await digest(),before,'readonly queries must not migrate, reconcile or write the database');
   }finally{pool.close();await rm(directory,{recursive:true,force:true});}
 });

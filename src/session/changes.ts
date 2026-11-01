@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { CaptureReadClock, type CaptureReadFence, type CaptureReadObservation, type CaptureReadScope } from "./capture-read-observation.js";
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { createPatch } from "diff";
@@ -40,6 +41,7 @@ export interface CaptureObservation {
 }
 
 export class SessionChangeCollector {
+  private readonly readClock = new CaptureReadClock();
   private readonly metadataWrites = new Map<string, Promise<void>>();
   private readonly pending = new Map<string, Promise<void>>();
   private readonly captures = new Map<string, Set<Promise<void>>>();
@@ -65,21 +67,23 @@ export class SessionChangeCollector {
 
   async recordWrite(member: SessionMember, evidence: WriteEvidence[], taskId?: string): Promise<void> {
     const path=ownershipPath(this.stateDir,this.sessionIdFor(member.id),member.id,taskId);
-    await this.writeMetadata(path,()=>finishWrite(member.root,path,evidence));
+    await this.writeMetadata(path,()=>finishWrite(member.root,path,evidence),member.id,taskId);
   }
 
-  private writeMetadata(key: string, write: () => Promise<void>): Promise<void> {
+  private writeMetadata(key: string, write: () => Promise<void>, memberId: string, taskId?: string): Promise<void> {
+    this.readClock.touch(memberId, taskId);
     const previous=this.metadataWrites.get(key);
     const next=(previous ? previous.then(write,write) : write()).finally(()=>{
       if(this.metadataWrites.get(key)===next)this.metadataWrites.delete(key);
+      this.readClock.touch(memberId, taskId);
     });
     this.metadataWrites.set(key,next);
     return next;
   }
 
-  private metadataKeys(memberId: string, taskId?: string): string[] {
+  private metadataKeys(memberId: string, taskId?: string, sessionId?: string): string[] {
     return [JSON.stringify([memberId, taskId ?? null, "baseline"]),
-      ownershipPath(this.stateDir, this.sessionIdFor(memberId), memberId, taskId)];
+      ownershipPath(this.stateDir, sessionId ?? this.sessionIdFor(memberId), memberId, taskId)];
   }
 
   captureObservation(memberId: string, taskId?: string): CaptureObservation {
@@ -88,6 +92,19 @@ export class SessionChangeCollector {
       || this.metadataKeys(memberId, taskId).some(value => this.metadataWrites.has(value));
     const error = this.captureErrors.get(key);
     return { state: pending ? "pending" : error ? "failed" : "idle", error: error?.message ?? null };
+  }
+
+  /** The caller supplies a scope verified by the readonly worker; this path performs no SQL. */
+  captureReadFence(): CaptureReadFence { return this.readClock.fence(); }
+
+  captureReadObservation(scope: CaptureReadScope, before: CaptureReadFence): CaptureReadObservation {
+    const key = JSON.stringify([scope.memberId, scope.taskId]);
+    const pending = this.pending.has(key) || Boolean(this.captures.get(key)?.size)
+      || this.metadataKeys(scope.memberId, scope.taskId ?? undefined, scope.sessionId).some(value => this.metadataWrites.has(value));
+    const error = this.captureErrors.get(key);
+    return this.readClock.observe(scope, before, {
+      state: pending ? "pending" : error ? "failed" : "idle", error: error?.message ?? null,
+    });
   }
 
   private pendingWork(): Promise<void>[] {
@@ -123,7 +140,7 @@ export class SessionChangeCollector {
     taskId?: string,
   ): Promise<void> {
     const key=JSON.stringify([member.id,taskId??null,"baseline"]);
-    return this.writeMetadata(key,()=>this.ensureBaselineNow(member,knownPaths,workingDirectory,taskId));
+    return this.writeMetadata(key,()=>this.ensureBaselineNow(member,knownPaths,workingDirectory,taskId),member.id,taskId);
   }
 
   private async ensureBaselineNow(member: SessionMember, knownPaths: string[], workingDirectory: string, taskId?: string): Promise<void> {
@@ -188,6 +205,7 @@ export class SessionChangeCollector {
 
   markDirty(memberId: string, paths: string[] = [], taskId?: string): void {
     if (this.closed) return;
+    this.readClock.touch(memberId, taskId);
     const key = JSON.stringify([memberId, taskId ?? null]);
     const previous = this.dirty.get(key);
     this.dirty.set(key, !paths.length || previous === null ? null
@@ -199,12 +217,13 @@ export class SessionChangeCollector {
         this.dirty.delete(key);
         await this.capture(memberId, taskId, paths ? [...paths] : undefined);
       }
-    }).finally(() => { this.pending.delete(key); });
+    }).finally(() => { this.pending.delete(key); this.readClock.touch(memberId, taskId); });
     this.pending.set(key, capture);
     void capture.catch(() => {});
   }
 
   capture(memberId: string, taskId?: string, changedPaths?: string[]): Promise<void> {
+    this.readClock.touch(memberId, taskId);
     const key = JSON.stringify([memberId, taskId ?? null]);
     const active = this.captures.get(key) ?? new Set<Promise<void>>();
     // An older publication can settle after a newer capture. Only the newest
@@ -219,6 +238,7 @@ export class SessionChangeCollector {
       }
       throw error;
     }).finally(() => {
+      this.readClock.touch(memberId, taskId);
       active.delete(work);
       if (!active.size) {
         this.captures.delete(key);

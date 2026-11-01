@@ -23,10 +23,10 @@ import { WorkbenchFeed, mergeSources } from "./feed.js";
 import { aggregateTasks, parseTaskReference, parseSessionReference } from "./task-aggregation.js";
 import { LocalActions } from "./actions.js";
 import { permitted } from "./local.js";
-import {readLocalActivity,readLocalTaskMessageState,withConsoleReadSignal} from "./isolated-queries.js";
+import {readLocalActivity,readLocalAudit,readLocalProjectSessions,readLocalTaskMessageState,withConsoleReadSignal} from "./isolated-queries.js";
 import { readLocalMetadata, readLocalPage, readLocalOverview, readLocalOverviewUsage, readLocalRunSummaries, readLocalSessionTitles, readLocalTaskIndex, readLocalUsage } from "./isolated-queries.js";
 import type {readRunDetail} from "./detail.js";
-import {readSummaryDetail,detailTemporarilyUnavailable} from "./read-summary-detail.js";
+import {readIsolatedRunDetail,readIsolatedArtifact} from "./read-detail.js";
 import type { Query } from "./query.js";
 import type { Run, SourceState, TaskMessageConfirmation } from "./types.js";
 import { WorkbenchError } from "./types.js";
@@ -175,6 +175,22 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
       run:{...detail.run,actions:{...detail.run.actions,complete:confirmation.available&&detail.run.actions.complete===true}}};
   };
   const routeRun = (req: Request) => decode(text(req.params.id));
+  const artifactTarget=(req:Request,part:string)=>{
+    const outer=text(req.params.id),routed=decodeTaskPart(part);
+    const expectedTaskId=parseTaskReference(outer),expectedSessionId=parseSessionReference(outer);
+    if((expectedTaskId||expectedSessionId)&&!routed)
+      throw new WorkbenchError('任务详情引用无效，请重新打开任务',400,'invalid_task_detail_reference','none');
+    const target=routed?decode(routed.run):routeRun(req);
+    if(!expectedTaskId&&!expectedSessionId){
+      const requested=decode(outer);
+      if(requested.node!==target.node||requested.local!==target.local)
+        throw new WorkbenchError('文件或命令引用不属于当前执行',400,'invalid_task_detail_reference','none');
+    }
+    const scope:Record<string,string>={};
+    if(expectedTaskId)scope.expectedTaskId=expectedTaskId;
+    if(expectedSessionId)scope.expectedSessionId=expectedSessionId;
+    return {target,id:routed?.id??part,scope};
+  };
   const rawRunDetail = async (reference: string) => {
     const target = decode(reference);
     return call<Awaited<ReturnType<typeof readRunDetail>>>(target.node, `/workbench/runs/${encodeURIComponent(target.local)}`);
@@ -266,17 +282,20 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
   localGet("/overview", (req) => readLocalOverview(config, search(req).tz || "UTC"));
   localGet("/overview-usage", (req) => readLocalOverviewUsage(config, search(req).tz || "UTC"));
   localGet("/usage", (req) => readLocalUsage(config, search(req)));
-  localGet("/runs/:id", (req) => readSummaryDetail(config, text(req.params.id)));
-  localGet("/runs/:id/files/:file", detailTemporarilyUnavailable);
-  localGet("/runs/:id/patch", detailTemporarilyUnavailable);
-  localGet("/runs/:id/commands/:command", detailTemporarilyUnavailable);
-  localGet("/projects/:id/sessions", () => {
-    throw new WorkbenchError('工作区历史会话暂不可用，请稍后重试；可继续从任务列表查看任务摘要',
-      503,'console_sessions_temporarily_unavailable','none');
-  });
+  localGet("/runs/:id", (req) => readIsolatedRunDetail(config, text(req.params.id),session));
+  localGet("/runs/:id/files/:file",req=>readIsolatedArtifact(config,
+    {kind:'file-diff',runId:text(req.params.id),fileId:text(req.params.file),cursor:text(req.query.cursor)||undefined,
+      expectedTaskId:text(req.query.expectedTaskId)||undefined,expectedSessionId:text(req.query.expectedSessionId)||undefined},session));
+  localGet("/runs/:id/patch",req=>readIsolatedArtifact(config,
+    {kind:'patch',runId:text(req.params.id),cursor:text(req.query.cursor)||undefined,
+      expectedTaskId:text(req.query.expectedTaskId)||undefined,expectedSessionId:text(req.query.expectedSessionId)||undefined},session));
+  localGet("/runs/:id/commands/:command",req=>readIsolatedArtifact(config,
+    {kind:'command-output',runId:text(req.params.id),commandId:text(req.params.command),cursor:text(req.query.cursor)||undefined,
+      expectedTaskId:text(req.query.expectedTaskId)||undefined,expectedSessionId:text(req.query.expectedSessionId)||undefined},session));
+  localGet("/projects/:id/sessions",req=>readLocalProjectSessions(config,text(req.params.id)));
   localGet("/activity", async (req) => {
     const kind = text(req.query.kind);
-    if(kind==="audit")throw new WorkbenchError('审计记录暂不可用，请稍后重试',503,'console_audit_temporarily_unavailable','none');
+    if(kind==="audit")return readLocalAudit(config,{q:text(req.query.q),limit:Math.min(1_000_100,Number(req.query.limit)||100)});
     const query = { limit: Math.min(1_000_100, Number(req.query.limit) || 100), q: text(req.query.q), level: text(req.query.level), hour: text(req.query.hour),after:typeof req.query.after==='string'?req.query.after:undefined,afterId:text(req.query.afterId) };
     const saved = await readLocalActivity(config, kind, query);
     if (kind !== "events" || !runtime) return saved;
@@ -487,18 +506,43 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
   get("/runs", (req) => feed.runs(search(req)));
   get("/usage", (req) => feed.usage(search(req)));
   get("/runs/:id", (req) => aggregateRunDetail(text(req.params.id),search(req).fresh==='1'));
-  // Gate at the controller too: a rolling upgrade must not send these reads to
-  // an older node whose native database work still runs on its Core event loop.
-  get("/runs/:id/files/:file", detailTemporarilyUnavailable);
-  get("/runs/:id/commands/:command", detailTemporarilyUnavailable);
-  get("/runs/:id/patch", detailTemporarilyUnavailable);
-  get("/projects/:id/sessions", () => {
-    throw new WorkbenchError('工作区历史会话暂不可用，请稍后重试；可继续从任务列表查看任务摘要',
-      503,'console_sessions_temporarily_unavailable','none');
+  get("/runs/:id/files/:file", async (req) => {
+    const {target,id:file,scope}=artifactTarget(req,text(req.params.file));
+    const cursor = z.string().max(8192).optional().parse(req.query.cursor);
+    const parameters = new URLSearchParams({...scope,...(cursor === undefined ? {} : { cursor })});
+    return call(target.node, `/workbench/runs/${encodeURIComponent(target.local)}/files/${encodeURIComponent(file)}?${parameters}`);
+  });
+  get("/runs/:id/commands/:command", async (req) => {
+    const {target,id:command,scope}=artifactTarget(req,text(req.params.command));
+    const cursor = z.string().max(8192).optional().parse(req.query.cursor);
+    const parameters = new URLSearchParams({...scope,...(cursor === undefined ? {} : { cursor })});
+    return call(target.node, `/workbench/runs/${encodeURIComponent(target.local)}/commands/${encodeURIComponent(command)}?${parameters}`);
+  });
+  get("/runs/:id/patch", async (req) => {
+    const reference = text(req.params.id);
+    const taskRef = parseTaskReference(reference);
+    if (!taskRef) {
+      const target = routeRun(req);
+      const cursor = z.string().max(8192).optional().parse(req.query.cursor);
+      const parameters = new URLSearchParams(cursor === undefined ? {} : { cursor });
+      return call(target.node, `/workbench/runs/${encodeURIComponent(target.local)}/patch?${parameters}`);
+    }
+    const { phases, complete } = await taskPhases(reference, true);
+    if (!complete) throw new WorkbenchError('部分工作区状态尚未取得，请刷新后再导出补丁',409,'task_incomplete','none');
+    const current = phases.filter((phase) => phase.currentPhase !== false);
+    if (current.length !== 1) throw new WorkbenchError('此任务包含多个当前工作区，请进入具体工作区后导出补丁',409,'cross_workspace_patch_not_supported','none');
+    const target = decode(current[0]!.id);
+    const cursor = z.string().max(8192).optional().parse(req.query.cursor);
+    const parameters = new URLSearchParams({expectedTaskId:taskRef,...(cursor === undefined ? {} : { cursor })});
+    return call(target.node, `/workbench/runs/${encodeURIComponent(target.local)}/patch?${parameters}`);
+  });
+  get("/projects/:id/sessions",async req=>{
+    const target=routeRun(req);
+    const data=await call<Awaited<ReturnType<typeof readLocalProjectSessions>>>(target.node,`/workbench/projects/${encodeURIComponent(target.local)}/sessions`);
+    return feed.projectConversations(data,search(req).fresh==='1');
   });
   get("/activity", async (req) => {
     const query = search(req);
-    if(query.kind==='audit')throw new WorkbenchError('审计记录暂不可用，请稍后重试',503,'console_audit_temporarily_unavailable','none');
     const sources = feed.sources().filter(source => !query.node || source.nodeId === query.node);
     const observed = new Map<string, number>();
     const index = { sources, complete: sources.every((source) => !source.stale) };

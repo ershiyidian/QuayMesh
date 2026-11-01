@@ -20,6 +20,9 @@ import type {
 } from "./types.js";
 import type { SessionStore } from "./store.js";
 import type { SqliteWriteOptions } from "../db/async-write.js";
+import { SessionProjectionReader, type ProjectionReadOptions } from "./projection-reader.js";
+import { projectionIdentity } from "./projection-read-identity.js";
+import { projectionScope, sameProjectionIdentity, sameProjectionCapture } from "./projection-read-protocol.js";
 
 import { mergeExecutionObservations, EXECUTION_OBSERVATION_TTL_MS, type ExecutionObservation } from "../execution-observation.js";
 
@@ -41,6 +44,10 @@ const PAGE_ROWS = 50;
 
 export class SessionProjector {
   private readonly scheduled = new Map<string, Promise<void>>();
+  private readonly reschedule = new Set<string>();
+  private readonly materializing = new Set<Promise<Snapshot>>();
+  private readonly closing = new AbortController();
+  private reader?: SessionProjectionReader;
   private refreshRemoteTask?: (taskId: string, memberId?: string) => Promise<void>;
   private closed = false;
 
@@ -50,6 +57,7 @@ export class SessionProjector {
     private readonly consoleUrl: string | null = null,
     private readonly revertEligibility?: (sessionId: SessionId, memberId: string, taskId?: string) => Promise<ProjectionRevertEligibility>,
     private readonly localNodeId?: string,
+    private readonly readOptions: ProjectionReadOptions = {},
   ) {}
 
   setRemoteTaskRefresher(refresh?: (taskId: string, memberId?: string) => Promise<void>): void {
@@ -107,27 +115,35 @@ export class SessionProjector {
     if (this.closed) return;
     const selectedTask = taskId ?? this.store.currentTask(sessionId)?.id;
     const key = JSON.stringify([sessionId,memberId,selectedTask??null]);
-    if (this.scheduled.has(key)) return;
+    if (this.scheduled.has(key)) { this.reschedule.add(key); return; }
     let observedRevision = -1;
     let successful = false;
-    const pending = Promise.resolve()
+    // Start background observation after the recorded tool result can continue.
+    const pending = new Promise<void>(resolve => setImmediate(resolve))
       .then(() => this.materialize(sessionId, memberId, selectedTask))
       .then(snapshot => { observedRevision=snapshot.rev;successful=true; })
-      .catch(error => { this.store.markProjectionError(sessionId,memberId,error instanceof Error?error.message:String(error)); throw error; })
+      .catch(async error => {
+        if (!this.closed) await this.store.writeAsync(() => this.store.markProjectionError(sessionId,memberId,
+          error instanceof Error?error.message:String(error)),{timeoutMs:250}).catch(()=>{});
+        throw error;
+      })
       .finally(() => {
         this.scheduled.delete(key);
-        const newer=selectedTask ? this.store.getTask(selectedTask).revision>observedRevision : this.hasPendingSnapshot(sessionId,memberId);
-        if (!this.closed && successful && newer) {
-          this.schedule(sessionId, memberId, selectedTask);
-        }
+        const requestedAgain=this.reschedule.delete(key);
+        if (this.closed) return;
+        const newer=successful && (selectedTask ? this.store.getTask(selectedTask).revision>observedRevision : this.hasPendingSnapshot(sessionId,memberId));
+        if (requestedAgain || newer) this.schedule(sessionId,memberId,selectedTask);
       });
     this.scheduled.set(key, pending);
     void pending.catch(()=>{});
   }
 
-  async materialize(sessionId: SessionId, memberId: string, taskId?: string, writeOptions?: SqliteWriteOptions): Promise<Snapshot> {
-    const deadline=writeOptions?Date.now()+(writeOptions.timeoutMs??5000):undefined;
-    writeOptions?.signal?.throwIfAborted();
+  /** Compose saved evidence only. No projection writes, capture, watchdog or live revert check. */
+  readSnapshot(sessionId: SessionId, memberId: string, taskId?: string): Promise<Snapshot> {
+    return this.composeSnapshot(sessionId, memberId, taskId);
+  }
+
+  private async composeSnapshot(sessionId: SessionId, memberId: string, taskId: string | undefined): Promise<Snapshot> {
     const session = this.store.getSession(sessionId);
     const member = this.store.getMember(sessionId, memberId);
     const memberRevisionBefore = member.revision;
@@ -150,15 +166,7 @@ export class SessionProjector {
       ? memberExecutionState(this.store,task.id,member.id,observation!)
       : this.store.taskData.projection(task.id,member.id)?.snapshot.execution_status ?? ExecutionState.idle
       : session.execution_state;
-    const revert = !localMember
-      ? { allowed: false, reason: "remote_member", revision: member.revision }
-      : this.revertEligibility
-      ? await this.revertEligibility(sessionId, memberId, task?.id)
-      : {
-          allowed: files.length > 0 && files.every((file) => file.revertible && file.coverage === "session_owned"),
-          reason: files.length > 0 && files.every((file) => file.revertible && file.coverage === "session_owned") ? null : "not_eligible",
-          revision: member.revision,
-        };
+    const revert = { allowed:false, reason:localMember ? "live_revert_not_observed" : "remote_member", revision:member.revision };
     const notices: string[] = [];
     if (!revert.allowed && revert.reason) notices.push(`Revert unavailable: ${revert.reason}`);
     if(task?.closure_reason==="superseded")notices.push("上一请求已归档，未收到明确交付结果");
@@ -231,17 +239,73 @@ export class SessionProjector {
       },
       notices,
     };
-    const persist=()=>{
-      const current=task?this.store.getTask(task.id):null;
-      const currentTask=current&&this.store.getSession(sessionId).current_task_id===current.id&&current.state==="active";
-      if(task&&current?.revision===revisionBefore)this.store.taskData.putProjection(task.id,memberId,revisionBefore,snapshot);
-      if((!task||currentTask)&&this.store.memberRevision(memberId)===memberRevisionBefore)
-        this.store.putSnapshot(sessionId,memberId,memberRevisionBefore,snapshot);
-    };
-    // 联邦只读请求可取消地等待缓存写锁，其余既有调用保留原有行为。
-    if(writeOptions)await this.store.writeAsync(persist,{...writeOptions,timeoutMs:Math.max(0,deadline!-Date.now())});
-    else persist();
     return snapshot;
+  }
+
+  materialize(sessionId: SessionId, memberId: string, taskId?: string, writeOptions?: SqliteWriteOptions): Promise<Snapshot> {
+    const work=this.materializeReadonly(sessionId,memberId,taskId,writeOptions);
+    this.materializing.add(work);
+    void work.finally(()=>this.materializing.delete(work)).catch(()=>{});
+    return work;
+  }
+
+  private async materializeReadonly(sessionId:SessionId,memberId:string,taskId?:string,writeOptions?:SqliteWriteOptions):Promise<Snapshot> {
+    const timeout=Math.max(0,Math.min(5_000,writeOptions?.timeoutMs??5_000)), deadline=Date.now()+timeout;
+    const expiry=new AbortController();
+    const timer=setTimeout(()=>expiry.abort(),timeout); timer.unref();
+    const signal=AbortSignal.any([this.closing.signal,expiry.signal,...(writeOptions?.signal?[writeOptions.signal]:[])]);
+    const interrupted=()=>Object.assign(new Error('Session projection observation was interrupted; saved evidence is unchanged.'), {
+      code:this.closed?'PROJECTION_CLOSED':writeOptions?.signal?.aborted?'REQUEST_CANCELLED':'REQUEST_TIMEOUT',effect:'not_started',
+    });
+    const changed=()=>Object.assign(new Error('Session evidence changed while projection was being read; refresh before retrying.'), {
+      code:'PROJECTION_CHANGED',effect:'not_started',
+    });
+    try {
+      if(this.closed||signal.aborted||timeout===0)throw interrupted();
+      const identity=projectionIdentity(this.store,sessionId,memberId,taskId);
+      const source=this.readOptions.capture, scope=projectionScope(identity), fence=source?.captureReadFence();
+      const capture=source&&fence?source.captureReadObservation(scope,fence):null;
+      const result=await (this.reader??=new SessionProjectionReader(this.readOptions.report)).read({operation:'session-projection',
+        stateDir:this.stateDir,consoleUrl:this.consoleUrl,localNodeId:this.localNodeId??identity.nodeId,identity,capture},signal);
+      const snapshot=result.snapshot;
+      if(!sameProjectionIdentity(identity,result.identity)||!sameProjectionCapture(capture,result.capture)
+        ||snapshot.sessionId!==sessionId||snapshot.taskId!==identity.taskId
+        ||snapshot.rev!==(identity.taskRevision??identity.memberRevision)||snapshot.changeRev!==identity.memberRevision
+        ||snapshot.workspace?.id!==memberId||snapshot.workspace.node_id!==identity.nodeId
+        ||snapshot.workspace.workspace_id!==identity.workspaceId||snapshot.workspace.root!==identity.root)throw changed();
+      // Retain the optional in-memory policy hook as an additional restriction.
+      // Runtime supplies no hook: all actual eligibility I/O is in the child.
+      if(this.revertEligibility&&(this.localNodeId===undefined||identity.nodeId===this.localNodeId)){
+        const policy=await beforeProjectionAbort(this.revertEligibility(sessionId,memberId,taskId),signal);
+        if(!policy.allowed||policy.revision!==identity.memberRevision){
+          snapshot.capabilities.revert=false;
+          snapshot.notices=snapshot.notices.filter(notice=>!notice.startsWith('Revert unavailable: '));
+          if(policy.reason)snapshot.notices.push(`Revert unavailable: ${policy.reason}`);
+        }
+      }
+      const verify=()=>{
+        if(this.closed||signal.aborted||Date.now()>=deadline)throw interrupted();
+        if(!sameProjectionIdentity(identity,projectionIdentity(this.store,sessionId,memberId,taskId)))throw changed();
+        if(source&&fence&&capture){
+          const current=source.captureReadObservation(scope,fence);
+          if(!capture.unchanged||!current.unchanged||current.generation!==capture.generation
+            ||current.state!==capture.state||current.error!==capture.error)throw changed();
+        }
+      };
+      verify();
+      // Every retry rechecks the same source revision/capture generation under
+      // the write transaction. Failure never replaces the confirmed snapshot.
+      await this.store.writeAsync(()=>{
+        verify();
+        if(!identity.taskId || identity.currentTaskId===identity.taskId && identity.taskState==='active')
+          this.store.putSnapshot(sessionId,memberId,identity.memberRevision,snapshot);
+        else this.store.taskData.putProjection(identity.taskId,memberId,identity.taskRevision!,snapshot);
+      },{...writeOptions,signal,timeoutMs:Math.max(0,deadline-Date.now())});
+      return snapshot;
+    } catch(error) {
+      if(signal.aborted||this.closed)throw interrupted();
+      throw error;
+    } finally {clearTimeout(timer);}
   }
 
   async readTask(taskId: string, sinceRev: number, memberId?: string, cursor?: string): Promise<ProjectionReadResult> {
@@ -482,8 +546,11 @@ export class SessionProjector {
 
   async close(): Promise<void> {
     this.closed = true;
-    await Promise.allSettled([...this.scheduled.values()]);
+    this.closing.abort();
+    this.reader?.close();
+    await Promise.allSettled([...this.scheduled.values(),...this.materializing]);
     this.scheduled.clear();
+    this.reschedule.clear();
   }
 
   private hasPendingSnapshot(sessionId: SessionId, memberId: string): boolean {
@@ -751,4 +818,14 @@ function emptySnapshot(
     capabilities: { refresh: true, revert: false, continue: false, open_file: false },
     notices: ["Snapshot is being prepared."],
   };
+}
+
+/** Await optional policy without allowing it to outlive the publication budget. */
+function beforeProjectionAbort<T>(work:Promise<T>,signal:AbortSignal):Promise<T> {
+  if(signal.aborted)return Promise.reject(signal.reason);
+  return new Promise<T>((resolve,reject)=>{
+    const abort=()=>{signal.removeEventListener('abort',abort);reject(signal.reason);};
+    signal.addEventListener('abort',abort,{once:true});
+    work.then(value=>{signal.removeEventListener('abort',abort);resolve(value);},error=>{signal.removeEventListener('abort',abort);reject(error);});
+  });
 }

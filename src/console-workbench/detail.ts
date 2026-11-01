@@ -3,12 +3,13 @@ import { join } from "node:path";
 import { formatPatch, parsePatch } from "diff";
 import type { ServerConfig } from "../config.js";
 import { WorkLedger } from "../work-ledger.js";
-import { runOperations, runTimeline } from "../console-run-data.js";
+import { runOperations } from "../console-run-data.js";
 import { LocalAgentStore } from "../local-agent-store.js";
 import type { SessionRuntime } from "../session/runtime.js";
 import type { CaptureObservation } from "../session/changes.js";
 import { linkForRun, readLocalIndex, requireRun } from "./local.js";
-import { WorkbenchError, type SourceState } from "./types.js";
+import { WorkbenchError } from "./types.js";
+import { presentRunDetail, type FileRow } from "./detail-presentation.js";
 import { diffPage } from "./diff.js";
 import { readRunCheckpoint } from "../session/run-checkpoints.js";
 
@@ -35,17 +36,6 @@ function checkpointForRun(ledger:WorkLedger,id:string,runtime?:SessionRuntime) {
     ? runtime.store.getTaskSnapshot(link.task_id,link.member_id) : null;
 }
 
-interface FileRow {
-  id: string; path: string; kind: string; add: number | null; del: number | null;
-  generated: boolean; revision: number | string; binary: boolean; revertible: boolean;
-  operationId?: string; fileIndex?: number;
-  source?:{runId:string;nodeId:string;projectName:string;root:string};
-}
-
-const commandState = (value: string) => value === "ok" || value === "completed" ? "done"
-  : value === "fail" || value === "failed" ? "failed" : value === "run" || value === "running" ? "running"
-    : value === "queued" ? "queued" : value === "cancelled" ? "cancelled"
-      : value === "interrupted" || value === "stopped" ? "interrupted" : "unknown";
 
 async function legacyFiles(config: ServerConfig, operations: ReturnType<typeof runOperations>): Promise<FileRow[]> {
   const files: FileRow[] = [];
@@ -110,40 +100,9 @@ export async function readRunDetail(config: ServerConfig, id: string, runtime?: 
     if (changeCaptures.some(capture => capture.state !== "idle")) {
       run.actions = { ...run.actions, review: false, complete: false, patch: false, revert: false };
     }
-    const operationIds = new Set(operations.map((operation) => operation.id));
-    const commands = snapshot ? snapshot.commands.filter((command) => operationIds.has(command.operation_id)).map((command) => ({
-      id: command.id, command: command.cmd, agent: command.agent, status: commandState(command.status),
-      exit: command.exitCode, startedAt: command.startedAt, ms: command.startedAt !== null && command.endedAt !== null ? command.endedAt - command.startedAt : null,
-      outputAvailable: command.output_available, output: "", supersededBy: command.supersededBy,
-    })) : operations.filter((operation) => ["command", "exec_command", "bash"].includes(operation.kind)).map((operation) => ({
-      id: operation.id, command: operation.label, agent: "host", status: commandState(operation.status),
-      exit: null, startedAt: Date.parse(operation.created_at),
-      ms: operation.finished_at ? Date.parse(operation.finished_at) - Date.parse(operation.created_at) : null,
-      outputAvailable: false, output: "此历史记录没有保存可读取的命令输出", supersededBy: null,
-    }));
-    const agentIds = new Set(executions.map((execution) => execution.agent_id));
-    const agentRows = snapshot ? snapshot.agents.filter((agent) => agentIds.has(agent.id)).map((agent) => ({
-      id: agent.id, name: agent.name, role: agent.task, provider: agent.provider,
-      status: agent.state === "working" ? "running" : agent.state,
-      tokens: agent.tokens, quality: agent.usage_quality,
-    })) : [...new Set(executions.map((execution) => execution.agent_id))].map((agentId) => {
-      const agent = agents.getById(agentId);
-      const own = executions.filter((execution) => execution.agent_id === agentId);
-      const latest = own.at(-1)!;
-      return { id: agentId, name: agent?.profileName ?? agentId, role: agent?.taskName ?? "",
-        provider: latest.provider, status: commandState(latest.status),
-        tokens: own.every((execution) => execution.delta !== null) ? own.reduce((sum, execution) => sum + (JSON.parse(execution.delta!).totalTokens ?? 0), 0) : null };
+    return presentRunDetail({ row, run, operations, executions, snapshot, files, warnings, changeCaptures,
+      agentMetadata: id => { const agent = agents.getById(id); return agent ? { name: agent.profileName, role: agent.taskName ?? "" } : undefined; },
     });
-    const summary=row.summary||run.reason||(run.executionStatus==='running'?'任务正在执行':run.executionStatus==='waiting'?'当前没有后台执行，请求尚未结束':'查看下方保存的执行记录');
-    return {
-      run,summary,phases:[{id:run.id,run,summary}],complete:true,sources:[] as SourceState[],missingPhases:[] as Array<{id:string;nodeId:string;error:string}>,
-      evidence: (JSON.parse(row.evidence) as Array<{ label: string; reference: string; outcome: string }>).map((evidence) => ({
-        name: evidence.label, detail: evidence.reference, ok: evidence.outcome === "passed" ? true : evidence.outcome === "failed" ? false : null, time: run.finishedAt,
-      })), files:files.map(file=>({...file,source:{runId:run.id,nodeId:run.nodeId,projectName:run.projectName,root:run.root}})), commands, agents: agentRows,
-      timeline: runTimeline(row, operations, executions).map((event) => ({ time: Date.parse(event.time), text: [event.title, event.detail].filter(Boolean).join(" · "), tone: event.type === "error" ? "red" : "muted" })),
-      instructions: snapshot?.instructions ?? [], skills: snapshot?.skills ?? [],
-      warnings, changeCaptures, revision: row.revision,
-    };
   } finally { agents.close(); ledger.close(); }
 }
 

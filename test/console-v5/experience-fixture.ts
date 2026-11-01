@@ -25,6 +25,12 @@ export async function consoleExperienceFixture(options: { historicalBackground?:
   const second=await call('attach_workspace',{session_id:completed.session_id,path:server.secondRoot});
   const patch=await server.client.callTool({name:'apply_patch',arguments:{workspace_id:second.workspace_id,patch:'*** Begin Patch\n*** Add File: finished.txt\n+真实完成的文件内容\n*** End Patch'},_meta:meta});
   await waitForRecordedTool(server,{sessionId:String(completed.session_id),workspaceId:String(second.workspace_id),conversationId:meta['openai/session'],paths:['finished.txt']},patch);
+  const completedCommand=await server.client.callTool({name:'exec_command',arguments:{
+    workspace_id:second.workspace_id,cmd:`"${process.execPath}" -e "process.stdout.write('finished command\\n')"`,
+    operation_key:'experience-completed-command',yield_time_ms:1000,
+  },_meta:meta});
+  await waitForRecordedTool(server,{sessionId:String(completed.session_id),workspaceId:String(second.workspace_id),
+    conversationId:meta['openai/session'],paths:[]},completedCommand);
   let historicalBackgroundOperationId: string | undefined;
   if(options.historicalBackground) {
     const ledger=new WorkLedger(server.config.stateDir);

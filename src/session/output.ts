@@ -1,3 +1,5 @@
+import { completeUtf8PrefixStart, completeUtf8PrefixEnd, fitUtf8 } from "./output-codec.js";
+export { fitUtf8 } from "./output-codec.js";
 import { EventEmitter } from "node:events";
 import { mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -291,28 +293,4 @@ export class SessionOutputStore {
 function safeName(value: string): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/.test(value)) throw new Error("OUTPUT_ID_INVALID");
   return value;
-}
-function completeUtf8PrefixStart(bytes: Buffer): number {
-  let index = 0;
-  while (index < bytes.length && (bytes[index]! & 0xc0) === 0x80) index++;
-  return index;
-}
-function completeUtf8PrefixEnd(bytes: Buffer): number {
-  if (!bytes.length) return 0;
-  let index = bytes.length - 1;
-  while (index >= 0 && (bytes[index]! & 0xc0) === 0x80) index--;
-  if (index < 0) return 0;
-  const lead = bytes[index]!;
-  const needed = lead < 0x80 ? 1 : lead >= 0xc2 && lead <= 0xdf ? 2 : lead >= 0xe0 && lead <= 0xef ? 3 : lead >= 0xf0 && lead <= 0xf4 ? 4 : 1;
-  return bytes.length - index < needed ? index : bytes.length;
-}
-export function fitUtf8(text: string, maximumBytes: number): string {
-  let size = 0, result = "";
-  for (const point of text) {
-    const bytes = Buffer.byteLength(point);
-    if (size + bytes > maximumBytes && result) break;
-    result += point; size += bytes;
-    if (size >= maximumBytes) break;
-  }
-  return result;
 }

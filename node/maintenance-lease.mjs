@@ -5,15 +5,11 @@ import { spawn } from "node:child_process";
 import { requestJson } from "./network.mjs";
 import { writeJson, readOptionalJson } from "./files.mjs";
 import { restrictedEnvironment } from "./environment.mjs";
+import { installationHistoryPolicy, sameSubjects, sameClaims, retainedHistoryIdentity, assertRetainedHistory } from "./maintenance-history.mjs";
 
 const hash = text => createHash("sha256").update(text).digest("hex");
 const validDigest = value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
-const subjectIdentities = rows => rows.map(({domain,id,generation,fingerprint}) => [domain,id,generation,fingerprint])
-  .sort((a,b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]));
-const sameSubjects = (left, right) => JSON.stringify(subjectIdentities(left)) === JSON.stringify(subjectIdentities(right));
-const claimIdentities = rows => rows.map(({id,operationId,ownerId,ownerPid,processStart,generation,fingerprint}) =>
-  [id,operationId,ownerId,ownerPid,processStart,generation,fingerprint]).sort((a,b)=>a[0].localeCompare(b[0]));
-const sameClaims = (left,right) => JSON.stringify(claimIdentities(left)) === JSON.stringify(claimIdentities(right));
+
 
 export function runMaintenanceProof(manifest, request, timeoutMs = 10000) {
   return new Promise((resolveProof, reject) => {
@@ -72,6 +68,8 @@ function activeCounts(status,claims) {
 }
 
 export async function beginInstallationMaintenance(options) {
+  const policy = installationHistoryPolicy(options.historyPolicy);
+  if (policy === "preserve" && !options.provider) throw new Error("Preserving history requires an explicit external maintenance provider.");
   if (options.provider) return acquireInstallationLease(options);
   // The default is deliberately unchanged. A rejected normal drain never
   // selects the external protocol or gets converted into an idle result.
@@ -85,20 +83,23 @@ export async function beginInstallationMaintenance(options) {
  * after a rejected normal maintenance request. Its callbacks close every
  * relevant entry point and prove the complete physical stop domain. */
 export async function acquireInstallationLease({ provider, manifest, manifestFile, previous, running, token, corePort,
-  proof = runMaintenanceProof }) {
+  proof = runMaintenanceProof, historyPolicy = "prove" }) {
+  const policy = installationHistoryPolicy(historyPolicy);
   if (!provider || ["acquire","assertHeld","release"].some(name => typeof provider[name] !== "function"))
     throw new Error("External maintenance requires acquire/assertHeld/release callbacks.");
   if (running.maintenance || running.installationTransition) throw new Error("Another maintenance operation already owns this node.");
   const health = await requestJson(`http://127.0.0.1:${previous.adminPort}/healthz`, { timeoutMs: 2500 });
   const core = running.components?.find(value => value.id === "core");
   if (!Number.isSafeInteger(health.pid) || health.pid < 1 || !core?.pid) throw new Error("Previous service identity is unavailable.");
-  const baseline = await proof(manifest, { action: "inspect", stateDir: manifest.stateDir, pids: [health.pid, core.pid] });
+  const baseline = await proof(manifest, { action: "inspect", stateDir: manifest.stateDir, pids: [health.pid, core.pid], historyPolicy: policy });
+  const retainedHistory = policy === "preserve" ? retainedHistoryIdentity(baseline) : undefined;
   if (baseline.admission.accepting !== true) throw new Error("Core admission is already owned by another pause.");
   const managerIdentity = baseline.processes.find(value => value.pid === health.pid);
   const coreIdentity = baseline.processes.find(value => value.pid === core.pid);
   if (![managerIdentity,coreIdentity].every(value => value?.alive && value.start)) throw new Error("Previous process generations cannot be verified.");
   const attemptId = randomUUID();
-  const context = Object.freeze({ version: 1, attemptId, nodeId: manifest.nodeId, stateDir: resolve(manifest.stateDir),
+  const context = Object.freeze({ version: policy === "preserve" ? 2 : 1, historyPolicy: policy,
+    ...(retainedHistory ? {retainedHistory} : {}), attemptId, nodeId: manifest.nodeId, stateDir: resolve(manifest.stateDir),
     configFile: manifest.config, manifestFile: resolve(manifestFile), manifestSha256: hash(await readFile(manifestFile)),
     oldCommit: previous.sourceCommit, targetCommit: manifest.sourceCommit, adminPort: previous.adminPort, corePort,
     createdAt: new Date().toISOString(), transitionFile: join(manifest.stateDir,"installation-transition.json"),
@@ -106,12 +107,13 @@ export async function acquireInstallationLease({ provider, manifest, manifestFil
     manager: {pid:managerIdentity.pid,start:managerIdentity.start}, core:{pid:coreIdentity.pid,start:coreIdentity.start},
     components: running.components.map(({id,pid,startedAt,restarts})=>({id,pid,startedAt,restarts})),
   });
-  const receipt = { version: 1, context, phase: "acquiring", stages: [] };
+  const receipt = { version: context.version, context, phase: "acquiring", stages: [] };
   await writeJson(context.receiptFile, receipt);
   let lease;
   try {
     lease = await provider.acquire(context);
-    if (lease?.version !== 1 || lease.attemptId !== attemptId || lease.pause?.reason !== `release-preflight:${attemptId}` ||
+    if (lease?.version !== context.version || installationHistoryPolicy(lease?.historyPolicy) !== policy ||
+        lease.attemptId !== attemptId || lease.pause?.reason !== `release-preflight:${attemptId}` ||
         !Number.isFinite(Date.parse(lease.pause?.changedAt))) throw new Error("External maintenance ownership does not match this attempt.");
     census(lease.census); subjects(lease.subjects); reviewedClaims(lease.claims);
     if (!sameSubjects(lease.subjects, baseline.subjects)) throw new Error("The reviewed historical subjects changed during acquisition.");
@@ -140,7 +142,8 @@ export async function acquireInstallationLease({ provider, manifest, manifestFil
     const check = await provider.assertHeld(lease, stage, context);
     const observed = census(check?.census);
     const snapshot = await proof(manifest, { action: "inspect", stateDir: manifest.stateDir,
-      pids: [context.manager.pid,context.core.pid] });
+      pids: [context.manager.pid,context.core.pid], historyPolicy: policy });
+    if (policy === "preserve") assertRetainedHistory(snapshot,context.retainedHistory);
     if (activeCounts(snapshot.admission,lease.claims??[]) || snapshot.admission.accepting ||
         !sameSubjects(lease.subjects, snapshot.subjects) || !sameClaims(lease.claims??[],reviewedClaims(snapshot.claims)))
       throw new Error(`Maintenance state changed at ${stage}.`);

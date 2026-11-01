@@ -10,6 +10,7 @@ import { restrictedEnvironment } from "./environment.mjs";
 import { packageRoot, installationStartupBudget } from "./app.mjs";
 import { componentPlans } from "./compile.mjs";
 import { beginInstallationMaintenance, runMaintenanceProof } from "./maintenance-lease.mjs";
+import { installationHistoryPolicy } from "./maintenance-history.mjs";
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve,ms));
 const REQUIRED_RELEASE_ENTRIES=["bin","node","dist","schema","skills","package.json","node_modules","components","runtime","release.json","components.lock.json","docs","scripts"];
@@ -327,7 +328,26 @@ export function databaseSnapshot(manifest,target,{stallTimeoutMs=60000,maxTimeou
   });
 }
 
-export async function activateInstallation(manifestFile,{timeoutMs=180000,maintenanceLease}={}) {
+/** A previous binary may reconcile historical rows before it understands the
+ * preserve fence. After any attempted stop, only the verified candidate may be
+ * recovered automatically; a previous binary requires an explicit new review. */
+export async function enforceInstallationRollbackBoundary({manifest,previous,transition,snapshot,current,error,historyPolicy="prove"}) {
+  const policy=installationHistoryPolicy(historyPolicy);
+  const schemaChanged=snapshot&&current.version!==snapshot.version;
+  if(!schemaChanged&&policy!=="preserve")return;
+  await writeJson(join(manifest.stateDir,"installation-transition.json"),{
+    ...transition,sourceCommit:manifest.sourceCommit,previousCommit:previous?.sourceCommit??null,
+    database:snapshot,currentDatabaseVersion:current.version,phase:"recovery_required",error:String(error),
+  });
+  if(schemaChanged)
+    throw new Error(`数据库已从 ${snapshot.version} 升级到 ${current.version}，保留新版数据和备份 ${snapshot.backup}；旧版本无法自动启动，请完成升级恢复。`);
+  throw new Error(`保留历史执行的发行切换失败；保留维护租约、当前数据库和备份 ${snapshot?.backup??"待核对"}，不自动启动未证明支持保留协议的旧发行。`);
+}
+
+export async function activateInstallation(manifestFile,{timeoutMs=180000,maintenanceLease,historyPolicy="prove"}={}) {
+  historyPolicy=installationHistoryPolicy(historyPolicy);
+  if(historyPolicy==="preserve"&&!maintenanceLease)
+    throw new Error("保留历史执行必须显式提供受审维护租约；普通升级不能自动选择该模式");
   const manifest = JSON.parse(await readFile(resolve(manifestFile),"utf8"));
   if (manifest.version!==1) throw new Error("安装记录版本无效");
   const recordFile = join(manifest.configDir,"installation.json");
@@ -352,7 +372,7 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
   try {
     if (running) {
       externalLease=await beginInstallationMaintenance({provider:maintenanceLease,manifest,manifestFile,
-        previous,running,token,corePort:loaded.node.corePort});
+        previous,running,token,corePort:loaded.node.corePort,historyPolicy});
       maintenanceBegun = true;
       await externalLease?.assertHeld("before_backup");
     }
@@ -361,7 +381,9 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
     await externalLease?.assertHeld("after_backup");
     transition={id:externalLease?.context.attemptId??randomUUID(),sourceCommit:manifest.sourceCommit,previousCommit:previous?.sourceCommit??null,
       startedAt:new Date().toISOString(),ownerPid:process.pid,database:snapshot,phase:"validating",
-      ...(externalLease?{maintenanceLease:{attemptId:externalLease.context.attemptId,pause:externalLease.lease.pause,
+      ...(externalLease?{maintenanceLease:{version:externalLease.context.version,historyPolicy,
+        ...(externalLease.context.retainedHistory?{retainedHistory:externalLease.context.retainedHistory}:{}),
+        attemptId:externalLease.context.attemptId,pause:externalLease.lease.pause,
         receiptFile:externalLease.context.receiptFile,manifestSha256:externalLease.context.manifestSha256}}:{})};
     await writeJson(transitionFile,transition);
     if(running){
@@ -373,19 +395,27 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
     await atomicWrite(manifest.config,await readFile(manifest.stagedConfig));
     await registeredService(manifest,true);
     const status = await waitRunning(manifest,token,timeoutMs,{resume:false});
-    if(externalLease?.lease.subjects.length){
+    if(externalLease&&(historyPolicy==="preserve"||externalLease.lease.subjects.length)){
       const newCorePid=status.components.find(value=>value.id==="core").pid;
-      const observed=await runMaintenanceProof(manifest,{action:"inspect",stateDir:manifest.stateDir,pids:[newCorePid]});
+      const observed=await runMaintenanceProof(manifest,{action:"inspect",stateDir:manifest.stateDir,pids:[newCorePid],historyPolicy});
       const core=observed.processes.find(value=>value.pid===newCorePid);
       if(!core?.alive||!core.start)throw new Error("新Core进程代次尚未确认，保留暂停与历史记录");
-      const result=await runMaintenanceProof(manifest,{action:"record",stateDir:manifest.stateDir,
+      const preserving=historyPolicy==="preserve";
+      const review={id:externalLease.context.attemptId,verifiedAt:new Date().toISOString(),
+        evidence:{version:externalLease.context.version,
+          boundary:preserving?"reviewed_installation_service_stop_domain":"reviewed_installation_stop_domain",
+          context:externalLease.context,pause:externalLease.lease.pause,
+          stages:externalLease.receipt.stages,claims:externalLease.lease.claims}};
+      const result=await runMaintenanceProof(manifest,{action:preserving?"verify-retained":"record",historyPolicy,stateDir:manifest.stateDir,
         attemptId:externalLease.context.attemptId,targetCommit:manifest.sourceCommit,core,
         previousProcesses:[externalLease.context.manager,externalLease.context.core],subjects:externalLease.lease.subjects,
-        claims:externalLease.lease.claims,
-        receipt:{id:externalLease.context.attemptId,verifiedAt:new Date().toISOString(),
-          evidence:{version:1,boundary:"reviewed_installation_stop_domain",context:externalLease.context,
-            pause:externalLease.lease.pause,stages:externalLease.receipt.stages,claims:externalLease.lease.claims}}});
-      if(!result.admission.quiescent||result.admission.accepting)throw new Error("历史物理证据写入后新Core仍未排空或暂停所有权丢失");
+        claims:externalLease.lease.claims,...(preserving?{review}:{receipt:review})});
+      if(preserving){
+        if(result.verifiedRetained!==true||result.recorded!==0||result.released!==0||result.admission.accepting||
+            result.retainedSubjects!==externalLease.lease.subjects.length||result.retainedClaims!==(externalLease.lease.claims??[]).length)
+          throw new Error("历史执行或占用未能完整保留，继续保持维护暂停");
+      }else if(!result.admission.quiescent||result.admission.accepting)
+        throw new Error("历史物理证据写入后新Core仍未排空或暂停所有权丢失");
     }
     await writeJson(recordFile,{...manifest,activatedAt:new Date().toISOString(),pid:status.components.find(value=>value.id==="core")?.pid});
     await writeJson(join(manifest.configDir,"previous-installation.json"),previous??null);
@@ -395,7 +425,9 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
       await rm(transitionFile,{force:true});
       await requestJson(`http://127.0.0.1:${manifest.adminPort}/maintenance/resume`,{method:"POST",token,timeoutMs:10000});
     }
-    return {directory:manifest.directory,config:manifest.config,sourceCommit:manifest.sourceCommit,activated:true};
+    return {directory:manifest.directory,config:manifest.config,sourceCommit:manifest.sourceCommit,activated:true,
+      ...(historyPolicy==="preserve"?{historyPolicy,retainedSubjects:externalLease.lease.subjects.length,
+        retainedClaims:(externalLease.lease.claims??[]).length}: {})};
   } catch (error) {
     if(activationCommitted)throw new Error("发行已经验证并提交，恢复准入尚待确认；保留当前服务，请查询管理端状态。",{cause:error});
     if (stopAttempted || stopped || !running) {
@@ -403,11 +435,7 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
         const active = await runningStatus(manifest.adminPort);
         if (active?.nodeId === manifest.nodeId) await stopService(manifest);
         const current=await databaseSnapshot(manifest);
-        if(snapshot && current.version!==snapshot.version){
-          await writeJson(transitionFile,{...transition,sourceCommit:manifest.sourceCommit,previousCommit:previous?.sourceCommit??null,
-            database:snapshot,currentDatabaseVersion:current.version,phase:"recovery_required",error:String(error)});
-          throw new Error(`数据库已从 ${snapshot.version} 升级到 ${current.version}，保留新版数据和备份 ${snapshot.backup}；旧版本无法自动启动，请完成升级恢复。`);
-        }
+        await enforceInstallationRollbackBoundary({manifest,previous,transition,snapshot,current,error,historyPolicy});
         if (oldConfig) await atomicWrite(manifest.config,oldConfig); else await rm(manifest.config,{force:true});
         if (oldUnit) await atomicWrite(manifest.unitFile,oldUnit,0o644);
         if(!externalLease)await rm(transitionFile,{force:true});

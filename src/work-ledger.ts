@@ -96,7 +96,7 @@ export function summarizeExecutions(rows: ExecutionRow[]): UsageSummary {
 /** Work/task accounting is separate from model sessions. No model calls occur here. */
 export class WorkLedger {
   readonly database: DatabaseHandle;
-  constructor(readonly stateDir: string) { this.database = openDatabase(stateDir); }
+  constructor(readonly stateDir: string, database?: DatabaseHandle) { this.database = database ?? openDatabase(stateDir); }
   close(): void { this.database.close(); }
   get db() { return this.database.sqlite; }
 
@@ -871,5 +871,3 @@ export function validateEvidence(value: Evidence[]): Evidence[] {
     !["passed", "failed", "not_run"].includes(entry.outcome))) throw new Error("Invalid bounded acceptance evidence.");
   return value.map(({ label, reference, outcome }) => ({ label, reference, outcome }));
 }
-
-

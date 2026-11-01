@@ -89,6 +89,20 @@ const claimReleaseReason = "reviewed_command_physical_quiescence";
 /** These are identities eligible for external review, not proof of termination.
  * The raw claim count still includes live, unsupported and unidentifiable rows. */
 export function reviewableCommandClaims(db: Database.Database): ReviewedCommandClaim[] {
+  return reviewedCommandClaims(db, false);
+}
+
+/** Preserve-v2 uses the exact v18 migration mapping: these three nullable TEXT
+ * fields were added without defaults or backfill. Fill only absent columns with
+ * NULL before hashing the complete row. No existing value or other column is
+ * omitted; a non-NULL value, retry, owner or any other mutation still fails. */
+export function retainableCommandClaims(db: Database.Database): ReviewedCommandClaim[] {
+  const version = Number(db.prepare("SELECT max(version) FROM qm_schema_migrations").pluck().get());
+  if (!Number.isSafeInteger(version) || version < 16) throw new Error("Preserving claims requires schema version 16 or newer.");
+  return reviewedCommandClaims(db, true);
+}
+
+function reviewedCommandClaims(db: Database.Database, preserveSchema: boolean): ReviewedCommandClaim[] {
   return db.transaction(() => {
     if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_owners'").get()) return [];
     const rows = db.prepare(`SELECT c.* FROM execution_claims c
@@ -104,7 +118,9 @@ export function reviewableCommandClaims(db: Database.Database): ReviewedCommandC
       const subject = quiescenceSubject(db, "operation", operationId);
       return [{ id: String(row.id), operationId, ownerId: String(row.owner_id), ownerPid: owner.owner_pid,
         processStart: owner.process_start!, generation: owner.generation,
-        fingerprint: digest({claim: canonical(row), subject}) }];
+        fingerprint: digest({claim: canonical(preserveSchema ? {
+          execution_id: null, execution_generation: null, owner_process_start: null, ...row,
+        } : row), subject}) }];
     });
   }).deferred();
 }

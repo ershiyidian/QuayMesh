@@ -7,6 +7,7 @@ export class WorkRunReconciler {
   private ledger?: WorkLedger;
   private pending?: Promise<void>;
   private maintenance = new AbortController();
+  private startupPending = false;
 
   constructor(
     private readonly stateDir: string,
@@ -14,12 +15,13 @@ export class WorkRunReconciler {
     private readonly onError: (error: unknown) => void = error => {
       console.error("QuayMesh 执行账本核对失败，将在下一周期重试", error);
     },
+    private readonly allowReconciliation: () => boolean = () => true,
   ) {}
 
   start(): void {
     if (this.timer) return;
     this.maintenance = new AbortController();
-    this.ledger = new WorkLedger(this.stateDir);
+    this.startupPending = true;
     this.startup();
     this.timer = setInterval(() => {
       if (this.pending) return;
@@ -33,6 +35,7 @@ export class WorkRunReconciler {
   }
 
   startup(): void {
+    if (!this.allowReconciliation()) return;
     const ledger = this.ledger ?? new WorkLedger(this.stateDir);
     this.ledger = ledger;
     ledger.reconcileTerminalOperations();
@@ -42,9 +45,12 @@ export class WorkRunReconciler {
     ledger.reconcileDeadExecutionClaims();
     ledger.reconcileStaleRuns();
     ledger.reconcileArchivedTaskRuns();
+    this.startupPending = false;
   }
 
   tick(): void {
+    if (!this.allowReconciliation()) return;
+    if (this.startupPending) { this.startup(); return; }
     const ledger = this.ledger ?? new WorkLedger(this.stateDir);
     this.ledger = ledger;
     ledger.reconcileTerminalOperations();
@@ -57,6 +63,7 @@ export class WorkRunReconciler {
   tickAsync(): Promise<void> {
     if (this.pending) return this.pending;
     if (this.maintenance.signal.aborted) return Promise.resolve();
+    if (!this.allowReconciliation()) return Promise.resolve();
     const ledger = this.ledger ?? new WorkLedger(this.stateDir);
     this.ledger = ledger;
     const pending = runSqliteWrite(ledger.db, () => this.tick(), { signal: this.maintenance.signal })

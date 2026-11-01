@@ -12,6 +12,7 @@ import { currentOperationEvents } from "../session/activity.js";
 import { savedOperationStatus, operationStatusBatch } from "../session/operation-status.js";
 import { observationBudget } from "../observation-budget.js";
 import { recoverWorkspaceClaim, recoverWorkspaceOperation } from "../execution-claim-control.js";
+import type { StatusOperationRow } from "../session/status-read-protocol.js";
 
 const id = z.string().min(1).max(256);
 const fileSelectionSchema = z.object({
@@ -85,6 +86,22 @@ export function registerWorkspaceContextTool({ server, config, workspaces, proce
         });
         return jsonReply(operationStatusBatch(results,results.some(result=>"error" in result),input.workspace_id,input.task_id));
       }
+      if (!input.operation_id) {
+        if (!observation || !member) throw new Error("MISSING_OPERATION_CONTEXT");
+        const budget = observationBudget("workspace_context",input,extra as {signal?:AbortSignal;_meta?:unknown});
+        try {
+          const saved = await sessionRuntime.statusReader.read({ownerId:observation.owner_id,
+            sessionId:observation.session_id,memberId:observation.member_id,workspaceId:workspace.id,root:member.root,
+            ...(observation.task_id ? {taskId:observation.task_id} : {}),limit:input.limit ?? 10},budget.signal);
+          // Runtime handles are local, live observations for the bounded result
+          // only. An absent handle says nothing about physical completion.
+          const operations = saved.operations.map(row => {
+            const handle = processSessions.findOperation(row.operation_id)?.session_id;
+            return {...row,...(handle === undefined ? {} : {process_handle:handle})};
+          });
+          return jsonReply({...saved,operations});
+        } finally {budget.dispose();}
+      }
       return jsonReply(await statusReply(sessionRuntime, processSessions, workspace, input.operation_id, input.limit, input.offset));
     }
     if (input.action === "recovery") {
@@ -148,26 +165,11 @@ export function registerWorkspaceContextTool({ server, config, workspaces, proce
   });
 }
 
-type StatusOperationRow = {
-  operation_id: string;
-  kind: string;
-  label: string;
-  state: string;
-  effect: string;
-  created_at: string;
-  finished_at: string | null;
-  process_handle?: string;
-  agent_id?: string;
-  result_ref?: string;
-  outcome: string;
-  error?: { code: string; message: string; next_action: string };
-};
-
 async function statusReply(
   runtime: NonNullable<ToolRegistrationContext["sessionRuntime"]>,
   processSessions: ToolRegistrationContext["processSessions"],
   workspace: { id: string; root: string },
-  operationId?: string,
+  operationId: string,
   limit = 10,
   offset = 0,
 ): Promise<Record<string, unknown>> {
@@ -184,7 +186,7 @@ async function statusReply(
       processHandle:processSessions.findOperation(operationId)?.session_id});
     if (saved) return saved;
   }
-  const events = operationId ? runtime.store.eventsForOperation(operationId,session.id,member.id) : runtime.store.eventsForSession(session.id);
+  const events = runtime.store.eventsForOperation(operationId,session.id,member.id);
   const byOperation = new Map<string, StatusOperationRow>();
   for (const event of currentOperationEvents(events)) {
     if (event.member_id !== member.id) continue;

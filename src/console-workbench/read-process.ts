@@ -7,8 +7,8 @@ import { CONSOLE_READ_OPERATIONS,CONSOLE_READ_BUSINESS_ERRORS } from './read-pro
 export const CONSOLE_READ_TIMEOUT_MS = 5_000;
 export const CONSOLE_READ_REQUEST_BYTES = 64 * 1024;
 export const CONSOLE_READ_RESULT_BYTES = 8 * 1024 * 1024;
-const MAX_ACTIVE = 1;
 const MAX_QUEUED = 8;
+const IDLE_READER_MS = 30_000;
 
 export class ConsoleReadError extends Error {
   readonly status:number;
@@ -26,6 +26,7 @@ export class ConsoleReadError extends Error {
 }
 
 interface ReadJob {
+  id: number;
   input: string;
   resolve: (value: unknown) => void;
   reject: (error: ConsoleReadError) => void;
@@ -39,35 +40,46 @@ interface ReadJob {
   result: string;
   finishReported: boolean;
 }
+interface Reader {
+  child: ChildProcessWithoutNullStreams;
+  closing: boolean;
+  chunks: Buffer[];
+  bytes: number;
+  idle?: ReturnType<typeof setTimeout>;
+}
 
 export interface ConsoleReadDiagnostic {
   event: 'console_read'; phase: 'start'|'finish'|'timeout'; route: string;
   childPid: number|null; elapsedMs: number; result: string;
 }
 
-/** Dedicated Console reader capacity. Each child handles one request and exits;
- * no execution command, shell, SQL text, module path or credentials enter it. */
+/** One owned, sequential reader with bounded waiting capacity. Reusing its
+ * module cache avoids a cold SQLite/schema import for each healthy read. Native
+ * work is still stopped by terminating this process, never by Promise.race. */
 export class ConsoleReadProcessPool {
   private readonly queue: ReadJob[] = [];
-  private readonly active = new Set<ReadJob>();
+  private active: ReadJob | null = null;
+  private reader?: Reader;
   private closed = false;
+  private sequence = 0;
   constructor(private readonly worker = new URL('./read-worker.js', import.meta.url),
     private readonly timeoutMs = CONSOLE_READ_TIMEOUT_MS,
     private readonly report:(event:ConsoleReadDiagnostic)=>void = event=>console.info(JSON.stringify(event))) {}
 
   read<T>(request: unknown, signal?: AbortSignal): Promise<T> {
     if (this.closed || signal?.aborted) return Promise.reject(new ConsoleReadError('console_read_aborted'));
-    if (this.active.size >= MAX_ACTIVE && this.queue.length >= MAX_QUEUED)
-      return Promise.reject(new ConsoleReadError('console_read_busy'));
+    if (this.queue.length >= MAX_QUEUED) return Promise.reject(new ConsoleReadError('console_read_busy'));
+    if(!Number.isSafeInteger(this.sequence+1))return Promise.reject(new ConsoleReadError('console_read_failed'));
+    const id=++this.sequence;
     let input: string;
-    try { input = JSON.stringify(request); }
+    try { input = JSON.stringify({id,request}); }
     catch { return Promise.reject(new ConsoleReadError('console_read_invalid')); }
     if (typeof input !== 'string' || Buffer.byteLength(input) > CONSOLE_READ_REQUEST_BYTES)
       return Promise.reject(new ConsoleReadError('console_read_too_large'));
     return new Promise<T>((resolve, reject) => {
       const operation=(request as {operation?:unknown}|null)?.operation;
       const route=CONSOLE_READ_OPERATIONS.includes(operation as typeof CONSOLE_READ_OPERATIONS[number])?String(operation):'unknown';
-      const job: ReadJob = { input, resolve: value => resolve(value as T), reject, done: false,
+      const job: ReadJob = { id,input, resolve: value => resolve(value as T), reject, done: false,
         route,createdAt:performance.now(),result:'pending',finishReported:false,
         deadline: setTimeout(() => this.fail(job, 'console_read_timeout'), this.timeoutMs), signal };
       job.abort = () => this.fail(job, 'console_read_aborted');
@@ -78,7 +90,9 @@ export class ConsoleReadProcessPool {
 
   close(): void {
     this.closed = true;
-    for (const job of [...this.queue, ...this.active]) this.fail(job, 'console_read_aborted');
+    for (const job of [...this.queue]) this.fail(job, 'console_read_aborted');
+    if(this.active)this.fail(this.active,'console_read_aborted');
+    if(this.reader)this.stopReader(this.reader);
   }
 
   private settle(job: ReadJob, error?: string, value?: unknown): void {
@@ -97,72 +111,101 @@ export class ConsoleReadProcessPool {
   }
 
   private fail(job: ReadJob, code: string): void {
-    if(!job.done&&code==='console_read_timeout'){job.result=code;this.diagnostic(job,'timeout');}
+    if(job.done)return;
+    if(code==='console_read_timeout'){job.result=code;this.diagnostic(job,'timeout');}
     this.settle(job, code);
-    // The ChildProcess handle belongs only to this read. Never kill a process
-    // group, Core, a task, a host job, or a PID supplied in a request.
-    if (job.child && job.child.exitCode === null && job.child.signalCode === null) job.child.kill('SIGKILL');
-    // Keep the slot occupied until the OS confirms child close. A stuck native
-    // call cannot turn repeated timeouts into unlimited replacement processes.
+    if(this.active===job&&this.reader)this.stopReader(this.reader);
+    // A killed native query retains its capacity slot until OS close. Never
+    // start replacements just because its public Promise has already rejected.
     this.drain();
   }
 
-  private drain(): void {
-    while (!this.closed && this.active.size < MAX_ACTIVE && this.queue.length) {
-      const job = this.queue.shift()!;
-      if (job.done) continue;
-      this.active.add(job);
-      this.start(job);
+  private stopReader(reader:Reader):void {
+    if(reader.closing)return;
+    reader.closing=true;clearTimeout(reader.idle);
+    if(reader.child.exitCode===null&&reader.child.signalCode===null)reader.child.kill('SIGKILL');
+  }
+
+  private reference(reader:Reader,active:boolean):void {
+    if(active)reader.child.ref();else reader.child.unref();
+    // Spawned pipe streams expose public ref/unref on supported Node platforms.
+    // Idle readers must not keep a CLI/test process alive after its work ends.
+    for(const stream of [reader.child.stdin,reader.child.stdout,reader.child.stderr]) {
+      const handle=stream as typeof stream & {ref?:()=>void;unref?:()=>void};
+      if(active)handle.ref?.();else handle.unref?.();
     }
   }
 
-  private start(job: ReadJob): void {
+  private drain(): void {
+    if(this.closed||this.active||this.reader?.closing)return;
+    const job=this.queue.shift();
+    if(!job){
+      if(this.reader&&!this.reader.idle){
+        const reader=this.reader;this.reference(reader,false);
+        reader.idle=setTimeout(()=>this.stopReader(reader),IDLE_READER_MS);reader.idle.unref();
+      }
+      return;
+    }
+    if(job.done){this.drain();return;}
+    this.active=job;
+    let reader:Reader;
+    try{reader=this.reader??this.spawnReader();}
+    catch{this.active=null;this.settle(job,'console_read_failed');this.drain();return;}
+    clearTimeout(reader.idle);reader.idle=undefined;this.reference(reader,true);
+    job.child=reader.child;this.diagnostic(job,'start');
+    reader.child.stdin.write(job.input+'\n',error=>{if(error&&this.active===job)this.fail(job,'console_read_failed');});
+  }
+
+  private spawnReader():Reader {
     const env: NodeJS.ProcessEnv = {};
-    // Preserve OS runtime locations only. In particular no NODE_OPTIONS,
-    // QUAYMESH_*, cloud key, proxy credential, or model token is inherited.
     for (const key of Object.keys(process.env)) if (/^(PATH|PATHEXT|SYSTEMROOT|WINDIR|TEMP|TMP|TMPDIR|HOME|USERPROFILE|LOCALAPPDATA|APPDATA|HOMEDRIVE|HOMEPATH|LANG|LC_ALL|TZ)$/i.test(key))
       env[key] = process.env[key];
-    let child: ChildProcessWithoutNullStreams;
-    try {
-      // Source-run tests use the same compiled reader produced by the normal
-      // build; never inherit a loader/debugger/NODE_OPTIONS into a child.
-      const worker=!existsSync(this.worker)&&import.meta.url.endsWith('.ts')&&this.worker.href===new URL('./read-worker.js',import.meta.url).href
-        ? new URL('../../dist/console-workbench/read-worker.js',import.meta.url) : this.worker;
-      child = spawn(process.execPath, ['--max-old-space-size=192', fileURLToPath(worker)],
-        {env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe']});
-      job.child = child;
-      this.diagnostic(job,'start');
-    } catch {
-      this.active.delete(job); this.settle(job, 'console_read_failed'); this.drain(); return;
-    }
-    let bytes = 0;
-    const chunks: Buffer[] = [];
-    child.stdout.on('data', (chunk: Buffer) => {
-      if (job.done) return;
-      bytes += chunk.length;
-      if (bytes > CONSOLE_READ_RESULT_BYTES) { this.fail(job, 'console_read_too_large'); return; }
-      chunks.push(chunk);
-    });
-    // Import/native errors may contain paths or data. They never become a
-    // Console response or a parent log; only fixed error codes are returned.
+    const worker=!existsSync(this.worker)&&import.meta.url.endsWith('.ts')&&this.worker.href===new URL('./read-worker.js',import.meta.url).href
+      ? new URL('../../dist/console-workbench/read-worker.js',import.meta.url) : this.worker;
+    const child=spawn(process.execPath,['--max-old-space-size=192',fileURLToPath(worker)],
+      {env,windowsHide:true,stdio:['pipe','pipe','pipe']});
+    const reader:Reader={child,closing:false,chunks:[],bytes:0};this.reader=reader;
+    child.stdout.on('data',(chunk:Buffer)=>this.receive(reader,chunk));
     (child.stderr as Readable).resume();
-    child.stdin.on('error', () => this.fail(job, 'console_read_failed'));
-    child.on('error', () => this.fail(job, 'console_read_failed'));
-    child.on('close', code => {
-      this.active.delete(job);
-      if (!job.done) {
-        try {
-          if (code !== 0) throw new Error();
-          const response = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {ok?: boolean; value?: unknown; code?: string};
-          if (response.ok !== true) this.settle(job,
-            response.code === 'console_read_too_large'||typeof response.code==='string'&&Object.hasOwn(CONSOLE_READ_BUSINESS_ERRORS,response.code)
-              ? response.code : 'console_read_failed');
-          else this.settle(job, undefined, response.value);
-        } catch { this.settle(job, 'console_read_failed'); }
-      }
-      this.diagnostic(job,'finish');
-      this.drain();
+    const failed=()=>{
+      if(this.reader!==reader)return;
+      if(this.active)this.fail(this.active,'console_read_failed');
+      else this.stopReader(reader);
+    };
+    child.stdin.on('error',failed);child.on('error',failed);
+    child.on('close',()=>{
+      clearTimeout(reader.idle);
+      if(this.reader!==reader)return;
+      const job=this.active;
+      if(job){this.settle(job,'console_read_failed');this.diagnostic(job,'finish');}
+      this.active=null;this.reader=undefined;this.drain();
     });
-    child.stdin.end(job.input);
+    return reader;
+  }
+
+  private receive(reader:Reader,chunk:Buffer):void {
+    if(this.reader!==reader||reader.closing)return;
+    const job=this.active;
+    if(!job){this.stopReader(reader);return;}
+    const newline=chunk.indexOf(10);
+    // There is exactly one in-flight request. A second/unsolicited frame cannot
+    // belong to the next job, which has not been sent yet.
+    if(newline>=0&&newline!==chunk.length-1){this.fail(job,'console_read_failed');return;}
+    const part=newline<0?chunk:chunk.subarray(0,newline);
+    reader.bytes+=part.length;
+    if(reader.bytes>CONSOLE_READ_RESULT_BYTES){this.fail(job,'console_read_too_large');return;}
+    reader.chunks.push(part);
+    if(newline<0)return;
+    try{
+      const response=JSON.parse(Buffer.concat(reader.chunks).toString('utf8')) as {id?:unknown;ok?:boolean;value?:unknown;code?:string};
+      if(response.id!==job.id)throw new Error('unexpected_frame');
+      reader.chunks=[];reader.bytes=0;
+      if(response.ok===true&&Object.hasOwn(response,'value'))this.settle(job,undefined,response.value);
+      else if(response.ok===false)this.settle(job,
+        response.code==='console_read_too_large'||typeof response.code==='string'&&Object.hasOwn(CONSOLE_READ_BUSINESS_ERRORS,response.code)
+          ?response.code:'console_read_failed');
+      else throw new Error('invalid_frame');
+      this.diagnostic(job,'finish');this.active=null;this.drain();
+    }catch{this.fail(job,'console_read_failed');}
   }
 }

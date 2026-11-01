@@ -72,6 +72,7 @@ export interface Preferences {
 }
 export interface CacheEntry<T = unknown> {
   data: T | null; time: number; error: Error & { code?: string } | null; loading: boolean;
+  retained?: {data:T;time:number}; receivedAt?:number;
   retryAt?: number; ctl?: AbortController; promise?: Promise<unknown> | null;
   startedAt?: number; duration?: number; failures?: number;
 }

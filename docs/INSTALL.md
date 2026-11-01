@@ -135,7 +135,9 @@ The backup uses a fixed read snapshot so background bookkeeping cannot restart t
 
 When the recorded backup requires a schema upgrade to the matching target release, Core startup receives 30 seconds plus the actual backup size at 4 MiB/s, capped at 30 minutes. Activation adds the unchanged 60-second stability check and 30 seconds for service startup. Ordinary startup, reinstalls without a schema change, downgrades, and recovery markers retain the normal 30-second Core deadline. Node status reports the selected startup budget.
 
-Rollback is automatic only while the database schema remains compatible. If a failed upgrade has changed the schema, the installer preserves the new database, backup, and transition record instead of starting an incompatible previous binary. Check the recorded backup and every process using the state directory before restoring data. Existing command pipes, PTYs, and model streams remain owned by their original processes; upgrade waits for them to finish.
+For the default `prove` policy, rollback is automatic only while the database schema remains compatible. If a failed upgrade has changed the schema, the installer preserves the new database, backup, and transition record instead of starting an incompatible previous binary. Check the recorded backup and every process using the state directory before restoring data. Existing command pipes, PTYs, and model streams remain owned by their original processes; upgrade waits for them to finish.
+
+With `historyPolicy: "preserve"`, activation requires a reviewed external maintenance provider and retains unresolved execution history and claims without declaring them physically complete or idle. After any stop attempt, failure keeps `recovery_required`, the database, backup, and lease; it does not automatically start the previous binary even when the schema is compatible. Review the retained state and current process identities before further recovery. See [upgrading while preserving unresolved history](operations/PRESERVE-HISTORY-UPGRADES.md).
 
 When initiating a Windows upgrade from a QuayMesh command, prepare the release first, then start the independent activation task:
 

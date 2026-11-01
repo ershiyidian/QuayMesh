@@ -23,15 +23,19 @@ export function databasePath(stateDir: string): string {
 let readonlyProcess = false;
 export function useReadonlyDatabases(): void { readonlyProcess = true; }
 
+/** Explicit readonly entry for query models. Never migrate, mkdir, chmod or
+ * change journal mode, including when called outside the dedicated worker. */
+export function openReadonlyDatabase(stateDir: string): DatabaseHandle {
+  const sqlite = new Database(databasePath(stateDir), {readonly: true, fileMustExist: true, timeout: 1000});
+  try {
+    sqlite.pragma("query_only = ON");
+    sqlite.pragma("foreign_keys = ON");
+    return {sqlite, db: createDrizzleDatabase(sqlite), close: () => sqlite.close()};
+  } catch (error) { sqlite.close(); throw error; }
+}
+
 export function openDatabase(stateDir: string): DatabaseHandle {
-  if (readonlyProcess) {
-    const sqlite = new Database(databasePath(stateDir), {readonly: true, fileMustExist: true, timeout: 1000});
-    try {
-      sqlite.pragma("query_only = ON");
-      sqlite.pragma("foreign_keys = ON");
-      return {sqlite, db: createDrizzleDatabase(sqlite), close: () => sqlite.close()};
-    } catch (error) { sqlite.close(); throw error; }
-  }
+  if (readonlyProcess) return openReadonlyDatabase(stateDir);
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   chmodSync(stateDir, 0o700);
   const path = databasePath(stateDir);
