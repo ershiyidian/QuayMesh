@@ -1,4 +1,5 @@
 import {readWorkbenchMetadata} from "./metadata.js";
+import {isolatedConsoleReadPath,isolatedReadUpgradeRequired,READ_UPGRADE_MESSAGE} from "./isolated-routes.js";
 import { randomUUID } from "node:crypto";
 import type { ServerConfig } from "../config.js";
 import { withTaskLifecycle,activeExecution,observeSourceStates,type TaskLifecycle } from '../console-task-state.js';
@@ -9,7 +10,7 @@ import { mapConcurrent } from "../concurrency.js";
 import { parseWorkspaceHandle } from "../federation/routing.js";
 import { sampleHealth } from "../federation/health.js";
 import { capabilities, capabilityLabels } from "../federation/capabilities.js";
-import { readLocalMetadata, readLocalOverviewUsage, readLocalRunSummaries, readLocalSessionTitles, readLocalTaskIndex, readLocalUsage } from "./local-queries.js";
+import { readLocalMetadata, readLocalOverviewUsage, readLocalRunSummaries, readLocalSessionTitles, readLocalTaskIndex, readLocalUsage } from "./isolated-queries.js";
 import { decodeBoundary, pageCursor } from "./run-query.js";
 import { dayAt, mergeTotals, type Query } from "./query.js";
 import { aggregateTaskIndex, aggregateTasks, applyRunTitles, applyTaskTitles, compareTaskIndex, fallbackTask, taskOnlyIndex, filterTaskIndex, resolveSessionTitles, taskKey, taskStage, type TaskIndex } from "./task-aggregation.js";
@@ -49,9 +50,14 @@ export class WorkbenchFeed {
 
   async call<T>(nodeId: string, path: string, body?: unknown): Promise<T> {
     if (!this.runtime) throw new WorkbenchError("当前未启用节点转发", 503, "federation_unavailable");
+    // Never send read traffic to an older synchronous Console route. A missing
+    // versioned endpoint is an upgrade requirement, not evidence of node death.
+    const target=body===undefined?isolatedConsoleReadPath(path):path;
     // The read transport supports a bounded retry window. Five seconds was
     // shorter than healthy Desktop reads after Modern Standby (6–10 seconds).
-    const reply = await this.runtime.request<ConsoleReply>(nodeId, "console", { method: body === undefined ? "GET" : "POST", path, body }, body === undefined ? 30_000 : undefined);
+    const reply = await this.runtime.request<ConsoleReply>(nodeId, "console", { method: body === undefined ? "GET" : "POST", path:target, body }, body === undefined ? 30_000 : undefined);
+    if(isolatedReadUpgradeRequired(target,reply.status,reply.body))
+      throw new WorkbenchError(READ_UPGRADE_MESSAGE,503,'node_read_upgrade_required','none');
     if (reply.status >= 400) {
       const error = reply.body as { message?: string; code?: string; effect?: WorkbenchError["effect"] } | null;
       throw new WorkbenchError(error?.message || "节点操作失败", reply.status, error?.code || "node_operation_failed", error?.effect ?? "unknown");
@@ -413,7 +419,7 @@ export class WorkbenchFeed {
 
   private async relatedRuns(identity:{taskId?:string;sessionId?:string},fresh=false) {
     const known=identity.taskId?[...this.cache.entries()].filter(([key])=>key.endsWith(':/workbench/session-titles'))
-      .flatMap(([,cached])=>{const value=cached.data as ReturnType<typeof readLocalSessionTitles>|null;
+      .flatMap(([,cached])=>{const value=cached.data as Awaited<ReturnType<typeof readLocalSessionTitles>>|null;
         return (value?.tasks??[]).filter(task=>task.id===identity.taskId).map(task=>({task,authoritative:value!.authoritative}));})
       .sort((a,b)=>Number(b.authoritative)-Number(a.authoritative)||b.task.revision-a.task.revision)[0]?.task:undefined;
     const [titles,index]=await Promise.all([
@@ -540,7 +546,7 @@ export class WorkbenchFeed {
     const short = (node: NodeView) => node.id === "desktop" ? "PC" : node.capabilities.coordinator ? "HUB" : node.nickname.slice(0, 3);
     const ingress = this.config.console?.mcpIngress;
     return { nodes: nodes.map((node) => {
-      const saved = this.cache.get(node.id + ":/workbench/metadata")?.data as ReturnType<typeof readLocalMetadata> | undefined;
+      const saved = this.cache.get(node.id + ":/workbench/metadata")?.data as Awaited<ReturnType<typeof readLocalMetadata>> | undefined;
       const settings = saved?.settings, health = node.health, egress = node.egress, GiB = 1024 ** 3;
       return { id: node.id, short: short(node), name: settings?.nickname ?? node.nickname,
         os: node.platform === "win32" ? "windows" : node.platform, role: capabilityLabels(node.capabilities).join(" · "), capabilities: node.capabilities, components: node.components ?? [], discovery: node.discovery ?? null, online: node.online,

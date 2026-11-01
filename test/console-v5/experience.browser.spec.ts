@@ -268,6 +268,34 @@ test('详情部分读取不把未知显示为零，消息确认后自动收敛',
   const completedReads=reads;await page.clock.fastForward(46_000);expect(reads).toBe(completedReads);
 });
 
+test('部分详情空态保留未知语义并禁用需要完整证据的操作',async({page})=>{
+  await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
+  const reference='qmtask:'+f.waiting.task_id,base=await f.get('runs/'+encodeURIComponent(reference)+'?fresh=1');
+  const partial={...base,complete:false,files:[],commands:[],agents:[],evidence:[],timeline:[],instructions:[],skills:[],
+    changeCaptures:[],run:{...base.run,actions:{...base.run.actions,review:false,complete:false,revert:false,patch:false}},
+    missingPhases:[{id:base.run.id,nodeId:base.run.nodeId,error:'完整记录尚未读取',pending:true}],
+    sources:[{nodeId:base.run.nodeId,name:'任务记录',online:true,observedAt:null,state:'loading',stale:false,error:null}]};
+  await page.route(url=>url.pathname.endsWith('/api/v4/runs/'+encodeURIComponent(reference)),route=>route.fulfill({json:partial}));
+  await login(page,f.server.baseUrl,'tasks');
+  await page.goto(f.server.baseUrl+'/console/#/tasks?days=0&scope=all&run='+encodeURIComponent(reference)+'&tab=diff');
+  await expect(page.locator('#inspector h2')).toHaveText(base.run.title);
+  await expect(page.locator('#inspector [data-action=detail-tab] .count')).toHaveCount(0);
+  await expect(page.locator('#inspector [data-action=finish-task],#inspector [data-action=single-accept],#inspector [data-action=single-reject],#inspector [data-action=patch],#inspector [data-action=revert]')).toHaveCount(0);
+  for(const tab of ['diff','commands','agents']){
+    await page.locator('#inspector [data-action=detail-tab][data-value='+tab+']').click();
+    await expect(page.locator('#inspector .empty h3')).toHaveText('任务详情尚未完整确认');
+    await expect(page.locator('#inspector .empty')).not.toContainText('暂无');
+  }
+  await page.locator('#inspector [data-action=detail-tab][data-value=context]').click();
+  await expect(page.locator('#inspector')).toContainText('项目指令尚未完整读取');
+  await expect(page.locator('#inspector')).toContainText('技能记录尚未完整读取');
+  await expect(page.locator('#inspector')).not.toContainText('未发现项目指令');
+  await expect(page.locator('#inspector')).not.toContainText('未发现技能');
+  await page.setViewportSize({width:390,height:844});
+  await page.screenshot({path:screenshots+'/partial-detail-context-narrow.png',fullPage:true});
+  expect(await page.locator('#inspector').evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
+});
+
 test('总览首次失败继续显示独立节点与已读任务，恢复后再显示完整统计',async({page})=>{
   await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
   let failed=true,overviewReads=0;

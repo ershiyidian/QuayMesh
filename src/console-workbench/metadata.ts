@@ -1,11 +1,11 @@
 import type {ServerConfig} from '../config.js';
 import type {FederationRuntime} from '../federation/runtime.js';
 import {rootHandle,workspaceHandle} from '../federation/routing.js';
-import {readLocalMetadata} from './local-queries.js';
+import {readLocalMetadata} from './isolated-queries.js';
 
 // 编辑表单读取持久配置及其版本；运行配置可能仍等待空闲时应用。
 export async function readWorkbenchMetadata(config:ServerConfig,runtime?:FederationRuntime) {
-  const metadata=readLocalMetadata(config);
+  const metadata=await readLocalMetadata(config);
   if(!runtime||!metadata.settings)return metadata;
   const node=config.federation?.nodeId??'local';
   try{

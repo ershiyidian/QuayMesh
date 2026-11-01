@@ -1,3 +1,5 @@
+import {ConsoleReadError} from "./read-process.js";
+import {isolatedConsoleReadPath,isolatedReadUpgradeRequired,READ_UPGRADE_MESSAGE} from "./isolated-routes.js";
 import {readWorkbenchMetadata} from "./metadata.js";
 import type { Request, Response, Router } from "express";
 import * as z from "zod/v4";
@@ -20,9 +22,11 @@ import { mapConcurrent } from "../concurrency.js";
 import { WorkbenchFeed, mergeSources } from "./feed.js";
 import { aggregateTasks, parseTaskReference, parseSessionReference } from "./task-aggregation.js";
 import { LocalActions } from "./actions.js";
-import { readLocalActivity, permitted } from "./local.js";
-import { readLocalMetadata, readLocalPage, readLocalOverview, readLocalOverviewUsage, readLocalRunSummaries, readLocalSessionTitles, readLocalTaskIndex, readLocalUsage } from "./local-queries.js";
-import { readRunDetail, readFileDiff, readRunPatch, readCommandOutput, textPage } from "./detail.js";
+import { permitted } from "./local.js";
+import {readLocalActivity,readLocalTaskMessageState,withConsoleReadSignal} from "./isolated-queries.js";
+import { readLocalMetadata, readLocalPage, readLocalOverview, readLocalOverviewUsage, readLocalRunSummaries, readLocalSessionTitles, readLocalTaskIndex, readLocalUsage } from "./isolated-queries.js";
+import type {readRunDetail} from "./detail.js";
+import {readSummaryDetail,detailTemporarilyUnavailable} from "./read-summary-detail.js";
 import type { Query } from "./query.js";
 import type { Run, SourceState, TaskMessageConfirmation } from "./types.js";
 import { WorkbenchError } from "./types.js";
@@ -67,15 +71,25 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
   const actions = new LocalActions(config, session, processSessions);
   const receipts = new WriteReceipts(config.stateDir);
   const localId = config.federation?.nodeId ?? "local";
-  const safe = (fn: (req: Request) => unknown | Promise<unknown>) => async (req: Request, res: Response) => {
-    try { res.json(await fn(req)); }
+  const safe = (fn: (req: Request) => unknown | Promise<unknown>, isolatedRead=false) => async (req: Request, res: Response) => {
+    const controller=isolatedRead?new AbortController():null;
+    const cancel=()=>{if(!res.writableFinished)controller?.abort();};
+    if(controller){req.once?.('aborted',cancel);res.once?.('close',cancel);}
+    try { res.json(await (controller?withConsoleReadSignal(controller.signal,()=>fn(req)):fn(req))); }
     catch (error) {
-      const status = error instanceof WorkbenchError ? error.status : error instanceof z.ZodError ? 422 : 500;
-      res.status(status).json({ code: error instanceof WorkbenchError ? error.code : error instanceof z.ZodError ? "invalid_input" : "console_read_failed",
+      const status = (error instanceof WorkbenchError || error instanceof ConsoleReadError) ? error.status : error instanceof z.ZodError ? 422 : 500;
+      res.status(status).json({ code: (error instanceof WorkbenchError || error instanceof ConsoleReadError) ? error.code : error instanceof z.ZodError ? "invalid_input" : "console_read_failed",
         message: error instanceof Error ? error.message : String(error),effect:error instanceof z.ZodError?"none":writeEffect(error) });
     }
+    finally{if(controller){req.off?.('aborted',cancel);res.off?.('close',cancel);}}
   };
-  const localGet = (path: string, fn: (req: Request) => unknown | Promise<unknown>) => operations.get(`/api/workbench${path}`, safe(fn));
+  // Node-local reads do not own the shared controller cache. Only these reads
+  // inherit request abort; feed refresh jobs retain their hard query deadline.
+  const localGet = (path: string, fn: (req: Request) => unknown | Promise<unknown>) => {
+    const oldPath=`/workbench${path}`,isolated=isolatedConsoleReadPath(oldPath);
+    operations.get(`/api${oldPath}`,safe(fn,true));
+    if(isolated!==oldPath)operations.get(`/api${isolated}`,safe(fn,true));
+  };
   const recorded = (scope: string, fn: (req: Request) => unknown | Promise<unknown>) => (req: Request) => {
     const requestKey = key.parse(req.body?.requestKey);
     const target = req.body?.id ?? req.body?.projectId ?? req.body?.previewId ?? "";
@@ -98,7 +112,10 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
   };
   const call = async <T>(node: string, path: string, body?: unknown): Promise<T> => {
     if (node !== localId) return feed.call<T>(node, path, body);
-    const reply = await operations.dispatch(body === undefined ? "GET" : "POST", path, body);
+    const target=body===undefined?isolatedConsoleReadPath(path):path;
+    const reply = await operations.dispatch(body === undefined ? "GET" : "POST", target, body);
+    if(isolatedReadUpgradeRequired(target,reply.status,reply.body))
+      throw new WorkbenchError(READ_UPGRADE_MESSAGE,503,'node_read_upgrade_required','none');
     if (reply.status >= 400) {
       const error = reply.body as { message?: string; code?: string; effect?:WorkbenchError["effect"] };
       throw new WorkbenchError(error.message || "操作失败", reply.status, error.code || "operation_failed",error.effect??"unknown");
@@ -249,16 +266,19 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
   localGet("/overview", (req) => readLocalOverview(config, search(req).tz || "UTC"));
   localGet("/overview-usage", (req) => readLocalOverviewUsage(config, search(req).tz || "UTC"));
   localGet("/usage", (req) => readLocalUsage(config, search(req)));
-  localGet("/runs/:id", (req) => readRunDetail(config, text(req.params.id), session));
-  localGet("/runs/:id/files/:file", (req) => readFileDiff(config, text(req.params.id), text(req.params.file), text(req.query.cursor) || undefined, session));
-  localGet("/runs/:id/patch", (req) => readRunPatch(config, text(req.params.id), text(req.query.cursor) || undefined, session));
-  localGet("/runs/:id/commands/:command", (req) => readCommandOutput(config, text(req.params.id), text(req.params.command), text(req.query.cursor) || undefined, session));
-  localGet("/projects/:id/sessions", (req) => actions.sessions(text(req.params.id)));
-  localGet("/activity", (req) => {
+  localGet("/runs/:id", (req) => readSummaryDetail(config, text(req.params.id)));
+  localGet("/runs/:id/files/:file", detailTemporarilyUnavailable);
+  localGet("/runs/:id/patch", detailTemporarilyUnavailable);
+  localGet("/runs/:id/commands/:command", detailTemporarilyUnavailable);
+  localGet("/projects/:id/sessions", () => {
+    throw new WorkbenchError('工作区历史会话暂不可用，请稍后重试；可继续从任务列表查看任务摘要',
+      503,'console_sessions_temporarily_unavailable','none');
+  });
+  localGet("/activity", async (req) => {
     const kind = text(req.query.kind);
-    if(kind==="audit")return actions.audit.page({q:text(req.query.q),limit:Math.min(1_000_100,Number(req.query.limit)||100),offset:0});
+    if(kind==="audit")throw new WorkbenchError('审计记录暂不可用，请稍后重试',503,'console_audit_temporarily_unavailable','none');
     const query = { limit: Math.min(1_000_100, Number(req.query.limit) || 100), q: text(req.query.q), level: text(req.query.level), hour: text(req.query.hour),after:typeof req.query.after==='string'?req.query.after:undefined,afterId:text(req.query.afterId) };
-    const saved = readLocalActivity(config, kind, query);
+    const saved = await readLocalActivity(config, kind, query);
     if (kind !== "events" || !runtime) return saved;
     const recent = (runtime.status().events as Array<{ time: string; kind: string; message: string; nodeId?: string }>).map((event) => ({
       id: `network:${localId}:${createHash('sha256').update(JSON.stringify(event)).digest('hex')}`, time: Date.parse(event.time),
@@ -275,8 +295,10 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
   });
 
   localGet('/tasks/:id/messages-state',req=>{
-    const { task } = consoleTask(id.parse(req.params.id));
-    return { available: true as const, ownerNodeId: localId, observedAt: Date.now(), ...session!.store.taskMessageState(task.id) };
+    if(taskAuthority()!==localId||config.federation?.enabled&&!config.federation.capabilities.coordinator)
+      throw new WorkbenchError('任务消息和结束操作必须由配置的 Coordinator 确认',503,'task_authority_required','none');
+    if(!session)throw new WorkbenchError('当前节点没有任务生命周期服务',503,'task_service_unavailable','none');
+    return readLocalTaskMessageState(config,id.parse(req.params.id));
   });
   localPost('/tasks/finish',async req=>{
     const input=z.object({taskId:id,expectedTaskRevision:revision,messageSequence:z.number().int().nonnegative().optional(),
@@ -465,47 +487,18 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
   get("/runs", (req) => feed.runs(search(req)));
   get("/usage", (req) => feed.usage(search(req)));
   get("/runs/:id", (req) => aggregateRunDetail(text(req.params.id),search(req).fresh==='1'));
-  get("/runs/:id/files/:file", async (req) => {
-    const routed = decodeTaskPart(text(req.params.file));
-    const target = routed ? decode(routed.run) : routeRun(req);
-    const file = routed?.id ?? text(req.params.file);
-    const cursor = z.string().max(8192).optional().parse(req.query.cursor);
-    const parameters = new URLSearchParams(cursor === undefined ? {} : { cursor });
-    return call(target.node, `/workbench/runs/${encodeURIComponent(target.local)}/files/${encodeURIComponent(file)}?${parameters}`);
-  });
-  get("/runs/:id/commands/:command", async (req) => {
-    const routed = decodeTaskPart(text(req.params.command));
-    const target = routed ? decode(routed.run) : routeRun(req);
-    const command = routed?.id ?? text(req.params.command);
-    const cursor = z.string().max(8192).optional().parse(req.query.cursor);
-    const parameters = new URLSearchParams(cursor === undefined ? {} : { cursor });
-    return call(target.node, `/workbench/runs/${encodeURIComponent(target.local)}/commands/${encodeURIComponent(command)}?${parameters}`);
-  });
-  get("/runs/:id/patch", async (req) => {
-    const reference = text(req.params.id);
-    const taskRef = parseTaskReference(reference);
-    if (!taskRef) {
-      const target = routeRun(req);
-      const cursor = z.string().max(8192).optional().parse(req.query.cursor);
-      const parameters = new URLSearchParams(cursor === undefined ? {} : { cursor });
-      return call(target.node, `/workbench/runs/${encodeURIComponent(target.local)}/patch?${parameters}`);
-    }
-    const { phases, complete } = await taskPhases(reference, true);
-    if (!complete) throw new WorkbenchError('部分工作区状态尚未取得，请刷新后再导出补丁',409,'task_incomplete','none');
-    const current = phases.filter((phase) => phase.currentPhase !== false);
-    if (current.length !== 1) throw new WorkbenchError('此任务包含多个当前工作区，请进入具体工作区后导出补丁',409,'cross_workspace_patch_not_supported','none');
-    const target = decode(current[0]!.id);
-    const cursor = z.string().max(8192).optional().parse(req.query.cursor);
-    const parameters = new URLSearchParams(cursor === undefined ? {} : { cursor });
-    return call(target.node, `/workbench/runs/${encodeURIComponent(target.local)}/patch?${parameters}`);
-  });
-  get("/projects/:id/sessions", async (req) => {
-    const target = routeRun(req);
-    const data=await call<ReturnType<LocalActions['sessions']>>(target.node, `/workbench/projects/${encodeURIComponent(target.local)}/sessions`);
-    return feed.projectConversations(data,search(req).fresh==='1');
+  // Gate at the controller too: a rolling upgrade must not send these reads to
+  // an older node whose native database work still runs on its Core event loop.
+  get("/runs/:id/files/:file", detailTemporarilyUnavailable);
+  get("/runs/:id/commands/:command", detailTemporarilyUnavailable);
+  get("/runs/:id/patch", detailTemporarilyUnavailable);
+  get("/projects/:id/sessions", () => {
+    throw new WorkbenchError('工作区历史会话暂不可用，请稍后重试；可继续从任务列表查看任务摘要',
+      503,'console_sessions_temporarily_unavailable','none');
   });
   get("/activity", async (req) => {
     const query = search(req);
+    if(query.kind==='audit')throw new WorkbenchError('审计记录暂不可用，请稍后重试',503,'console_audit_temporarily_unavailable','none');
     const sources = feed.sources().filter(source => !query.node || source.nodeId === query.node);
     const observed = new Map<string, number>();
     const index = { sources, complete: sources.every((source) => !source.stale) };
@@ -730,7 +723,10 @@ function decodeTaskPart(value: string): { run: string; id: string } | null {
 }
 
 function mergeTaskDetails(task: Run, phases: RoutedTaskDetail[], observation:{complete:boolean;sources:SourceState[];missing:Array<{id:string;nodeId:string;error:string;pending?:boolean}>}): RunDetail {
-  const confirmed=observation.complete&&observation.sources.every(source=>source.online&&source.state==='ready'&&!source.stale&&!source.error);
+  const complete=observation.complete&&phases.every(({detail})=>detail.complete);
+  const missing=uniqueBy([...observation.missing,...phases.flatMap(({phase,detail})=>detail.complete?[]:
+    detail.missingPhases.length?detail.missingPhases:[{id:phase,nodeId:detail.run.nodeId,error:'阶段记录尚未完整读取',pending:true}])],value=>value.id);
+  const confirmed=complete&&observation.sources.every(source=>source.online&&source.state==='ready'&&!source.stale&&!source.error);
   const currentRefs = new Set(task.currentPhaseRefs ?? task.phaseRefs ?? phases.map((item) => item.phase));
   const current = phases.filter((item) => currentRefs.has(item.phase));
   const singleCurrentPhase = current.length === 1;
@@ -774,7 +770,7 @@ function mergeTaskDetails(task: Run, phases: RoutedTaskDetail[], observation:{co
     summary,
     changeCaptures,
     phases:phases.map(({phase,detail})=>({id:phase,run:detail.run,summary:detail.summary})),
-    complete:observation.complete,sources:observation.sources,missingPhases:observation.missing,
+    complete,sources:observation.sources,missingPhases:missing,
     evidence,
     files,
     commands,

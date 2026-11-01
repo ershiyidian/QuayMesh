@@ -134,49 +134,99 @@ export class ComponentSupervisor extends EventEmitter {
       if (value.child !== child) return;
       value.stableSince=null; value.probeError=error.message;
       value.state = value.lastReadyAt ? "degraded" : "starting"; value.error = error.message;
-    } finally { value.observedAt = Date.now(); }
+    } finally { if (value.child === child) value.observedAt = Date.now(); }
   }
   spawnComponent(value) {
     const { plan } = value;
     value.state = "starting"; value.error = null; value.startedAt = Date.now(); value.lastReadyAt = null;
     value.stableSince=null; value.probeError=null;
-    const log = new RollingLog(join(this.logDir, `${plan.id}.log`));
-    value.log = log;
-    log.on("error", error => { value.error = `日志写入失败：${error.message}`; this.emit("fault", error); });
+    // A surviving descendant can keep an exited generation's stdio open.
+    // Share one rolling writer until all generations using it have closed.
+    let log = value.log;
+    if (!log || log.destroyed || log.writableEnded) {
+      log = new RollingLog(join(this.logDir, `${plan.id}.log`));
+      log.users = 0; value.log = log; value.logClosed = undefined;
+      log.on("error", error => {
+        if (value.log === log) value.error = `日志写入失败：${error.message}`;
+        this.emit("fault", error);
+      });
+    }
+    log.users++;
     const child = spawn(plan.command, plan.args || [], { cwd:plan.cwd, env:plan.env,
       stdio:["ignore","pipe","pipe"], shell:false, windowsHide:true, detached:process.platform !== "win32" });
     value.child = child; value.spawned = false;
-    child.once("spawn", () => { value.spawned = true; });
+    child.once("spawn", () => { if (value.child === child) value.spawned = true; });
     child.stdout.pipe(log, { end:false }); child.stderr.pipe(log, { end:false });
-    child.once("error", error => { value.error = error.message; });
-    value.closed = new Promise(resolve => child.once("close", (code, signal) => {
-      value.child = null; value.spawned = false;
-      value.lastExitCode=code; value.lastExitSignal=signal; value.lastExitAt=Date.now(); value.stableSince=null;
-      log.end();
-      value.logClosed = finished(log).catch(error => { value.error = error.message; this.emit("fault", error); });
-      if (value.stopping || this.stopped) value.state = "stopped";
-      else {
-        value.failures = Date.now() - value.startedAt >= 60000 ? 1 : value.failures + 1;
-        value.restarts++;
-        value.error = `${plan.id} 已退出，code=${code} signal=${signal || "none"}${value.error ? `；此前：${value.error}` : ""}`;
-        value.state = "backoff";
-        value.nextStartAt = Date.now() + Math.min(30000, 500 * 2 ** Math.min(value.failures - 1, 6));
+    let exited = false, resolveExit;
+    value.exited = new Promise(resolve => { resolveExit = resolve; });
+    const recordExit = (code, signal) => {
+      if (exited) return;
+      exited = true;
+      if (value.child === child) {
+        value.child = null; value.spawned = false;
+        value.lastExitCode=code; value.lastExitSignal=signal; value.lastExitAt=Date.now(); value.stableSince=null;
+        if (value.stopping || this.stopped) value.state = "stopped";
+        else {
+          value.failures = Date.now() - value.startedAt >= 60000 ? 1 : value.failures + 1;
+          value.restarts++;
+          value.error = `${plan.id} 已退出，code=${code} signal=${signal || "none"}${value.error ? `；此前：${value.error}` : ""}`;
+          value.state = "backoff";
+          value.nextStartAt = Date.now() + Math.min(30000, 500 * 2 ** Math.min(value.failures - 1, 6));
+        }
+        this.emit("change", this.snapshot());
       }
-      this.emit("change", this.snapshot()); resolve();
+      resolveExit();
+    };
+    child.once("exit", recordExit);
+    child.once("error", error => {
+      if (value.child === child) value.error = error.message;
+      // Failed spawn has no OS process and emits error/close, but no exit.
+      if (!child.pid) recordExit(null, null);
+    });
+    value.closed = new Promise(resolve => child.once("close", () => {
+      if (--log.users === 0 && (this.stopped || value.removed)) this.finishLog(value, log);
+      resolve();
     }));
+  }
+  finishLog(value, log) {
+    if (log.drained) return log.drained;
+    log.end();
+    log.drained = finished(log).catch(error => {
+      if (value.log === log) value.error = error.message;
+      this.emit("fault", error);
+    });
+    if (value.log === log) value.logClosed = log.drained;
+    return log.drained;
+  }
+  async drainLog(log, closed) {
+    if (!log) return;
+    let timer;
+    try {
+      await Promise.race([Promise.resolve(closed).then(() => log.drained ?? new Promise(resolve => {
+        // A zero-byte write is a barrier behind all already-piped output. Keep
+        // the writer open across replacements, including inherited old pipes.
+        if (log.destroyed) resolve(); else log.write(Buffer.alloc(0), () => resolve());
+      })), new Promise(resolve => { timer = setTimeout(resolve, 250); })]);
+    } finally { clearTimeout(timer); }
   }
   async stopComponent(id) {
     const value = this.components.get(id);
     if (!value) throw new Error(`未知组件 ${id}`);
     value.stopping = true;
     const child = value.child;
-    if (!child) { await value.logClosed; value.state = "stopped"; value.stopping = false; return; }
+    const log = value.log, closed = value.closed;
+    if (!child) {
+      if (log?.users === 0 && (this.stopped || value.removed)) this.finishLog(value, log);
+      await this.drainLog(log, closed);
+      value.state = "stopped"; value.stopping = false; return;
+    }
+    const exited = value.exited;
     let timer;
     try {
       if (value.plan.stop) await value.plan.stop(child);
       else child.kill("SIGTERM");
       timer = setTimeout(() => {
-        if (value.child !== child) return;
+        if (value.child !== child || child.exitCode !== null || child.signalCode !== null) return;
         if (process.platform === "win32") {
           const killer = spawn("taskkill.exe", ["/PID",String(child.pid),"/T","/F"], { windowsHide:true, stdio:"ignore" });
           killer.once("error", error => this.emit("fault", error));
@@ -186,7 +236,11 @@ export class ComponentSupervisor extends EventEmitter {
         }
       }, this.shutdownMs);
       timer.unref();
-      await value.closed; await value.logClosed;
+      // OS exit ends supervision of this process. Waiting for inherited stdio
+      // here would later kill live descendants even though the parent is gone.
+      await exited;
+      clearTimeout(timer);
+      await this.drainLog(log, closed);
     } finally { clearTimeout(timer); value.stopping = false; }
     value.state = "stopped";
   }
@@ -223,7 +277,11 @@ export class ComponentSupervisor extends EventEmitter {
       await Promise.all([...this.checks.values()]);
       const order = validatePlans([...this.components.values()].map(value => value.plan)).reverse();
       for (const id of order) if (changed.has(id)) await this.stopComponent(id);
-      for (const id of this.components.keys()) if (!plans.some(plan => plan.id === id)) this.components.delete(id);
+      for (const id of this.components.keys()) if (!plans.some(plan => plan.id === id)) {
+        const value = this.components.get(id); value.removed = true;
+        if (value.log?.users === 0) this.finishLog(value, value.log);
+        this.components.delete(id);
+      }
       for (const plan of plans) {
         const current = this.components.get(plan.id);
         if (!current) this.components.set(plan.id, component(plan));
