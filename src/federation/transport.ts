@@ -62,6 +62,7 @@ const MAX_LARGE_FRAMES = 8;
 const FRAME_TRANSFER_TIMEOUT_MS = 30_000;
 const FRAME_SERVICE = "$frame.v1";
 const FEATURES = "frame-stream-v1";
+const STREAM_ERROR_HEADER = "x-quaymesh-stream-error";
 
 function progressNotification(value: unknown): PeerProgressNotification | undefined {
   if (!value || typeof value !== "object") return;
@@ -472,12 +473,31 @@ export class PeerTransport extends EventEmitter {
     if (typeof reverseId === "string") {
       const pending = this.streams.get(reverseId);
       if (!pending || pending.link !== link) { stream.respond({ ":status": 404 }); stream.end(); return; }
-      this.streams.delete(reverseId); clearTimeout(pending.timer);
       stream.respond({ ":status": 200 }); pending.resolve(stream); return;
     }
     const service = headers["x-quaymesh-service"];
     const metadata = this.decodeMetadata(headers["x-quaymesh-metadata"]);
     if (typeof service !== "string") { stream.respond({ ":status": 400 }); stream.end(); return; }
+    if (service === "artifact.read") {
+      // Open the source under its read claim before acknowledging the body.
+      // A reset after an optimistic 200 can surface only as Premature close.
+      try {
+        await this.receiveStream(link, service, metadata, stream);
+        if (!stream.headersSent && !stream.destroyed) stream.respond({ ":status": 200 });
+      } catch (error) {
+        if (stream.headersSent || stream.destroyed) throw error;
+        const envelope = peerError(error);
+        envelope.message = envelope.message.slice(0, 1024);
+        if (Buffer.byteLength(JSON.stringify(envelope)) > 8192 && envelope.details) {
+          // Headers are bounded; keep blocker identities if resource lists are large.
+          envelope.details = Object.fromEntries(Object.entries(envelope.details)
+            .filter(([key]) => ["claim_id", "operationId", "executionId", "taskId", "operation_id", "owner_node_id", "task_id", "type"].includes(key)));
+        }
+        stream.respond({ ":status": 409, [STREAM_ERROR_HEADER]: Buffer.from(JSON.stringify(envelope)).toString("base64url") });
+        stream.end();
+      }
+      return;
+    }
     stream.respond({ ":status": 200 });
     await this.receiveStream(link, service, metadata, stream);
   }
@@ -564,22 +584,31 @@ export class PeerTransport extends EventEmitter {
     if (signal?.aborted) throw interruptedStream("传输流等待已取消");
     if (link.client) return this.requestStream(link, service, metadata, undefined, signal);
     const id = randomUUID();
+    let accepted: Duplex | undefined;
+    let sourceReady = service !== "artifact.read";
+    let ready: (() => void) | undefined;
     const stream = new Promise<Duplex>((resolve, reject) => {
       let settled = false;
       const finish = (error?: Error, value?: Duplex) => {
         if (settled) { value?.destroy(); return; }
         settled = true; clearTimeout(timer); signal?.removeEventListener("abort", aborted); this.streams.delete(id);
-        error ? reject(error) : resolve(value!);
+        if (error) { accepted?.destroy(); reject(error); }
+        else resolve(value!);
       };
       const aborted = () => finish(interruptedStream("传输流等待已取消"));
       const timer = setTimeout(() => finish(new NodeUnavailableError(link.peerId, "建立传输流超时")), 10_000);
       timer.unref();
-      this.streams.set(id, { link, resolve: value => finish(undefined,value), reject: error => finish(error), timer });
+      ready = () => { if (sourceReady) return; sourceReady = true; if (accepted) finish(undefined, accepted); };
+      this.streams.set(id, { link, resolve: value => {
+        if (accepted) { value.destroy(); return; }
+        accepted = value;
+        if (sourceReady) finish(undefined, value);
+      }, reject: error => finish(error), timer });
       signal?.addEventListener("abort", aborted, {once:true});
       if (signal?.aborted) aborted();
     });
     // Register the receiving slot BEFORE asking the remote client to open it.
-    void link.call("$openStream", { id, service, metadata }, 10_000, undefined, signal).catch((error) => {
+    void link.call("$openStream", { id, service, metadata }, 10_000, undefined, signal).then(() => ready?.()).catch((error) => {
       const pending = this.streams.get(id); if (pending) { clearTimeout(pending.timer); this.streams.delete(id); pending.reject(error); }
     });
     return stream;
@@ -605,7 +634,18 @@ export class PeerTransport extends EventEmitter {
       stream.on("error", error => finish(interruptedStream("传输流在响应头前出错", error)));
       stream.once("aborted", () => finish(interruptedStream("传输流在响应头前被取消")));
       stream.once("response", (headers) => {
-        finish(headers[":status"] !== 200 ? new Error(`传输流被拒绝 (${headers[":status"]})`) : undefined);
+        if (headers[":status"] === 200) { finish(); return; }
+        const encoded = headers[STREAM_ERROR_HEADER];
+        if (typeof encoded === "string" && encoded.length <= 32 * 1024) {
+          try {
+            const value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+            if (!value || typeof value.message !== "string") throw new Error("Invalid stream error envelope");
+            const envelope = peerError(value);
+            finish(new PeerApplicationError(link.peerId,
+              envelope.code === "EXECUTION_CONFLICT" ? envelope.message : value.message.slice(0, 8192), envelope.code, envelope)); return;
+          } catch {}
+        }
+        finish(new Error(`传输流被拒绝 (${headers[":status"]})`));
       });
       stream.once("close", () => finish(interruptedStream(`传输流在响应头前关闭 (rstCode=${stream.rstCode})`)));
     });
@@ -613,7 +653,13 @@ export class PeerTransport extends EventEmitter {
   async openReverse(link: PeerLink, params: { id: string; service: string; metadata: unknown }, signal?: AbortSignal): Promise<void> {
     if (!link.client) throw new Error("反向传输需要主动连接");
     const stream = await this.requestStream(link, params.service, params.metadata, params.id, signal);
-    void this.receiveStream(link, params.service, params.metadata, stream).catch((error) => stream.destroy(error));
+    const receiving = this.receiveStream(link, params.service, params.metadata, stream);
+    if (params.service === "artifact.read") {
+      // The existing RPC acknowledges source admission, not full body delivery.
+      // Frame streams must retain their independent handshake to avoid deadlock.
+      try { await receiving; }
+      catch (error) { stream.destroy(error instanceof Error ? error : new Error(String(error))); throw error; }
+    } else void receiving.catch((error) => stream.destroy(error));
   }
   private async receiveStream(link: PeerLink, service: string, metadata: unknown, stream: Duplex): Promise<void> {
     if (service !== FRAME_SERVICE) { await this.onStream(service, metadata, stream, link.peerId); return; }

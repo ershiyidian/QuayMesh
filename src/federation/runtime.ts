@@ -723,6 +723,7 @@ export class FederationRuntime extends EventEmitter {
       this.trackStream(stream,lease);
       try {
         const file=await lease.run(()=>this.hooks.artifactRead(metadata));
+        if (stream.destroyed) { file.destroy(); return; }
         file.on("error",error=>stream.destroy(error));stream.on("close",()=>file.destroy());file.pipe(stream);
       } catch(error) { lease.release();throw error; }
       return;
@@ -846,7 +847,9 @@ export class FederationRuntime extends EventEmitter {
         } finally {source.destroy();}
         outcome="completed";
       } catch(error) {
-        failure=error instanceof Error?error.message:String(error);
+        failure=error instanceof PeerApplicationError
+          ? `${error.code ?? "NODE_OPERATION_FAILED"} (${error.nodeId}): ${error.message}${error.details ? " " + JSON.stringify(error.details) : ""}`
+          : error instanceof Error?error.message:String(error);
         outcome=controller.signal.aborted?"cancelled":"failed";
       } finally {
         // Do not publish a terminal transfer until its operation receipt has
