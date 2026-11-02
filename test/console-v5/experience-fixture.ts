@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {createRealTestServer,structured,waitForRecordedTool} from '../session-card/server-fixture.js';
+import {createRealTestServer,structured,waitForFixture,waitForRecordedTool} from '../session-card/server-fixture.js';
 import {openDatabase} from '../../src/db/client.js';
 import {SessionChangeCollector} from '../../src/session/changes.js';
 import {SessionStore} from '../../src/session/store.js';
@@ -46,6 +46,17 @@ export async function consoleExperienceFixture(options: { historicalBackground?:
       ledger.endOperation(historicalBackgroundOperationId,'completed');
     } finally {ledger.close();}
   }
+  const completionLedger=new WorkLedger(server.config.stateDir);
+  try {
+    const store=new SessionStore(completionLedger.db),taskId=String(completed.task_id);
+    // A terminal command receipt can precede its accepted capture tail. Wait
+    // for this fixture's Task work to settle before asking the real finalizer.
+    await waitForFixture(server,{sessionId:String(completed.session_id)},'completed fixture Task settles',async()=>({
+      activeRuns:store.runIdsForTask(taskId).filter(id=>completionLedger.hasActiveChild(id)).length,
+      activeWork:(completionLedger.db.prepare('SELECT COUNT(*) AS n FROM qm_runtime_work WHERE task_id=? AND blocking=1')
+        .get(taskId) as {n:number}).n,
+    }),value=>value.activeRuns===0&&value.activeWork===0);
+  }finally{completionLedger.close();}
   await call('finish_task',{task_id:completed.task_id,status:'completed',summary:'文件已经写入'});
   const completedSelection=await call('task_resume',{action:'inspect',task_id:completed.task_id});
   const waiting=await call('start_session',{title:'等待下一步的工作',request_key:'experience-wait',new_goal:true,

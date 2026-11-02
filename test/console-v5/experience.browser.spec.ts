@@ -598,12 +598,17 @@ test('Task首页保留历史展开与焦点，当前任务入口使用相同分�
 test('首页只观察任务来源，命令面板按需读取完整工作区目录',async({page})=>{
   await page.clock.install();
   await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
-  const snapshot=await f.get('overview?fresh=1'),directory=await f.get('projects?fresh=1'),requests:string[]=[];
+  const snapshot=await f.get('overview?fresh=1'),directory=await f.get('projects?fresh=1'),requests:string[]=[],usageRequests:string[]=[];
   expect(directory.items.length).toBeGreaterThan(0);
-  expect(snapshot).not.toHaveProperty('usageSources');
-  expect(snapshot).not.toHaveProperty('todayUsage');
+  expect(snapshot.usageSources).toEqual([]);
+  expect(snapshot.todayUsage).toEqual({available:false,total:null,input:null,cached:null,output:null,reasoning:null});
+  expect(snapshot.coverage.usage).toBe(false);
   await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>route.fulfill({json:snapshot}));
-  page.on('request',request=>{if(new URL(request.url()).pathname.endsWith('/api/v4/projects'))requests.push(request.url());});
+  page.on('request',request=>{
+    const path=new URL(request.url()).pathname;
+    if(path.endsWith('/api/v4/projects'))requests.push(request.url());
+    if(path.endsWith('/api/v4/usage'))usageRequests.push(request.url());
+  });
   let reads=0;
   await page.route(url=>url.pathname.endsWith('/api/v4/projects'),route=>{
     reads++;
@@ -613,6 +618,7 @@ test('首页只观察任务来源，命令面板按需读取完整工作区目�
   await expect(page.locator('#global-notice .notice')).toHaveCount(0);
   await expect(page.locator('.overview-current')).not.toContainText('状态待更新');
   expect(requests).toHaveLength(0);
+  expect(usageRequests).toHaveLength(0);
   await page.locator('#topbar [data-action=palette]').click();
   const palette=page.getByRole('dialog',{name:'搜索与命令面板'});
   await palette.getByLabel('搜索命令').fill(directory.items[0].name);
@@ -635,6 +641,7 @@ test('首页只观察任务来源，命令面板按需读取完整工作区目�
   expect(requests.length).toBeGreaterThanOrEqual(3);
   await palette.getByLabel('搜索命令').press('Escape');
   await expect(palette).toHaveCount(0);
+  expect(usageRequests).toHaveLength(0);
 });
 
 test('当前任务失效后保留记录，空态紧凑且今日完成按Task结果查询',async({page})=>{
