@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { CaptureReadClock, type CaptureReadFence, type CaptureReadObservation, type CaptureReadScope } from "./capture-read-observation.js";
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
@@ -10,7 +10,7 @@ import { isPathInsideRoot } from "../roots.js";
 import { resolvePhysicalPath, samePhysicalPath } from "../physical-paths.js";
 import { textPage } from "../bounded-reply.js";
 import type { FileSummary, SessionId, SessionMember } from "./types.js";
-import type { SessionStore } from "./store.js";
+import type { CapturedChangeSet, SessionStore } from "./store.js";
 import { beginWrite, finishWrite, memberFile, ownershipPath, readFileState, readOwnedFiles, sameFileState, type WriteEvidence } from "./write-evidence.js";
 
 interface GitNumstat {
@@ -151,24 +151,25 @@ export class SessionChangeCollector {
   private async ensureBaselineNow(member: SessionMember, knownPaths: string[], workingDirectory: string, taskId?: string): Promise<void> {
     const eligibility = await getGitEligibility(workingDirectory);
     if (eligibility.ok && eligibility.gitRoot) {
-      const existing = this.store.getChangeBaseline(this.sessionIdFor(member.id), member.id, eligibility.gitRoot, taskId);
+      const gitRoot = eligibility.gitRoot;
+      const existing = this.store.getChangeBaseline(this.sessionIdFor(member.id), member.id, gitRoot, taskId);
       if (existing) return;
       const parent = eligibility.hasHead
-        ? (await git(eligibility.gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim()
+        ? (await git(gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim()
         : undefined;
       const snapshot = await createWorkingTreeSnapshot(
-        eligibility.gitRoot,
+        gitRoot,
         parent,
-        quaymeshSnapshotExcludes(eligibility.gitRoot, member.root),
+        quaymeshSnapshotExcludes(gitRoot, member.root),
       );
-      this.store.putChangeBaseline({
+      await this.store.writeAsync(() => this.store.putChangeBaseline({
         session_id: this.sessionIdFor(member.id),
         member_id: member.id,
-        repo_root: eligibility.gitRoot,
+        repo_root: gitRoot,
         baseline_ref: snapshot,
         latest_ref: snapshot,
         coverage: "session_owned",
-      }, taskId);
+      }, taskId));
       return;
     }
 
@@ -198,14 +199,14 @@ export class SessionChangeCollector {
     const pending = `${baselinePath}.pending-${process.pid}-${Date.now()}`;
     await writeFile(pending, JSON.stringify({ version: 1, files } satisfies OrdinaryBaseline), "utf8");
     await rename(pending, baselinePath);
-    this.store.putChangeBaseline({
+    await this.store.writeAsync(() => this.store.putChangeBaseline({
       session_id: this.sessionIdFor(member.id),
       member_id: member.id,
       repo_root: member.root,
       baseline_ref: `ordinary:${digest(files)}`,
       latest_ref: `ordinary:${digest(files)}`,
       coverage: "partial",
-    }, taskId);
+    }, taskId));
   }
 
   /** Acknowledge admission, not completion. The batch keeps its own blocking
@@ -308,41 +309,23 @@ export class SessionChangeCollector {
     if (baselines.length === 0) return;
     const previousFiles = this.store.fileSummaries(sessionId, memberId, taskId);
     const previousByPath = new Map(previousFiles.map(file => [file.path, file]));
-    const previous = JSON.stringify(previousFiles.map(({ patchRef: _patchRef, versionRef: _versionRef, ...file }) => file));
-    const files: Array<FileSummary & { patchRef: string; versionRef: string }> = [];
+    const captures: CapturedChangeSet[] = [];
     const memberRoot = resolvePhysicalPath(member.root);
     for (const baseline of baselines) {
       if (baseline.baseline_ref.startsWith("ordinary:") && samePhysicalPath(baseline.repo_root, member.root)) {
-        files.push(...await this.captureOrdinary(sessionId, member, baseline.baseline_ref, previousByPath, taskId));
+        captures.push(await this.captureOrdinary(sessionId, member, baseline.baseline_ref, previousByPath, taskId));
       } else {
         const repoRoot = resolvePhysicalPath(baseline.repo_root);
         const scoped = changedPaths?.map(path => resolvePhysicalPath(resolve(memberRoot, path)))
           .filter(path => isPathInsideRoot(path, repoRoot))
           .map(path => relative(repoRoot, path).replaceAll("\\", "/"));
         if (scoped && !scoped.length) continue;
-        files.push(...await this.captureGit(sessionId, member, baseline.repo_root,
+        captures.push(await this.captureGit(sessionId, member, baseline.repo_root,
           baseline.baseline_ref, baseline.latest_ref, previousByPath, taskId, scoped));
       }
     }
-    const versions = new Map<string, Array<FileSummary & { patchRef: string }>>();
-    for (const file of files) {
-      const group = versions.get(file.versionRef) ?? [];
-      group.push(file);
-      versions.set(file.versionRef, group);
-    }
-    for (const [version, group] of versions) this.store.replaceFileSummaries(sessionId, member.id, version, group, taskId);
-    const current = JSON.stringify(this.readSummaries(sessionId, memberId, taskId));
-    if (current === previous) return;
-    this.store.appendEvent({
-      session_id: sessionId,
-      task_id: taskId ?? null,
-      member_id: memberId,
-      type: "file_changed",
-      source_id: `capture-${randomUUID()}`,
-      timestamp: new Date().toISOString(),
-      payload: {},
-    });
-    await this.onCaptured?.(sessionId, memberId, taskId);
+    const changed = await this.store.publishChangeCaptureAsync(sessionId, memberId, captures, taskId);
+    if (changed) await this.onCaptured?.(sessionId, memberId, taskId);
   }
 
   async fileDiff(sessionId: SessionId, fileId: string, hash: string, taskId?: string): Promise<{ file: FileSummary; patch: string }> {
@@ -421,7 +404,7 @@ export class SessionChangeCollector {
     previousFiles: ReadonlyMap<string, CapturedFile>,
     taskId?: string,
     changedPaths?: string[],
-  ): Promise<Array<FileSummary & { patchRef: string; versionRef: string }>> {
+  ): Promise<CapturedChangeSet> {
     const physicalRepoRoot = resolvePhysicalPath(repoRoot), memberRoot = resolvePhysicalPath(member.root);
     const current = await createWorkingTreeSnapshot(
       repoRoot,
@@ -483,18 +466,17 @@ export class SessionChangeCollector {
         && previous.hash === (previous.versionRef === current ? file.hash : digest([previous.versionRef, entry.path, patch]));
       files.push({ ...file, recordedAt: unchanged ? previous.recordedAt ?? null : Date.now() });
     }
-    this.store.putChangeBaseline({
+    return { baseline: {
       session_id: sessionId,
       member_id: member.id,
       repo_root: repoRoot,
       baseline_ref: baselineRef,
       latest_ref: current,
       coverage: "session_owned",
-    }, taskId);
-    return files;
+    }, files };
   }
 
-  private async captureOrdinary(sessionId: SessionId, member: SessionMember, baselineRef: string, previousFiles: ReadonlyMap<string, CapturedFile>, taskId?: string): Promise<Array<FileSummary & { patchRef: string; versionRef: string }>> {
+  private async captureOrdinary(sessionId: SessionId, member: SessionMember, baselineRef: string, previousFiles: ReadonlyMap<string, CapturedFile>, taskId?: string): Promise<CapturedChangeSet> {
     const baseline = JSON.parse(await readFile(this.ordinaryBaselinePath(member, taskId), "utf8")) as OrdinaryBaseline;
     const files: Array<FileSummary & { patchRef: string; versionRef: string }> = [];
     const owned = await readOwnedFiles(ownershipPath(this.stateDir, sessionId, member.id, taskId));
@@ -539,15 +521,14 @@ export class SessionChangeCollector {
     }
     // Recording metadata is not part of the content/version identity.
     const versionRef = `ordinary:${digest(files.map(({ recordedAt: _recordedAt, ...file }) => file))}`;
-    this.store.putChangeBaseline({
+    return { baseline: {
       session_id: sessionId,
       member_id: member.id,
       repo_root: member.root,
       baseline_ref: baselineRef,
       latest_ref: versionRef,
       coverage: "partial",
-    }, taskId);
-    return files.map((file) => ({ ...file, versionRef }));
+    }, files: files.map((file) => ({ ...file, versionRef })) };
   }
 
   private sessionIdFor(memberId: string): SessionId {

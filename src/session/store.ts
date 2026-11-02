@@ -106,6 +106,11 @@ interface ChangeBaselineRow {
   coverage: "session_owned" | "workspace_observed" | "partial";
 }
 
+export interface CapturedChangeSet {
+  baseline: ChangeBaselineRow;
+  files: Array<FileSummary & { patchRef: string; versionRef: string }>;
+}
+
 export interface AgentOperationLink {
   operationId: string;
   agentId: string;
@@ -1199,6 +1204,22 @@ export class SessionStore {
     };
   }
 
+  /** Bind exported content and its acknowledgement revisions to one readonly
+   * snapshot; other processes may commit while the files are being written. */
+  readRecoveryExport(root: string, limit: number): {
+    rows: RecoveryRow[];
+    revisions: Array<{ sessionId: SessionId; memberId: string; revision: number }>;
+  } {
+    return this.db.transaction(() => {
+      const candidates = this.ownerIdsForRoot(root).flatMap(ownerId => this.recentRecoveryRows(ownerId, root, limit).rows);
+      const rows = [...new Map(candidates.map(row => [row.session_id, row])).values()];
+      const revisions = rows.flatMap(row => this.getSession(row.session_id).members
+        .filter(member => member.node_id === row.node_id && member.root === row.root)
+        .map(member => ({ sessionId: row.session_id, memberId: member.id, revision: member.revision })));
+      return { rows, revisions };
+    }).deferred();
+  }
+
   recentRecoveryRows(
     ownerId: string,
     root: string,
@@ -1925,6 +1946,40 @@ export class SessionStore {
         input.coverage,
       );
     }).immediate();
+  }
+
+  /** Evidence files must already be complete. Publish their versions, visible
+   * summaries and event in one transaction, then notify committed readers. */
+  async publishChangeCaptureAsync(sessionId: SessionId, memberId: string,
+    captures: CapturedChangeSet[], taskId?: string): Promise<boolean> {
+    if (!captures.length) return false;
+    const versions = new Map<string, CapturedChangeSet["files"]>();
+    for (const { baseline, files } of captures) {
+      if (baseline.session_id !== sessionId || baseline.member_id !== memberId
+        || files.some(file => file.member_id !== memberId || file.versionRef !== baseline.latest_ref))
+        throw new Error("CAPTURE_PUBLICATION_SCOPE_MISMATCH");
+      const group = versions.get(baseline.latest_ref) ?? [];
+      group.push(...files);
+      // Include empty versions: returning to the baseline is a publication too.
+      versions.set(baseline.latest_ref, group);
+    }
+    const event: Omit<SessionEvent, "sequence"> = {
+      session_id: sessionId, task_id: taskId ?? null, member_id: memberId,
+      type: "file_changed", source_id: `capture-${randomUUID()}`,
+      timestamp: new Date().toISOString(), payload: {},
+    };
+    const visible = () => JSON.stringify(this.fileSummaries(sessionId, memberId, taskId)
+      .map(({ patchRef: _patchRef, versionRef: _versionRef, ...file }) => file));
+    const saved = await this.writeAsync(() => {
+      const before = visible();
+      for (const capture of captures) this.putChangeBaseline(capture.baseline, taskId);
+      for (const [version, files] of versions) this.replaceFileSummaries(sessionId, memberId, version, files, taskId);
+      return visible() === before ? null : this.persistEvent(event);
+    });
+    if (!saved) return false;
+    // A listener failure is post-commit and must never replay the SQL body.
+    this.notifyEvent(event, saved.result, saved.taskId);
+    return saved.result.changed;
   }
 
   sessionStartedAt(sessionId: SessionId): number {

@@ -12,6 +12,17 @@ const MAX_DETAIL_ROWS = 20;
 const MAX_EXPORT_ROWS = 100;
 const DISPLAY_PATHS = 5;
 
+interface ExportBatch {
+  promise: Promise<void>;
+  resolve(): void;
+  reject(error: unknown): void;
+}
+
+interface RootExport {
+  pending: ExportBatch | null;
+  done: Promise<void>;
+}
+
 export interface RecoveryDetail {
   row: RecoveryRow;
   operations: Array<{
@@ -29,7 +40,7 @@ export interface RecoveryDetail {
 }
 
 export class RecoveryService {
-  private readonly writes = new Map<string, Promise<void>>();
+  private readonly writes = new Map<string, RootExport>();
   private closed = false;
 
   constructor(
@@ -96,13 +107,33 @@ export class RecoveryService {
   async exportRoot(root: string): Promise<void> {
     if (this.closed) throw new Error("RECOVERY_SERVICE_CLOSED");
     const canonicalRoot = resolve(root);
-    const previous = this.writes.get(canonicalRoot) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(() => this.exportRootNow(canonicalRoot));
-    this.writes.set(canonicalRoot, next);
+    let work = this.writes.get(canonicalRoot);
+    if (!work) {
+      const created: RootExport = { pending: null, done: Promise.resolve() };
+      this.writes.set(canonicalRoot, created);
+      created.done = Promise.resolve().then(() => this.exportPending(canonicalRoot, created));
+      work = created;
+    }
+    if (!work.pending) {
+      let resolve!: () => void, reject!: (error: unknown) => void;
+      const promise = new Promise<void>((done, failed) => { resolve = done; reject = failed; });
+      work.pending = { promise, resolve, reject };
+    }
+    return work.pending.promise;
+  }
+
+  private async exportPending(root: string, work: RootExport): Promise<void> {
     try {
-      await next;
+      while (work.pending) {
+        const batch = work.pending;
+        // Requests accepted after this point need a later, fresh export. They
+        // share the next batch, never the snapshot already being published.
+        work.pending = null;
+        try { await this.exportRootNow(root); batch.resolve(); }
+        catch (error) { batch.reject(error); }
+      }
     } finally {
-      if (this.writes.get(canonicalRoot) === next) this.writes.delete(canonicalRoot);
+      if (this.writes.get(root) === work) this.writes.delete(root);
     }
   }
 
@@ -137,7 +168,7 @@ export class RecoveryService {
 
   async close(): Promise<void> {
     this.closed = true;
-    await Promise.allSettled([...this.writes.values()]);
+    await Promise.allSettled([...this.writes.values()].map(work => work.done));
     this.writes.clear();
   }
 
@@ -148,10 +179,12 @@ export class RecoveryService {
       throw error;
     });
     if (!present) return;
-    const owners = this.store.ownerIdsForRoot(root);
-    const rows = owners.flatMap((ownerId) => this.store.recentRecoveryRows(ownerId, root, MAX_EXPORT_ROWS).rows);
-    const unique = new Map(rows.map((row) => [row.session_id, this.withDisplayLimit(row)]));
-    const sessions = [...unique.values()].sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at));
+    // File publication and waiting for its write lock may admit newer events.
+    // Only acknowledge the revisions observed for this export, never the newer
+    // revisions read after the files have already been written.
+    const { rows, revisions } = this.store.readRecoveryExport(root, MAX_EXPORT_ROWS);
+    const sessions = rows.map(row => this.withDisplayLimit(row))
+      .sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at));
     const directory = join(root, ".quaymesh");
     await mkdir(directory, { recursive: true, mode: 0o700 });
     const updatedAt = new Date().toISOString();
@@ -159,12 +192,11 @@ export class RecoveryService {
     const markdown = renderMarkdown(sessions, updatedAt);
     await atomicWrite(join(directory, "sessions.json"), json);
     await atomicWrite(join(directory, "Sessions.md"), markdown);
-    for (const session of sessions) {
-      const memberRows = this.store.getSession(session.session_id).members;
-      for (const member of memberRows) {
-        this.store.markProjectionExported(session.session_id, member.id, member.revision);
+    if (revisions.length) await this.store.writeAsync(() => {
+      for (const { sessionId, memberId, revision } of revisions) {
+        this.store.markProjectionExported(sessionId, memberId, revision);
       }
-    }
+    });
   }
 
   private withDisplayLimit(row: RecoveryRow): RecoveryRow {
