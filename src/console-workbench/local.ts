@@ -2,7 +2,8 @@ import { basename, relative, sep } from "node:path";
 import { statSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import type { ServerConfig } from "../config.js";
-import { assertAllowedPath } from "../roots.js";
+import { permitted } from "./local-state-queries.js";
+export { permitted } from "./local-state-queries.js";
 import { WorkLedger, summarizeExecutions, type ExecutionRow, type WorkRunRow } from "../work-ledger.js";
 import { runPresentation } from "../console-run-data.js";
 import { workspaceHandle, rootHandle } from "../federation/routing.js";
@@ -29,11 +30,6 @@ export interface RunLink {
 
 interface OperationRow {
   id: string; run_id: string; kind: string; label: string; status: string; created_at: string; finished_at: string | null;
-}
-
-export function permitted(config: ServerConfig, path: string): boolean {
-  try { assertAllowedPath(path, config.allowedRoots); return true; }
-  catch { return false; }
 }
 
 export function requireRun(config: ServerConfig, ledger: WorkLedger, id: string): WorkRunRow {

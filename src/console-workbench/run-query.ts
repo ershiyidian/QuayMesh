@@ -52,11 +52,11 @@ interface RunSelection { sql: string; params: Array<string | number> }
 interface CountedRunSelection extends RunSelection { total: number; counts: Record<string, number> }
 
 // 摘要与聚合可跳过未使用的计数；指定 ID 必须在关联和状态分类前限制候选。
-export function runQuery(ledger: WorkLedger, nodeId: string, projectIds: string[], query: Query, at: number,
+export function runQuery(ledger: Pick<WorkLedger, "db">, nodeId: string, projectIds: string[], query: Query, at: number,
   options: RunQueryOptions & { counts: false }): RunSelection;
-export function runQuery(ledger: WorkLedger, nodeId: string, projectIds: string[], query: Query, at: number,
+export function runQuery(ledger: Pick<WorkLedger, "db">, nodeId: string, projectIds: string[], query: Query, at: number,
   options?: RunQueryOptions & { counts?: true }): CountedRunSelection;
-export function runQuery(ledger: WorkLedger, nodeId: string, projectIds: string[], query: Query, at: number,
+export function runQuery(ledger: Pick<WorkLedger, "db">, nodeId: string, projectIds: string[], query: Query, at: number,
   options: RunQueryOptions = {}): RunSelection | CountedRunSelection {
   const db = ledger.db;
   const stateOnly=options.fields==='state';
@@ -176,7 +176,7 @@ export function runQuery(ledger: WorkLedger, nodeId: string, projectIds: string[
   return { sql: selectedSql, params: selectedValues, total, counts };
 }
 
-export function selectRunPage(ledger: WorkLedger, nodeId: string, projectIds: string[], query: Query) {
+export function selectRunPage(ledger: Pick<WorkLedger, "db">, nodeId: string, projectIds: string[], query: Query) {
   const boundary = decodeBoundary(query.cursor);
   const at = boundary?.at ?? Date.now();
   const base = runQuery(ledger, nodeId, projectIds, query, at);

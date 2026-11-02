@@ -1,4 +1,4 @@
-import {useReadonlyDatabases} from '../db/client.js';
+import {useReadonlyDatabases} from '../db/readonly.js';
 import {assertAllowedPath} from '../roots.js';
 import {parseConsoleReadRequest,consoleReadFailureCode,type ConsoleReadRequest} from './read-protocol.js';
 import {CONSOLE_READ_REQUEST_BYTES,CONSOLE_READ_RESULT_BYTES} from './read-process.js';
@@ -15,7 +15,6 @@ async function indexRead(input:ConsoleReadRequest):Promise<unknown> {
     case 'metadata': return local.readLocalMetadata(input.config);
     case 'page': return local.readLocalPage(input.config,input.query??{});
     case 'task-index': return local.readLocalTaskIndex(input.config,input.at,input.scope);
-    case 'task-state-index': return local.readLocalTaskStateIndex(input.config,input.at);
     case 'session-titles': return local.readLocalSessionTitles(input.config,input.scope);
     case 'run-summaries': return local.readLocalRunSummaries(input.config,input.ids??[]);
     case 'usage': return local.readLocalUsage(input.config,input.query??{},input.at);
@@ -40,6 +39,10 @@ async function execute(frame:Buffer):Promise<string> {
     }
     let value:unknown;
     switch(input.operation) {
+      case 'task-state-index': {
+        const {readLocalTaskStateIndex}=await import('./local-state-queries.js');
+        value=readLocalTaskStateIndex(input.config,input.at);break;
+      }
       case 'activity-calls': case 'activity-events': {
         const {readLocalActivity}=await import('./activity.js');
         value=readLocalActivity(input.config,input.operation==='activity-calls'?'calls':'events',{

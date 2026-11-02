@@ -33,6 +33,8 @@ Console details, files, patches, command output, project sessions and audit reco
 
 The `task-state-index` operation combines phase state, saved Task lifecycle, titles and membership in one readonly SQLite transaction and one node response. It uses the same execution/acceptance classifier as the full index, including current phases, unresolved execution, finalization and the last meaningful outcome. It omits usage deltas, change evidence and checkpoint JSON. Its explicit state projection has no `tokens` or `changed` fields; missing measurements are not reported as zero or false. The isolated route is a separate capability, and an older node does not silently fall back to the full historical index.
 
+Its dedicated `local-state-queries.ts` module opens a raw readonly SQLite connection with `query_only`, foreign keys and the existing lock-wait budget. A fresh state reader loads the shared SQL/classification functions without importing the ORM schema, migrations, write recovery or full detail/usage projections. The process-wide readonly mode also applies when another operation later loads those modules into the same worker. The original query text, transaction boundary, permission checks and response fields are shared with the existing readers.
+
 The overview, ordinary Task lists and conversation lists use that combined state read. Only a query that needs changes or token ordering requests the full index; list summaries are then read for the selected page. A node/project scope reads its owner and configured or advertised Coordinator, then the selected Tasks' registered members. Unrelated projects on the same owner cannot add their remote members to that scope. Missing authority or a registered member keeps coverage incomplete. Standalone mode uses local authority. Project-session previews restrict project candidates in SQL before state classification and retain the saved conversation, thread, claim and review-protection fields.
 
 Authenticated Console GET/HEAD RPCs carry cancellation through the existing `withConsoleReadSignal` asynchronous context to the owned reader. A nested route controller combines its signal with the inherited RPC signal. The HTTP relay also forwards read cancellation to `fetch`, including response-body consumption. An accepted POST keeps its durable execution and receipt when its caller stops waiting; transport cancellation does not revoke that write. Shared feed refreshes retain their own bounded lifetime and are not owned by an individual browser wait.
@@ -44,6 +46,8 @@ Background projection performs full composition and revert eligibility reads in 
 ## Console behavior
 
 Normal loading and refreshing are progress states. Failed or expired evidence is an attention state. A successful page fetch does not renew a node's old observation time or prove that a task is still executing.
+
+For snapshot aggregates such as usage, `complete` describes coverage of node snapshots. A covered response can still have sources in `refreshing` state and contain older observations. The UI and acceptance checks continue their bounded follow-up reads while sources are pending; freshness is confirmed separately from coverage.
 
 Partial details retain previously read records with their original read time and a visible historical label. Unknown counts remain unknown. Unconfirmed evidence cannot enable acceptance, reversion or completion actions. Pending details get bounded supplementary reads, including in manual-refresh mode. The detail header has its own refresh control for narrow windows.
 
