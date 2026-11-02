@@ -1,0 +1,253 @@
+diff --git a/pkg/codexappserver/bridge.go b/pkg/codexappserver/bridge.go
+--- a/pkg/codexappserver/bridge.go
++++ b/pkg/codexappserver/bridge.go
+@@ -981,6 +981,13 @@
+ 	}
+ }
+ 
++func jsonStringPayload(value string) json.RawMessage {
++	// QuayMesh json-events-v1: a string is always JSON-encodable. Go escapes from
++	// strconv.Quote (for example \\x1b) are not valid JSON escapes.
++	payload, _ := json.Marshal(value)
++	return payload
++}
++
+ func (b *Bridge) readStdout(stdout io.Reader) {
+ 	scanner := bufio.NewScanner(stdout)
+ 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+@@ -996,7 +1003,7 @@
+ 				Source:  "stdout",
+ 				Method:  "decode/error",
+ 				Summary: line,
+-				Payload: json.RawMessage(strconv.Quote(line)),
++				Payload: jsonStringPayload(line),
+ 			})
+ 			continue
+ 		}
+@@ -1031,7 +1038,7 @@
+ 			Source:  "stderr",
+ 			Method:  "stderr",
+ 			Summary: line,
+-			Payload: json.RawMessage(strconv.Quote(line)),
++			Payload: jsonStringPayload(line),
+ 		})
+ 	}
+ }
+diff --git a/pkg/adminui/ui.go b/pkg/adminui/ui.go
+--- a/pkg/adminui/ui.go
++++ b/pkg/adminui/ui.go
+@@ -133,9 +133,14 @@
+ }
+ 
+ func writeJSON(w http.ResponseWriter, status int, v any) {
++	// QuayMesh json-events-v1: encode before committing. An invalid RawMessage or an
++	// unsupported value must not turn into an empty successful response.
++	payload, err := json.Marshal(v)
++	if err != nil {
++		status = http.StatusInternalServerError
++		payload = []byte(`{"error":{"code":"response_encoding_failed","message":"Unable to encode JSON response."}}`)
++	}
+ 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+ 	w.WriteHeader(status)
+-	enc := json.NewEncoder(w)
+-	enc.SetEscapeHTML(true)
+-	_ = enc.Encode(v)
++	_, _ = w.Write(append(payload, '\n'))
+ }
+diff --git a/pkg/codexappserver/bridge_json_test.go b/pkg/codexappserver/bridge_json_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/codexappserver/bridge_json_test.go
+@@ -0,0 +1,87 @@
++package codexappserver
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++)
++
++func TestBridgeLineEventsRemainJSONEncodable(t *testing.T) {
++	t.Parallel()
++
++	cases := []struct {
++		name string
++		line string
++	}{
++		{"ansi", "\x1b[31mred\x1b[0m"},
++		{"controls", "before\x00\x01\a\b\f\v\t\x1f\x7fafter"},
++		{"invalid_utf8", "before\xff\xfeafter"},
++	}
++	for _, source := range []string{"stdout", "stderr"} {
++		for _, tc := range cases {
++			t.Run(source+"/"+tc.name, func(t *testing.T) {
++				bridge := NewBridgeWithLookupEnv(nil, nil, func(string) (string, bool) { return "", false })
++				if source == "stdout" {
++					bridge.readStdout(strings.NewReader(tc.line + "\n"))
++				} else {
++					bridge.readStderr(strings.NewReader(tc.line + "\n"))
++				}
++				events := bridge.RecentEvents(10)
++				if len(events) != 1 || events[0].Source != source {
++					t.Fatalf("expected one %s event, got %#v", source, events)
++				}
++				wantMethod := "stderr"
++				if source == "stdout" {
++					wantMethod = "decode/error"
++				}
++				if events[0].Method != wantMethod || !json.Valid(events[0].Payload) {
++					t.Fatalf("invalid diagnostic event: %#v", events[0])
++				}
++				payload, err := json.Marshal(struct {
++					Events []Event `json:"events"`
++				}{events})
++				if err != nil {
++					t.Fatalf("event history cannot be encoded: %v", err)
++				}
++				var decoded struct {
++					Events []struct {
++						Payload string `json:"payload"`
++						Summary string `json:"summary"`
++					} `json:"events"`
++				}
++				if err := json.Unmarshal(payload, &decoded); err != nil {
++					t.Fatal(err)
++				}
++				// JSON replaces each invalid UTF-8 byte with a replacement rune.
++				want := string([]rune(tc.line))
++				if len(decoded.Events) != 1 || decoded.Events[0].Payload != want || decoded.Events[0].Summary != want {
++					t.Fatalf("diagnostic text changed: %#v, want %q", decoded.Events, want)
++				}
++				if snapshot := bridge.Snapshot(); snapshot.Running || snapshot.Starting || snapshot.Ready || snapshot.PID != 0 {
++					t.Fatalf("reading diagnostics changed bridge lifecycle: %#v", snapshot)
++				}
++			})
++		}
++	}
++}
++
++func TestBridgeMalformedStdoutKeepsFollowingNotification(t *testing.T) {
++	t.Parallel()
++
++	bridge := NewBridgeWithLookupEnv(nil, nil, func(string) (string, bool) { return "", false })
++	bridge.readStdout(strings.NewReader("\x1b[31mnot-json\x1b[0m\ninvalid-\xff\n" +
++		`{"method":"remoteControl/status/changed","params":{"ready":true}}` + "\n"))
++	events := bridge.RecentEvents(10)
++	if len(events) != 3 || events[0].Method != "decode/error" || events[1].Method != "decode/error" ||
++		events[2].Method != "remoteControl/status/changed" {
++		t.Fatalf("malformed lines hid subsequent notifications: %#v", events)
++	}
++	for index, event := range events {
++		if event.Seq != int64(index+1) || !json.Valid(event.Payload) {
++			t.Fatalf("invalid event at %d: %#v", index, event)
++		}
++	}
++	if _, err := json.Marshal(events); err != nil {
++		t.Fatalf("mixed event history cannot be encoded: %v", err)
++	}
++}
+diff --git a/pkg/adminui/json_response_test.go b/pkg/adminui/json_response_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/adminui/json_response_test.go
+@@ -0,0 +1,100 @@
++package adminui
++
++import (
++	"encoding/json"
++	"errors"
++	"io"
++	"math"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++	"unicode/utf8"
++)
++
++type failingJSONPayload struct{}
++
++func (failingJSONPayload) MarshalJSON() ([]byte, error) {
++	return nil, errors.New("must-not-leak-marshaler-secret")
++}
++
++func TestWriteJSONEncodingFailureReturnsStructuredError(t *testing.T) {
++	t.Parallel()
++
++	cases := []struct {
++		name  string
++		value any
++	}{
++		{"invalid_raw_message", json.RawMessage(`"must-not-leak-payload-\x1b"`)},
++		{"unsupported_channel", make(chan int)},
++		{"non_finite_number", math.NaN()},
++		{"marshaler_error", failingJSONPayload{}},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				writeJSON(w, http.StatusAccepted, struct {
++					Value  any    `json:"value"`
++					Secret string `json:"secret"`
++				}{tc.value, "must-not-leak-other-field"})
++			}))
++			defer server.Close()
++			client := server.Client()
++			client.Timeout = 2 * time.Second
++			response, err := client.Get(server.URL)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer response.Body.Close()
++			body, err := io.ReadAll(response.Body)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if response.StatusCode != http.StatusInternalServerError || !json.Valid(body) {
++				t.Fatalf("encoding failure returned HTTP %d with body %q", response.StatusCode, body)
++			}
++			if response.Header.Get("Content-Type") != "application/json; charset=utf-8" {
++				t.Fatalf("unexpected content type: %s", response.Header.Get("Content-Type"))
++			}
++			const want = "{\"error\":{\"code\":\"response_encoding_failed\",\"message\":\"Unable to encode JSON response.\"}}\n"
++			if string(body) != want || strings.Contains(string(body), "must-not-leak") {
++				t.Fatalf("encoding error exposed payload or error details: %q", body)
++			}
++		})
++	}
++}
++
++func TestWriteJSONSuccessKeepsJSONContract(t *testing.T) {
++	t.Parallel()
++
++	value := "<script>&\x1b[31mred\x1b[0m\x00\xff\xfe"
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		writeJSON(w, http.StatusCreated, map[string]string{"value": value})
++	}))
++	defer server.Close()
++	client := server.Client()
++	client.Timeout = 2 * time.Second
++	response, err := client.Get(server.URL)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer response.Body.Close()
++	body, err := io.ReadAll(response.Body)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if response.StatusCode != http.StatusCreated || !utf8.Valid(body) || !json.Valid(body) || !strings.HasSuffix(string(body), "\n") {
++		t.Fatalf("unexpected successful response: status=%d body=%q", response.StatusCode, body)
++	}
++	if strings.Contains(string(body), "<script>") || !strings.Contains(string(body), `\u003cscript\u003e\u0026`) {
++		t.Fatalf("HTML escaping changed: %q", body)
++	}
++	var decoded map[string]string
++	if err := json.Unmarshal(body, &decoded); err != nil {
++		t.Fatal(err)
++	}
++	if decoded["value"] != string([]rune(value)) {
++		t.Fatalf("successful JSON text changed: %q", decoded["value"])
++	}
++}

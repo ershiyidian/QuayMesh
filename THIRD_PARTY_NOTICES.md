@@ -15,6 +15,8 @@ QuayMesh uses MIT for its project code. The following components retain their re
 
 The bundled component source archives provide the corresponding source used by the component build. `components.lock.json` records their selected versions.
 
+Local source modifications, archive hashes, and regression commands are documented in [third_party/patches/README.md](third_party/patches/README.md).
+
 ## Runtime dependencies
 
 `package.json` and `pnpm-lock.yaml` identify the application dependencies and selected versions. Platform packages include production dependencies with their package-level license files.

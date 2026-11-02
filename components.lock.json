@@ -11,7 +11,16 @@
     "version": "0.0.15",
     "go": "1.27.0",
     "archive": "third_party/sources/tunnel-client-0.0.15.zip",
-    "directory": "tunnel-client-master"
+    "directory": "tunnel-client-master",
+    "sha256": "b095cd82e0d64762afe1592a3ec41b082c12b00fe811bc4702d4c90361f52dcc",
+    "unpatchedArchiveSha256": "7eb1cb293aa3cd7d5aba448f9e5f96bd1f518bde354207e1887b092c25ca0359",
+    "localPatches": [
+      {
+        "id": "quaymesh-json-events-v1",
+        "path": "third_party/patches/tunnel-client-0.0.15-json-events-v1.patch",
+        "sha256": "2e3aee8605ec194e3febbb93a8469af600a892e178845bf6011dce96cec38bb3"
+      }
+    ]
   },
   "egress": {
     "mode": "configured-executable"
