@@ -576,12 +576,12 @@ export class ProcessSessionManager {
     }
   }
 
-  shutdown(): Promise<void> {
-    this.shutdownPromise ??= this.closeOwnedProcesses();
+  shutdown(options: { drainSharedWork?: () => Promise<void> } = {}): Promise<void> {
+    this.shutdownPromise ??= this.closeOwnedProcesses(options.drainSharedWork);
     return this.shutdownPromise;
   }
 
-  private async closeOwnedProcesses(): Promise<void> {
+  private async closeOwnedProcesses(drainSharedWork?: () => Promise<void>): Promise<void> {
     this.shuttingDown = true;
     const owned = [...this.sessions.values()];
     const active = owned.filter(session => session.running);
@@ -605,6 +605,10 @@ export class ProcessSessionManager {
     }
     this.sessions.clear();
     this.legacySessions.clear();
+    // Session capture/recovery shares this coordinator. Stop commands first,
+    // then let those already accepted tails publish and release their leases.
+    // A failed drain must not close their coordinator underneath them.
+    await drainSharedWork?.();
     if (this.claims.size === 0) {
       try { await this.executionCoordinator?.closeAsync(); } catch (error) { failures.push(error); }
     }

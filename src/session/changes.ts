@@ -4,6 +4,7 @@ import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/p
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { createPatch } from "diff";
 import { git, getGitEligibility } from "../git.js";
+import type { ExecutionCoordinator } from "../execution-coordinator.js";
 import { createWorkingTreeSnapshot } from "../review-checkpoints.js";
 import { isPathInsideRoot } from "../roots.js";
 import { resolvePhysicalPath, samePhysicalPath } from "../physical-paths.js";
@@ -44,6 +45,8 @@ export class SessionChangeCollector {
   private readonly readClock = new CaptureReadClock();
   private readonly metadataWrites = new Map<string, Promise<void>>();
   private readonly pending = new Map<string, Promise<void>>();
+  private readonly admissions = new Map<string, Promise<void>>();
+  private readonly settlingBatches = new Set<string>();
   private readonly captures = new Map<string, Set<Promise<void>>>();
   private readonly captureTokens = new Map<string, symbol>();
   private readonly dirty = new Map<string, Set<string> | null>();
@@ -54,6 +57,7 @@ export class SessionChangeCollector {
   constructor(
     private readonly store: SessionStore,
     private readonly stateDir: string,
+    private readonly execution?: ExecutionCoordinator,
   ) {}
 
   setCaptureListener(listener: (sessionId: string, memberId: string, taskId?: string) => Promise<void> | void): void {
@@ -140,7 +144,8 @@ export class SessionChangeCollector {
     taskId?: string,
   ): Promise<void> {
     const key=JSON.stringify([member.id,taskId??null,"baseline"]);
-    return this.writeMetadata(key,()=>this.ensureBaselineNow(member,knownPaths,workingDirectory,taskId),member.id,taskId);
+    return this.writeMetadata(key, () => this.withCaptureWork(taskId,
+      () => this.ensureBaselineNow(member,knownPaths,workingDirectory,taskId)), member.id, taskId);
   }
 
   private async ensureBaselineNow(member: SessionMember, knownPaths: string[], workingDirectory: string, taskId?: string): Promise<void> {
@@ -203,34 +208,81 @@ export class SessionChangeCollector {
     }, taskId);
   }
 
-  markDirty(memberId: string, paths: string[] = [], taskId?: string): void {
-    if (this.closed) return;
+  /** Acknowledge admission, not completion. The batch keeps its own blocking
+   * lease until Git, evidence publication and any coalesced captures settle. */
+  markDirty(memberId: string, paths: string[] = [], taskId?: string): Promise<void> {
+    if (this.closed) return Promise.reject(new Error("Session change collector is closed."));
+    try { this.execution?.assertAccepting(); }
+    catch (error) { return Promise.reject(error); }
     this.readClock.touch(memberId, taskId);
     const key = JSON.stringify([memberId, taskId ?? null]);
     const previous = this.dirty.get(key);
     this.dirty.set(key, !paths.length || previous === null ? null
       : new Set([...(previous ?? []), ...paths]));
-    if (this.pending.has(key)) return;
-    const capture = Promise.resolve().then(async () => {
-      while (this.dirty.has(key)) {
-        const paths = this.dirty.get(key);
-        this.dirty.delete(key);
-        await this.capture(memberId, taskId, paths ? [...paths] : undefined);
+    const previousBatch = this.pending.get(key);
+    if (previousBatch) {
+      // Its Git loop may have finished while lease release is waiting for the
+      // database. A new caller must await admission of a new batch, not reuse
+      // the old acknowledged lease and leave dirty paths behind it.
+      if (this.settlingBatches.has(key)) {
+        const admitted = previousBatch.then(() => this.markDirty(memberId, paths, taskId),
+          () => this.markDirty(memberId, paths, taskId));
+        void admitted.catch(() => {});
+        return admitted;
       }
-    }).finally(() => { this.pending.delete(key); this.readClock.touch(memberId, taskId); });
+      return this.admissions.get(key)!;
+    }
+    let admitted!: () => void, rejected!: (error: unknown) => void;
+    const admission = new Promise<void>((resolve, reject) => { admitted = resolve; rejected = reject; });
+    // Older in-process callers observe the batch through flush()/close().
+    // Their ignored admission promise must not create an unhandled rejection.
+    void admission.catch(() => {});
+    const capture = Promise.resolve().then(() => this.withCaptureWork(taskId, async () => {
+      admitted();
+      try {
+        while (this.dirty.has(key)) {
+          const paths = this.dirty.get(key);
+          this.dirty.delete(key);
+          await this.captureTracked(memberId, taskId, paths ? [...paths] : undefined);
+        }
+      } finally { this.settlingBatches.add(key); }
+    })).catch(error => {
+      rejected(error);
+      this.captureErrors.set(key, error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    }).finally(() => {
+      this.pending.delete(key); this.admissions.delete(key); this.settlingBatches.delete(key);
+      this.readClock.touch(memberId, taskId);
+    });
     this.pending.set(key, capture);
+    this.admissions.set(key, admission);
     void capture.catch(() => {});
+    return admission;
   }
 
   capture(memberId: string, taskId?: string, changedPaths?: string[]): Promise<void> {
+    if (this.closed) return Promise.reject(new Error("Session change collector is closed."));
+    return this.captureTracked(memberId, taskId, changedPaths, true);
+  }
+
+  private withCaptureWork<T>(taskId: string | undefined, action: () => Promise<T>): Promise<T> {
+    return this.execution ? this.execution.withWork({ kind: "capture", taskId }, action) : action();
+  }
+
+  private captureTracked(memberId: string, taskId?: string, changedPaths?: string[], admit = false): Promise<void> {
     this.readClock.touch(memberId, taskId);
     const key = JSON.stringify([memberId, taskId ?? null]);
     const active = this.captures.get(key) ?? new Set<Promise<void>>();
     // An older publication can settle after a newer capture. Only the newest
     // capture's result may replace the observation for this member and Task.
     const token = Symbol();
-    this.captureTokens.set(key, token);
-    const work = this.captureNow(memberId, taskId, changedPaths).then(() => {
+    const collect = () => {
+      // A pause-rejected independent caller never began capture and must not
+      // replace the result token of an already accepted, still draining batch.
+      this.captureTokens.set(key, token);
+      return this.captureNow(memberId, taskId, changedPaths);
+    };
+    const work = (admit ? this.withCaptureWork(taskId, collect) : collect()).then(() => {
       if (this.captureTokens.get(key) === token) this.captureErrors.delete(key);
     }, error => {
       if (this.captureTokens.get(key) === token) {

@@ -1507,8 +1507,7 @@ export function createServer(
           await localUserApi?.close();
           await federation?.close();
           await toolActivities.waitForIdle();
-          await processSessions.shutdown();
-          await sessionRuntime.close();
+          await processSessions.shutdown({ drainSharedWork: () => sessionRuntime.close() });
           localAgentStore.close();
           sessionLedger.close();
           projectConsole.close();

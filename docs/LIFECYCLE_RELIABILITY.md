@@ -135,6 +135,14 @@ This register retains all 42 findings from the lifecycle investigation and adds 
 | E03 | Gateway selection cannot migrate existing TCP/TLS sessions | Keep established streams with their owner; never blindly replay a model request. Transparent recovery requires support from that provider's application protocol. |
 | E04 | A generic probe or 503 hides the failure layer | Report proxy connection, tunnel, target TLS, and HTTP probe stages with safe error codes; generic reachability does not establish provider business health. |
 
+### Change capture and maintenance drain
+
+Synchronous tool completion registers independent background work before releasing the existing tool lease; asynchronous completion callbacks acquire a blocking `capture` tail lease before their first terminal-state write. Its receipt waits for admission of the background change-capture and recovery-export work, not for Git snapshots or metadata export to finish. The background work retains its own lease through Git, evidence publication, and coalesced captures, so a returned operation receipt does not make unfinished capture work appear idle.
+
+Baseline capture, change capture, and recovery-metadata Git work all count toward maintenance drain. Already accepted operation tails and their inherited work may finish while admission is paused; new independent capture requests, including attempts to join a pending batch, still check admission. This uses the existing runtime-work ledger without changing the schema. It adds no durable replay queue or guarantee that interrupted capture will rerun after a Core crash.
+
+During normal shutdown, managed commands, output draining, and finish listeners settle first. Session capture and recovery work then drain while their shared execution coordinator remains open; the coordinator closes afterward. A failed shared-work drain does not close the coordinator underneath that work.
+
 ### Slow SQLite write diagnostics
 
 `SessionStore.writeAsync` emits a `sqlite_write` info event when one synchronous phase takes at least 50 ms or the whole call takes at least 250 ms. Fixed sources identify `session_feed_update`, `session_reconcile`, or other `session_store` writes. Each event separates setup, `BEGIN IMMEDIATE`, transaction body, `COMMIT`, rollback, and timeout-restoration counts, totals, and maxima. Retry count, scheduled delay, and actual asynchronous wait are separate; actual wait includes scheduler delays and is neither CPU time nor time holding the write transaction.

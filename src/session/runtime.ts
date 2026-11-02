@@ -105,10 +105,10 @@ export function createSessionRuntime(options: SessionRuntimeOptions): SessionRun
   options.processSessions?.setHandleStore({
     allocate: id => store.writeAsync(() => store.allocateProcessHandle(id)), resolve: handle => store.operationForHandle(handle),
   });
-  const changes = new SessionChangeCollector(store, config.stateDir);
-  const context = new ContextReadRecorder(store);
   const execution = options.execution ?? new ExecutionCoordinator(config.stateDir);
   const ownsExecution = options.execution === undefined;
+  const changes = new SessionChangeCollector(store, config.stateDir, execution);
+  const context = new ContextReadRecorder(store);
   let reverter: SessionReverter;
   const projector = new SessionProjector(
     store,

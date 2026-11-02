@@ -608,7 +608,7 @@ export class SessionService {
     if (this.projections?.schedule) {
       this.projections.schedule(session.id, member.id, task.id);
     }
-    this.scheduleRecovery(member.root);
+    await this.scheduleRecovery(member.root);
 
     const bootstrap = {
       session_id: session.id,
@@ -659,7 +659,7 @@ export class SessionService {
         source_id: `member-attached-${task.id}-${existing.id}-${member.id}`, timestamp: new Date().toISOString(),
         payload: { attached_member_id: member.id },
       });
-      this.refreshMember(session.id, existing.id, task.id);
+      await this.refreshMember(session.id, existing.id, task.id);
     }
 
     return { member };
@@ -839,32 +839,40 @@ export class SessionService {
       throw new Error(`OPERATION_TASK_SCOPE_UNKNOWN: ${operationId}`);
     }
     this.store.taskData.requireScope(taskId, event.session_id, event.member_id);
-    if (invocation) {
-      await this.store.writeAsync(() => this.store.updateInvocation({
-        ownerId: invocation.owner_id,
-        transportInstanceId: invocation.transport_instance_id,
-        requestId: invocation.request_id,
-        state: result.status,
-        effect: result.effect,
-        resultRef: result.result_ref ?? invocation.result_ref,
-        finished: true,
-      }));
-    }
-    await this.operationFinished({
-      ticket_id: operationId,
-      operation_id: operationId,
-      invocation_id: invocation?.id,
-      session_id: event.session_id,
-      task_id: taskId,
-      member_id: event.member_id,
-      run_id: String(event.payload.run_id ?? ""),
-      kind: String(event.payload.kind ?? "command"),
-      label: String(event.payload.label ?? "command"),
-      started_at: Date.parse(event.timestamp),
-      actor: event.payload.actor === "app" ? "app"
-        : event.payload.actor === "agent" ? "agent"
-          : event.payload.actor === "system" ? "system" : "model",
-    }, result);
+    // The command claim may already be released. Own the tail before changing
+    // the invocation: reconciliation can copy that terminal state to the
+    // business operation while an asynchronous writer is still waiting.
+    const finish = async () => {
+      if (invocation) {
+        await this.store.writeAsync(() => this.store.updateInvocation({
+          ownerId: invocation.owner_id,
+          transportInstanceId: invocation.transport_instance_id,
+          requestId: invocation.request_id,
+          state: result.status,
+          effect: result.effect,
+          resultRef: result.result_ref ?? invocation.result_ref,
+          finished: true,
+        }));
+      }
+      await this.operationFinished({
+        ticket_id: operationId,
+        operation_id: operationId,
+        invocation_id: invocation?.id,
+        session_id: event.session_id,
+        task_id: taskId,
+        member_id: event.member_id,
+        run_id: String(event.payload.run_id ?? ""),
+        kind: String(event.payload.kind ?? "command"),
+        label: String(event.payload.label ?? "command"),
+        started_at: Date.parse(event.timestamp),
+        actor: event.payload.actor === "app" ? "app"
+          : event.payload.actor === "agent" ? "agent"
+            : event.payload.actor === "system" ? "system" : "model",
+      }, result);
+    };
+    return this.execution && (this.changes || this.recovery)
+      ? this.execution.withWork({ kind: "capture", taskId, operationId, allowWhilePaused: true, blocking: true }, finish)
+      : finish();
   }
 
   async operationFinished(ticket: OperationTicket, result: OperationFinishResult): Promise<void> {
@@ -873,6 +881,17 @@ export class SessionService {
       await this.operationProgress(ticket, { effect: result.effect, result_ref: result.result_ref });
       return;
     }
+    // Reserve the accepted operation's tail before its terminal write. The
+    // receipt waits only for background admission, never for Git snapshots.
+    // Its children inherit this lease even if maintenance pauses in between.
+    const finish = () => this.finishOperation(ticket, result);
+    return this.execution && (this.changes || this.recovery)
+      ? this.execution.withWork({ kind: "capture", taskId: ticket.task_id, operationId: ticket.operation_id,
+          allowWhilePaused: true, blocking: true }, finish)
+      : finish();
+  }
+
+  private async finishOperation(ticket: OperationTicket, result: OperationFinishResult): Promise<void> {
     const ledger = this.requireLedger();
     const ledgerStatus = result.status === OperationState.succeeded
       ? "completed"
@@ -911,8 +930,8 @@ export class SessionService {
     if (!appended) return;
 
     if (result.effect !== "not_started" && (["patch", "command", "copy", "agent_control"].includes(ticket.kind) || result.known_paths?.length)) {
-      this.changes?.markDirty(ticket.member_id, result.known_paths ?? [], ticket.task_id);
-      // 文件差异异步生成；已完成操作的回执和资源释放不等待扫描。
+      await this.changes?.markDirty(ticket.member_id, result.known_paths ?? [], ticket.task_id);
+      // 仅等待独立 capture lease 登记，文件差异仍异步生成。
     }
 
     await this.reconcile(ticket.session_id);
@@ -921,7 +940,7 @@ export class SessionService {
       this.projections.schedule(ticket.session_id, ticket.member_id, ticket.task_id);
     }
     const member = this.store.getMember(ticket.session_id, ticket.member_id);
-    this.scheduleRecovery(member.root);
+    await this.scheduleRecovery(member.root);
   }
 
   /** The owning recorder calls this only after a locally joined handler settles.
@@ -1114,19 +1133,29 @@ export class SessionService {
     return this.store.recentRecoveryRows(context.owner_id, workspaceRoot, limit, cursor);
   }
 
-  private scheduleRecovery(root: string): void {
-    if (!this.recovery || this.stopped) return;
-    const pending = stat(root).then(info => info.isDirectory(),(error:NodeJS.ErrnoException)=>{
-      if(error.code==="ENOENT")return false;
-      throw error;
-    }).then(exists => exists ? this.recovery!.ensureGitIgnore(root).then(() => this.recovery!.exportRoot(root)) : undefined)
+  private scheduleRecovery(root: string): Promise<void> {
+    if (!this.recovery || this.stopped) return Promise.resolve();
+    let admitted!: () => void, rejected!: (error: unknown) => void;
+    const admission = new Promise<void>((resolve, reject) => { admitted = resolve; rejected = reject; });
+    void admission.catch(() => {});
+    const exportRoot = async () => {
+      admitted();
+      const exists = await stat(root).then(info => info.isDirectory(),(error:NodeJS.ErrnoException)=>{
+        if(error.code==="ENOENT")return false;
+        throw error;
+      });
+      if (exists) { await this.recovery!.ensureGitIgnore(root); await this.recovery!.exportRoot(root); }
+    };
+    const pending = (this.execution ? this.execution.withWork({ kind: "capture" }, exportRoot) : exportRoot())
       .catch((error) => {
+        rejected(error);
         console.error(JSON.stringify({ event: "session_recovery_export_failed", root, error: error instanceof Error ? error.message : String(error) }));
       })
       .finally(() => {
         this.pendingRecovery.delete(pending);
       });
     this.pendingRecovery.add(pending);
+    return admission;
   }
 
   private requireLedger(): WorkLedger {
@@ -1134,10 +1163,10 @@ export class SessionService {
     return this.ledger;
   }
 
-  refreshMember(sessionId: SessionId, memberId: string, taskId?: string): void {
+  async refreshMember(sessionId: SessionId, memberId: string, taskId?: string): Promise<void> {
     if (this.store.getMember(sessionId, memberId).node_id !== this.nodeId) return;
     this.projections?.schedule(sessionId, memberId, taskId);
-    this.scheduleRecovery(this.store.getMember(sessionId, memberId).root);
+    await this.scheduleRecovery(this.store.getMember(sessionId, memberId).root);
   }
 
   async close(): Promise<void> {

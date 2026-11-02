@@ -16,7 +16,7 @@ import { canonicalExecutionRoot, overlaps, claimResources, exclusiveConflict, re
 export { canonicalExecutionRoot, overlaps } from "./execution-inspection.js";
 
 export interface RuntimeWorkInput {
-  kind: "tool" | "resource" | "console" | "transfer" | "egress";
+  kind: "tool" | "resource" | "console" | "transfer" | "egress" | "capture";
   operationId?: string;
   taskId?: string;
   allowWhilePaused?: boolean;
@@ -120,7 +120,9 @@ export class ExecutionCoordinator {
 
   constructor(stateDir: string) { this.stateDir = resolve(stateDir); this.database = openDatabase(stateDir); }
 
-  private assertAccepting(): void {
+  /** Joining already-held work still needs admission. New work must also use
+   * beginWork(), which rechecks inside its registration transaction. */
+  assertAccepting(): void {
     const inherited = acceptedWork.getStore();
     if (inherited?.stateDir === this.stateDir && this.database.sqlite.prepare("SELECT 1 FROM qm_runtime_work WHERE id=?").get(inherited.id)) return;
     const state = this.database.sqlite.prepare("SELECT accepting,reason FROM qm_runtime_admission WHERE id=1").get() as { accepting: number; reason: string | null };
