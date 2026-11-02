@@ -118,6 +118,47 @@ test('healthy reads reuse one process; active cancellation replaces only that re
   }finally{pool.close();await delay(50);await rm(files.directory,{recursive:true,force:true});}
 });
 
+for(const release of ['response','close'] as const)test(`an expired queued read never starts after an owned reader ${release}`,async()=>{
+  const files=await setup(),events:ConsoleReadDiagnostic[]=[],budget=500;
+  let blockFinish:string|undefined;
+  const pool=new ConsoleReadProcessPool(files.worker,budget,event=>{
+    events.push(event);
+    if(event.phase==='finish'&&event.route===blockFinish){
+      blockFinish=undefined;
+      // Hold this real response/close callback past the queued request's total
+      // budget, before the event loop can dispatch that request's timer. The
+      // next drain must check elapsed time itself, without starting more work.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,budget+25);
+    }
+  });
+  try{
+    const first=await pool.read<{pid:number}>({mode:'identity'});
+    const controller=new AbortController();
+    const active=release==='response'
+      ?pool.read({operation:'metadata',mode:'identity'})
+      :pool.read({operation:'page',mode:'native',database:files.database,marker:files.marker},controller.signal);
+    const activeSettled=release==='response'?active:assert.rejects(active,{code:'console_read_aborted'});
+    if(release==='close'){
+      for(let n=0;n<100&&!existsSync(files.marker);n++)await delay(5);
+      assert.equal(Number(await readFile(files.marker,'utf8')),first.pid);
+    }
+    const expired=assert.rejects(pool.read({operation:'task-state-index',mode:'identity'}),{code:'console_read_timeout'});
+    blockFinish=release==='response'?'metadata':'page';
+    if(release==='close')controller.abort();
+    await Promise.all([activeSettled,expired]);
+    assert.equal(events.filter(event=>event.route==='task-state-index'&&event.phase==='start').length,0,
+      'expired work must neither be sent to the warm reader nor spawn a replacement');
+    const completion=events.filter(event=>event.route==='task-state-index'&&event.phase==='finish');
+    assert.equal(completion.length,1);assert.equal(completion[0].childPid,null);
+    const next=await pool.read<{pid:number}>({mode:'identity'});
+    if(release==='response')assert.equal(next.pid,first.pid,'queue expiration must preserve the healthy warm reader');
+    else{
+      assert.equal(alive(first.pid),false,'the cancelled native reader must close before capacity is reused');
+      assert.notEqual(next.pid,first.pid);
+    }
+  }finally{pool.close();await delay(50);await rm(files.directory,{recursive:true,force:true});}
+});
+
 test('an unsolicited second frame cannot resolve the next queued read',async()=>{
   const files=await setup(),pool=new ConsoleReadProcessPool(files.worker,3000,()=>{});
   try{

@@ -149,6 +149,10 @@ export class ConsoleReadProcessPool {
       return;
     }
     if(job.done){this.drain();return;}
+    // A response/close callback can run before an overdue queue timer. Keep
+    // the original total budget without starting or killing a reader for work
+    // that has already expired while waiting for capacity.
+    if(performance.now()-job.createdAt>=this.timeoutMs){this.fail(job,'console_read_timeout');return;}
     this.active=job;
     let reader:Reader;
     try{reader=this.reader??this.spawnReader();}
