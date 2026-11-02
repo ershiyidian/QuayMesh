@@ -330,7 +330,7 @@ export class QuayMeshNode {
       configRevision:this.configRevision,pendingConfigRevision:this.pendingConfiguration?.revision || null,
       configuration:{applied:this.configRevision,desired:this.pendingConfiguration?.revision || this.configRevision,
         state:this.applying ? "applying" : this.pendingConfiguration?.failed ? "rejected" : this.pendingConfiguration ? "pending" : "applied"},
-      maintenance:this.maintenance,maintenanceProtocol:2,relayActiveRequests:this.relay?.activeRequests??0,
+      maintenance:this.maintenance,maintenanceProtocol:2,maintenancePauseReceipt:1,relayActiveRequests:this.relay?.activeRequests??0,
       components:this.supervisor?.snapshot() || [],discovery:this.discovery,
       installationTransition:this.installationTransition??null,
       startupReadiness:this.startupReadiness??null,
@@ -555,7 +555,10 @@ export class QuayMeshNode {
           res.writeHead(200,{"content-type":"application/json"}).end(JSON.stringify(result)); return;
         }
         if (req.method === "POST" && path === "/maintenance/begin") {
-          await this.beginMaintenance(); res.writeHead(200,{"content-type":"application/json"}).end('{"paused":true}'); return;
+          const owner=await this.beginMaintenance();
+          if(!owner||this.maintenanceOwner!==owner||!this.maintenancePauseExpected)
+            throw Object.assign(new Error("本次维护暂停归属已变化，不能出具暂停回执"),{status:409});
+          res.writeHead(200,{"content-type":"application/json"}).end(JSON.stringify({paused:true,pause:this.maintenancePauseExpected}));return;
         }
         if (req.method === "POST" && path === "/maintenance/resume") {
           const chunks=[];let bytes=0;

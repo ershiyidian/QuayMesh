@@ -73,9 +73,12 @@ export async function beginInstallationMaintenance(options) {
   if (options.provider) return acquireInstallationLease(options);
   // The default is deliberately unchanged. A rejected normal drain never
   // selects the external protocol or gets converted into an idle result.
-  await requestJson(`http://127.0.0.1:${options.previous.adminPort}/maintenance/begin`, {
+  const result=await requestJson(`http://127.0.0.1:${options.previous.adminPort}/maintenance/begin`, {
     method:"POST",token:options.token,timeoutMs:35000,
   });
+  // The Linux installer binds compensation to the exact pause returned by
+  // this successful request. External providers retain their own protocol.
+  options.onNormalPause?.(result?.pause);
   return null;
 }
 

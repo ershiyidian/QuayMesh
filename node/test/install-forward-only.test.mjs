@@ -5,15 +5,34 @@ import { mkdir, readFile, readdir, writeFile, symlink, chmod, copyFile, mkdtemp,
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { registerHooks } from "node:module";
 import Database from "better-sqlite3";
 import { migrateDatabase } from "../../dist/db/migrations.js";
 import { quiescenceSubject, recordExecutionQuiescence, unresolvedSubjects, retainableCommandClaims,
   readMaintenanceStatus } from "../../dist/maintenance-status.js";
 import { retainedHistoryIdentity, assertRetainedHistory } from "../maintenance-history.mjs";
 import { forwardOnlyDatabaseMigration } from "../database-migration.mjs";
-import { activateInstallation, databaseMigration, databaseSnapshot, enforceInstallationRollbackBoundary } from "../install.mjs";
-import { main } from "../cli.mjs";
 import { cluster, freePort, token } from "./helpers.mjs";
+
+// These migration fixtures already replace systemctl and the Manager with a
+// trace file/HTTP server. Keep their physical-domain boundary equally explicit;
+// linux-stop-domain.test.mjs exercises the real reader and HTTP fence. The
+// actual installer, migration child, SQLite transactions and service order run
+// unchanged. This loader hook exists only in this isolated test process.
+const guardUrl = new URL("../linux-stop-domain.mjs", import.meta.url).href;
+const hooks = registerHooks({ load(url, context, nextLoad) {
+  if (url !== guardUrl) return nextLoad(url, context);
+  return { format: "module", shortCircuit: true, source: `
+    export {stopDomainError} from ${JSON.stringify(guardUrl + "?actual-error")};
+    export async function createLinuxInstallationGuard(){return {async assertHeld(stage, options){
+      if(stage!=='rollback_before_stop'&&!options?.expectedPause)throw new Error('test fixture requires the actual pause receipt');
+    }}};` };
+} });
+let activateInstallation, databaseMigration, databaseSnapshot, enforceInstallationRollbackBoundary, main;
+try {
+  ({ activateInstallation, databaseMigration, databaseSnapshot, enforceInstallationRollbackBoundary } = await import("../install.mjs"));
+  ({ main } = await import("../cli.mjs"));
+} finally { hooks.deregister(); }
 
 const repository=fileURLToPath(new URL("../../",import.meta.url)),commit="a".repeat(40),previousCommit="c".repeat(40);
 const exactColumns=["execution_id","execution_generation","owner_process_start"];
@@ -179,14 +198,21 @@ test("forward-only策略须显式无备份；CLI不接受隐式迁移选择",asy
 async function activationFixture(t){
   const f=await fixture(t),requests=[],secret=token(),port=await freePort();
   const trace=join(f.root,"service-trace.jsonl"),stopped=join(f.root,"service-stopped");
+  const pause={instance:{pid:1002,processStart:"linux:fixture:1002",token:"fixture-instance"},
+    accepting:false,reason:"node-maintenance",changedAt:"2026-11-02T00:00:00.001Z"};
   const server=http.createServer(async(req,res)=>{
     requests.push(req.url);res.setHeader("content-type","application/json");
     if(req.url==="/status"){
       const down=await readFile(stopped).then(()=>true,()=>false);
-      res.end(JSON.stringify(down?null:{nodeId:"edge",release:previousCommit,components:[]}));return;
+      res.end(JSON.stringify(down?null:{nodeId:"edge",release:previousCommit,components:[],maintenancePauseReceipt:1}));return;
     }
     assert.equal(req.headers.authorization,`Bearer ${secret}`);
-    if(req.url==="/maintenance/begin"||req.url==="/maintenance/resume"){res.end('{}');return;}
+    if(req.url==="/maintenance/begin"){res.end(JSON.stringify({paused:true,pause}));return;}
+    if(req.url==="/maintenance/resume"){
+      let raw="";for await(const part of req)raw+=part;
+      if(JSON.stringify(JSON.parse(raw).expected)!==JSON.stringify(pause)){res.writeHead(409).end('{}');return;}
+      res.end('{"paused":false}');return;
+    }
     res.writeHead(404).end();
   });
   await new Promise(resolve=>server.listen(port,"127.0.0.1",resolve));
@@ -197,7 +223,8 @@ async function activationFixture(t){
   const configuration=JSON.stringify({schemaVersion:1,id:"edge",stateDir:f.stateDir,adminPort:port,capabilities:{worker:true},
     mesh:{enabled:false,address:"127.0.0.2"},clusterFile:join(f.root,"cluster.json"),secretsFile:join(f.root,"secrets.env")});
   await writeFile(config,configuration);await writeFile(stagedConfig,configuration);await writeFile(unitFile,"old-unit");
-  const previous={...f.manifest,version:1,nodeId:"edge",sourceCommit:previousCommit,adminPort:port,unitFile,platform:"linux",user:true};
+  const previous={...f.manifest,version:1,nodeId:"edge",sourceCommit:previousCommit,adminPort:port,unitFile,platform:"linux",user:true,
+    config,entrypoint:join(f.candidate,"bin","quaymesh.js")};
   await writeFile(join(f.root,"installation.json"),JSON.stringify(previous));
   const prepared={...previous,...f.manifest,configDir:f.root,config,stagedConfig,
     entrypoint:join(f.candidate,"bin","quaymesh.js")};

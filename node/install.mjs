@@ -12,6 +12,7 @@ import { packageRoot, installationStartupBudget } from "./app.mjs";
 import { componentPlans } from "./compile.mjs";
 import { beginInstallationMaintenance, runMaintenanceProof } from "./maintenance-lease.mjs";
 import { installationHistoryPolicy } from "./maintenance-history.mjs";
+import { createLinuxInstallationGuard, stopDomainError } from "./linux-stop-domain.mjs";
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve,ms));
 const REQUIRED_RELEASE_ENTRIES=["bin","node","dist","schema","skills","package.json","node_modules","components","runtime","release.json","components.lock.json","docs","scripts"];
@@ -413,17 +414,31 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
   const oldConfig = await readFile(manifest.config).catch(error => { if(error.code==="ENOENT")return null;throw error; });
   const oldUnit = manifest.unitFile ? await readFile(manifest.unitFile).catch(error => {if(error.code==="ENOENT")return null;throw error;}) : null;
   let stopped = false, stopAttempted = false, maintenanceBegun = false, activationCommitted=false;
-  let externalLease, transition;
+  let externalLease, transition, linuxGuard, normalPause;
   const transitionFile=join(manifest.stateDir,"installation-transition.json");
   const priorTransition=await readOptionalJson(transitionFile);
   if(priorTransition)throw new Error(`已有未收口的发行切换 ${priorTransition.sourceCommit}；请先核对安装记录与数据库备份。`);
   let snapshot;
   try {
     if (running) {
+      if(previous.platform==="linux"&&!maintenanceLease){
+        // An old Manager cannot bind a default drain reply to its exact pause.
+        // Refuse before mutation; an explicit reviewed provider remains valid.
+        if(running.maintenancePauseReceipt!==1)throw stopDomainError("PAUSE_RECEIPT_UNSUPPORTED");
+        linuxGuard=await createLinuxInstallationGuard({manifest:previous,status:running,token,corePort:loaded.node.corePort,
+          expectedUnitText:systemdUnit({...previous,configFile:previous.config})});
+      }
       externalLease=await beginInstallationMaintenance({provider:maintenanceLease,manifest,manifestFile,
-        previous,running,token,corePort:loaded.node.corePort,historyPolicy});
+        previous,running,token,corePort:loaded.node.corePort,historyPolicy,
+        ...(linuxGuard?{onNormalPause:pause=>{
+          if(!pause||pause.accepting!==false||pause.reason!=="node-maintenance"||!Number.isFinite(Date.parse(pause.changedAt))
+            ||!Number.isSafeInteger(pause.instance?.pid)||typeof pause.instance?.processStart!=="string"
+            ||typeof pause.instance?.token!=="string"||!pause.instance.token)throw stopDomainError("PAUSE_RECEIPT_INVALID");
+          normalPause=structuredClone(pause);
+        }}:{})});
       maintenanceBegun = true;
       await externalLease?.assertHeld("before_backup");
+      await linuxGuard?.assertHeld("before_backup",{expectedPause:normalPause});
     }
     snapshot=migrationPolicy==="forward-only"?await databaseMigration(manifest):await databaseSnapshot(manifest,backup?join(dirname(resolve(manifestFile)),
       externalLease?`rollback-core-${externalLease.context.attemptId}.sqlite`:"rollback-core.sqlite"):undefined,
@@ -439,6 +454,7 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
     await writeJson(transitionFile,transition);
     if(running){
       await externalLease?.assertHeld("before_stop");
+      await linuxGuard?.assertHeld("before_stop",{expectedPause:normalPause});
       stopAttempted = true;
       await stopService(previous); stopped = true;
       await externalLease?.assertHeld("after_stop");
@@ -493,7 +509,21 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
     if (stopAttempted || stopped || (!running && snapshot)) {
       try {
         const active = await runningStatus(manifest.adminPort);
-        if (active?.nodeId === manifest.nodeId) await stopService(manifest);
+        if (active?.nodeId === manifest.nodeId) {
+          let stopManifest=manifest;
+          if(manifest.platform==="linux"){
+            // Rollback is another real stop. Neither the previous generation's
+            // census nor its external lease can authorize stopping a new one.
+            const activeManifest=active.release===manifest.sourceCommit?manifest:
+              active.release===previous?.sourceCommit?previous:null;
+            if(!activeManifest)throw stopDomainError("ROLLBACK_RELEASE_UNCONFIRMED");
+            const rollbackGuard=await createLinuxInstallationGuard({manifest:activeManifest,status:active,token,corePort:loaded.node.corePort,
+              expectedUnitText:systemdUnit({...activeManifest,configFile:activeManifest.config})});
+            await rollbackGuard.assertHeld("rollback_before_stop",{retainedClaims:externalLease?.lease.claims?.length??0});
+            stopManifest=activeManifest;
+          }
+          await stopService(stopManifest);
+        }
         const current=await databaseSnapshot(manifest);
         await enforceInstallationRollbackBoundary({manifest,previous,transition,snapshot,current,error,historyPolicy});
         if (oldConfig) await atomicWrite(manifest.config,oldConfig); else await rm(manifest.config,{force:true});
@@ -514,7 +544,8 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
         if(externalLease)await externalLease.release({outcome:"aborted-before-stop",transition:transition??null,activeStatus:running});
         else{
           await rm(transitionFile,{force:true});
-          await requestJson(`http://127.0.0.1:${previous.adminPort}/maintenance/resume`,{method:"POST",token,timeoutMs:10000});
+          await requestJson(`http://127.0.0.1:${previous.adminPort}/maintenance/resume`,{method:"POST",token,timeoutMs:10000,
+            ...(normalPause?{body:{expected:normalPause}}:{})});
         }
       }catch(recovery){throw new AggregateError([error,recovery],"发行切换未开始；恢复自有维护租约尚待确认，保留维护记录");}
     }
