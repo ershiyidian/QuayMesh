@@ -51,7 +51,8 @@ export function planIdentity(plan) {
 function component(plan) {
   return { plan, state:"stopped", restarts:0, failures:0, nextStartAt:0, nextProbeAt:0,
     child:null, startedAt:null, lastReadyAt:null, stableSince:null, probeError:null,
-    lastExitCode:null, lastExitSignal:null, lastExitAt:null, error:null, stopping:false, log:null };
+    lastExitCode:null, lastExitSignal:null, lastExitAt:null, lastRecoveryAt:null, lastRecoveryReason:null,
+    error:null, stopping:false, log:null };
 }
 function validatePlans(plans) {
   const definitions = new Map(plans.map(plan => [plan.id, plan]));
@@ -89,6 +90,7 @@ export class ComponentSupervisor extends EventEmitter {
       stableSince:value.stableSince, crashLoop:value.failures>=3,
       probeError:value.probeError, lastExitCode:value.lastExitCode,
       lastExitSignal:value.lastExitSignal, lastExitAt:value.lastExitAt,
+      lastRecoveryAt:value.lastRecoveryAt, lastRecoveryReason:value.lastRecoveryReason,
     }));
   }
   async start() {
@@ -134,6 +136,18 @@ export class ComponentSupervisor extends EventEmitter {
       if (value.child !== child) return;
       value.stableSince=null; value.probeError=error.message;
       value.state = value.lastReadyAt ? "degraded" : "starting"; value.error = error.message;
+      if (value.plan.recoverOnUnhealthy && error.restartComponent === true && !this.stopped && !this.paused) {
+        // 当前检查只停止自己的进程；replacePlans 会等待 checks，不能在此调用。
+        const failures = value.failures;
+        value.lastRecoveryAt = Date.now(); value.lastRecoveryReason = error.message;
+        await this.stopComponent(value.plan.id);
+        if (!this.stopped && !this.paused) {
+          value.failures = failures + 1; value.restarts++;
+          value.state = "backoff";
+          value.error = `${error.message}；正在重新建立连接`;
+          value.nextStartAt = Date.now() + Math.min(30000,500 * 2 ** Math.min(value.failures - 1,6));
+        }
+      }
     } finally { if (value.child === child) value.observedAt = Date.now(); }
   }
   spawnComponent(value) {
@@ -153,8 +167,12 @@ export class ComponentSupervisor extends EventEmitter {
     }
     log.users++;
     const child = spawn(plan.command, plan.args || [], { cwd:plan.cwd, env:plan.env,
-      stdio:["ignore","pipe","pipe"], shell:false, windowsHide:true, detached:process.platform !== "win32" });
+      stdio:["ignore","pipe","pipe",...(plan.onMessage ? ["ipc"] : [])], shell:false, windowsHide:true, detached:process.platform !== "win32" });
     value.child = child; value.spawned = false;
+    if (plan.onMessage) child.on("message",message => {
+      if (value.child !== child || value.stopping || this.stopped) return;
+      plan.onMessage(message);
+    });
     child.once("spawn", () => { if (value.child === child) value.spawned = true; });
     child.stdout.pipe(log, { end:false }); child.stderr.pipe(log, { end:false });
     let exited = false, resolveExit;

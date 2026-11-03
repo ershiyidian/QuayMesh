@@ -602,7 +602,7 @@ export class WorkbenchFeed {
       const saved = this.cache.get(node.id + ":/workbench/metadata")?.data as Awaited<ReturnType<typeof readLocalMetadata>> | undefined;
       const settings = saved?.settings, health = node.health, egress = node.egress, GiB = 1024 ** 3;
       return { id: node.id, short: short(node), name: settings?.nickname ?? node.nickname,
-        os: node.platform === "win32" ? "windows" : node.platform, role: capabilityLabels(node.capabilities).join(" · "), capabilities: node.capabilities, components: node.components ?? [], discovery: node.discovery ?? null, online: node.online,
+        os: node.platform === "win32" ? "windows" : node.platform, role: capabilityLabels(node.capabilities).join(" · "), capabilities: node.capabilities, components: node.components ?? [], discovery: node.discovery ?? null, publicMcp: node.publicMcp ?? null, online: node.online,
         cpu: health.cpu ?? null, memoryUsed: (health.memoryTotal - health.memoryFree) / GiB, memoryTotal: health.memoryTotal / GiB,
         disks: (health.disks ?? []).map((disk) => ({ mount: disk.mount, used: (disk.total - disk.free) / GiB, total: disk.total / GiB })),
         gpus: health.gpus.map((gpu) => ({ name: gpu.name, util: gpu.utilization, used: gpu.memoryUsedMiB / 1024, total: gpu.memoryTotalMiB / 1024, temp: gpu.temperature ?? null })),

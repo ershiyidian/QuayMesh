@@ -31,6 +31,7 @@ export interface FederationConfig {
   egress: {
     enabled: boolean;
     listenPort: number;
+    controlListenPort?: number;
     mihomoConfig?: string;
     proxyUrl: string;
     controllerUrl?: string;
@@ -46,8 +47,12 @@ export interface NodeManifest {
   nickname: string;
   capabilities: NodeCapabilities;
   discovery?: { ready: boolean; lastSuccessAt?: number | null; lastError?: string | null };
+  publicMcp?: { url: string; ready: boolean; state: string; lastReadyAt?: number | null;
+    lastRequestAt?: number | null; lastSuccessAt?: number | null; lastStatus?: number | null;
+    lastError?: string | null } | null;
   components?: { id: string; state: string; pid?: number | null; restarts?: number; error?: string | null;
     startedAt?: number | null; stableSince?: number | null; crashLoop?: boolean; observedAt?: number | null;
+    lastRecoveryAt?: number | null; lastRecoveryReason?: string | null;
     lastExitCode?: number | null; lastExitSignal?: string | null; lastExitAt?: number | null }[];
   priority: number;
   roots: ExportedRoot[];
@@ -58,7 +63,7 @@ export interface NodeManifest {
   tools: string[];
   providers: unknown[];
   egress: { enabled: boolean; healthy: boolean; healthySince?: number; error?: string; checkedAt?: number; latencyMs?: number;
-    draining?: boolean; activeConnections?: number };
+    draining?: boolean; activeConnections?: number; controlConnections?: number };
   health: {
     cpuCount: number;
     cpu?: number | null;

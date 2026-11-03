@@ -4,12 +4,12 @@ import { spawn } from "node:child_process";
 import { resolve,join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { platformName } from "../node/compile.mjs";
-import { copyEasyTierCompanions, verifyComponentBinaries } from "../node/component-binaries.mjs";
+import { copyEasyTierCompanions, copyTailscaleBinaries, verifyComponentBinaries } from "../node/component-binaries.mjs";
 
 const root=fileURLToPath(new URL("..",import.meta.url));
 const {values}=parseArgs({options:{
   easytier:{type:"string"},tunnel:{type:"string"},"easytier-cli":{type:"string"},
-  egress:{type:"string"},source:{type:"boolean",default:false},
+  egress:{type:"string"},tailscale:{type:"string"},source:{type:"boolean",default:false},
 }});
 const metadata=JSON.parse(await readFile(join(root,"components.lock.json"),"utf8"));
 const target=join(root,"components",platformName());
@@ -28,6 +28,7 @@ for(const [key,name] of imports)if(values[key]){
   if(process.platform!=="win32")await chmod(join(target,exe(name)),0o755);
   if(key==="easytier")await copyEasyTierCompanions(resolve(values[key]),target);
 }
+if(values.tailscale)await copyTailscaleBinaries(resolve(values.tailscale),target,metadata.tailscale.version);
 if(values.source){
   const build=join(root,".build","components");
   await mkdir(build,{recursive:true});
@@ -44,6 +45,6 @@ if(values.source){
   await run("go",["build","-trimpath","-o",join(target,exe("tunnel-client")),"./cmd/client"],
     join(build,metadata.tunnel.directory),{...process.env,GOTOOLCHAIN:"auto"});
 }
-if(!values.source&&!values.easytier&&!values.tunnel&&!values.egress)throw new Error("请指定 --source 或组件的本机可执行文件路径");
-console.log(JSON.stringify(await verifyComponentBinaries(target)));
+if(!values.source&&!values.easytier&&!values.tunnel&&!values.egress&&!values.tailscale)throw new Error("请指定 --source 或组件的本机可执行文件路径");
+console.log(JSON.stringify(await verifyComponentBinaries(target,{tailscaleVersion:metadata.tailscale.version})));
 console.log(`组件目录：${target}`);

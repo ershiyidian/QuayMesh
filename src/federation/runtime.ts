@@ -34,6 +34,12 @@ import { dispatchConsoleRequest } from "./console-request.js";
 import { withConsoleReadSignal } from "../console-workbench/isolated-queries.js";
 import type {LocalApiPeerHooks} from "../local-user-api/service.js";
 
+const CONTROL_EGRESS = Object.freeze({ purpose: "quaymesh-managed-control-v1" });
+function isControlEgress(metadata: unknown): boolean {
+  return metadata !== null && typeof metadata === "object"
+    && (metadata as JsonRecord).purpose === CONTROL_EGRESS.purpose;
+}
+
 export interface ArtifactWriteLifecycle {
   temporaryPath: string;
   claimId?: string;
@@ -75,6 +81,7 @@ export class FederationRuntime extends EventEmitter {
   private readonly known = new Map<string, NodeManifest>();
   private readonly events: { time: string; kind: string; nodeId: string; message: string; details?: Record<string, unknown> }[] = [];
   private readonly egressStreams = new Set<Duplex>();
+  private readonly controlEgressStreams = new Map<Duplex, string | undefined>();
   private manifest: NodeManifest;
   private activeCalls = 0;
   private heartbeat?: NodeJS.Timeout;
@@ -83,7 +90,9 @@ export class FederationRuntime extends EventEmitter {
   private probing = false;
   private proxyUrl: string;
   private selected?: string;
+  private controlSelected?: string;
   private egress?: EgressListener;
+  private controlEgress?: EgressListener;
   private ingress?: EgressListener;
   private readonly cacheFile: string;
   private pendingCache?: NodeManifest[];
@@ -150,11 +159,11 @@ export class FederationRuntime extends EventEmitter {
       });
     }
   }
-  private componentStatus(): Pick<NodeManifest,"components"|"discovery"> {
+  private componentStatus(): Pick<NodeManifest,"components"|"discovery"|"publicMcp"> {
     const file = this.config.statusFile;
     if (!file || !existsSync(file)) return {};
-    const status = JSON.parse(readFileSync(file,"utf8")) as Pick<NodeManifest,"components"|"discovery">;
-    return { components:status.components, discovery:status.discovery };
+    const status = JSON.parse(readFileSync(file,"utf8")) as Pick<NodeManifest,"components"|"discovery"|"publicMcp">;
+    return { components:status.components, discovery:status.discovery, publicMcp:status.publicMcp ?? null };
   }
 
   private makeManifest(): NodeManifest {
@@ -162,7 +171,8 @@ export class FederationRuntime extends EventEmitter {
       ...this.componentStatus(), roots: this.config.roots, platform: process.platform, version: runtimeVersion(), runtime: this.runtimeIdentity,
       tools: [...this.modelTools].sort(), providers: this.hooks.providers(),
       egress: { ...(this.manifest?.egress ?? { enabled: this.config.capabilities.egress, healthy: this.config.capabilities.egress ? false : !this.config.egress.enabled }),
-        draining: !this.execution.admissionState().accepting, activeConnections: this.egressStreams.size },
+        draining: !this.execution.admissionState().accepting, activeConnections: this.egressStreams.size,
+        controlConnections: this.controlEgressStreams.size },
       health: this.manifest?.health ?? { cpuCount: 0, load: [], memoryFree: 0, memoryTotal: 0, uptime: 0, gpus: [], activeCalls: 0 }, updatedAt: Date.now() };
   }
   start(): Promise<void> {
@@ -202,6 +212,16 @@ export class FederationRuntime extends EventEmitter {
         this.probeTimer = setInterval(() => void this.probe(), this.config.egress.probeIntervalMs); this.probeTimer.unref();
       } else this.manifest.egress = { enabled:false, healthy:false };
     } else this.manifest.egress = { enabled: false, healthy: true };
+    const controlPort = this.config.egress.enabled ? this.config.egress.controlListenPort : undefined;
+    if (this.controlEgress && this.controlEgress.address !== controlPort) {
+      await this.controlEgress.close(); this.controlEgress = undefined;
+    }
+    if (controlPort !== undefined && !this.controlEgress) {
+      this.controlEgress = new EgressListener(controlPort, () => this.openGatewayStream("egress", true), error =>
+        this.event("control_egress_error", this.controlSelected ?? this.localId, "受管控制连接建立失败",
+          { code: error.code, phase: error.phase ?? "gateway_select" }));
+      await this.controlEgress.start();
+    }
   }
   get localId(): string { return this.config.nodeId; }
   addModelTool(name: string): void { this.modelTools.add(name); }
@@ -245,8 +265,15 @@ export class FederationRuntime extends EventEmitter {
     }
     return nodes;
   }
-  gateway(): NodeView | undefined {
-    const next = chooseGateway(this.nodes(), Date.now(), this.config.egress.recoveryDelayMs, this.selected);
+  gateway(managedControl = false): NodeView | undefined {
+    // A managed component must be able to validate its control connection
+    // while this Core still rejects model work. Other draining gateways stay
+    // excluded; ordinary egress keeps its existing admission and drain rules.
+    const nodes = this.nodes().map(node => managedControl && node.id === this.localId
+      ? { ...node, egress: { ...node.egress, draining: false } } : node);
+    const next = chooseGateway(nodes, Date.now(), this.config.egress.recoveryDelayMs,
+      managedControl ? this.controlSelected : this.selected);
+    if (managedControl) { this.controlSelected = next?.id; return next; }
     if (next?.id !== this.selected) { this.selected = next?.id; this.event("gateway", next?.id ?? "", next ? `发信端切换至 ${next.nickname}` : "暂无可用发信端"); }
     return next;
   }
@@ -257,7 +284,7 @@ export class FederationRuntime extends EventEmitter {
       proxyUrl: this.config.egress.enabled ? `http://127.0.0.1:${this.config.egress.listenPort}` : null,
       nodes: this.nodes(), events: this.events.slice(-40).reverse(), transfers: this.transferStore.list(), startupError: this.startupError,
       links: [...this.transport.links.values()].map(link => ({ nodeId: link.peerId, ...link.diagnostics() })),
-      activeEgressConnections: this.egressStreams.size };
+      activeEgressConnections: this.egressStreams.size, activeControlEgressConnections: this.controlEgressStreams.size };
   }
   private event(kind: string, nodeId: string, message: string, details?: Record<string, unknown>): void {
     this.events.push({ time: new Date().toISOString(), kind, nodeId, message, details });
@@ -291,6 +318,12 @@ export class FederationRuntime extends EventEmitter {
   private remember(manifest: NodeManifest, peerId: string): void {
     if (manifest.id !== peerId) throw new Error("节点身份与目录清单不匹配");
     this.known.set(peerId, manifest);
+    if (manifest.egress.draining) {
+      // Older gateways count every egress stream as blocking business work.
+      // Release only our managed control streams so those gateways can drain;
+      // healthy established business connections must remain untouched.
+      for (const [stream, target] of this.controlEgressStreams) if (target === peerId) stream.destroy();
+    }
     this.persistCache([...this.known.values()]);
   }
   private publishManifest(): void {
@@ -660,20 +693,24 @@ export class FederationRuntime extends EventEmitter {
     }
     return dispatch();
   }
-  private async openGatewayStream(service: "ingress" | "egress"): Promise<Duplex> {
+  private async openGatewayStream(service: "ingress" | "egress", managedControl = false): Promise<Duplex> {
     const node = service === "ingress"
       ? this.nodes().find(candidate => candidate.id === this.config.coordinatorId && candidate.online)
-      : this.gateway();
+      : this.gateway(managedControl);
     if (!node) throw Object.assign(new Error(service === "ingress" ? "Coordinator 当前不可用" : "暂无可用出口"),
       { code: service === "ingress" ? "COORDINATOR_UNAVAILABLE" : "EGRESS_UNAVAILABLE", phase: "gateway_select" });
-    return this.openNodeStream(node.id, service);
+    return this.openNodeStream(node.id, service, managedControl ? CONTROL_EGRESS : {});
   }
   async openNodeStream(node: string, service: string, metadata: unknown = {}): Promise<Duplex> {
+    const managedControl = service === "egress" && isControlEgress(metadata);
+    if (managedControl && (!this.config.egress.enabled || this.config.egress.controlListenPort === undefined))
+      throw Object.assign(new Error("受管控制连接入口未配置"), { code: "CONTROL_EGRESS_DISABLED", phase: "gateway_admission" });
     if (node === this.localId) {
       if (service === "ingress") return dialTcp("127.0.0.1", this.hooks.httpPort);
       if (service === "egress") {
         if (!this.config.capabilities.egress || !this.manifest.egress.healthy)
           throw Object.assign(new Error("EGRESS_CAPABILITY_UNAVAILABLE"), { code: "EGRESS_CAPABILITY_UNAVAILABLE", phase: "gateway_admission" });
+        if (managedControl) return this.trackControlStream(await connectProxy(this.proxyUrl), node);
         const lease=this.execution.beginWork({kind:"egress"});
         try { return this.trackStream(await lease.run(()=>connectProxy(this.proxyUrl)),lease,true); }
         catch(error) { lease.release(); throw error; }
@@ -682,11 +719,23 @@ export class FederationRuntime extends EventEmitter {
     }
     const link = this.transport.links.get(node); if (!link) throw new NodeUnavailableError(node);
     if(service!=="egress")return link.openStream(service, metadata);
+    if (managedControl) return this.trackControlStream(await link.openStream(service, metadata), node);
     const lease=this.execution.beginWork({kind:"egress"});
     try { return this.trackStream(await lease.run(()=>link.openStream(service,metadata)),lease,true); }
     catch(error) { lease.release(); throw error; }
   }
 
+  private trackControlStream(stream: Duplex, target?: string): Duplex {
+    // A drain announcement may arrive while the remote dial is in flight.
+    if (this.stopped || target !== undefined && target !== this.localId && this.known.get(target)?.egress.draining) {
+      stream.destroy();
+      throw Object.assign(new Error("受管控制连接的出口正在维护"), { code: "EGRESS_GATEWAY_DRAINING", phase: "gateway_admission" });
+    }
+    this.controlEgressStreams.set(stream, target);
+    stream.once("close", () => this.controlEgressStreams.delete(stream));
+    if (stream.destroyed) this.controlEgressStreams.delete(stream);
+    return stream;
+  }
   private trackStream(stream: Duplex, lease: RuntimeWorkLease, egress = false): Duplex {
     if (egress) this.egressStreams.add(stream);
     const release = () => {
@@ -706,15 +755,20 @@ export class FederationRuntime extends EventEmitter {
     if (service === "egress") {
       if (!this.config.capabilities.egress || !this.manifest.egress.healthy)
         throw Object.assign(new Error("本机 mihomo 出口当前不可用"), { code: "EGRESS_CAPABILITY_UNAVAILABLE", phase: "gateway_admission" });
-      const lease=this.execution.beginWork({kind:"egress"});
-      this.trackStream(stream,lease,true);
+      // PeerTransport authenticates the peer before delivering its metadata.
+      // Managed infrastructure is tracked by this runtime, not as model work.
+      // A remote maintenance pause still refuses every new incoming stream.
+      const managedControl = isControlEgress(metadata);
+      if (managedControl) this.execution.assertAccepting();
+      const lease = managedControl ? undefined : this.execution.beginWork({kind:"egress"});
+      if (lease) this.trackStream(stream,lease,true); else this.trackControlStream(stream);
       try {
-        const proxy=await lease.run(()=>connectProxy(this.proxyUrl));
+        const proxy=await (lease ? lease.run(()=>connectProxy(this.proxyUrl)) : connectProxy(this.proxyUrl));
         if (stream.destroyed) { proxy.destroy(); return; }
         bridge(stream,proxy);
       }
       catch(error) {
-        lease.release();
+        lease?.release();
         this.event("egress_connect_error", this.localId, "出口代理连接失败", {
           code: (error as NodeJS.ErrnoException)?.code, phase: (error as { phase?: string })?.phase ?? "proxy_connect" });
         throw error;
@@ -898,7 +952,8 @@ export class FederationRuntime extends EventEmitter {
     for (const abort of this.aborts.values()) abort.abort();
     await Promise.allSettled(this.pendingTransfers.values());
     await this.sessionFeed?.close();
-    await Promise.all([this.egress?.close(), this.ingress?.close()]);
+    for (const stream of this.controlEgressStreams.keys()) stream.destroy();
+    await Promise.all([this.egress?.close(), this.controlEgress?.close(), this.ingress?.close()]);
     await this.transport.close();
     while(this.cacheWriting)await this.cacheWriting;
     await Promise.allSettled([this.releaseRecording]);

@@ -2,6 +2,7 @@ import { createServer, request as httpRequest } from "node:http";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { parseArgs } from "node:util";
 
 const AUTH_PATHS = new Set(["/authorize", "/token", "/register", "/revoke", "/introspect"]);
 const MCP_PATHS = new Set(["/mcp", "/mcp/"]);
@@ -67,12 +68,16 @@ export function createPublicMcpIngress({
   onRequest = () => {},
 } = {}) {
   const declared = new URL(publicUrl);
-  if (declared.protocol !== "https:" || declared.pathname !== "/mcp" || declared.search || declared.hash)
+  if (declared.protocol !== "https:" || declared.pathname !== "/mcp" || declared.search || declared.hash
+      || declared.username || declared.password)
     throw new Error("publicUrl must be a fixed HTTPS origin ending in /mcp");
   const base = declared.origin;
   const target = new URL(upstream);
-  if (target.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(target.hostname))
-    throw new Error("Upstream must be on loopback");
+  if (target.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(target.hostname)
+      || target.pathname !== "/" || target.search || target.hash || target.username || target.password)
+    throw new Error("Upstream must be an HTTP loopback origin");
+  if (!Number.isInteger(port) || port < 0 || port > 65535)
+    throw new Error("Port must be an integer between 0 and 65535");
   const rate = new Map();
   let windowStart = Date.now();
   let registrations = 0;
@@ -94,13 +99,25 @@ export function createPublicMcpIngress({
     }
     const url = new URL(raw, base);
     const pathname = url.pathname;
-    res.once("finish", () => onRequest({
-      method, path: pathname, status: res.statusCode, ms: Date.now()-started,
-      // 只记录发现请求特征，不记录 OAuth code/state、Authorization 或 Cookie。
-      origin: typeof req.headers.origin === "string" ? req.headers.origin.slice(0, 100) : null,
-      agent: String(req.headers["user-agent"] ?? "").slice(0, 120),
-      accept: String(req.headers.accept ?? "").slice(0, 100),
-    }));
+    let recorded = false;
+    let failure;
+    const record = outcome => {
+      if (recorded) return;
+      recorded = true;
+      onRequest({
+        method, path: pathname, status: res.headersSent ? res.statusCode : null,
+        ms: Date.now()-started, outcome: failure ?? outcome,
+        // 不记录查询参数、凭据或原始错误文本；中途断开也只写一条结果。
+        origin: typeof req.headers.origin === "string" ? req.headers.origin.slice(0, 100) : null,
+        agent: String(req.headers["user-agent"] ?? "").slice(0, 120),
+        accept: String(req.headers.accept ?? "").slice(0, 100),
+      });
+    };
+    res.once("finish", () => record("completed"));
+    res.once("close", () => record("client_closed"));
+    res.once("error", () => record("client_error"));
+    req.once("aborted", () => record("client_aborted"));
+    req.once("error", () => record("client_error"));
     if (method === "OPTIONS" && origin &&
         (METADATA_PATHS.has(pathname) || MCP_PATHS.has(pathname) || AUTH_PATHS.has(pathname))) {
       res.writeHead(204, {
@@ -171,18 +188,20 @@ export function createPublicMcpIngress({
       }
       replyHeaders["cache-control"] ??= "no-store";
       res.writeHead(status, replyHeaders);
-      reply.on("error", () => res.destroy());
-      reply.once("aborted", () => res.destroy());
+      reply.on("error", () => { failure ??= "upstream_error"; res.destroy(); });
+      reply.once("aborted", () => { failure ??= "upstream_closed"; res.destroy(); });
       reply.pipe(res);
     });
-    outgoing.once("timeout", () => outgoing.destroy(new Error("upstream_timeout")));
+    outgoing.once("timeout", () => { failure ??= "upstream_timeout"; outgoing.destroy(); });
     outgoing.once("error", () => {
+      failure ??= "upstream_error";
       if (!res.headersSent && !res.destroyed) res.writeHead(502, {
         "content-type": "application/json", "cache-control": "no-store",
       }).end('{"error":"coordinator_unavailable"}');
       else if (!res.destroyed) res.destroy();
     });
     req.once("aborted", () => outgoing.destroy());
+    req.once("error", () => outgoing.destroy());
     res.once("close", () => { if (!res.writableFinished) outgoing.destroy(); });
     req.pipe(outgoing);
   });
@@ -202,19 +221,41 @@ export function createPublicMcpIngress({
   };
 }
 
+async function commandOptions(args) {
+  const { values } = parseArgs({ args, allowPositionals: false, options: {
+    config: { type: "string" }, "public-url": { type: "string" },
+    upstream: { type: "string" }, port: { type: "string" },
+  } });
+  let publicUrl = values["public-url"];
+  let upstream = values.upstream;
+  if (values.config !== undefined) {
+    if (publicUrl !== undefined || upstream !== undefined)
+      throw new Error("Use either --config or --public-url with --upstream");
+    const node = JSON.parse(await readFile(values.config, "utf8"));
+    if (!node.capabilities?.coordinator || !node.publicMcp?.url)
+      throw new Error("Missing publicMcp Coordinator config");
+    if (!Number.isInteger(node.corePort) || node.corePort < 1 || node.corePort > 65535)
+      throw new Error("Coordinator corePort must be an integer between 1 and 65535");
+    publicUrl = node.publicMcp.url;
+    upstream = "http://127.0.0.1:" + node.corePort;
+  } else if (!publicUrl || !upstream) {
+    throw new Error("Provide --config or both --public-url and --upstream");
+  }
+  if (values.port !== undefined && !/^\d+$/.test(values.port))
+    throw new Error("Port must be an integer between 0 and 65535");
+  return { publicUrl, upstream, port: values.port === undefined ? 29176 : Number(values.port) };
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  const configIndex = process.argv.indexOf("--config");
-  if (configIndex < 0 || !process.argv[configIndex + 1]) throw new Error("Expected --config path");
-  const node = JSON.parse(await readFile(process.argv[configIndex + 1], "utf8"));
-  if (!node.capabilities?.coordinator || !node.publicMcp?.url) throw new Error("Missing publicMcp Coordinator config");
-  const portIndex = process.argv.indexOf("--port");
-  const port = portIndex >= 0 ? Number(process.argv[portIndex + 1]) : 29176;
-  const upstream = "http://127.0.0.1:" + node.corePort;
   const ingress = await createPublicMcpIngress({
-    publicUrl: node.publicMcp.url, upstream, port,
-    onRequest: event => console.info(JSON.stringify(event)),
+    ...await commandOptions(process.argv.slice(2)),
+    onRequest: event => {
+      console.info(JSON.stringify(event));
+      if (process.connected) process.send({ type: "public-mcp-request", ...event }, () => {});
+    },
   }).start();
-  console.log("Public MCP ingress listening on loopback; public URL " + ingress.publicUrl);
+  console.log("Public MCP ingress listening on 127.0.0.1:" + ingress.server.address().port
+    + "; public URL " + ingress.publicUrl);
   for (const signal of ["SIGINT", "SIGTERM"]) {
     process.once(signal, () => { void ingress.close().then(() => process.exit(0)); });
   }

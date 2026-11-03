@@ -127,7 +127,7 @@ test("full cgroup traversal includes nested business processes and managed PGID 
   await assert.rejects(f.observe(), error => error.code === "ENOENT");
 });
 
-async function guardedFixture(t) {
+async function guardedFixture(t, { ingress = false } = {}) {
   const f = await kernelFixture(t), token = makeToken(), requests = [];
   const idle = { ...zero, instance: { pid: f.core.pid, processStart: f.core.start, token: "core-instance" },
     accepting: false, reason: "node-maintenance", changedAt: "2026-11-02T00:00:00.001Z" };
@@ -140,12 +140,82 @@ async function guardedFixture(t) {
     assert.equal(req.headers.authorization, `Bearer ${token}`); return { body: idle };
   });
   const manifest = { platform: "linux", nodeId: "edge", sourceCommit: "current", directory: releaseRoot, adminPort: port };
+  const ingressProcesses = [];
+  if (ingress) {
+    const configuration = cluster(), stateDir = join(f.root, "tailscale");
+    manifest.config = join(f.root, "node.json");
+    await writeFile(join(f.root, "cluster.json"), JSON.stringify(configuration));
+    await writeFile(join(f.root, "secrets.env"), `QUAYMESH_CLUSTER_TOKEN=${token}\n`);
+    await writeFile(manifest.config, JSON.stringify({ schemaVersion: 1, id: "edge", stateDir: f.root,
+      capabilities: { worker: true }, mesh: { enabled: false, address: "127.0.0.2" },
+      network: { externalAccess: true }, secretsFile: "./secrets.env", nodeRuntime: process.execPath,
+      components: { tailscale: { executable: process.execPath } },
+      publicMcp: { url: "https://fixture.example.ts.net/mcp", listenPort: 29177, funnel: { stateDir } } }));
+    ingressProcesses.push({ id: "public-mcp", pid: 10008, args: [process.execPath, join(releaseRoot, "node/public-mcp.mjs"),
+      "--public-url", "https://fixture.example.ts.net/mcp", "--upstream", `http://127.0.0.1:${configuration.discovery.localPort}`,
+      "--port", "29177"] },
+    { id: "funnel", pid: 10009, args: [process.execPath, "--tun=userspace-networking",
+      `--socket=${join(stateDir, "tailscaled.sock")}`, `--state=${join(stateDir, "tailscaled.state")}`,
+      `--statedir=${stateDir}`, "--port=0", "--no-logs-no-support"] });
+    for (const row of ingressProcesses) {
+      await f.add(row.pid, { parentPid: f.manager.pid, args: row.args });
+      status.components.push({ id: row.id, pid: row.pid, state: "ready", startedAt: 100, restarts: 0 });
+    }
+    await f.members([f.manager.pid, f.core.pid, ...ingressProcesses.map(row => row.pid)]);
+  }
   const unit = { mainPid: f.manager.pid, group: "/unit", invocationId: "a".repeat(32), fragmentDigest: "f".repeat(64) };
   const options = { manifest, status, token, corePort: port, kernel: f.kernel, inspectUnit: async () => structuredClone(unit) };
   const guard = await createLinuxInstallationGuard(options);
   const expectedPause = { instance: idle.instance, accepting: idle.accepting, reason: idle.reason, changedAt: idle.changedAt };
-  return { ...f, options, guard, expectedPause, idle, status, unit, requests };
+  return { ...f, options, guard, expectedPause, idle, status, unit, requests, ingressProcesses };
 }
+
+test("managed public MCP and Funnel retain exact command identities without approving their descendants", linux, async t => {
+  const f = await guardedFixture(t, { ingress: true });
+  const first = await f.guard.assertHeld("before_backup", { expectedPause: f.expectedPause });
+  assert.equal(first.count, 4); assert.equal(first.unapprovedCount, 0);
+  // Installed module paths remain canonical when the recorded release is a symlink.
+  const alias = join(f.root, "installed-release"); await symlink(releaseRoot, alias);
+  f.options.manifest.directory = alias;
+  const throughAlias = await createLinuxInstallationGuard(f.options);
+  assert.equal((await throughAlias.assertHeld("before_backup", { expectedPause: f.expectedPause })).count, 4);
+  // Even a known read-worker command is unapproved when born under Funnel.
+  await f.add(10010, { parentPid: 10009, pgid: 10009, sid: 10009,
+    args: [process.execPath, "--max-old-space-size=192", join(releaseRoot, "dist/session/projection-read-worker.js")] });
+  await f.members([10001, 10002, 10008, 10009, 10010]);
+  await assert.rejects(f.guard.assertHeld("before_stop", { expectedPause: f.expectedPause }), error => {
+    assert.equal(error.code, "LINUX_STOP_DOMAIN_UNTRACKED_PROCESSES");
+    assert.equal(error.details.unapprovedCount, 1); assert.equal(error.details.unapproved[0].pid, 10010); return true;
+  });
+});
+
+test("managed ingress rejects another script, changed daemon arguments and a mismatched executable without printing argv", linux, async t => {
+  const f = await guardedFixture(t, { ingress: true });
+  for (const row of f.ingressProcesses) {
+    const changed = [...row.args];
+    if (row.id === "public-mcp") changed[1] = "/unreviewed/node/public-mcp.mjs";
+    else changed[3] = "--state=/unreviewed/sensitive-state-sentinel";
+    await writeFile(join(f.procRoot, String(row.pid), "cmdline"), changed.join("\0") + "\0");
+    await assert.rejects(f.guard.assertHeld("before_stop", { expectedPause: f.expectedPause }), error => {
+      assert.equal(error.code, "LINUX_STOP_DOMAIN_MANAGED_PROCESS_COMMAND_CHANGED");
+      assert.equal(error.details.pid, row.pid);
+      assert.equal(JSON.stringify(error).includes("sensitive-state-sentinel"), false); return true;
+    });
+    await writeFile(join(f.procRoot, String(row.pid), "cmdline"), row.args.join("\0") + "\0");
+  }
+  const executable = join(f.procRoot, "10009/exe"); await rm(executable); await symlink("/bin/false", executable);
+  await assert.rejects(f.guard.assertHeld("before_stop", { expectedPause: f.expectedPause }), code("MANAGED_PROCESS_COMMAND_CHANGED"));
+});
+
+test("managed ingress still requires configured plans and direct Manager parentage", linux, async t => {
+  const f = await guardedFixture(t, { ingress: true });
+  const funnel = f.ingressProcesses.find(row => row.id === "funnel");
+  await f.add(funnel.pid, { parentPid: f.core.pid, args: funnel.args });
+  await assert.rejects(createLinuxInstallationGuard(f.options), code("COMPONENT_PARENT_CHANGED"));
+  const node = JSON.parse(await readFile(f.options.manifest.config, "utf8")); delete node.publicMcp;
+  await writeFile(f.options.manifest.config, JSON.stringify(node));
+  await assert.rejects(createLinuxInstallationGuard(f.options), code("COMPONENT_COMMAND_UNCONFIRMED"));
+});
 
 test("actual HTTP fence plus real filesystem census accepts only exact Core read workers and detects later business before stop", linux, async t => {
   const f = await guardedFixture(t);

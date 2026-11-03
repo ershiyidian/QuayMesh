@@ -25,7 +25,7 @@ export const federationConfigSchema = z.object({
   peers: z.array(peerSchema).max(32).default([]), roots: z.array(exportedRootSchema).max(256).default([]),
   heartbeatMs: z.number().int().min(1000).max(60000).default(5000), rpcTimeoutMs: z.number().int().min(1000).max(600000).default(120000),
   egress: z.object({
-    enabled: z.boolean().default(false), listenPort: port.default(17890),
+    enabled: z.boolean().default(false), listenPort: port.default(17890), controlListenPort: port.optional(),
     mihomoConfig: z.string().optional(), proxyUrl: z.string().url().default("http://127.0.0.1:7890"), controllerUrl: z.string().url().optional(),
     controllerSecretEnv: z.string().default("MIHOMO_SECRET"), probeUrl: z.string().url().default("https://www.gstatic.com/generate_204"),
     probeIntervalMs: z.number().int().min(3000).max(300000).default(15000), recoveryDelayMs: z.number().int().min(0).max(300000).default(60000),
@@ -37,4 +37,8 @@ export const federationConfigSchema = z.object({
     value[key].forEach((entry, index) => { if (seen.has(entry.id)) context.addIssue({ code: "custom", path: [key, index, "id"], message: "ID 重复" }); seen.add(entry.id); });
   }
   if (value.peers.some((peer) => peer.id === value.nodeId)) context.addIssue({ code: "custom", path: ["peers"], message: "节点列表填写其他机器" });
+  if (value.egress.controlListenPort === value.egress.listenPort)
+    context.addIssue({ code: "custom", path: ["egress", "controlListenPort"], message: "受管控制连接需要独立于业务出口的监听端口" });
+  if (value.egress.controlListenPort !== undefined && !value.egress.enabled)
+    context.addIssue({ code: "custom", path: ["egress", "controlListenPort"], message: "受管控制连接需要启用动态出口" });
 });

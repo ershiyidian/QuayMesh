@@ -16,6 +16,7 @@ import { requestJson, requestDiscoveryReady, connectSocket } from "./network.mjs
 import { assertMeshPortFree, assertManagedMeshListener } from "./easytier-health.mjs";
 import { SourceErrors } from "./source-errors.mjs";
 import { resumeAdmissionWithRetry } from "./maintenance-recovery.mjs";
+import { createTailscaleProbe } from "./tailscale.mjs";
 
 export const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -51,6 +52,7 @@ export class QuayMeshNode {
     this.config = configuration; this.root = root; this.intervalMs = intervalMs; this.readinessMs = readinessMs;
     this.stopped = false; this.configRevision = configuration.revision;
     this.discovery = { ready:false, lastSuccessAt:null, lastError:null };
+    this.publicMcpRequests = {lastRequestAt:null,lastSuccessAt:null,lastStatus:null};
     this.pendingConfiguration = null; this.errors = new SourceErrors();
     this.componentObservations=new Map();
     this.settingsQueue = Promise.resolve(); this.settingsApply = null; this.pendingSettingsRevision = null;
@@ -92,7 +94,7 @@ export class QuayMeshNode {
         // egress, or a command inherited from a previous model terminal.
         for (const key of Object.keys(plan.env)) if (/^QUAYMESH_LOCAL_API_/i.test(key)) delete plan.env[key];
         await access(plan.command, process.platform === "win32" ? constants.F_OK : constants.X_OK);
-        const settings = node.components[plan.id === "mesh" ? "easytier" : plan.id === "discovery" ? "tunnel" : plan.id];
+        const settings = node.components[plan.id === "mesh" ? "easytier" : plan.id === "discovery" ? "tunnel" : plan.id === "funnel" ? "tailscale" : plan.id];
         if (settings?.configFile) plan.configuration = await readFile(settings.configFile,"utf8");
         const effective = { command:plan.command, args:[...(plan.args || [])], cwd:plan.cwd,
           env:{...plan.env}, requires:plan.requires, configuration:plan.configuration };
@@ -150,6 +152,35 @@ export class QuayMeshNode {
           };
           plan.ready = () => requestDiscoveryReady(`http://127.0.0.1:${cluster.discovery.healthPort}/readyz`,{timeoutMs:2500});
         }
+        if (plan.id === "public-mcp") {
+          const upstreamReady = async () => {
+            const ready = await requestJson(`http://127.0.0.1:${cluster.discovery.localPort}/readyz`,{timeoutMs:2500});
+            if (ready?.ok !== true) throw new Error("公网 MCP 的 Coordinator 尚未就绪");
+          };
+          plan.beforeStart = upstreamReady;
+          plan.onMessage = event => {
+            if (event?.type !== "public-mcp-request" || event.method !== "POST" ||
+                !["/mcp","/mcp/"].includes(event.path) || (event.status !== null && !Number.isInteger(event.status))) return;
+            this.publicMcpRequests.lastRequestAt = Date.now();
+            this.publicMcpRequests.lastStatus = event.status;
+            if (event.status >= 200 && event.status < 300 && event.outcome === "completed")
+              this.publicMcpRequests.lastSuccessAt = this.publicMcpRequests.lastRequestAt;
+          };
+          plan.ready = async () => {
+            await upstreamReady();
+            const metadata = await requestJson(`http://127.0.0.1:${node.publicMcp.listenPort}/.well-known/oauth-protected-resource`,{timeoutMs:2500});
+            if (metadata?.resource !== new URL(node.publicMcp.url).origin) throw new Error("公网 MCP 资源发现与配置不一致");
+          };
+        }
+        if (plan.id === "funnel") {
+          const stateDir = node.publicMcp.funnel.stateDir;
+          const command = join(dirname(plan.command),"tailscale");
+          await access(command,constants.X_OK);
+          plan.beforeStart = () => mkdir(stateDir,{recursive:true,mode:0o700});
+          plan.ready = createTailscaleProbe({socketPath:join(stateDir,"tailscaled.sock"),
+            publicUrl:node.publicMcp.url,port:node.publicMcp.listenPort,command});
+          plan.recoverOnUnhealthy = true;
+        }
         plan.effective = effective;
       }
       return { configuration, revision, generatedDir, coreConfigDir, token, plans };
@@ -157,7 +188,7 @@ export class QuayMeshNode {
   }
   async createRelay(configuration) {
     const {node,cluster} = configuration;
-    if (!node.capabilities.discovery && !node.capabilities.desktopUi && !node.capabilities.consoleRelay) return null;
+    if (!node.capabilities.discovery && !node.capabilities.desktopUi && !node.capabilities.consoleRelay && !node.publicMcp?.funnel) return null;
     return new McpRelay({ origin:hostUrl(cluster.coordinator.address,cluster.coordinator.mcpPort),
       port:cluster.discovery.localPort,
       socksUrl:node.mesh.enabled && node.mesh.mode === "no-tun" ? `socks5://127.0.0.1:${node.mesh.socksPort}` : undefined,
@@ -176,6 +207,10 @@ export class QuayMeshNode {
     this.generation = await this.prepare(this.config,this.configRevision);
     this.token = this.generation.token;
     const {node,cluster} = this.config;
+    const previousStatus = await readOptionalJson(this.statusFile);
+    if (previousStatus?.nodeId === node.id && previousStatus.publicMcp?.url === node.publicMcp?.url)
+      for (const key of Object.keys(this.publicMcpRequests))
+        this.publicMcpRequests[key] = previousStatus.publicMcp?.[key] ?? null;
     this.installationTransition=await readOptionalJson(join(node.stateDir,"installation-transition.json"));
     this.startupReadiness=await installationStartupBudget(this.root,this.installationTransition,this.release,this.readinessMs);
     if(this.installationTransition)this.maintenance=true;
@@ -204,7 +239,7 @@ export class QuayMeshNode {
       catch(error){throw new Error(`Core 启动未通过 ${this.startupReadiness.coreReadinessMs} ms 就绪预算：${error.message}`,{cause:error});}
       await this.confirmConfiguration(this.generation);
       this.membership = await new MembershipClient({node,cluster,token:this.token,release:this.release,
-        status:() => ({components:this.supervisor.snapshot(),discovery:this.discovery}),
+        status:() => ({components:this.supervisor.snapshot(),discovery:this.discovery,publicMcp:this.publicMcpStatus()}),
         onConfiguration:async(next,revision) => {
           if (revision > this.configRevision) {
             this.pendingConfiguration = {cluster:next,revision,requestedAt:Date.now(),failed:false};
@@ -318,9 +353,23 @@ export class QuayMeshNode {
     await writeJson(join(generation.configuration.node.stateDir,"cluster.snapshot.json"), {
       revision:generation.revision, cluster:generation.configuration.cluster,
     });
+    if (this.config.node.publicMcp?.url !== generation.configuration.node.publicMcp?.url)
+      this.publicMcpRequests = {lastRequestAt:null,lastSuccessAt:null,lastStatus:null};
     this.config = generation.configuration; this.configRevision = generation.revision;
     this.generation = generation; this.corePort = this.config.node.corePort;
     if (this.membership) { this.membership.node = this.config.node; this.membership.cluster = this.config.cluster; }
+  }
+  publicMcpStatus() {
+    if (!this.config.node.publicMcp?.funnel) return null;
+    const components = this.supervisor?.snapshot() || [];
+    const ingress = components.find(value=>value.id==="public-mcp");
+    const funnel = components.find(value=>value.id==="funnel");
+    const ready = ingress?.state === "ready" && funnel?.state === "ready";
+    const unavailable = [ingress,funnel].find(value=>value?.state !== "ready");
+    return {url:this.config.node.publicMcp.url,ready,
+      state:ready ? "ready" : unavailable?.state || "starting",
+      lastReadyAt:ingress?.lastReadyAt && funnel?.lastReadyAt ? Math.min(ingress.lastReadyAt,funnel.lastReadyAt) : null,
+      ...this.publicMcpRequests,lastError:funnel?.error || ingress?.error || null};
   }
   status() {
     const errors = this.errors.snapshot();
@@ -331,7 +380,7 @@ export class QuayMeshNode {
       configuration:{applied:this.configRevision,desired:this.pendingConfiguration?.revision || this.configRevision,
         state:this.applying ? "applying" : this.pendingConfiguration?.failed ? "rejected" : this.pendingConfiguration ? "pending" : "applied"},
       maintenance:this.maintenance,maintenanceProtocol:2,maintenancePauseReceipt:1,relayActiveRequests:this.relay?.activeRequests??0,
-      components:this.supervisor?.snapshot() || [],discovery:this.discovery,
+      components:this.supervisor?.snapshot() || [],discovery:this.discovery,publicMcp:this.publicMcpStatus(),
       installationTransition:this.installationTransition??null,
       startupReadiness:this.startupReadiness??null,
       activeCoreRelease:this.activeCoreRelease??null,

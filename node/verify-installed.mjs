@@ -19,10 +19,10 @@ if (typeof globalThis.gc !== "function") {
 // 从发行包自己的 package.json 解析依赖，验证解压后的依赖入口真实可用。
 const here = dirname(fileURLToPath(import.meta.url));
 const bundle = resolve(here, "..");
-const componentVersions = await verifyComponentBinaries(join(bundle, "components", platformName()));
 const require = createRequire(join(bundle, "package.json"));
 const packageJson=JSON.parse(await readFile(join(bundle,"package.json"),"utf8"));
 const lock=JSON.parse(await readFile(join(bundle,"components.lock.json"),"utf8"));
+const componentVersions = await verifyComponentBinaries(join(bundle, "components", platformName()),{tailscaleVersion:lock.tailscale?.version});
 if(process.versions.node!==lock.node)throw new Error(`发行 Node 版本不符：${process.versions.node}，期望 ${lock.node}`);
 const nativeVersion=require("better-sqlite3/package.json").version;
 if(nativeVersion!==packageJson.dependencies["better-sqlite3"])throw new Error(`发行 SQLite 依赖版本不符：${nativeVersion}`);

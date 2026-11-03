@@ -12,8 +12,11 @@ QuayMesh uses MIT for its project code. The following components retain their re
 | Pi integration | [earendil-works/pi](https://github.com/earendil-works/pi) | MIT; integration files listed in `NOTICE` |
 | EasyTier | [EasyTier/EasyTier](https://github.com/EasyTier/EasyTier) | LGPL-3.0; source archive and licenses in `third_party/` |
 | OpenAI tunnel-client | [openai/tunnel-client](https://github.com/openai/tunnel-client) | Apache-2.0; source archive and licenses in `third_party/` |
+| Tailscale (optional Linux Funnel component) | [tailscale/tailscale v1.102.4](https://github.com/tailscale/tailscale/tree/v1.102.4) | BSD-3-Clause; license in `third_party/licenses/tailscale-LICENSE` |
 
 The bundled component source archives provide the corresponding source used by the component build. `components.lock.json` records their selected versions.
+
+The optional Tailscale component imports the unmodified `tailscaled` and `tailscale` programs from the official static Linux package. `components.lock.json` records its version, source tag, and download URLs. Both programs retain their upstream notices; Tailscale's [dependency licenses](https://tailscale.com/licenses) apply to its bundled dependencies.
 
 Local source modifications, archive hashes, and regression commands are documented in [third_party/patches/README.md](third_party/patches/README.md).
 

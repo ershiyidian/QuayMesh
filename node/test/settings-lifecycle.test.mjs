@@ -107,3 +107,29 @@ test("CF07：长任务仍活跃时设置保持 pending，不进入维护、不�
   assert.equal(prepared,false);
   assert.equal(paused,false);
 });
+
+test("CF09：公网请求观测随入口地址隔离，同地址配置确认保留已恢复的历史",{skip:process.platform!=="linux"},async t=>{
+  const f=await fixture(t),port=await freePort();
+  const raw=JSON.parse(await readFile(f.config,"utf8"));
+  Object.assign(raw,{adminPort:port,network:{externalAccess:true},
+    publicMcp:{url:"https://gemini-one.example.ts.net/mcp",funnel:{}}});
+  await writeFile(f.config,JSON.stringify(raw));
+  const config=await loadSettingsAuthority(f.config),node=new QuayMeshNode(config);
+  node.token=f.key;node.supervisor={snapshot:()=>[],close:async()=>{}};
+  const history={lastRequestAt:Date.now()-100,lastSuccessAt:Date.now()-200,lastStatus:200};
+  node.publicMcpRequests={...history};
+  await node.startAdmin();t.after(()=>node.close());
+  const status=async()=> (await (await fetch(`http://127.0.0.1:${port}/status`)).json()).publicMcp;
+
+  await node.confirmConfiguration({configuration:config,revision:2});
+  assert.deepEqual(await status(),{url:raw.publicMcp.url,ready:false,state:"starting",
+    lastReadyAt:null,...history,lastError:null});
+
+  raw.publicMcp.url="https://gemini-two.example.ts.net/mcp";
+  await writeFile(f.config,JSON.stringify(raw));
+  const changed=await loadSettingsAuthority(f.config);
+  await node.confirmConfiguration({configuration:changed,revision:3});
+  assert.deepEqual(await status(),{url:raw.publicMcp.url,ready:false,state:"starting",
+    lastReadyAt:null,lastRequestAt:null,lastSuccessAt:null,lastStatus:null,lastError:null});
+  assert.equal(JSON.parse(await readFile(join(config.node.stateDir,"cluster.snapshot.json"),"utf8")).revision,3);
+});

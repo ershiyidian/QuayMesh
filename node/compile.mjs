@@ -8,7 +8,7 @@ export function platformName(platform = process.platform, arch = process.arch) {
 }
 export function componentPath(root, name, node) {
   if (node.components[name]?.executable) return node.components[name].executable;
-  const base = name === "easytier" ? "easytier-core" : name === "tunnel" ? "tunnel-client" : "mihomo";
+  const base = name === "easytier" ? "easytier-core" : name === "tunnel" ? "tunnel-client" : name === "tailscale" ? "tailscaled" : "mihomo";
   return join(root, "components", platformName(), `${base}${process.platform === "win32" ? ".exe" : ""}`);
 }
 export function easyTierConfig(node, cluster) {
@@ -68,6 +68,8 @@ export function compileCore(node, cluster, { root, tokenFile, ownerToken, member
         proxyUrl:node.consoleSettings?.egress?.proxyUrl??proxyUrl,
         ...(node.components.egress?.configFile ? { mihomoConfig:node.components.egress.configFile } : {}),
         ...node.consoleSettings?.egress,
+        ...(node.publicMcp?.funnel && (caps.worker || caps.egress) && node.consoleSettings?.egress?.enabled !== false
+          ? { controlListenPort:node.publicMcp.funnel.controlProxyPort } : {}),
         controllerSecretEnv:"QUAYMESH_PROXY_CONTROLLER_SECRET", probeUrl:node.consoleSettings?.egress?.probeUrl??cluster.egress.probeUrl,
         probeIntervalMs:node.consoleSettings?.egress?.probeIntervalMs??15000, recoveryDelayMs:node.consoleSettings?.egress?.recoveryDelayMs??cluster.egress.recoveryDelayMs,
         inheritProxy:node.consoleSettings?.egress?.inheritProxy??node.network.externalAccess,
@@ -130,6 +132,24 @@ export function componentPlans(node, cluster, env, { root, generatedDir, configD
         ...component.environment,
       },
       requires:[...(managedMesh ? ["mesh"] : []), ...(plans.some(plan => plan.id === "egress") ? ["egress"] : [])] });
+  }
+  if (node.publicMcp?.funnel) {
+    const ingress = node.publicMcp;
+    const component = node.components.tailscale || {};
+    const stateDir = ingress.funnel.stateDir;
+    const dynamicProxy = (node.capabilities.worker || node.capabilities.egress)
+      && node.consoleSettings?.egress?.enabled !== false;
+    const proxy = dynamicProxy ? hostUrl("127.0.0.1",ingress.funnel.controlProxyPort)
+      : node.network.proxyUrl || (node.network.inheritProxy ? env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy : undefined);
+    plans.push({ id:"public-mcp", command:node.nodeRuntime || process.execPath,
+      args:[join(root,"node","public-mcp.mjs"),"--public-url",ingress.url,
+        "--upstream",hostUrl("127.0.0.1",cluster.discovery.localPort),"--port",String(ingress.listenPort)],
+      cwd:root, env:restrictedEnvironment(env), requires:[] });
+    plans.push({ id:"funnel", command:componentPath(root,"tailscale",node),
+      args:["--tun=userspace-networking",`--socket=${join(stateDir,"tailscaled.sock")}`,
+        `--state=${join(stateDir,"tailscaled.state")}`,`--statedir=${stateDir}`,"--port=0","--no-logs-no-support"],
+      cwd:root, env:{...proxyEnvironment(restrictedEnvironment(env),proxy),...component.environment},
+      requires:["public-mcp",...(dynamicProxy ? ["core"] : []),...(plans.some(plan=>plan.id==="egress") ? ["egress"] : [])] });
   }
   return plans;
 }

@@ -87,6 +87,8 @@ OpenAI maintains the current [connection instructions](https://developers.openai
 
 ## Connect multiple machines
 
+For a managed, fixed HTTPS endpoint for Gemini, see [Gemini ingress](GEMINI.md). The Linux node manager runs the public MCP adapter and optional Tailscale Funnel component using the same release and lifecycle as the other QuayMesh components.
+
 Prepare a coordinator and one or more workers. The coordinator provides the shared MCP endpoint and task directory. Workers expose their own project roots.
 
 Create a site using your coordinator's reachable EasyTier address:

@@ -167,12 +167,23 @@ export function validateNode(input, cluster, directory = process.cwd()) {
   check(CAPABILITIES.some(name => value.capabilities[name]), "节点至少需要一项能力");
   check(value.capabilities.coordinator === (value.id === cluster.coordinator.id), "Coordinator 能力与 cluster.coordinator.id 必须一致");
   if (value.publicMcp !== undefined) {
-    check(value.capabilities.coordinator, "只有 Coordinator 可以配置公网 MCP 资源");
-    keys(value.publicMcp, ["url","allowedRedirectHosts","legacyUrls"], "node.publicMcp");
+    check(value.capabilities.coordinator || value.publicMcp.funnel !== undefined,
+      "工作节点的公网 MCP 配置需要托管 Funnel 入口");
+    keys(value.publicMcp, ["url","allowedRedirectHosts","legacyUrls","listenPort","funnel"], "node.publicMcp");
     const publicUrl = httpUrl(value.publicMcp.url,"node.publicMcp.url");
     check(publicUrl.protocol === "https:" && publicUrl.pathname === "/mcp" && !publicUrl.search && !publicUrl.hash,
       "公网 MCP 地址必须是 HTTPS 且路径恰好为 /mcp");
     value.publicMcp.url = publicUrl.href;
+    if (value.publicMcp.funnel !== undefined) {
+      keys(value.publicMcp.funnel, ["stateDir","controlProxyPort"], "node.publicMcp.funnel");
+      check(process.platform === "linux", "托管 Funnel 当前支持 Linux 节点");
+      check(publicUrl.hostname.endsWith(".ts.net"), "Funnel 需要使用该设备的固定 ts.net 域名");
+      check(!publicUrl.port, "Funnel 公网地址需要使用 HTTPS 443");
+      value.publicMcp.listenPort ??= 29177;
+      port(value.publicMcp.listenPort, "node.publicMcp.listenPort");
+      value.publicMcp.funnel.controlProxyPort ??= 17889;
+      port(value.publicMcp.funnel.controlProxyPort, "node.publicMcp.funnel.controlProxyPort");
+    } else check(value.publicMcp.listenPort === undefined, "公网 MCP 监听端口需要配置 Funnel");
     value.publicMcp.legacyUrls ??= [];
     check(Array.isArray(value.publicMcp.legacyUrls) && value.publicMcp.legacyUrls.length <= 4,
       "旧公网 MCP 资源地址最多保留 4 个");
@@ -224,15 +235,21 @@ export function validateNode(input, cluster, directory = process.cwd()) {
   value.adminPort ??= DEFAULT_PORTS.admin;
   for (const field of ["corePort","peerPort","adminPort"]) port(value[field], field);
   value.stateDir = expandPath(value.stateDir || defaultStateDir(), directory);
+  if (value.publicMcp?.funnel) {
+    check(value.network.externalAccess, "托管 Funnel 需要允许该节点访问外网");
+    value.publicMcp.funnel.stateDir = expandPath(value.publicMcp.funnel.stateDir || join(value.stateDir,"tailscale"), directory);
+  }
   value.clusterFile = expandPath(value.clusterFile || "./cluster.json", directory);
   if (value.secretsFile) value.secretsFile = expandPath(value.secretsFile, directory);
   value.components ??= {};
-  keys(value.components, ["easytier","tunnel","egress"], "components");
+  keys(value.components, ["easytier","tunnel","egress","tailscale"], "components");
   for (const [name, component] of Object.entries(value.components)) {
-    keys(component, ["executable","args","configFile","environment"], `components.${name}`);
+    keys(component, name === "tailscale" ? ["executable","environment"] : ["executable","args","configFile","environment"], `components.${name}`);
     if (component.executable) component.executable = expandPath(component.executable, directory);
-    component.args ??= [];
-    check(Array.isArray(component.args) && component.args.every(arg => typeof arg === "string"), `${name}.args 必须是字符串数组`);
+    if (name !== "tailscale") {
+      component.args ??= [];
+      check(Array.isArray(component.args) && component.args.every(arg => typeof arg === "string"), `${name}.args 必须是字符串数组`);
+    }
     if (component.configFile) component.configFile = expandPath(component.configFile, directory);
     if (component.environment) {
       object(component.environment, `${name}.environment`);
@@ -263,7 +280,12 @@ export function validateNode(input, cluster, directory = process.cwd()) {
   if (value.capabilities.discovery) check(!!cluster.discovery.resourceUrl, "discovery 需要配置 tunnel 的 resourceUrl");
   const ports = [value.corePort,value.peerPort,value.adminPort];
   if (value.capabilities.coordinator) ports.push(value.registryPort ?? cluster.coordinator.apiPort);
-  if (value.capabilities.discovery || value.capabilities.desktopUi || value.capabilities.consoleRelay) ports.push(cluster.discovery.localPort);
+  if (value.capabilities.discovery || value.capabilities.desktopUi || value.capabilities.consoleRelay || value.publicMcp?.funnel) ports.push(cluster.discovery.localPort);
+  if (value.publicMcp?.funnel) {
+    ports.push(value.publicMcp.listenPort);
+    if ((value.capabilities.worker || value.capabilities.egress) && value.consoleSettings.egress?.enabled !== false)
+      ports.push(value.consoleSettings.egress?.listenPort ?? 17890,value.publicMcp.funnel.controlProxyPort);
+  }
   if (value.capabilities.discovery) ports.push(cluster.discovery.healthPort);
   if (value.mesh.enabled) ports.push(value.mesh.rpcPort);
   if (value.mesh.enabled && value.mesh.mode === "no-tun") ports.push(value.mesh.socksPort);

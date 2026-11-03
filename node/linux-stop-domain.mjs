@@ -4,6 +4,8 @@ import { createHash } from "node:crypto";
 import { posix, resolve, basename } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { requestJson } from "./network.mjs";
+import { loadNodeConfig } from "./config.mjs";
+import { componentPlans } from "./compile.mjs";
 
 const digest = value => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
@@ -11,6 +13,7 @@ const positive = value => Number.isSafeInteger(value) && value > 0;
 const within = (path, root) => path === root || path.startsWith(root === "/" ? "/" : root + "/");
 const decodeMount = value => value.replace(/\\(040|011|012|134)/gu, (_all, octal) => String.fromCharCode(parseInt(octal, 8)));
 const workers = ["dist/console-workbench/read-worker.js", "dist/session/status-read-worker.js", "dist/session/projection-read-worker.js"];
+const ingressComponents = new Set(["public-mcp", "funnel"]);
 const activity = ["claims", "waiting", "operations", "executions", "queuedOperations", "queuedExecutions", "activeWork", "allRuntimeWork", "persistedRuntimeWork"];
 
 export function stopDomainError(reason, details) {
@@ -156,6 +159,12 @@ export function createLinuxKernelReader({ procRoot = "/proc", cgroupRoot = "/sys
       if (expected) {
         check(["start", "parentPid", "pgid", "sid", "group"].every(key => row[key] === expected[key]) && same(row.uids, expected.uids),
         "MANAGED_PROCESS_GENERATION_CHANGED", { pid });
+        if (expected.command) {
+          const args = (await readLinuxBounded(processFile(pid, "cmdline"))).split("\0");
+          if (args.at(-1) === "") args.pop();
+          check(same(args, expected.command.args) && await readlink(processFile(pid, "exe")) === expected.command.executable,
+            "MANAGED_PROCESS_COMMAND_CHANGED", { pid });
+        }
         classification = expected.classification;
       } else if (row.parentPid === core.pid) {
         const args = (await readLinuxBounded(processFile(pid, "cmdline"))).split("\0");
@@ -250,10 +259,29 @@ function compactCensus(value) {
 function componentIdentity(status) {
   check(Array.isArray(status.components) && status.components.some(row => row.id === "core"), "COMPONENT_IDENTITIES_UNAVAILABLE");
   const active = status.components.filter(row => row.pid != null);
-  check(active.every(row => ["core", "mesh", "discovery", "egress"].includes(row.id) && positive(row.pid)
+  check(active.every(row => ["core", "mesh", "discovery", "egress", "public-mcp", "funnel"].includes(row.id) && positive(row.pid)
     && row.state === "ready" && Number.isFinite(row.startedAt) && Number.isSafeInteger(row.restarts)), "COMPONENT_IDENTITIES_UNAVAILABLE");
   check(new Set(active.map(row => row.pid)).size === active.length && active.some(row => row.id === "core"), "COMPONENT_IDENTITIES_UNAVAILABLE");
   return active.map(({ id, pid, startedAt, restarts }) => ({ id, pid, startedAt, restarts })).sort((a, b) => a.id.localeCompare(b.id));
+}
+
+async function ingressCommandIdentities(manifest, components) {
+  const active = components.filter(row => ingressComponents.has(row.id));
+  if (!active.length) return new Map();
+  check(typeof manifest.config === "string", "COMPONENT_COMMAND_UNCONFIRMED");
+  const loaded = await loadNodeConfig(manifest.config);
+  check(loaded.node.id === manifest.nodeId && loaded.node.publicMcp?.funnel, "COMPONENT_COMMAND_UNCONFIRMED");
+  const plans = componentPlans(loaded.node, loaded.cluster, loaded.env, {
+    root: await realpath(manifest.directory), generatedDir: resolve(loaded.node.stateDir, "generated"),
+    configDir: resolve(loaded.node.stateDir, "core"), release: manifest.sourceCommit,
+  });
+  // These additional managed identities are exact installed plans, not a
+  // generic Node/tailscaled exception. Descendants still need their own census.
+  return new Map(await Promise.all(active.map(async ({ id }) => {
+    const plan = plans.find(value => value.id === id);
+    check(plan, "COMPONENT_COMMAND_UNCONFIRMED");
+    return [id, { executable: await realpath(plan.command), args: [plan.command, ...plan.args] }];
+  })));
 }
 
 /** A fresh guard belongs to exactly one running Manager/component generation.
@@ -263,6 +291,7 @@ export async function createLinuxInstallationGuard({ manifest, status, token, co
   const deadline = performance.now() + 10000;
   check(manifest.platform === "linux" && status.nodeId === manifest.nodeId && status.release === manifest.sourceCommit, "RELEASE_IDENTITY_CHANGED");
   const components = componentIdentity(status), coreComponent = components.find(row => row.id === "core");
+  const ingressCommands = await ingressCommandIdentities(manifest, components);
   const unit = await inspectUnit(manifest, { deadline, expectedUnitText });
   const health = await http(`http://127.0.0.1:${manifest.adminPort}/healthz`, { timeoutMs: 2500 });
   check(health.pid === unit.mainPid, "MANAGER_IDENTITY_CHANGED");
@@ -274,7 +303,7 @@ export async function createLinuxInstallationGuard({ manifest, status, token, co
   for (const component of components) {
     const row = await kernel.identity(component.pid, hierarchy, boot);
     check(row.parentPid === manager.pid && row.pgid === row.pid && row.sid === row.pid && row.uids.every(value => value === uid), "COMPONENT_PARENT_CHANGED", { pid: row.pid });
-    approved.push({ ...row, classification: component.id });
+    approved.push({ ...row, classification: component.id, ...(ingressCommands.has(component.id) ? { command: ingressCommands.get(component.id) } : {}) });
   }
   const core = approved.find(row => row.pid === coreComponent.pid);
   budget(deadline);

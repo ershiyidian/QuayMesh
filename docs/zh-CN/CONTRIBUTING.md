@@ -49,6 +49,15 @@ pnpm build:bundle
 
 导入 EasyTier 时，同时复制所选可执行文件旁已有的 CLI、已知 Windows DLL 和配套驱动。组件准备和最终验包都会从包内组件目录实际执行 `--version`；缺少启动依赖时，验证会在安装前失败。
 
+需要管理 Gemini Funnel 入口的 Linux 安装包还需导入可选的 Tailscale 组件。使用 `components.lock.json` 记录的版本，官方包解压后保持 `tailscale` 与 `tailscaled` 位于同一目录：
+
+```bash
+pnpm build:components --easytier /path/easytier-core --tunnel /path/tunnel-client --tailscale /path/tailscaled
+pnpm build:bundle
+```
+
+导入时复制两个 Tailscale 程序并验证锁定版本，最终验包会再次检查。没有导入这个可选组件的安装包继续使用原有平台要求。运行配置及身份保留方法见 [Gemini 入口](GEMINI.md)。
+
 输出目录为 `releases/quaymesh-<version>-<commit>-<platform>/`，包含 `release.json`、运行时、程序文件、运行依赖和组件源码。
 
 ### Linux SQLite 兼容构建

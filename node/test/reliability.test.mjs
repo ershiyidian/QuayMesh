@@ -56,12 +56,17 @@ test("收到新集群配置只记录期望值，未经应用确认不会覆盖�
 });
 
 test("就绪检查失败保持原进程，其他组件的探测不会等待它", async t => {
+  let server, supervisor;
+  t.after(async() => {
+    await supervisor?.close();
+    if (server?.listening) await new Promise(resolve => {server.closeAllConnections();server.close(resolve);});
+  });
   const root = await directory(t);
   const mode = join(root,"mode"); await writeFile(mode,"ready");
   const script = join(root,"component.mjs");
   await writeFile(script,"setInterval(()=>{},1000); process.on('SIGTERM',()=>process.exit(0));\n");
   let fastChecks = 0, slowActive = false, fastDuringSlow = 0, mostFastDuringSlow = 0;
-  const server = http.createServer(async(req,res) => {
+  server = http.createServer(async(req,res) => {
     if (req.url === "/slow") {
       const state = await readFile(mode,"utf8"); slowActive = true; fastDuringSlow = 0;
       setTimeout(() => { slowActive = false; res.writeHead(state === "ready" ? 200 : 503).end(); },180);
@@ -72,16 +77,15 @@ test("就绪检查失败保持原进程，其他组件的探测不会等待它",
     }
   });
   await new Promise(resolve => server.listen(0,"127.0.0.1",resolve));
-  t.after(() => new Promise(resolve => {server.closeAllConnections();server.close(resolve);}));
   const base = `http://127.0.0.1:${server.address().port}`;
   const probe = path => async() => {
     const response = await requestText(base+path,{timeoutMs:2500});
     if (response.status !== 200) throw new Error(`HTTP ${response.status}`);
   };
-  const supervisor = new ComponentSupervisor({logDir:root,intervalMs:20});
+  supervisor = new ComponentSupervisor({logDir:root,intervalMs:20});
   supervisor.define(["slow","fast"].map(id => ({id,command:process.execPath,args:[script],env:{...process.env},requires:[],ready:probe('/'+id)})));
   supervisor.on("fault",error=>{throw error;});
-  await supervisor.start(); t.after(() => supervisor.close());
+  await supervisor.start();
   await supervisor.waitReady(new Set(["slow","fast"]));
   await until(() => mostFastDuringSlow,value => value >= 2);
   const pid = supervisor.snapshot().find(value=>value.id==="slow").pid;

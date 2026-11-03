@@ -22,6 +22,16 @@
       }
     ]
   },
+  "tailscale": {
+    "version": "1.102.4",
+    "mode": "imported-binaries",
+    "license": "BSD-3-Clause",
+    "source": "https://github.com/tailscale/tailscale/tree/v1.102.4",
+    "packages": {
+      "linux-x64": "https://pkgs.tailscale.com/stable/tailscale_1.102.4_amd64.tgz",
+      "linux-arm64": "https://pkgs.tailscale.com/stable/tailscale_1.102.4_arm64.tgz"
+    }
+  },
   "egress": {
     "mode": "configured-executable"
   }

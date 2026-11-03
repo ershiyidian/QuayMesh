@@ -87,6 +87,8 @@ sudo ./runtime/node bin/quaymesh.js install \
 
 ## 连接多台机器
 
+需要为 Gemini 提供受管的固定 HTTPS 地址时，参阅 [Gemini 入口](GEMINI.md)。Linux 节点管理器统一管理公网 MCP 适配器和可选的 Tailscale Funnel 组件，它们随其他 QuayMesh 组件一起发布和升级。
+
 准备一个协调节点和若干执行节点。协调节点提供统一 MCP 入口和任务目录，各个执行节点提供本机项目。
 
 使用协调节点实际可达的地址生成站点：

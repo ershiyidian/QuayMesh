@@ -49,6 +49,15 @@ pnpm build:bundle
 
 EasyTier imports also copy its CLI and known Windows DLL and driver companions when they are present beside the selected executable. Component preparation and final bundle verification run `--version` from the packaged component directory; a missing runtime dependency fails verification before installation.
 
+Linux packages that manage a Gemini Funnel ingress also import the optional Tailscale component. Use the version in `components.lock.json` and keep `tailscale` beside `tailscaled` in the extracted official package:
+
+```bash
+pnpm build:components --easytier /path/easytier-core --tunnel /path/tunnel-client --tailscale /path/tailscaled
+pnpm build:bundle
+```
+
+The import copies both Tailscale programs and checks their pinned version. Final bundle verification repeats that check. Packages without this optional component retain their existing platform requirements. See [Gemini ingress](docs/GEMINI.md) for runtime configuration and state preservation.
+
 The output directory is `releases/quaymesh-<version>-<commit>-<platform>/`. It contains `release.json`, the runtime, application files, production dependencies, and component sources.
 
 ### Linux SQLite compatibility builds

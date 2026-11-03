@@ -277,6 +277,11 @@
               "minimum": 1,
               "maximum": 65535
             },
+            "controlListenPort": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
             "mihomoConfig": {
               "type": "string"
             },
