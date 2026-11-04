@@ -108,7 +108,7 @@ let pageSearch = '', sessionSearch = '', groupEvents = true, sortLayout = pref.t
 const NAV = [['overview', '任务总览', 'overview'], ['tasks', '任务', 'tasks'], ['changes', '改动审查', 'changes'], ['sessions', '会话', 'sessions'], ['machines', '机器', 'machines'], ['workspaces', '工作空间', 'workspaces'], ['activity', '活动', 'activity'], ['usage', '用量分析', 'usage'], ['settings', '设置', 'settings']];
 const titleOf = (v: string) => NAV.find(n => n[0] === v)?.[1] || '任务总览';
 function taskRouteDefaults(view: string, p: Record<string,string | undefined>) {
-    if (view === 'tasks' && !['scope','run','overviewGroup','requestState','resultStatus','status','stage','attention','q','project','node','date','finishedDay','usageDate','usageDays'].some(key => Boolean(p[key]))) {
+    if (view === 'tasks' && !['scope','run','overviewGroup','requestState','resultStatus','identity','status','stage','attention','q','project','node','date','finishedDay','usageDate','usageDays'].some(key => Boolean(p[key]))) {
         p.overviewGroup = 'current'; p.requestState = 'active';
     }
     return p;
@@ -118,7 +118,7 @@ function currentQuery(extra: Record<string, string | number | boolean | null | u
   const p = route.p;
   return queryString({ tz: timeZone() || deviceTimeZone, days: p.days ?? '0', node: p.node, project: p.project, q: p.q, status: p.status || (route.view === 'changes' && p.reviewMode !== 'all' ? 'review' : undefined), stage: p.stage, sort: p.sort,
     cursor: p.cursor, limit: p.limit || '25', changed: route.view === 'changes' ? '1' : p.changed, date: p.date, finishedDay: p.finishedDay,
-    execution: p.execution, requestState: p.requestState, resultStatus: p.resultStatus, overviewGroup: p.overviewGroup, attention: p.attention, usageDate:p.usageDate, usageDays:p.usageDays, ...extra });
+    execution: p.execution, requestState: p.requestState, resultStatus: p.resultStatus, identity:p.identity, overviewGroup: p.overviewGroup, attention: p.attention, usageDate:p.usageDate, usageDays:p.usageDays, ...extra });
 }
 function queryString(parameters: Record<string, string | number | boolean | null | undefined>): string {
   return new URLSearchParams(Object.entries(parameters).flatMap(([key, value]): Array<[string,string]> => value === undefined || value === null || value === '' ? [] : [[key,String(value)]])).toString();
@@ -199,15 +199,16 @@ function activityForRun(run: Run) {
 }
 function taskActivityTime(run: Run): string {
     const at = activityForRun(run).lastProgressAt;
-    return '<span class="small muted">上次活动</span><br>' + (at === null ? '<span class="muted">尚未确认</span>' : smallTime(at));
+    return '<span class="activity-time-label small muted">上次活动<br></span>' + (at === null ? '<span class="muted">尚未确认</span>' : smallTime(at));
 }
 function taskActivityTone(run: Run): string {
     const activity = activityForRun(run);
     return activity.state === 'executing' ? 'running' : activity.state === 'ended' ? run.resultStatus === 'completed' ? 'accepted' : run.resultStatus === 'failed' ? 'failed' : '' : '';
 }
-function missingTaskAuthorityNotice(count: number | undefined, showRecords = false): string {
+function missingTaskAuthorityNotice(count: number | undefined, selected = false): string {
     if (!count) return '';
-    return `<div class="notice visually-spaced" data-task-record-issues><div><b>任务记录需核对</b><p>${fmt(count)} 条记录尚未关联到任务目录。执行历史已保留，暂不计入当前、未关闭和已结束统计；关联确认前不可完成或验收。</p></div>${showRecords ? btn('查看任务记录','all-task-queue','','small') : ''}</div>`;
+    const label = `${fmt(count)} 条任务记录待核对`;
+    return `<details class="notice task-record-notice" id="task-record-help" data-key="task-record-help" data-task-record-issues ${expandedGroups.has('task-record-help') ? 'open' : ''}><summary aria-label="待核对记录说明">${selected ? `<span>${label}</span>` : `<button type="button" class="link-btn" data-action="unconfirmed-task-queue">${label}</button>`}<span class="small muted">说明</span>${icon('down',14)}</summary><p>执行历史已保留；关联确认前，暂不计入当前、未关闭和已结束统计，也不可完成或验收。</p></details>`;
 }
 function overviewTaskGroups(value: Overview) {
     const rows = new Map<string, Overview['current'][number]>();
@@ -353,7 +354,7 @@ catch {
     setTimeout(() => { if (innerWidth <= 1000)
         $('#inspector-close')?.focus(); }, 30);
 } }
-function param(p: Record<string, string | number | boolean | null | undefined>) { if ('q' in p || 'status' in p || 'stage' in p || 'requestState' in p || 'resultStatus' in p || 'overviewGroup' in p || 'attention' in p || 'node' in p || 'project' in p || 'days' in p || 'usageDate' in p || 'usageDays' in p || 'sort' in p)
+function param(p: Record<string, string | number | boolean | null | undefined>) { if ('q' in p || 'status' in p || 'stage' in p || 'requestState' in p || 'resultStatus' in p || 'identity' in p || 'overviewGroup' in p || 'attention' in p || 'node' in p || 'project' in p || 'days' in p || 'usageDate' in p || 'usageDays' in p || 'sort' in p)
     p.cursor = null; selectedRuns.clear(); navigate(route.view, p, true, true); }
 function schedulePaint() {
     if (paintQueued) return;
@@ -534,9 +535,9 @@ async function loadMoreFile(path: string): Promise<void> {
 }
 document.addEventListener('toggle', event => {
   const target = (event.target as HTMLElement);
-  if (target instanceof HTMLDetailsElement && target.id === 'overview-older-open') {
-    if (target.open) expandedGroups.add('overview-older-open');
-    else expandedGroups.delete('overview-older-open');
+  if (target instanceof HTMLDetailsElement && ['overview-older-open','task-record-help'].includes(target.id)) {
+    if (target.open) expandedGroups.add(target.id);
+    else expandedGroups.delete(target.id);
   }
   if (target instanceof HTMLDetailsElement && target.open && target.id.startsWith('command-') && route.p.run) {
     const commandId = target.id.slice('command-'.length);
@@ -557,7 +558,7 @@ function overviewTaskRow(r: Run & {progressLabel?: string; progressSummary?: str
     const activitySummaries = ['已确认后台执行仍在运行','正在停止当前执行','已确认仍在执行队列中','最近 30 分钟没有新活动；任务仍可继续'];
     const saved = r.progressSummary || '', generated = activitySummaries.find(text => saved === text || saved === text + '；部分任务信息待更新');
     const retained = generated ? saved.endsWith('；部分任务信息待更新') ? '部分任务信息待更新' : null : r.progressSummary;
-    const progress = [...new Set([activity.detail,retained].filter((text): text is string => Boolean(text)))].join(' · ');
+    const progress = retained;
     const observationNote = stale ? `<span class="small muted">状态待更新${typeof observation.observedAt === 'number' && Number.isFinite(observation.observedAt) && observation.observedAt > 0 ? ' · 上次确认 ' + smallTime(observation.observedAt) : ''}</span>` : '';
     return `<article class="overview-task-row" role="listitem" data-key="overview-${group}-${esc(r.id)}"><div class="overview-task-content"><div class="overview-task-heading"><button class="run-title overview-task-title" data-action="open-run" data-id="${esc(r.id)}" title="${esc(title)}">${esc(title)}</button>${badge(label,tone)}</div>${progress ? `<p class="overview-task-progress">${esc(progress)}</p>` : ''}<div class="overview-task-meta">${taskScope(r,false)}${workspaceSummary(r)}<span class="overview-task-time">${timeLabel} ${validAt !== null ? smallTime(validAt) : '尚未确认'}</span>${observationNote}</div></div>${ib('chevron','open-run','打开任务',`data-id="${esc(r.id)}"`)}</article>`;
 }
@@ -589,17 +590,16 @@ function overviewPage() {
     const compactEmpty = (title: string) => `<div class="overview-empty">${icon('tasks',18)}<p>${esc(title)}</p></div>`;
     const currentEmpty = groups.complete || o.coverage.tasks && groups.currentCount === 0 ? '暂无当前任务'
         : o.coverage.tasks ? '本页暂无仍符合条件的记录，可查看全部当前任务' : '已读记录中暂无当前任务，完整结果待更新';
-    const currentCountNote = o.coverage.tasks ? `首页展示 ${groups.current.length} 项当前记录 · 上次读取共 ${shown(groups.currentCount)} 项`
-        : `已读记录中 ${groups.current.length} 项当前 · 完整数量待更新`;
-    const current = panel('当前任务', `<div class="overview-task-list overview-current" role="list" aria-label="当前任务">${groups.current.map(r => overviewTaskRow(r,'current')).join('') || compactEmpty(currentEmpty)}</div>`, badge(groupCount(groups.currentCount)), !groups.complete ? `<span class="small muted">${currentCountNote}</span>${btn('查看全部当前任务','current-task-queue','','small ghost')}` : '', 'overview-current-panel');
+    const currentCountNote = o.coverage.tasks ? '' : `<span class="small muted">已读取 ${groups.current.length} 项 · 总数待更新</span>`;
+    const current = panel('当前任务', `<div class="overview-task-list overview-current" role="list" aria-label="当前任务">${groups.current.map(r => overviewTaskRow(r,'current')).join('') || compactEmpty(currentEmpty)}</div>`, badge(groupCount(groups.currentCount)), !groups.complete ? `${currentCountNote}${btn('查看全部当前任务','current-task-queue','','small ghost')}` : '', 'overview-current-panel');
     const older = groups.olderOpen.length || groups.olderOpenCount ? `<details class="panel overview-older" id="overview-older-open" data-key="overview-older-open" ${expandedGroups.has('overview-older-open') ? 'open' : ''}><summary><span>较早未关闭</span>${badge(groupCount(groups.olderOpenCount))}<span class="small muted overview-expand">展开查看</span><span class="small muted overview-collapse">收起</span>${icon('down',14)}</summary><div class="overview-task-list" role="list" aria-label="较早未关闭">${groups.olderOpen.map(r => overviewTaskRow(r,'older')).join('')}</div><div class="panel-foot">${btn('查看全部较早未关闭任务','older-task-queue','','small ghost')}</div></details>` : '';
     const recent = panel('最近结束的任务', `<div class="overview-task-list overview-recent" role="list" aria-label="最近结束的任务">${o.recent.map(r => overviewTaskRow(r,'recent')).join('') || compactEmpty(o.coverage.tasks ? '暂无已结束任务' : '已结束任务状态待确认')}</div>`, btn('全部已结束任务','closed-task-queue','','small ghost'), '', 'overview-recent-panel');
     const attention = o.attention.length ? panel('需要处理', o.attention.slice(0, 3).map(a => overviewAttentionRow(a)).join(''), badge(String(shown(o.attentionCount)), 'warn'), o.attentionCount != null && o.attentionCount > 3 ? `<button class="link-btn" data-action="attention-queue">全部 ${o.attentionCount} 项 ${icon('arrow',13)}</button>` : '', 'overview-attention-panel') : '';
     const fleetBody = f ? `<div class="fleet-labels"><span>节点</span><span>CPU</span><span>内存</span></div>${f.nodes.map(n => `<div class="fleet-row" data-key="fleet-${esc(n.id)}"><button class="run-title" data-action="node" data-id="${esc(n.id)}">${nodeTag(n.id)}<span class="small muted fleet-description">${n.id === f.gatewayId ? fleetObservation().current ? '当前出口' : '上次出口' : n.online ? n.gpuSampled === false ? 'GPU 尚未采集' : n.gpus.length + ' GPU' : '离线'}</span></button><div class="reading">${n.online && n.cpu != null ? fmt(n.cpu) + '%' : '—'}${meter(n.online ? n.cpu : null)}</div><div class="reading">${n.online && percent(n.memoryUsed,n.memoryTotal) !== null ? Math.round(percent(n.memoryUsed,n.memoryTotal)!) + '%' : '—'}${meter(n.online ? percent(n.memoryUsed,n.memoryTotal) : null)}</div></div>`).join('')}` : resourceState('fleet/status');
     const machines = panel('机器', fleetBody, f ? `<button class="link-btn small" data-action="nav" data-view="machines">${fleetOnlineLabel()} ${icon('chevron', 12)}</button>` : '', '', 'overview-machines-panel');
     const gateway = f ? panel('连接', `<div class="connection-grid"><span class="muted">入口</span><span>${esc(node(f.ingressNodeId)?.short || '尚未配置')}</span>${f.ingressNodeId ? badge((fleetObservation().current ? '' : '上次确认') + (node(f.ingressNodeId)?.online ? '在线' : '未连接'), fleetObservation().current ? node(f.ingressNodeId)?.online ? 'good' : 'warn' : '') : badge('入口未配置')}<span class="muted">出网</span><span>${esc(node(f.gatewayId)?.short || '—')} · ${esc(node(f.gatewayId)?.egress?.region || '—')}</span><span class="num small">${node(f.gatewayId)?.egress?.latency ?? '—'} ms</span></div><div class="endpoint"><code>${esc(f.mcpUrl || f.ingressLabel || (f.ingressNodeId ? '由该节点的托管 MCP 隧道提供' : '尚未配置 MCP 入口'))}</code>${ib('copy', 'copy', '复制 MCP 地址', `data-text="${esc(f.mcpUrl || '')}" ${f.mcpUrl ? '' : 'disabled'}`)}</div>`, '', '', 'overview-connection-panel') : '';
-    const summary = `<section class="overview-summary" aria-label="任务统计"><div><span>当前任务${groups.complete || groups.currentCount == null ? '' : ' · 上次读取'}</span>${summaryValue(groups.currentCount,o.knownCounts.current)}</div><button type="button" data-action="attention-queue"><span>需要处理</span>${summaryValue(o.attentionCount,o.knownCounts.attention)}</button><button type="button" data-action="completed-queue"><span>今日完成</span>${summaryValue(o.completedToday,o.knownCounts.completedToday)}</button></section>`;
-    return `<div class="page overview-page">${pageHead('任务总览', day(Date.now()), btn(icon('tasks',14)+'全部任务','all-task-queue','','small'))}${staleNotice(overviewPath())}${summary}${missingTaskAuthorityNotice(o.coverage.tasks?o.missingAuthorityCount:0,true)}<div class="overview-grid"><div class="stack overview-primary">${current}${older}${recent}</div><aside class="stack overview-secondary" aria-label="待办与节点">${attention}${machines}${gateway}</aside></div></div>`;
+    const summary = `<section class="overview-summary" aria-label="任务统计"><div><span>当前任务${groups.complete || groups.currentCount == null ? '' : ' · <span class="overview-observation">上次读取</span>'}</span>${summaryValue(groups.currentCount,o.knownCounts.current)}</div><button type="button" data-action="attention-queue"><span>需要处理</span>${summaryValue(o.attentionCount,o.knownCounts.attention)}</button><button type="button" data-action="completed-queue"><span>今日完成</span>${summaryValue(o.completedToday,o.knownCounts.completedToday)}</button></section>`;
+    return `<div class="page overview-page">${pageHead('任务总览', day(Date.now()), btn(icon('tasks',14)+'全部任务','all-task-queue','','small'))}${staleNotice(overviewPath())}${summary}${missingTaskAuthorityNotice(o.coverage.tasks?o.missingAuthorityCount:0)}<div class="overview-grid"><div class="stack overview-primary">${current}${older}${recent}</div><aside class="stack overview-secondary" aria-label="待办与节点">${attention}${machines}${gateway}</aside></div></div>`;
 }
 function taskRow(r: Run) {
     const selected = selectedRuns.has(r.id), active = route.p.run === r.id;
@@ -623,7 +623,7 @@ function taskScopeTabs(page?: RunPage, projection = taskPageProjection(page)) {
 }
 function taskCountsComplete(page?: RunPage): boolean { return Boolean(page?.coverage?.tasks ?? page?.complete); }
 function setTaskScope(key: string) {
-    param({status:null,scope:key === '' ? 'all' : null,overviewGroup:key === 'current' ? 'current' : key === 'older' ? 'olderOpen' : null,
+    param({status:null,identity:null,scope:key === '' ? 'all' : null,overviewGroup:key === 'current' ? 'current' : key === 'older' ? 'olderOpen' : null,
         requestState:['current','older','open'].includes(key) ? 'active' : key === 'ended' ? 'closed' : null,
         attention:key === 'attention' ? '1' : null,stage:key === 'active' ? 'running,stopping,queued' : null});
 }
@@ -632,7 +632,7 @@ function runBadges(run: Run): string {
     const tone = taskActivityTone(run);
     const unconfirmed = Boolean(run.taskId && !run.requestState);
     const label = unconfirmed && activity.state !== 'executing' ? '任务归属待核对' : activity.label;
-    const notes = [...new Set([unconfirmed ? activity.state === 'executing' ? '任务归属待核对' : null : activity.detail,observation.stale && activity.state !== 'ended' ? '状态待更新' : null].filter((text): text is string => Boolean(text)))];
+    const notes = [unconfirmed && activity.state === 'executing' ? '任务归属待核对' : null,observation.stale && activity.state !== 'ended' ? '状态待更新' : null].filter((text): text is string => Boolean(text));
     return `<span class="state ${tone}" data-activity-state="${activity.state}">${icon(activity.state === 'executing' ? 'running' : activity.state === 'ended' ? 'check' : 'tasks',13)}${esc(label)}</span>${notes.length ? `<div class="small muted">${notes.map(esc).join(' · ')}</div>` : ''}${run.actions.review ? badge('待验收','warn') : ''}${run.finalization?.error ? badge('交付确认失败','warn') : ''}`;
 }
 
@@ -667,11 +667,12 @@ function tasksPage() {
     const stateControls = sel ? lifecycleControl + `<select class="select queue-state" data-param="status" aria-label="任务状态">${states.map(([v, t, n]) => opt(v, t + (n == null ? '' : ' · ' + n), route.p.status || '')).join('')}</select>` : taskScopeTabs(d, projection) + `<select class="select" data-param="status" aria-label="具体任务状态">${states.map(([v,t,n]) => opt(v,t + (n == null ? '' : ' · ' + n),route.p.status || '')).join('')}</select>`;
     const filters = `<div class="task-filters">${stateControls}<div class="toolbar list-search">${searchField(route.p.q, '搜索任务…')}${sel ? ib('filter', 'toggle-filters', '筛选任务', `aria-expanded="${route.p.filters === '1'}"`, route.p.filters === '1' ? 'active' : '') : ''}</div><div class="toolbar extended-filters ${sel && route.p.filters !== '1' ? 'hidden' : ''}">${scopes()}${rangeSelect(route.p.days ?? '0')}<select class="select" aria-label="任务排序" data-param="sort">${[['newest', '最近创建'], ['oldest', '最早创建'], ['tokens', '用量最高'], ['duration', '记录跨度最长']].map(([v, t]) => opt(v, t, route.p.sort || 'newest')).join('')}</select></div>${route.p.overviewGroup ? `<div class="filter-chip">${route.p.overviewGroup === 'current' ? '当前任务' : '较早未关闭'} ${ib('close', 'clear-overview-group', '清除任务分组')}</div>` : ''}${route.p.finishedDay ? `<div class="filter-chip">完成于 ${esc(route.p.finishedDay)} ${ib('close', 'clear-finished', '清除完成日期')}</div>` : ''}${route.p.attention ? `<div class="filter-chip">待办事项 ${ib('close', 'clear-attention', '清除待办筛选')}</div>` : ''}${route.p.usageDate || route.p.usageDays ? `<div class="filter-chip">用量发生范围：${esc(route.p.usageDate || ('近 ' + route.p.usageDays + ' 天'))}${ib('close','clear-usage-range','清除用量发生范围')}</div>` : ''}${route.p.date ? `<div class="filter-chip">${esc(route.p.date)} ${ib('close', 'clear-date', '清除日期筛选')}</div>` : ''}</div>`;
     const emptyTitle = projection.grouped ? projection.complete ? '暂无当前任务' : '本页已读记录中没有匹配任务' : d?.complete ? '没有匹配任务' : '已读取来源中没有匹配任务';
+    const identityFilter = route.p.identity === 'unconfirmed' ? `<div class="filter-chip">待核对记录 ${ib('close','clear-task-identity','清除待核对筛选')}</div>` : '';
     const emptyDetail = projection.grouped ? projection.complete ? '' : '完整数量待更新，可以继续翻页或重新读取。' : d?.complete ? '' : '部分节点尚未确认，完整结果仍待核对。';
     let list = !d ? resourceState(path) : !projection.items.length ? `<div class="panel">${empty(emptyTitle, emptyDetail, btn('清除筛选', 'reset-filters'))}${pagination(d, projection.countLabel)}</div>` : sortLayout === 'timeline' && !sel ? timelineView({...d, items:projection.items}, projection.countLabel) : `<div class="panel task-list-panel"><div class="table-wrap"><table class="data-table run-table"><colgroup><col style="width:34px"><col><col style="width:140px"><col style="width:58px"><col style="width:105px"><col style="width:86px"><col style="width:90px"><col style="width:94px"><col style="width:32px"></colgroup><thead><tr><th><label class="check-label"><input type="checkbox" data-select-all="runs" aria-label="选择本页全部任务" ${projection.items.every(r => selectedRuns.has(r.id)) ? 'checked' : ''}></label></th><th>任务 / 项目</th><th>状态</th><th>节点</th><th>改动</th><th class="align-right">上次活动</th><th class="align-right">Token</th><th class="align-right">创建于</th><th></th></tr></thead><tbody>${projection.items.map(taskRow).join('')}</tbody></table></div>${pagination(d, projection.countLabel)}</div>`;
     if (projection.moved.length) list += panel('已移出当前的任务', `<p class="panel-body small muted">这些已读取的任务已转入较早未关闭，仍可打开任务记录。</p><div class="overview-task-list" role="list" aria-label="已移出当前的任务">${projection.moved.map(run => overviewTaskRow(run,'older')).join('')}</div>`, badge(String(projection.moved.length)), btn('查看全部较早未关闭任务','older-task-queue','','small ghost'), 'task-aged-records');
     const actions = sel ? ib('download', 'export-runs', '导出本页') : segmented([['list', icon('tasks', 14)], ['timeline', icon('activity', 14)]], sortLayout, 'layout') + btn(icon('download', 14) + '导出本页', 'export-runs', projection.items.length ? '' : 'disabled');
-    return `<div class="split ${sel ? 'has-detail' : 'no-detail'} ${review ? 'review-mode' : ''} ${route.p.focus === '1' ? 'detail-focus' : ''}"><section class="list-pane" aria-label="任务列表"><div class="page">${pageHead(review ? '改动审查' : '任务', review ? '选择待验收结果，或切换查看所有文件改动。' : '', actions)}${review ? segmented([['review','待验收'],['all','全部改动']],route.p.reviewMode || 'review','review-mode') : ''}${filters}${bulk}${staleNotice(path)}${missingTaskAuthorityNotice(d?.coverage.tasks?d.missingAuthorityCount:0)}${list}</div></section>${sel ? '<button class="inspector-mask" data-action="close-inspector" aria-label="关闭详情"></button>' + inspector() : ''}</div>`;
+    return `<div class="split ${sel ? 'has-detail' : 'no-detail'} ${review ? 'review-mode' : ''} ${route.p.focus === '1' ? 'detail-focus' : ''}"><section class="list-pane" aria-label="任务列表"><div class="page">${pageHead(review ? '改动审查' : '任务', review ? '选择待验收结果，或切换查看所有文件改动。' : '', actions)}${review ? segmented([['review','待验收'],['all','全部改动']],route.p.reviewMode || 'review','review-mode') : ''}${filters}${identityFilter}${bulk}${staleNotice(path)}${missingTaskAuthorityNotice(d?.coverage.tasks?route.p.identity === 'unconfirmed'?d.total:d.missingAuthorityCount:0,route.p.identity === 'unconfirmed')}${list}</div></section>${sel ? '<button class="inspector-mask" data-action="close-inspector" aria-label="关闭详情"></button>' + inspector() : ''}</div>`;
 }
 function timelineView(d: RunPage, countLabel?: string) {
     const now = Date.now(), days = Math.max(1, Math.min(30, Number(route.p.days) || 1)), span = days * 864e5, start = now - span, pct = (time: number) => clamp((time - start) / span * 100, 0, 100);
@@ -1366,6 +1367,8 @@ const ACTIONS = {
     'older-task-queue': () => navigate('tasks', { days: '0', requestState: 'active', overviewGroup: 'olderOpen' }),
     'clear-overview-group': () => param({overviewGroup:null,scope:'all'}),
     'all-task-queue': () => navigate('tasks',{scope:'all',days:'0'}),
+    'unconfirmed-task-queue': () => navigate('tasks',{scope:'all',days:'0',identity:'unconfirmed'}),
+    'clear-task-identity': () => param({identity:null,scope:'all'}),
     'closed-task-queue': () => navigate('tasks', { days: '0', requestState: 'closed' }),
     'overview-task-action': (el: HTMLElement) => navigate('tasks', { run: el.dataset.id!, tab: el.dataset.kind === 'review' ? 'diff' : 'summary', days: '0' }),
     status: (el: HTMLElement) => param({ status: el.dataset.value!, stage:null, attention:null }), 'reset-filters': () => navigate(route.view, {}, true), 'clear-date': () => param({ date: null }), 'clear-finished': () => param({ finishedDay: null, execution: null, resultStatus: null }), 'clear-attention': () => param({ attention: null }), page: (el: HTMLElement) => { selectedRuns.clear(); param({ cursor: el.dataset.value! || null }); $('.list-pane')?.scrollTo({ top: 0 }); $('#view')!.scrollTo({ top: 0 }); },

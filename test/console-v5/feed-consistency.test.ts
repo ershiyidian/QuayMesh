@@ -236,6 +236,13 @@ test('global coverage and pagination complete while unregistered worker records 
   const second=await f.feed.runs({days:'0',limit:'2',cursor:first.nextCursor});
   assert.equal(second.total,5);assert.equal(second.items.length,2);assert.ok(second.nextCursor);
   assert.ok(second.items.every(task=>!first.items.some(previous=>previous.id===task.id)));
+  const unconfirmed=await f.feed.runs({days:'0',identity:'unconfirmed',limit:'2'});
+  assert.equal(unconfirmed.total,3);assert.ok(unconfirmed.nextCursor);assert.equal(unconfirmed.coverage.tasks,true);
+  const remaining=await f.feed.runs({days:'0',identity:'unconfirmed',limit:'2',cursor:unconfirmed.nextCursor});
+  const records=[...unconfirmed.items,...remaining.items];
+  assert.deepEqual(records.map(task=>task.taskId).sort(),['orphan-closed','orphan-empty','orphan-live']);
+  assert.equal(records.find(task=>task.taskId==='orphan-live')?.executionStatus,'running');
+  assert.ok(records.every(task=>task.actions.complete===false&&task.actions.review===false));
   const scoped=await f.feed.runs({project:workspaceHandle('b','project'),days:'0'});
   assert.equal(scoped.complete,false);assert.equal(scoped.coverage.tasks,false);
   f.nodes[2]!.online=false;f.feed.invalidate();

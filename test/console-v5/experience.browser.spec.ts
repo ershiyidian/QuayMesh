@@ -647,34 +647,68 @@ test('首页只观察任务来源，命令面板按需读取完整工作区目�
 test('历史登记缺项独立提示，已读取统计和任务记录仍可使用',async({page})=>{
   await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
   const snapshot=await f.get('overview?fresh=1'),records=await f.get('runs?days=0&limit=100');
-  snapshot.missingAuthorityCount=1;snapshot.complete=true;snapshot.coverage.tasks=true;
+  const registeredOnly=await f.get('runs?days=0&identity=unconfirmed');
+  expect(registeredOnly.total).toBe(0);expect(registeredOnly.items).toEqual([]);
+  snapshot.missingAuthorityCount=2;snapshot.complete=true;snapshot.coverage.tasks=true;
   snapshot.currentCount=snapshot.current.length;snapshot.olderOpen=[];snapshot.olderOpenCount=80;
   snapshot.taskSources=snapshot.taskSources.map((source:any)=>({...source,state:'ready',stale:false,observedAt:Date.now(),error:null}));
   const orphan={...records.items[0],id:'qmtask:unregistered-record',localId:'unregistered-record',taskId:'unregistered-record',
     title:'保留的历史任务记录',requestState:undefined,resultStatus:null,finalization:null,taskRevision:undefined,
     executionStatus:'unknown',phaseExecutionStatus:'completed',actions:{interrupt:false,resume:false,review:false,revert:false,complete:false}};
-  records.items.push(orphan);records.total=records.items.length;records.counts.all=records.total;records.counts.scopeAll=records.total;
-  records.missingAuthorityCount=1;records.complete=true;records.coverage.tasks=true;
+  const live={...orphan,id:'qmtask:unregistered-live',localId:'unregistered-live',taskId:'unregistered-live',title:'仍在执行的待核对记录',
+    executionStatus:'running',phaseExecutionStatus:'running',executionObservedAt:Date.now()};
+  records.items.push(orphan,live);records.total=records.items.length;records.counts.all=records.total;records.counts.scopeAll=records.total;
+  records.missingAuthorityCount=2;records.complete=true;records.coverage.tasks=true;
   await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>route.fulfill({json:snapshot}));
-  await page.route(url=>url.pathname.endsWith('/api/v4/runs'),route=>route.fulfill({json:records}));
+  await page.route(url=>url.pathname.endsWith('/api/v4/runs'),route=>{
+    const selected=new URL(route.request().url()).searchParams.get('identity')==='unconfirmed';
+    const items=selected?records.items.filter((task:any)=>task.taskId&&!task.requestState):records.items;
+    const counts=selected?{all:2,scopeAll:2,scopeOpen:0,scopeClosed:0,scopeActive:1,scopeWaiting:0,scopeResults:0,scopeAttention:0,unknown:1,running:1}
+      :{...records.counts,all:items.length,scopeAll:items.length,scopeActive:1,unknown:1,running:1};
+    return route.fulfill({json:{...records,items,total:items.length,counts}});
+  });
   await login(page);
-  await expect(page.locator('[data-task-record-issues]')).toContainText('1 条记录尚未关联到任务目录');
+  const notice=page.locator('[data-task-record-issues]');
+  await expect(notice).toContainText('2 条任务记录待核对');
+  await expect(notice.locator('p')).not.toBeVisible();
+  await notice.locator('summary>.small').click();
+  await expect(notice.locator('p')).toBeVisible();
+  await notice.locator('summary>.small').click();
+  await expect(notice.locator('p')).not.toBeVisible();
   await expect(page.locator('.overview-summary>div strong')).toHaveText(String(snapshot.currentCount));
   await expect(page.locator('.overview-summary')).not.toContainText('项已读取');
   await expect(page.locator('[data-key=overview-current-panel]')).not.toContainText('完整数量待更新');
-  await expect(page.locator('[data-key=overview-current-panel]')).toContainText('首页展示');
+  await expect(page.getByRole('button',{name:'查看全部当前任务',exact:true})).toBeVisible();
+  await expect(page.locator('[data-key=overview-current-panel]>.panel-foot .small.muted')).toHaveCount(0);
   await expect(page.locator('#global-notice')).not.toContainText('更新延迟');
   await page.screenshot({path:screenshots+'/overview-record-issues.png',fullPage:true});
   await page.setViewportSize({width:390,height:844});
   expect(await page.locator('#view').evaluate(el=>el.scrollWidth<=el.clientWidth)).toBe(true);
+  expect((await notice.boundingBox())!.height).toBeLessThan(60);
   await page.screenshot({path:screenshots+'/overview-record-issues-narrow.png',fullPage:true});
-  await page.getByRole('button',{name:'查看任务记录',exact:true}).click();
-  await expect(page.locator('[data-task-record-issues]')).toContainText('任务记录需核对');
+  snapshot.current=[];snapshot.currentCount=0;
+  await page.locator('#topbar [data-action=refresh]').click();
+  await expect(page.locator('.overview-current')).toContainText('暂无当前任务');
+  await expect(page.locator('.overview-current')).not.toContainText('完整结果待更新');
+  await notice.getByRole('button',{name:'2 条任务记录待核对',exact:true}).click();
+  await expect(page).toHaveURL(/identity=unconfirmed/);
+  await expect(page).not.toHaveURL(/requestState=active/);
+  await expect(page.locator('.run-table tbody tr')).toHaveCount(2);
+  await expect(page.locator('[data-task-record-issues]')).toContainText('2 条任务记录待核对');
   const row=page.locator('.run-table tbody tr').filter({hasText:orphan.title});
   await expect(row).toContainText('任务归属待核对');
   await expect(row).not.toContainText('已完成');
+  await expect(page.locator('.run-table tbody tr').filter({hasText:live.title})).toContainText('执行中');
   await row.getByRole('checkbox').check();
   await expect(page.locator('[data-action=bulk-accept]')).toBeDisabled();
+  await expect(row.locator('.activity-time-label')).toBeVisible();
+  await page.screenshot({path:screenshots+'/task-record-filter-narrow.png',fullPage:true});
+  await page.setViewportSize({width:1400,height:950});
+  await expect(row.locator('.activity-time-label')).not.toBeVisible();
+  await page.screenshot({path:screenshots+'/task-record-filter.png',fullPage:true});
+  await page.getByRole('button',{name:'清除待核对筛选',exact:true}).click();
+  await expect(page).not.toHaveURL(/identity=/);
+  await expect(page.locator('.run-table tbody tr')).toHaveCount(records.items.length);
 });
 
 test('当前任务失效后保留记录，空态紧凑且今日完成按Task结果查询',async({page})=>{
@@ -772,6 +806,7 @@ test('手动模式按活动截止时间重分首页任务，数量和执行优�
   await page.locator('#overview-older-open>summary').click();
   await expect(page.locator('#overview-older-open .overview-task-title')).toHaveText([silenceBoundary.title,executionOnly.title]);
   await expect(page.locator('#overview-older-open .overview-task-heading>.badge')).toHaveText(['等待继续','等待继续']);
+  await expect(page.locator('#overview-older-open .overview-task-progress')).toHaveCount(0);
   await expect(page.locator('#view')).not.toContainText('已确认后台执行仍在运行');
   await expect(page.locator('#global-notice .notice')).toHaveCount(0);
   expect(reads).toBe(loaded);

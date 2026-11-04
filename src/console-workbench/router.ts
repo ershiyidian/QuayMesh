@@ -48,6 +48,7 @@ const querySchema = z.object({
   node: z.string().optional(), project: z.string().optional(), q: z.string().max(1000).optional(),
   session: z.string().optional(), root: z.string().optional(),
   requestState: z.enum(["active", "closed"]).optional(),
+  identity: z.literal('unconfirmed').optional(),
   overviewGroup: z.enum(["current", "olderOpen"]).optional(),
   resultStatus: z.enum(["completed", "failed", "cancelled", "handed_off"]).optional(),
   days: z.coerce.number().int().min(0).max(36500).optional().transform((value) => value === undefined ? undefined : String(value)),

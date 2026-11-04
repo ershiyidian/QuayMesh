@@ -26,6 +26,16 @@
 .overview-summary>button:hover { background:var(--hover); }
 .overview-summary span { color:var(--muted);font-size:12px; }
 .overview-summary strong { font-size:23px;font-weight:600;font-variant-numeric:tabular-nums; }
+.overview-summary .overview-observation { display:inline-block;white-space:nowrap; }
+.task-record-notice { display:block;margin-top:12px;padding:10px 12px; }
+.task-record-notice>summary { display:flex;align-items:center;gap:8px;list-style:none;cursor:pointer; }
+.task-record-notice>summary::-webkit-details-marker { display:none; }
+.task-record-notice>summary>.small { margin-left:auto; }
+.task-record-notice>summary>.link-btn { text-align:left; }
+.task-record-notice>p { margin:8px 0 0;color:var(--secondary);font-size:12px;line-height:1.6; }
+.task-record-notice[open]>summary>svg:last-child { transform:rotate(180deg); }
+.overview-primary .panel-foot>.btn:last-child { margin-left:auto; }
+@media(min-width:761px) { .no-detail .run-table .task-time .activity-time-label { display:none; } }
 .overview-task-row {
   display:grid;
   grid-template-columns:minmax(0,1fr) auto;

@@ -222,6 +222,7 @@ export function filterTaskIndex<T extends FilterableTaskIndex>(tasks: T[], query
     && (!query.node || task.nodeIds.includes(query.node))
     && (!query.project || task.projectIds.includes(query.project))
     && (!query.session || task.sessionId === query.session)
+    && (query.identity !== 'unconfirmed' || Boolean(task.taskId && !task.requestState))
     && (!query.requestState || task.requestState === query.requestState)
     && (!query.resultStatus || task.resultStatus === query.resultStatus)
     && (!query.root || task.roots.includes(query.root))
