@@ -111,7 +111,7 @@ export async function requestJson(urlInput, { method = "GET", body, token, agent
         catch (error) { reject(error); }
       });
     });
-    const timer = setTimeout(() => req.destroy(new Error(`请求 ${url.pathname} 超时`)), timeoutMs);
+    const timer = setTimeout(() => req.destroy(Object.assign(new Error(`请求 ${url.pathname} 超时`),{code:"ETIMEDOUT"})), timeoutMs);
     timer.unref();
     req.once("error", error => { clearTimeout(timer); reject(error); });
     req.once("close", () => clearTimeout(timer));

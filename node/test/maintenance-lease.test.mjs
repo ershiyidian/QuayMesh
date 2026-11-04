@@ -19,7 +19,7 @@ async function serve(t,handle){
   const server=http.createServer((req,res)=>{
     void (async()=>{let body="";for await(const chunk of req)body+=chunk;
       const result=await handle(req,body?JSON.parse(body):{});
-      res.writeHead(result.status??200,{"content-type":"application/json"}).end(JSON.stringify(result.body??{}));
+      res.writeHead(result.status??200,{"content-type":"application/json"}).end(result.raw??JSON.stringify(result.body??{}));
     })().catch(error=>res.writeHead(500).end(JSON.stringify({error:String(error)})));
   });
   await new Promise((resolve,reject)=>{server.once("error",reject);server.listen(0,"127.0.0.1",()=>{server.off("error",reject);resolve();});});
@@ -322,6 +322,76 @@ test("standard begin不覆盖已有外部pause，接受后的drain失败只释�
   assert.equal(posts.length,2);assert.equal(posts[0].action,"pause");assert.equal(posts[0].expected.accepting,true);
   assert.equal(posts[1].action,"resume");assert.equal(posts[1].expected.reason,"node-maintenance");
   assert.equal(posts[1].expected.changedAt,"2026-10-23T00:00:00.002Z");assert.equal(state.accepting,true);
+});
+
+async function drainReadFixture(t,onIdle){
+  const root=await directory(t),instance={pid:1002,processStart:"core-generation",token:"core-instance"};
+  const fixture={posts:[],idleReads:0,relayAccepting:true,state:{instance,accepting:true,reason:null,changedAt:"2026-11-04T00:00:00.000Z"}};
+  const port=await serve(t,async(req,body)=>{
+    assert.equal(req.headers.authorization,`Bearer ${token}`);
+    if(req.url==="/internal/quaymesh/idle"){
+      if(fixture.state.accepting)return {body:{...fixture.state,idle:false,quiescent:false}};
+      fixture.idleReads++;
+      return onIdle(fixture,req);
+    }
+    assert.equal(req.url,"/internal/quaymesh/admission");
+    fixture.posts.push(body);
+    if(JSON.stringify(body.expected)!==JSON.stringify(fixture.state))return {status:409,body:{code:"ADMISSION_PRECONDITION_FAILED"}};
+    fixture.state={instance,accepting:body.action==="resume",reason:body.action==="resume"?null:"node-maintenance",
+      changedAt:body.action==="resume"?"2026-11-04T00:00:00.002Z":"2026-11-04T00:00:00.001Z"};
+    if(body.action==="pause")fixture.pause=structuredClone(fixture.state);
+    return {body:fixture.state};
+  });
+  fixture.node=new QuayMeshNode({revision:1,node:{stateDir:root,corePort:port}});fixture.node.token=token;
+  fixture.node.relay={activeRequests:0,setAccepting:value=>{fixture.relayAccepting=value;}};
+  return fixture;
+}
+
+test("maintenance drain retries a real first HTTP timeout and waits for observed quiescence",{timeout:10000},async t=>{
+  const f=await drainReadFixture(t,async fixture=>{
+    if(fixture.idleReads===1)await new Promise(()=>{});
+    const quiescent=fixture.idleReads>=3;
+    return {body:{...fixture.state,idle:quiescent,quiescent}};
+  });
+  const owner=await f.node.beginMaintenance(5000);
+  assert.equal(owner,f.node.maintenanceOwner);assert.equal(f.idleReads,3);
+  assert.equal(f.node.maintenance,true);assert.equal(f.relayAccepting,false);
+  assert.deepEqual(f.node.maintenancePauseExpected,f.pause);
+  assert.deepEqual(f.posts.map(value=>value.action),["pause"]);
+  await f.node.endMaintenance();
+  assert.deepEqual(f.posts[1].expected,f.pause);
+  assert.equal(f.node.maintenance,false);assert.equal(f.relayAccepting,true);
+});
+
+test("maintenance drain caps an unavailable read to the remaining budget and compensates the original pause",{timeout:5000},async t=>{
+  const f=await drainReadFixture(t,()=>new Promise(()=>{})),started=Date.now();
+  await assert.rejects(f.node.beginMaintenance(400),error=>error.status===409&&error.cause?.code==="ETIMEDOUT");
+  const elapsed=Date.now()-started;
+  assert.ok(elapsed>=350&&elapsed<2000,`drain elapsed ${elapsed} ms`);
+  assert.equal(f.idleReads,1);assert.deepEqual(f.posts.map(value=>value.action),["pause","resume"]);
+  assert.deepEqual(f.posts[1].expected,f.pause);assert.equal(f.state.accepting,true);
+  assert.equal(f.node.maintenance,false);assert.equal(f.relayAccepting,true);
+});
+
+for(const failure of ["malformed-json","unauthorized"])test(`maintenance drain does not retry ${failure}`,async t=>{
+  const f=await drainReadFixture(t,()=>failure==="malformed-json"?{raw:"{broken"}:{status:401,body:{error:"unauthorized"}});
+  await assert.rejects(f.node.beginMaintenance(1000),error=>failure==="malformed-json"?error instanceof SyntaxError:error.status===401);
+  assert.equal(f.idleReads,1);assert.deepEqual(f.posts.map(value=>value.action),["pause","resume"]);
+  assert.deepEqual(f.posts[1].expected,f.pause);assert.equal(f.state.accepting,true);
+});
+
+test("maintenance retry refuses another pause's idle state and never replaces its original CAS",async t=>{
+  const f=await drainReadFixture(t,(fixture,req)=>{
+    if(fixture.idleReads===1){req.socket.destroy();return {body:{...fixture.state,idle:false,quiescent:false}};}
+    fixture.state={...fixture.state,reason:"release-preflight:other-owner",changedAt:"2026-11-04T00:00:00.003Z"};
+    return {body:{...fixture.state,idle:true,quiescent:true}};
+  });
+  await assert.rejects(f.node.beginMaintenance(1000),error=>error instanceof AggregateError&&
+    /维护暂停归属已改变/.test(error.errors[0]?.message)&&error.errors[1]?.status===409);
+  assert.deepEqual(f.posts.map(value=>value.action),["pause","resume"]);
+  assert.deepEqual(f.posts[1].expected,f.pause);
+  assert.equal(f.state.reason,"release-preflight:other-owner");
+  assert.equal(f.node.maintenance,true);assert.equal(f.relayAccepting,false);
 });
 
 test("本manager受管Core真实替换后显式交接CAS，普通resume不能接受陌生实例",{timeout:15000},async t=>{

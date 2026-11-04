@@ -446,17 +446,31 @@ export class QuayMeshNode {
       throw Object.assign(new Error("准入已由其他暂停持有，不能覆盖其维护状态"),{status:409});
     this.maintenance = true; this.relay?.setAccepting(false);
     const owner=randomUUID();this.maintenanceOwner=owner;
-    let pauseAcquired=false;
+    let pauseAcquired=false,pauseExpected;
     try {
       const paused=await this.admission("pause",admissionExpectation(before));
-      pauseAcquired=true;this.maintenancePauseExpected=admissionExpectation(paused);
+      pauseAcquired=true;pauseExpected=admissionExpectation(paused);this.maintenancePauseExpected=pauseExpected;
       const deadline = Date.now() + timeoutMs;
-      do {
-        const idle = await requestJson(`http://127.0.0.1:${this.corePort}/internal/quaymesh/idle`,{token:this.token,timeoutMs:3000});
-        if ((idle.quiescent??idle.idle)===true && !this.relay?.activeRequests) return owner;
-        await sleep(100);
-      } while (!this.stopped && Date.now() < deadline);
-      throw Object.assign(new Error("已接受的工作尚未结束，保留当前组件"),{status:409});
+      let lastReadError;
+      while (!this.stopped && Date.now() < deadline) {
+        try {
+          const idle = await requestJson(`http://127.0.0.1:${this.corePort}/internal/quaymesh/idle`,{
+            token:this.token,timeoutMs:Math.max(1,Math.min(3000,deadline-Date.now())),
+          });
+          if(!this.maintenance||this.maintenanceOwner!==owner||pauseExpected&&(
+              ["accepting","reason","changedAt"].some(key=>idle[key]!==pauseExpected[key])||
+              ["pid","processStart","token"].some(key=>idle.instance?.[key]!==pauseExpected.instance[key])))
+            throw Object.assign(new Error("维护暂停归属已改变，保留当前组件"),{status:409});
+          if (Date.now()<deadline && (idle.quiescent??idle.idle)===true && !this.relay?.activeRequests) return owner;
+          lastReadError=undefined;
+        } catch(error) {
+          if(!["ETIMEDOUT","ECONNRESET","EPIPE","ECONNREFUSED","EHOSTUNREACH","ENETUNREACH"].includes(error?.code))throw error;
+          lastReadError=error;
+        }
+        const remaining=deadline-Date.now();
+        if(!this.stopped&&remaining>0)await sleep(Math.min(100,remaining));
+      }
+      throw Object.assign(new Error("已接受的工作尚未结束，保留当前组件",lastReadError?{cause:lastReadError}:undefined),{status:409});
     } catch (error) {
       if(!pauseAcquired){
         // A 409 confirms the CAS did not write. An uncertain HTTP result must
@@ -465,7 +479,7 @@ export class QuayMeshNode {
         else this.errors.fail("admission",error);
         throw error;
       }
-      try { await this.endMaintenance(); }
+      try { await this.endMaintenance(pauseExpected); }
       catch (recovery) { throw new AggregateError([error,recovery],"维护失败，恢复准入仍待重试"); }
       throw error;
     }
