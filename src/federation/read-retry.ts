@@ -104,7 +104,7 @@ function backoffMs(attempt: number, random: () => number): number {
 function dropBrokenLink(error: unknown, link: ReadRetryLink<unknown>): void {
   if (!error || typeof error !== "object") return;
   const code = String((error as { code?: unknown }).code ?? "");
-  if (code === "ECONNRESET" || code === "EPIPE" || code === "ECONNABORTED" || code === "ECONNREFUSED") {
+  if (code === "RPC_INTERRUPTED" || code === "ECONNRESET" || code === "EPIPE" || code === "ECONNABORTED" || code === "ECONNREFUSED") {
     link.close();
   }
 }
@@ -150,6 +150,7 @@ export async function executeBoundedRead<T>(options: PeerDispatchOptions<T>): Pr
       }
       return result;
     } catch (error) {
+      options.signal?.throwIfAborted();
       lastError = error;
       dropBrokenLink(error, link);
       if (!isTransientPeerFailure(error) || attempt === maxAttempts - 1) throw error;
