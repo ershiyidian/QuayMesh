@@ -159,8 +159,8 @@ test('手动模式的一次部分读取会补齐，完成后不继续轮询',asy
     coverage:{...snapshot.coverage,tasks:false},taskSources:snapshot.taskSources.map((source:any)=>({...source,state:'loading',observedAt:null,stale:false,error:null}))};
   partial.sources=partial.taskSources;
   for(const key of ['sources','taskSources'])snapshot[key]=snapshot[key].map((source:any)=>({...source,state:'ready',stale:false,observedAt:Date.now(),error:null}));
-  let reads=0;
-  await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>{reads++;return route.fulfill({json:reads===1?partial:snapshot});});
+  let reads=0,pendingOnRead=1;
+  await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>{reads++;return route.fulfill({json:reads===pendingOnRead?partial:snapshot});});
   await login(page);
   await expect(page.locator('.overview-summary>div strong')).toHaveText('待确认');
   await expect(page.locator('.overview-page .resource-update.pending')).toBeVisible();
@@ -171,6 +171,14 @@ test('手动模式的一次部分读取会补齐，完成后不继续轮询',asy
   expect(reads).toBe(2);
   await page.clock.fastForward(46_000);
   expect(reads).toBe(2);
+  pendingOnRead=3;
+  await page.locator('#topbar [data-action=refresh]').click();
+  await expect(page.locator('.overview-page .resource-update.pending')).toHaveText('正在更新…');
+  await expect(page.locator('#toasts .toast .green')).toHaveCount(0);
+  await page.clock.fastForward(1_100);
+  await expect(page.locator('.overview-page .resource-update.pending')).toHaveCount(0);
+  await expect(page.locator('.overview-current')).toContainText('等待下一步的工作');
+  expect(reads).toBe(4);
 });
 
 for(const resume of ['切回任务','恢复可见'] as const)test(`待完成详情在${resume}命中缓存后继续补读，成功后停止`,async({page})=>{
@@ -432,7 +440,7 @@ test('详情部分读取不把未知显示为零，消息确认后自动收敛',
   await login(page);
   await page.goto(f.server.baseUrl+'/console/#/tasks?days=0&scope=all&run='+encodeURIComponent(reference)+'&tab=diff');
   await expect(page.locator('#inspector .session-heading h2')).toHaveText(ready.run.title);
-  await expect(page.locator('#inspector .resource-update.pending')).toContainText('部分数据仍在读取');
+  await expect(page.locator('#inspector .resource-update.pending')).toContainText('正在更新');
   await expect(page.locator('#inspector [data-action=detail-tab] .count')).toHaveCount(0);
   await expect(page.locator('#inspector [data-action=finish-task]')).toHaveCount(0);
   for(const [tab,unconfirmed] of [['diff','文件改动'],['commands','命令记录'],['agents','代理记录']]){

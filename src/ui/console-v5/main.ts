@@ -386,7 +386,7 @@ async function refresh(manual = false) {
         activePaths = new Set(routePaths());
         await Promise.all([...paths.map(p => load(p, manual)), ...visibleCommandPaths().map(path => loadCommand(path, manual))]);
         const errors = paths.filter(p => CACHE.get(p)?.error);
-        if (manual) toast(errors.length ? `${errors.length} 个资源刷新失败，其余数据可用` : '已重新读取当前视图', errors.length ? 'warn' : 'good');
+        if (manual && errors.length) toast(`${errors.length} 个资源刷新失败，其余数据可用`, 'warn');
     } finally {
         refreshInFlight = --refreshCount > 0; schedulePaint();
     }
@@ -402,7 +402,7 @@ function resourceState(path: string) {
     const failed = Boolean(entry?.error), loading = !failed || Boolean(entry?.loading);
     if (failed) localReadFailures.add(path);
     const title = loading ? (failed ? '正在重试' : '正在读取') + name : name + '暂未读取';
-    return `<section class="panel resource-state ${loading ? 'loading' : 'read-failed'}" data-key="resource-${esc(path)}" aria-label="${esc(name)}读取状态" aria-busy="${loading}"><div class="resource-state-heading">${loading ? '<span class="spinner"></span>' : icon('alert',18)}<h3>${esc(title)}</h3></div><p role="status">${failed ? esc(readFailureMessage(entry!.error)) : '已读取的内容会先显示，其他部分仍在读取。'}</p>${loading && !failed ? '<div class="resource-skeletons" aria-hidden="true"><div class="skeleton"></div><div class="skeleton"></div></div>' : ''}<div class="resource-state-actions">${failed ? btn(loading ? '正在重试…' : '重试这部分', 'retry', `data-path="${esc(path)}" ${loading ? 'disabled' : ''}`, 'small') : ''}${path.startsWith('overview') ? btn('打开任务列表','nav','data-view="tasks"','small ghost') : ''}${failed ? btn('查看诊断','diagnostics','','small ghost') : ''}</div></section>`;
+    return `<section class="panel resource-state ${loading ? 'loading' : 'read-failed'}" data-key="resource-${esc(path)}" aria-label="${esc(name)}读取状态" aria-busy="${loading}"><div class="resource-state-heading">${loading ? '<span class="spinner"></span>' : icon('alert',18)}<h3>${esc(title)}</h3></div>${failed ? `<p role="status">${esc(readFailureMessage(entry!.error))}</p>` : ''}${loading && !failed ? '<div class="resource-skeletons" aria-hidden="true"><div class="skeleton"></div><div class="skeleton"></div></div>' : ''}<div class="resource-state-actions">${failed ? btn(loading ? '正在重试…' : '重试这部分', 'retry', `data-path="${esc(path)}" ${loading ? 'disabled' : ''}`, 'small') : ''}${path.startsWith('overview') ? btn('打开任务列表','nav','data-view="tasks"','small ghost') : ''}${failed ? btn('查看诊断','diagnostics','','small ghost') : ''}</div></section>`;
 }
 function staleNotice(path: string, captures?: RunDetail['changeCaptures']) {
   const entry = renderedResourceEntry(path), name = resourceName(path);
@@ -416,7 +416,7 @@ function staleNotice(path: string, captures?: RunDetail['changeCaptures']) {
     progress = `<div class="notice warn resource-update" role="status" aria-busy="${entry.loading}">${entry.loading ? '<span class="spinner"></span>' : icon('alert',16)}<div><b>${esc(entry.loading ? '正在重试' + name : name + '更新失败')}</b><p>${esc(readFailureMessage(entry.error))}</p><p class="small">继续显示${entry.time ? ' ' + esc(fullTime(entry.time)) + ' 读取的' : '上次成功读取的'}内容。</p></div>${btn(entry.loading ? '正在重试…' : '重试这部分','retry',`data-path="${esc(path)}" ${entry.loading ? 'disabled' : ''}`,'small')}</div>`;
   } else if (entry?.data && (entry.loading || pending)) {
     const exhausted = pendingReads.get(path)?.exhausted;
-    progress = `<div class="resource-update pending" role="status" aria-busy="${!exhausted}">${exhausted ? icon('tasks',14) : '<span class="spinner"></span>'}<span>${exhausted ? '仍有数据未返回，保留已读取的内容。' : pending ? '部分数据仍在读取，已返回的内容先显示。' : '正在更新' + esc(name) + '，保留已读取的内容。'}</span>${exhausted ? btn('重新读取这部分','retry',`data-path="${esc(path)}"`,'small') : ''}</div>`;
+    progress = `<div class="resource-update pending" role="status" aria-busy="${!exhausted}">${exhausted ? icon('tasks',14) : '<span class="spinner"></span>'}<span>${exhausted ? '部分数据未返回' : '正在更新…'}</span>${exhausted ? btn('重试','retry',`data-path="${esc(path)}"`,'small') : ''}</div>`;
   }
   const warning = messages.length ? '<div class="notice warn visually-spaced">' + icon('alert') + '<div>' + messages.map(esc).join('<br>') + '</div>' + btn('重试', 'retry', 'data-path="' + esc(path) + '"', 'small') + '</div>' : '';
   return `<div class="resource-state-slot" data-key="resource-status-${esc(path)}">${progress}${warning}</div>`;
@@ -1432,10 +1432,17 @@ const ACTIONS = {
         download('quaymesh-usage.json', JSON.stringify({exportedAt:new Date().toISOString(),query:usagePath(),timeZone:timeZone() || deviceTimeZone,...u},null,2), 'application/json'); },
     'export-diagnostics': () => download('quaymesh-console-diagnostics.json', JSON.stringify(diagnosticSnapshot(),null,2), 'application/json'), shortcuts: () => dialog({ title: '工作台快捷键', wide: true, confirm: null, cancel: '关闭', body: `<div class="key-grid">${KEYS.map(([k, t]) => `<div><span>${t}</span><kbd>${k}</kbd></div>`).join('')}</div>` })
 };
-document.addEventListener('click', e => { const el = (e.target as HTMLElement).closest<HTMLElement>('[data-action]'); if (!el || (el instanceof HTMLButtonElement && el.disabled))
-    return; const action = ACTIONS[el.dataset.action! as keyof typeof ACTIONS]; if (!action)
-    return; e.preventDefault(); Promise.resolve(withLock(el.dataset.action! + ':' + (el.dataset.id! || ''), () => action(el))).catch(err => { if (err.name !== 'AbortError')
-    toast(err.message || '操作失败', 'bad'); }); });
+document.addEventListener('click', e => {
+    const el = (e.target as HTMLElement).closest<HTMLElement>('[data-action]');
+    if (!el || (el instanceof HTMLButtonElement && el.disabled)) return;
+    const name = el.dataset.action!, action = ACTIONS[name as keyof typeof ACTIONS];
+    if (!action) return;
+    e.preventDefault();
+    const execute = async () => action(el);
+    // 重新读取会取消旧请求；写操作继续等待各自的回执。
+    const pending = name === 'refresh' || name === 'retry' ? execute() : withLock(name + ':' + (el.dataset.id || ''), execute);
+    pending.catch(err => { if (err.name !== 'AbortError') toast(err.message || '操作失败', 'bad'); });
+});
 let inputTimer: ReturnType<typeof setTimeout> | undefined;
 function handleSearch(el: HTMLInputElement | HTMLTextAreaElement) {
     if (!el.dataset.search)
