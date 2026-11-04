@@ -50,10 +50,20 @@ if ($HostExecutable) {
             throw 'The original QuayMesh Host exited before its shutdown request.'
         }
         $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-        $exitClient = Start-Process -FilePath $expectedImage -ArgumentList '--exit' -PassThru -NoNewWindow
+        $exitStart = [Diagnostics.ProcessStartInfo]::new($expectedImage, '--exit')
+        $exitStart.UseShellExecute = $false
+        $exitStart.CreateNoWindow = $true
+        $exitClient = [Diagnostics.Process]::Start($exitStart)
         $clientBudget = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-        if (-not $exitClient.WaitForExit($clientBudget) -or $exitClient.ExitCode -ne 0) {
-            throw 'The Host exit client did not complete successfully; shutdown remains unconfirmed.'
+        if (-not $exitClient.WaitForExit($clientBudget)) {
+            throw 'Timed out waiting for the Host exit client; shutdown remains unconfirmed.'
+        }
+        $exitCode = $exitClient.ExitCode
+        if ($null -eq $exitCode) {
+            throw 'The Host exit client returned no exit code; shutdown remains unconfirmed.'
+        }
+        if ($exitCode -ne 0) {
+            throw "The Host exit client exited with code $exitCode; shutdown remains unconfirmed."
         }
         while ([DateTime]::UtcNow -lt $deadline) {
             $remaining = @(Get-OriginalTaskInstances)
