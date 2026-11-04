@@ -213,14 +213,16 @@ export function registerSessionAppTools(
       bindTask(ownerId, input);
       const authorized = authorizedSession(ownerId, input.session_id);
       const member = memberForRequest(authorized, input.member_id);
-      const { file, patch } = input.task_id
+      const { file, patch, previewOmitted } = input.task_id
         ? await dependencies.changes.fileDiffForTask(input.task_id, authorized.session.id, input.file_id, input.hash)
         : await dependencies.changes.fileDiff(authorized.session.id, input.file_id, input.hash);
       if (file.member_id !== member.id) throw new Error(`FILE_NOT_IN_MEMBER: ${input.file_id}`);
       const page = pageTextForFileDiff(patch, input.cursor ?? "0");
       return jsonReply({
         patch: page.text,
-        ...(file.binary ? { note: "Binary file change; textual diff is unavailable." } : {}),
+        ...(file.binary ? { note: "二进制文件，无法显示文本差异。" }
+          : previewOmitted === "not_generated" ? { note: "此文件未生成文本差异。" }
+            : previewOmitted === "too_large" ? { note: "文本差异超出预览大小，可导出完整补丁查看。" } : {}),
         cursor: page.cursor,
         done: page.cursor === null,
       });

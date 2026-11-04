@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -28,6 +29,7 @@ import { freePort } from "../../node/test/helpers.mjs";
 
 type Detail = Awaited<ReturnType<typeof readRunDetail>>;
 type AppPatchPage = { patch: string; cursor: string | null; done: boolean };
+type AppFileDiffPage = { patch?: string; note?: string; cursor: string | null; done: boolean };
 
 async function waitForPublication(entered: Promise<void>, capture: Promise<void>): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -72,7 +74,7 @@ function appPatchPage(result: Awaited<ReturnType<Client["callTool"]>>): AppPatch
   return page;
 }
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, options: { git?: boolean } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "qm-capture-observation-"));
   const releases = new Set<() => void>();
   const cleanups: Array<() => Promise<void> | void> = [() => rm(directory, { recursive: true, force: true })];
@@ -87,7 +89,7 @@ async function fixture(t: TestContext) {
   const root = join(directory, "project"), stateDir = join(directory, "state");
   await mkdir(root);
   await writeFile(join(root, "tracked.txt"), "base\n");
-  for (const args of [["init"], ["config", "user.email", "test@example.invalid"],
+  if (options.git !== false) for (const args of [["init"], ["config", "user.email", "test@example.invalid"],
     ["config", "user.name", "Capture observation"], ["add", "."], ["commit", "-m", "baseline"]]) await git(root, args);
   const config = loadConfig(writeTestQuayMeshConfig(join(directory, "config"), {
     storage: { stateDir }, workspaces: { allowedRoots: [root], worktreeRoot: join(directory, "worktrees") },
@@ -178,7 +180,7 @@ async function fixture(t: TestContext) {
     assert.equal(changes.captureObservation(member.id, task.id).state, "pending", "ownership metadata is observed while writing");
     await recording;
   };
-  return { root, ledger, runtime, store, changes, session, member, task, runId, newRun, reference, detail, patch, write, blockPublication, cardClient };
+  return { root, ledger, runtime, store, changes, session, member, task, runId, newRun, reference, detail, patch, write, blockPublication, cardClient, baseUrl };
 }
 
 test("live detail observes metadata and queued/direct capture without waiting, and patch rejects until capture settles", { timeout: 60_000 }, async t => {
@@ -190,6 +192,12 @@ test("live detail observes metadata and queued/direct capture without waiting, a
   await baseline;
   assert.equal(f.changes.captureObservation(f.member.id, f.task.id).state, "idle");
   assert.deepEqual(f.store.fileSummaries(f.session.id, f.member.id, f.task.id), []);
+  const warmDeadline = Date.now() + 5000;
+  let warm = await f.detail(f.reference(f.runId));
+  while (!warm.complete && Date.now() < warmDeadline) warm = await f.detail(f.reference(f.runId));
+  assert.equal(warm.complete, true);
+  assert.equal(warm.changeCaptures[0]?.state, "idle");
+  assert.deepEqual(warm.files, []);
   await f.write("base\nfirst change\n");
   let publication = f.blockPublication();
   try {
@@ -199,22 +207,32 @@ test("live detail observes metadata and queued/direct capture without waiting, a
     let flushed = false;
     const flush = f.changes.flushTask(f.member.id, f.task.id).then(() => { flushed = true; });
     void flush.catch(() => undefined);
-    const raw = await f.detail(f.reference(f.runId));
+    assert.deepEqual(f.store.fileSummaries(f.session.id, f.member.id, f.task.id).map(file => file.path), ["tracked.txt"]);
+    // 冷读可先返回索引；保持发布回调挂起，等已落盘文件进入详情。
+    const detailDeadline = Date.now() + 5000;
+    let raw = await f.detail(f.reference(f.runId));
+    while (raw.files.length === 0 && Date.now() < detailDeadline) {
+      assert.equal(flushed, false, "reading detail must not release or wait for the capture gate");
+      raw = await f.detail(f.reference(f.runId));
+    }
     assert.equal(flushed, false);
     assert.deepEqual(raw.files.map(file => file.path), ["tracked.txt"]);
     assert.deepEqual(raw.changeCaptures.map(capture => [capture.runId, capture.state]), [[f.reference(f.runId), "pending"]]);
-    assert.match(raw.warnings.join("\n"), /文件改动正在整理/);
     assert.equal(raw.run.actions.patch, false);
     assert.equal(raw.run.actions.review, false);
     assert.equal(raw.run.actions.revert, false);
     assert.deepEqual(await f.patch(f.reference(f.runId), 409), {
-      code: "change_capture_pending", message: "文件改动仍在整理，请稍后刷新再导出补丁", effect: "none",
+      code: "change_capture_pending", message: "文件改动仍在整理，请稍后重试", effect: "none",
     });
     const aggregated = await f.detail(taskReference(f.task.id));
     assert.deepEqual(aggregated.changeCaptures.map(capture => [capture.runId, capture.state]), [[f.reference(f.runId), "pending"]]);
     publication.release(); await flush;
   } finally { publication.release(); }
   assert.equal(f.changes.captureObservation(f.member.id, f.task.id).state, "idle");
+  const settled = await f.detail(f.reference(f.runId));
+  assert.equal(settled.changeCaptures[0]?.state, "idle");
+  assert.equal(settled.complete, true, "a normal hot-cache request rechecks the capture clock without waiting for cache expiry");
+  assert.deepEqual(settled.files.map(file => file.path), ["tracked.txt"]);
   assert.match((await f.patch(f.reference(f.runId))).patch!, /\+first change/);
 
   await f.write("base\nsecond change\n");
@@ -268,12 +286,17 @@ test("an older queued capture success cannot clear a newer direct capture failur
     f.changes.markDirty(f.member.id, ["tracked.txt"], f.task.id);
     await publication.wait();
     const baseline = f.store.getChangeBaseline(f.session.id, f.member.id, f.root, f.task.id)!;
-    f.store.putChangeBaseline({ ...baseline, latest_ref: "newer-missing-capture-commit" }, f.task.id);
-    await assert.rejects(f.changes.capture(f.member.id, f.task.id, ["tracked.txt"]), /newer-missing-capture-commit/);
-    const pending = f.changes.captureObservation(f.member.id, f.task.id);
-    assert.equal(pending.state, "pending", "the older publication is still observed in flight");
-    assert.match(pending.error!, /newer-missing-capture-commit/);
-    f.store.putChangeBaseline(baseline, f.task.id);
+    // 重叠采集使用完整快照；只在隔离数据库注入缺失基线，让真实 Git 读取失败。
+    const updateBaseline = f.ledger.db.prepare("UPDATE qm_task_change_baselines SET baseline_ref=? WHERE task_id=? AND member_id=? AND repo_root=?");
+    assert.equal(updateBaseline.run("newer-missing-capture-commit", f.task.id, f.member.id, baseline.repo_root).changes, 1);
+    try {
+      await assert.rejects(f.changes.capture(f.member.id, f.task.id, ["tracked.txt"]), /newer-missing-capture-commit/);
+      const pending = f.changes.captureObservation(f.member.id, f.task.id);
+      assert.equal(pending.state, "pending", "the older publication is still observed in flight");
+      assert.match(pending.error!, /newer-missing-capture-commit/);
+    } finally {
+      assert.equal(updateBaseline.run(baseline.baseline_ref, f.task.id, f.member.id, baseline.repo_root).changes, 1);
+    }
     publication.release();
     await assert.rejects(f.changes.flushTask(f.member.id, f.task.id), /newer-missing-capture-commit/);
     const failed = f.changes.captureObservation(f.member.id, f.task.id);
@@ -443,4 +466,96 @@ test("qm_patch cursors bind live revisions and frozen Task identity across real 
       "frozen pages keep their saved revision while another Task changes the same member");
     publication.release(); await f.changes.flushTask(f.member.id, next.id);
   } finally { publication.release(); }
+});
+
+async function savedArtifact(f: Awaited<ReturnType<typeof fixture>>, suffix: string, status = 200) {
+  const response = await fetch(f.baseUrl + encodeURIComponent(f.reference(f.runId)) + suffix);
+  const value = await response.json() as {
+    file: { binary: boolean; previewOmitted?: string; rows: unknown[] };
+    patch: string; complete: boolean; nextCursor: string | null; code?: string;
+  };
+  assert.equal(response.status, status, JSON.stringify(value));
+  return value;
+}
+
+test("large ordinary text is explicitly omitted in real HTTP and MCP reads, including frozen history", { timeout: 60_000 }, async t => {
+  const f = await fixture(t, { git: false }), client = await f.cardClient();
+  await f.write("base\n" + "中文😀 large ordinary text\n".repeat(90_000));
+  await f.changes.capture(f.member.id, f.task.id, ["tracked.txt"]);
+  await f.changes.flushTask(f.member.id, f.task.id);
+  const file = f.store.fileSummaries(f.session.id, f.member.id, f.task.id)[0]!;
+  assert.equal(file.binary, false);
+  assert.equal(file.large, true);
+  assert.equal(file.additions, null);
+  assert.equal(file.removals, null);
+  assert.equal(file.revertible, true, "owned content keeps its complete restore evidence");
+  const path = "/files/" + encodeURIComponent(file.id);
+  const preview = await savedArtifact(f, path);
+  assert.equal(preview.file.previewOmitted, "not_generated");
+  assert.deepEqual(preview.file.rows, []);
+  assert.equal((await savedArtifact(f, "/patch", 413)).code, "patch_not_generated");
+  const args = { session_id: f.session.id, task_id: f.task.id, member_id: f.member.id };
+  const app = await client.callTool({ name: "qm_file_diff", arguments: { ...args, file_id: file.id, hash: file.hash } });
+  assert.notEqual(app.isError, true, JSON.stringify(app.content));
+  const appPage = app.structuredContent as AppFileDiffPage | undefined;
+  assert.equal(appPage?.note, "此文件未生成文本差异。");
+  assert.equal(appPage?.patch, "");
+  const exported = await client.callTool({ name: "qm_patch", arguments: args });
+  assert.equal(exported.isError, true);
+  assert.match(JSON.stringify(exported.content), /PATCH_NOT_GENERATED/);
+  f.ledger.finish(f.runId, { status: "completed", acceptance: "not_applicable", summary: "retained large text", evidence: [] });
+  await f.runtime.service.checkpointRun(f.runId, f.session.id, f.member.id, f.task.id);
+  assert.equal((await savedArtifact(f, path)).file.previewOmitted, "not_generated");
+  assert.equal((await savedArtifact(f, "/patch", 413)).code, "patch_not_generated");
+});
+
+test("an oversized real Git text patch keeps complete UTF-8 HTTP export while its preview is bounded", { timeout: 120_000 }, async t => {
+  const f = await fixture(t), client = await f.cardClient();
+  await f.write("base\n" + "中文😀 change\n".repeat(560_000));
+  await f.changes.capture(f.member.id, f.task.id, ["tracked.txt"]);
+  await f.changes.flushTask(f.member.id, f.task.id);
+  const file = f.store.fileSummaries(f.session.id, f.member.id, f.task.id)[0]!;
+  assert.equal(file.binary, false);
+  assert.ok((await stat(file.patchRef)).size > 8 * 1024 * 1024);
+  const preview = await savedArtifact(f, "/files/" + encodeURIComponent(file.id));
+  assert.equal(preview.file.previewOmitted, "too_large");
+  assert.deepEqual(preview.file.rows, []);
+  const expected = "# " + file.path + "\n" + await readFile(file.patchRef, "utf8");
+  const expectedHash = createHash("sha256").update(expected).digest("hex"), receivedHash = createHash("sha256");
+  let cursor: string | null = null, pages = 0, bytes = 0;
+  do {
+    const page = await savedArtifact(f, "/patch" + (cursor ? "?cursor=" + encodeURIComponent(cursor) : ""));
+    assert.ok(Buffer.byteLength(page.patch) <= 64 * 1024);
+    assert.ok(!page.patch.includes("\ufffd"), "UTF-8 characters must survive every page boundary");
+    receivedHash.update(page.patch); bytes += Buffer.byteLength(page.patch); pages++;
+    assert.ok(pages < 200, "pagination must advance");
+    assert.equal(page.complete, page.nextCursor === null);
+    cursor = page.nextCursor;
+  } while (cursor !== null);
+  assert.ok(pages > 128);
+  assert.equal(bytes, Buffer.byteLength(expected));
+  assert.equal(receivedHash.digest("hex"), expectedHash, "the real HTTP download reproduces every saved patch byte");
+  const app = await client.callTool({ name: "qm_file_diff", arguments: {
+    session_id: f.session.id, task_id: f.task.id, member_id: f.member.id, file_id: file.id, hash: file.hash,
+  } });
+  assert.notEqual(app.isError, true, JSON.stringify(app.content));
+  assert.equal((app.structuredContent as AppFileDiffPage | undefined)?.note, "文本差异超出预览大小，可导出完整补丁查看。");
+});
+
+test("ordinary binary records stay visible but an empty stored patch is not exported as complete", { timeout: 60_000 }, async t => {
+  const f = await fixture(t, { git: false }), client = await f.cardClient();
+  await f.write("base\u0000binary content\n");
+  await f.changes.capture(f.member.id, f.task.id, ["tracked.txt"]);
+  await f.changes.flushTask(f.member.id, f.task.id);
+  const file = f.store.fileSummaries(f.session.id, f.member.id, f.task.id)[0]!;
+  assert.equal(file.binary, true);
+  const preview = await savedArtifact(f, "/files/" + encodeURIComponent(file.id));
+  assert.equal(preview.file.binary, true);
+  assert.deepEqual(preview.file.rows, []);
+  assert.equal((await savedArtifact(f, "/patch", 413)).code, "patch_not_generated");
+  const app = await client.callTool({ name: "qm_file_diff", arguments: {
+    session_id: f.session.id, task_id: f.task.id, member_id: f.member.id, file_id: file.id, hash: file.hash,
+  } });
+  assert.notEqual(app.isError, true, JSON.stringify(app.content));
+  assert.equal((app.structuredContent as AppFileDiffPage | undefined)?.note, "二进制文件，无法显示文本差异。");
 });

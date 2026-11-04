@@ -9,7 +9,7 @@ import { dialog, formObject } from "./dialogs.js";
 import { consoleError, validateSession, WriteIntent, type ConsoleError, type ConsoleSession } from "./client.js";
 import { icon } from './icons.js';
 import { setDisplayTimeZone, timeZone, tm, fullTime, day, smartTime, ago, duration, fmt, compact, bytes, csvCell, timestamp } from './format.js';
-import { esc, clamp, stages, stage, status, btn, ib, badge, meter, smallTime, spark, usageText, diffStat, resultExplanation, changeCaptureBlockReason, changeCaptureNotice, dedupeCaptureWarnings, transferPercent, percent, QUALITY } from './presentation.js';
+import { esc, clamp, stages, stage, status, btn, ib, badge, meter, smallTime, spark, usageText, diffStat, fileDiffStat, resultExplanation, changeCaptureBlockReason, changeCaptureNotice, dedupeCaptureWarnings, transferPercent, percent, QUALITY } from './presentation.js';
 import type { Run, RunDetail, RunPage, Overview, Fleet, Machine, NodeSettingsSnapshot, ChangeFile, Command, FileDiff, PatchPage, Project, Root, ListResponse, Sessions, Thread, SourceState, UsageReport, ActivityPage, EventRow, TransferRow, AuditRow, RevertPreview, RevertReceipt, ArchivePreview, ReviewReceipt, ActionReceipt, ControlReceipt, Preferences, Route, CacheEntry } from './contracts.js';
 import Prism from "prismjs";
 import "prismjs/components/prism-typescript.js";
@@ -796,10 +796,14 @@ function pairDiffRows(rows: FileDiff['file']['rows']) {
 function diffFile(d: RunDetail, f: ChangeFile) {
     const path = 'runs/' + enc(d.run.id) + '/files/' + enc(f.id), payload = data<FileDiff>(path), key = d.run.id + ':' + f.id;
     if (f.generated && !loadedBigFiles.has(key))
-        return `<div class="large-file"><span class="muted">生成文件 · ${fmt((f.add ?? 0) + (f.del ?? 0))} 行变化</span>${btn('加载文件', 'load-big', `data-run="${esc(d.run.id)}" data-id="${esc(f.id)}"`, 'small')}</div>`;
+        return `<div class="large-file"><span class="muted">较大文件${f.add == null && f.del == null ? '' : ' · ' + fmt((f.add ?? 0) + (f.del ?? 0)) + ' 行变化'}</span>${btn('查看差异', 'load-big', `data-run="${esc(d.run.id)}" data-id="${esc(f.id)}"`, 'small')}</div>`;
     if (!payload)
         return resourceState(path);
     if (payload.file.binary) return '<div class="large-file muted">二进制文件，无法显示文本差异</div>';
+    if (payload.file.previewOmitted) {
+        const original = btn('复制路径', 'copy-path', `data-text="${esc((f.source?.root ?? d.run.root).replace(/[\\/]$/, '') + '/' + f.path)}"`, 'small');
+        return `<div class="large-file"><span class="muted">${payload.file.previewOmitted === 'not_generated' ? '此文件未生成文本差异' : '文本差异超出预览大小'}</span>${payload.file.previewOmitted === 'too_large' && d.run.actions.patch !== false ? btn('下载完整补丁', 'patch', `data-id="${esc(d.run.id)}"`, 'small') : original}</div>`;
+    }
     const all = cachedDiff(payload), limit = diffLimits.get(key) || 400, rows = all.slice(0, limit);
     let table;
     if (diffMode === 'split' && innerWidth > 760) {
@@ -819,7 +823,7 @@ function diffView(d: RunDetail) {
         return captureNotice + (changeCaptureBlockReason(d.changeCaptures) ? '' : detailEmpty(d,'暂无已记录的文件改动','文件改动'));
     const files = visibleFiles(d), opened = openFiles(d);
     const toolbar = `<div class="diff-toolbar">${searchField(fileSearch, '查找文件…', 'files')}<span class="spacer"></span><label class="switch"><input type="checkbox" data-diff-wrap ${pref.wrap ? 'checked' : ''} aria-label="代码自动换行">换行</label><span class="desktop-only">${segmented([['unified', '统一'], ['split', '并排']], diffMode, 'diff-mode')}</span>${ib('panel', 'files-toggle-all', '展开或收起文件', `aria-label="展开或收起文件"`)}</div>`;
-    return `<div class="session-diff">${captureNotice}${toolbar}${files.map(f => { const on = opened.has(f.id), parts = f.path.split('/'), name = parts.pop(), dir = parts.join('/'); return `<section class="file-section ${on ? 'expanded' : ''}" data-key="file-${esc(d.run.id)}-${esc(f.id)}"><header class="file-header"><button class="file-toggle" data-action="toggle-file" data-id="${esc(f.id)}" aria-expanded="${on}" title="${esc(f.path)}">${icon(on ? 'down' : 'chevron', 13)}<span class="file-status ${f.kind}">${f.kind}</span><span class="file-path">${dir ? `<span>${esc(dir)}/</span>` : ''}<b>${esc(name)}</b>${f.source ? `<small class="file-source">${esc(f.source.nodeId)} · ${esc(f.source.projectName)} · ${esc(f.source.root)}</small>` : ''}</span><span class="diff-summary"><span class="green">+${fmt(f.add)}</span><span class="red">−${fmt(f.del)}</span></span></button>${ib('copy', 'copy-path', '复制文件路径', `data-text="${esc(f.source ? f.source.root.replace(/[\\/]$/, '') + '/' + f.path : f.path)}"`, 'file-copy')}</header>${on ? diffFile(d, f) : ''}</section>`; }).join('') || empty('没有匹配文件')}</div>`;
+    return `<div class="session-diff">${captureNotice}${toolbar}${files.map(f => { const on = opened.has(f.id), parts = f.path.split('/'), name = parts.pop(), dir = parts.join('/'); return `<section class="file-section ${on ? 'expanded' : ''}" data-key="file-${esc(d.run.id)}-${esc(f.id)}"><header class="file-header"><button class="file-toggle" data-action="toggle-file" data-id="${esc(f.id)}" aria-expanded="${on}" title="${esc(f.path)}">${icon(on ? 'down' : 'chevron', 13)}<span class="file-status ${f.kind}">${f.kind}</span><span class="file-path"><span class="file-name">${dir ? `<span class="file-directory">${esc(dir)}/</span>` : ''}<b>${esc(name)}</b></span>${f.source ? `<small class="file-source" title="${esc(f.source.root)}">${esc(node(f.source.nodeId)?.name || f.source.nodeId)} · ${esc(f.source.projectName)}</small>` : ''}</span>${fileDiffStat(f)}</button>${ib('copy', 'copy-path', '复制文件路径', `data-text="${esc(f.source ? f.source.root.replace(/[\\/]$/, '') + '/' + f.path : f.path)}"`, 'file-copy')}</header>${on ? diffFile(d, f) : ''}</section>`; }).join('') || empty('没有匹配文件')}</div>`;
 }
 function machinesPage() {
     const f = fleet();
@@ -1095,6 +1099,7 @@ async function getPatch(id: string) {
     .then(() => { if (!finished) controller.abort(); });
   let cursor = null, revision = null;
   const chunks = [];
+  let transferred = 0;
   try {
   do {
     const payload: PatchPage = await API.get<PatchPage>('runs/' + enc(id) + '/patch' + (cursor ? '?cursor=' + enc(cursor) : ''), controller.signal);
@@ -1102,7 +1107,8 @@ async function getPatch(id: string) {
     if (revision !== null && revision !== payload.revision) throw new ApiError('下载期间文件发生变化，请重新下载', 409, 'revision_conflict');
     revision = payload.revision;
     chunks.push(payload.patch);
-    if (view.progress) view.progress.textContent = `已读取 ${chunks.length} 部分 · ${bytes(chunks.reduce((sum, part) => sum + new TextEncoder().encode(part).length, 0))}`;
+    transferred += new TextEncoder().encode(payload.patch).length;
+    if (view.progress) view.progress.textContent = `已读取 ${chunks.length} 部分 · ${bytes(transferred)}`;
     if (payload.complete) break;
     if (!payload.nextCursor || payload.nextCursor === cursor) throw new ApiError('补丁分页缺少下一页', 0, 'invalid_cursor');
     cursor = payload.nextCursor;

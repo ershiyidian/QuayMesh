@@ -69,7 +69,15 @@ export function usageText(r: Run) { const u = r.usage; if (!u || u.quality === '
     return '<span class="muted" title="用量未上报">未知</span>'; if (u.quality === 'not_used')
     return '<span class="muted" title="已确认未调用模型">0</span>'; return `<span class="num" title="${fmt(u.total)} Token · ${u.quality === 'partial' ? '部分已记录' : '统计完整'}">${u.quality === 'partial' ? '<span class="amber">≥</span> ' : ''}${compact(u.total)}</span>`; }
 
-export function diffStat(r: Run) { return r.diff ? `<span class="diff-summary"><span class="green">+${fmt(r.diff.add)}</span><span class="red">−${fmt(r.diff.del)}</span></span>` : '<span class="muted">—</span>'; }
+function changeCounts(add:number|null,del:number|null):string {
+  const values=(add==null?'':`<span class="green">+${fmt(add)}</span>`)+(del==null?'':`<span class="red">−${fmt(del)}</span>`);
+  return values?`<span class="diff-summary">${values}</span>`:'';
+}
+
+export function diffStat(r: Run) { return r.diff ? changeCounts(r.diff.add,r.diff.del) : '<span class="muted">—</span>'; }
+export function fileDiffStat(file:{add:number|null;del:number|null;binary:boolean;generated:boolean}):string {
+  return changeCounts(file.add,file.del)||`<span class="muted file-kind">${file.binary?'二进制':file.generated?'较大文件':'行数未统计'}</span>`;
+}
 
 export function resultExplanation(summary: string, reason: string | null, state: string) {
   // 没有交付总结时，接口会把状态说明作为概要回退；同一句话只显示一次。

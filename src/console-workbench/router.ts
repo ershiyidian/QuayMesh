@@ -26,7 +26,7 @@ import { permitted } from "./local.js";
 import {readLocalActivity,readLocalAudit,readLocalProjectSessions,readLocalTaskMessageState,withConsoleReadSignal} from "./isolated-queries.js";
 import { readLocalMetadata, readLocalPage, readLocalOverview, readLocalOverviewUsage, readLocalRunSummaries, readLocalSessionTitles, readLocalTaskIndex, readLocalTaskStateIndex, readLocalUsage } from "./isolated-queries.js";
 import type {readRunDetail} from "./detail.js";
-import {readIsolatedRunDetail,readIsolatedArtifact} from "./read-detail.js";
+import {readIsolatedRunDetail,readIsolatedArtifact,observeCachedLocalDetail} from "./read-detail.js";
 import type { Query } from "./query.js";
 import type { Run, SourceState, TaskMessageConfirmation, PhaseDetailPage } from "./types.js";
 import { WorkbenchError } from "./types.js";
@@ -202,7 +202,14 @@ export function mountConsoleWorkbench(router: Router, operations: ConsoleOperati
   };
   const readPhaseDetail = async (reference:string,fresh:boolean,deadline:number) => {
     const target=decode(reference),path=`/workbench/runs/${encodeURIComponent(target.local)}`;
-    const resource=await feed.readNode<RunDetail>(target.node,path,()=>rawRunDetail(reference),{fresh,deadline});
+    let resource=await feed.readNode<RunDetail>(target.node,path,()=>rawRunDetail(reference),{fresh,deadline});
+    if(target.node===localId&&session&&resource.data){
+      const observed=observeCachedLocalDetail(resource.data,session);
+      if(observed.changed){
+        resource=await feed.readNode<RunDetail>(target.node,path,()=>rawRunDetail(reference),{fresh:true,deadline});
+        if(resource.data)resource={...resource,data:observeCachedLocalDetail(resource.data,session).value};
+      }else resource={...resource,data:observed.value};
+    }
     return {phase:reference,detail:resource.data,source:resource.source};
   };
   type TaskPhases={task:Run;phases:Run[];complete:boolean;sources:SourceState[];lifecycle?:TaskLifecycle;missingNodes:string[]};

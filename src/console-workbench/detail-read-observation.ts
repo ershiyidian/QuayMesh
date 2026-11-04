@@ -14,11 +14,11 @@ export function applyDetailReadObservation(result: ConsoleDetailRead, observatio
   const value = { ...result.value, run: { ...result.value.run, actions: { ...result.value.run.actions } },
     warnings: [...result.value.warnings], changeCaptures: [...result.value.changeCaptures],
     missingPhases: [...result.value.missingPhases] };
-  const current = read.scope && read.fence && observation && sameScope(read.scope, observation.scope)
-    && observation.generation === read.fence.generation && observation.sequence >= read.fence.sequence
-    && observation.unchanged;
+  const observed = read.scope && read.fence && observation && sameScope(read.scope, observation.scope)
+    && observation.generation === read.fence.generation && observation.sequence >= read.fence.sequence;
+  const current = observed && observation?.unchanged;
   const settled = read.kind === "checkpoint" || Boolean(current && observation?.state === "idle");
-  if (read.kind === "live" && current && observation) {
+  if (read.kind === "live" && observed && observation) {
     value.changeCaptures = [{ runId: value.run.id, nodeId: value.run.nodeId,
       projectName: value.run.projectName, root: value.run.root, state: observation.state, error: observation.error }];
   }
@@ -28,10 +28,10 @@ export function applyDetailReadObservation(result: ConsoleDetailRead, observatio
     value.run.actions = { ...read.candidateActions, revert: false };
   } else {
     const reason = !read.contentComplete ? "保存的详情证据不完整"
-      : current && observation?.state === "failed" ? "文件改动整理失败"
-      : current && observation?.state === "pending" ? "文件改动仍在整理"
+      : observed && observation?.state === "failed" ? "文件改动整理失败"
+      : observed && observation?.state === "pending" ? "文件改动仍在整理"
       : "详情读取期间状态已变化或实时观察尚未取得，请刷新后再确认";
-    const failed = !read.contentComplete || current && observation?.state === "failed";
+    const failed = !read.contentComplete || observed && observation?.state === "failed";
     value.missingPhases = [{ id: value.run.id, nodeId: value.run.nodeId, error: reason, ...(!failed ? {pending: true} : {}) }];
     if (failed && !value.warnings.includes(reason)) value.warnings.push(reason);
     value.run.actions = { ...value.run.actions, review: false, complete: false, patch: false, revert: false };

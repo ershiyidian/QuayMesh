@@ -379,9 +379,11 @@ button.session-live:hover { background:var(--hover) }
 .file-status.A { color:var(--green);background:var(--good-bg) }
 .file-status.D { color:var(--red);background:var(--bad-bg) }
 .file-status.R { color:var(--purple);background:var(--accent-bg) }
-.file-path { display:flex;flex:1;min-width:0;font:11px/1.5 var(--mono);white-space:nowrap }
-.file-path>span { color:var(--muted);overflow:hidden;text-overflow:ellipsis;min-width:0 }
-.file-path>b { font-weight:450;flex-shrink:0;color:var(--text) }
+.file-path { display:flex;flex-direction:column;gap:3px;flex:1;min-width:0;font:11px/1.5 var(--mono) }
+.file-name { display:flex;min-width:0;white-space:nowrap }
+.file-directory { color:var(--muted);overflow:hidden;text-overflow:ellipsis;min-width:0 }
+.file-name>b { font-weight:450;flex-shrink:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;color:var(--text) }
+.file-kind { flex-shrink:0;white-space:nowrap;font-size:11px }
 .file-copy { opacity:0;width:25px;height:25px }
 .file-header:hover .file-copy,.file-header:focus-within .file-copy { opacity:1 }
 .diff-scroll { overflow:auto;min-width:0;background:var(--raised) }
@@ -967,7 +969,7 @@ dialog[open] {
   .file-header { top:46px;min-height:39px }
   .file-toggle { padding:7px 8px;gap:6px;min-height:39px }
   .file-path { font-size:11px }
-  .file-path b { max-width:185px;overflow:hidden;text-overflow:ellipsis }
+  .file-name>b { max-width:100% }
   .file-header .diff-summary { font-size:10px;gap:4px }
   .file-copy { opacity:1;width:26px }
   .diff-table { font-size:11px;line-height:19px }

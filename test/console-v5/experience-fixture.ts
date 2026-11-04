@@ -96,15 +96,20 @@ export async function liveCaptureFixture(f:Awaited<ReturnType<typeof consoleExpe
     workspaceId:String(f.second.workspace_id),conversationId:'console-experience',paths:[]},operation);
   const reference='qmtask:'+f.waiting.task_id;
   const observed:{collector?:SessionChangeCollector}={};
-  const original=SessionChangeCollector.prototype.captureObservation;
+  const original=SessionChangeCollector.prototype.captureReadObservation;
   let detail:any;
   try {
-    SessionChangeCollector.prototype.captureObservation=function(memberId,taskId){
-      if(taskId===f.waiting.task_id)observed.collector=this;
-      return original.call(this,memberId,taskId);
+    SessionChangeCollector.prototype.captureReadObservation=function(scope,before){
+      if(scope.taskId===f.waiting.task_id)observed.collector=this;
+      return original.call(this,scope,before);
     };
-    detail=await f.get('runs/'+encodeURIComponent(reference)+'?fresh=1');
-  } finally {SessionChangeCollector.prototype.captureObservation=original;}
+    detail=await waitForFixture(f.server,{sessionId:String(f.waiting.session_id),
+      workspaceId:String(f.second.workspace_id),conversationId:'console-experience',paths:[]},
+      'the real parent capture observation and shared workspace phase are available',
+      ()=>f.get('runs/'+encodeURIComponent(reference)+'?fresh=1'),
+      value=>Boolean(observed.collector&&value.phases.some((phase:any)=>
+        canonicalWorkspaceRoot(phase.run.root)===canonicalWorkspaceRoot(f.server.secondRoot)&&phase.run.memberId)));
+  } finally {SessionChangeCollector.prototype.captureReadObservation=original;}
   assert.ok(observed.collector,'The real live detail must observe its capture scope');
   const phase=detail.phases.find((value:any)=>canonicalWorkspaceRoot(value.run.root)===canonicalWorkspaceRoot(f.server.secondRoot));
   assert.ok(phase?.run.memberId,'The current task must have a phase in the shared workspace');

@@ -12,6 +12,7 @@ import { WorkbenchError } from "./types.js";
 import { presentRunDetail, type FileRow } from "./detail-presentation.js";
 import { diffPage } from "./diff.js";
 import { readRunCheckpoint } from "../session/run-checkpoints.js";
+import { readPatchPreview, readPatchBytePage, requireCompletePatches, textPatchWasOmitted, type PreviewOmission } from "../session/patch-evidence.js";
 
 export interface ChangeCapture extends CaptureObservation {
   runId: string;
@@ -124,25 +125,28 @@ export async function readFileDiff(config: ServerConfig, id: string, fileId: str
     let path: string;
     let revision: string | number;
     let binary = false;
+    let previewOmitted: PreviewOmission | undefined;
     const archived = checkpointForRun(ledger,id,runtime);
     if (archived) {
       const file = archived.files.find((file) => file.id === fileId);
       if (!file) throw new WorkbenchError("这段工作没有保存此文件的差异", 404, "file_not_found");
-      patch = await readFile(file.patchRef, "utf8"); path = file.path; revision = file.hash; binary = file.binary;
+      const preview = textPatchWasOmitted(file) ? { patch: "", previewOmitted: "not_generated" as const } : await readPatchPreview(file.patchRef);
+      patch = preview.patch; previewOmitted = preview.previewOmitted; path = file.path; revision = file.hash; binary = file.binary;
     } else if (runtime && link && (link.task_id || link.latest_run === id)) {
       const file = runtime.store.fileSummaries(link.session_id, link.member_id,link.task_id ?? undefined).find((file) => file.id === fileId);
       if (!file) throw new WorkbenchError("任务中没有此文件", 404, "file_not_found");
       const result = await runtime.changes.fileDiff(link.session_id, file.id, file.hash,link.task_id ?? undefined);
-      patch = result.patch; path = file.path; revision = file.hash; binary = file.binary;
+      patch = result.patch; previewOmitted = result.previewOmitted; path = file.path; revision = file.hash; binary = file.binary;
     } else {
       const files = await legacyFiles(config, runOperations(ledger, id));
       const file = files.find((file) => file.id === fileId);
       if (!file) throw new WorkbenchError("任务中没有此文件", 404, "file_not_found");
-      const saved = await readFile(join(config.stateDir, "console-changes", `${file.operationId}.patch`), "utf8");
-      patch = formatPatch(parsePatch(saved)[file.fileIndex!]); path = file.path; revision = file.revision;
+      const saved = await readPatchPreview(join(config.stateDir, "console-changes", `${file.operationId}.patch`));
+      previewOmitted = saved.previewOmitted;
+      patch = previewOmitted ? "" : formatPatch(parsePatch(saved.patch)[file.fileIndex!]); path = file.path; revision = file.revision;
     }
-    const page = binary ? { rows: [], totalRows: 0, nextCursor: null } : diffPage(patch, cursor);
-    return { file: { id: fileId, path, rows: page.rows, totalRows: page.totalRows, revision, binary }, complete: page.nextCursor === null, nextCursor: page.nextCursor };
+    const page = binary || previewOmitted ? { rows: [], totalRows: 0, nextCursor: null } : diffPage(patch, cursor);
+    return { file: { id: fileId, path, rows: page.rows, totalRows: page.totalRows, revision, binary, ...(previewOmitted ? { previewOmitted } : {}) }, complete: page.nextCursor === null, nextCursor: page.nextCursor };
   } finally { ledger.close(); }
 }
 
@@ -153,9 +157,10 @@ export async function readRunPatch(config: ServerConfig, id: string, cursor?: st
     const link = linkForRun(ledger, id);
     const archived = checkpointForRun(ledger,id,runtime);
     if (archived) {
-      const patches = await Promise.all(archived.files.map((file) => readFile(file.patchRef, "utf8")));
-      const page = textPage(patches.join("\n"), cursor);
-      return { patch: page.text, complete: page.nextCursor === null, nextCursor: page.nextCursor, revision: archived.revision };
+      await requireCompletePatches(archived.files);
+      const pieces = archived.files.flatMap((file, index) => [...(index ? [{ text: "\n" }] : []), { path: file.patchRef }]);
+      const page = await readPatchBytePage(pieces, cursor === undefined ? 0 : Number(cursor));
+      return { patch: page.text, complete: page.nextOffset === null, nextCursor: page.nextOffset === null ? null : String(page.nextOffset), revision: archived.revision };
     }
     if (runtime && link && (link.task_id || link.latest_run === id)) {
       requireIdleCapture(runtime, link.member_id, link.task_id ?? undefined);
@@ -168,9 +173,15 @@ export async function readRunPatch(config: ServerConfig, id: string, cursor?: st
         revision };
     }
     const files = await legacyFiles(config, runOperations(ledger, id));
-    const patches = await Promise.all([...new Set(files.map((file) => file.operationId))].map((operation) => readFile(join(config.stateDir, "console-changes", `${operation}.patch`), "utf8")));
-    const page = textPage(patches.join("\n"), cursor);
-    return { patch: page.text, complete: page.nextCursor === null, nextCursor: page.nextCursor, scope: "operation_history", revision: ledger.run(id).revision };
+    const pieces = [...new Set(files.map(file => file.operationId))].flatMap((operation, index) => [...(index ? [{ text: "\n" }] : []), { path: join(config.stateDir, "console-changes", `${operation}.patch`) }]);
+    const page = await readPatchBytePage(pieces, cursor === undefined ? 0 : Number(cursor));
+    return { patch: page.text, complete: page.nextOffset === null, nextCursor: page.nextOffset === null ? null : String(page.nextOffset), scope: "operation_history", revision: ledger.run(id).revision };
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("PATCH_NOT_GENERATED:"))
+      throw new WorkbenchError("部分文件未生成完整补丁", 413, "patch_not_generated", "none");
+    if (error instanceof Error && error.message.startsWith("Invalid patch response offset"))
+      throw new WorkbenchError("补丁游标无效", 400, "invalid_cursor", "none");
+    throw error;
   } finally { ledger.close(); }
 }
 

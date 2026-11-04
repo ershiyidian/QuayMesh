@@ -8,6 +8,7 @@ import type { CaptureReadFence } from "../session/capture-read-observation.js";
 import { completeUtf8PrefixEnd, fitUtf8 } from "../session/output-codec.js";
 import { readSavedOutputPage } from "../session/output-reader.js";
 import { SavedArtifactError, readSavedArtifactRange, readSavedTextArtifact, savedArtifactId, savedArtifactSize } from "../session/saved-artifacts.js";
+import { PATCH_PREVIEW_BYTES, textPatchWasOmitted, type PreviewOmission } from "../session/patch-evidence.js";
 import { linkForRun, permitted } from "./local.js";
 import { diffPage } from "./diff.js";
 import { WorkbenchError } from "./types.js";
@@ -23,7 +24,7 @@ export type ConsoleArtifactRequest = (
   | { kind: "file-diff"; runId: string; fileId: string; cursor?: string }
   | { kind: "patch"; runId: string; cursor?: string }
   | { kind: "command-output"; runId: string; commandId: string; cursor?: string }) & ArtifactParentScope;
-type FileValue = { file: { id: string; path: string; rows: ReturnType<typeof diffPage>["rows"]; totalRows: number; revision: string; binary: boolean }; complete: boolean; nextCursor: string | null };
+type FileValue = { file: { id: string; path: string; rows: ReturnType<typeof diffPage>["rows"]; totalRows: number; revision: string; binary: boolean; previewOmitted?: PreviewOmission }; complete: boolean; nextCursor: string | null };
 type PatchValue = { patch: string; complete: boolean; nextCursor: string | null; revision: number };
 type OutputValue = { chunk: string; cursor: number; done: boolean; hasMore: boolean; totalBytes: number; truncated: boolean; retainedFrom: number;
   outputState: "writing" | "ready" | "incomplete" | "expired" | "unknown"; errorCode: string | null };
@@ -57,7 +58,10 @@ async function patchPage(root: string, runId: string, files: SavedFile[], live: 
     const file = files[index]!;
     if (index) pieces.push({ text: Buffer.from("\n") });
     if (live) pieces.push({ text: Buffer.from(`# ${file.path}\n`) });
-    pieces.push({ path: file.patchRef, bytes: await savedArtifactSize(root, file.patchRef) });
+    const bytes = await savedArtifactSize(root, file.patchRef);
+    if (textPatchWasOmitted(file) || file.binary && bytes === 0)
+      throw new WorkbenchError("部分文件未生成完整补丁", 413, "patch_not_generated", "none");
+    pieces.push({ path: file.patchRef, bytes });
   }
   const revision = fingerprint({ runId, format: live ? "live-with-path-v1" : "checkpoint-v1", files: files.map(file => [file.id, file.hash, file.versionRef]) });
   const total = pieces.reduce((sum, piece) => sum + ("text" in piece ? piece.text.length : piece.bytes), 0);
@@ -147,11 +151,13 @@ export async function readRunArtifact(config: ServerConfig, ledger: WorkLedger, 
       if (!file) throw new WorkbenchError("文件不属于这个阶段", 404, "file_not_found", "none");
       const revision = fingerprint([request.runId, file.id, file.hash]);
       const offset = cursorOffset(request.cursor, revision);
-      const patch = file.binary ? "" : await readSavedTextArtifact(root, file.patchRef, 8 * 1024 * 1024);
-      const page = file.binary ? { rows: [], totalRows: 0, nextCursor: null } : diffPage(patch, String(offset));
-      if (file.binary && offset !== 0) throw new WorkbenchError("二进制差异游标无效", 400, "invalid_cursor", "none");
+      const previewOmitted: PreviewOmission | undefined = file.binary ? undefined : textPatchWasOmitted(file) ? "not_generated"
+        : await savedArtifactSize(root, file.patchRef) > PATCH_PREVIEW_BYTES ? "too_large" : undefined;
+      const patch = file.binary || previewOmitted ? "" : await readSavedTextArtifact(root, file.patchRef, PATCH_PREVIEW_BYTES);
+      const page = file.binary || previewOmitted ? { rows: [], totalRows: 0, nextCursor: null } : diffPage(patch, String(offset));
+      if ((file.binary || previewOmitted) && offset !== 0) throw new WorkbenchError("差异预览游标无效", 400, "invalid_cursor", "none");
       return { kind: request.kind, read, value: { file: { id: file.id, path: file.path, rows: page.rows,
-        totalRows: page.totalRows, revision: file.hash, binary: file.binary }, complete: page.nextCursor === null,
+        totalRows: page.totalRows, revision: file.hash, binary: file.binary, ...(previewOmitted ? { previewOmitted } : {}) }, complete: page.nextCursor === null,
         nextCursor: page.nextCursor === null ? null : nextCursor(Number(page.nextCursor), revision) } };
     }
     const page = await patchPage(root, request.runId, files, read.kind === "live", request.cursor);

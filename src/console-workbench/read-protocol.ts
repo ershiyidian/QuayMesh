@@ -21,6 +21,7 @@ export const CONSOLE_READ_BUSINESS_ERRORS = {
   artifact_unavailable:{status:404,message:'保存的内容当前不可读取'},
   artifact_changed:{status:409,message:'保存的内容在读取期间变化，请重试'},
   artifact_too_large:{status:413,message:'保存的内容超过单次读取预算'},
+  patch_not_generated:{status:413,message:'部分文件未生成完整补丁'},
   snapshot_unavailable:{status:404,message:'此阶段没有可验证的独立快照'},
   file_not_found:{status:404,message:'文件不属于这个阶段'},
   command_not_found:{status:404,message:'命令不属于这个任务'},

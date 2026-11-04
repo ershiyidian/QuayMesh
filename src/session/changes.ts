@@ -8,10 +8,11 @@ import type { ExecutionCoordinator } from "../execution-coordinator.js";
 import { createWorkingTreeSnapshot } from "../review-checkpoints.js";
 import { isPathInsideRoot } from "../roots.js";
 import { resolvePhysicalPath, samePhysicalPath } from "../physical-paths.js";
-import { textPage } from "../bounded-reply.js";
 import type { FileSummary, SessionId, SessionMember } from "./types.js";
 import type { CapturedChangeSet, SessionStore } from "./store.js";
-import { beginWrite, finishWrite, memberFile, ownershipPath, readFileState, readOwnedFiles, sameFileState, type WriteEvidence } from "./write-evidence.js";
+import { beginWrite, evidenceDirectory, finishWrite, memberFile, ownershipPath, readFileState, readOwnedFiles, sameFileState, type WriteEvidence } from "./write-evidence.js";
+import { contentDigest, fileIdentity, hasRestorableState, INLINE_FILE_BYTES, ordinaryVersion, readFileContent, type FileContent } from "./file-content.js";
+import { captureGitPatch, readPatchPreview, readPatchTextPage, requireCompletePatches, textPatchWasOmitted, type PatchPiece, type PreviewOmission } from "./patch-evidence.js";
 
 interface GitNumstat {
   additions: number | null;
@@ -53,6 +54,8 @@ export class SessionChangeCollector {
   private onCaptured?: (sessionId: string, memberId: string, taskId?: string) => Promise<void> | void;
   private closed = false;
   private readonly captureErrors = new Map<string, Error>();
+  private readonly ordinaryObservations = new Map<string, FileContent>();
+  private readonly ordinaryVersions = new Map<string, { content: string; version: string }>();
 
   constructor(
     private readonly store: SessionStore,
@@ -66,7 +69,7 @@ export class SessionChangeCollector {
 
   async prepareWrite(member: SessionMember, paths: string[], cwd = member.root, taskId?: string): Promise<WriteEvidence[]> {
     await this.ensureBaseline(member, paths, cwd, taskId);
-    return beginWrite(member.root, paths, cwd);
+    return beginWrite(member.root, paths, cwd, evidenceDirectory(this.stateDir, this.sessionIdFor(member.id), member.id, taskId));
   }
 
   async recordWrite(member: SessionMember, evidence: WriteEvidence[], taskId?: string): Promise<void> {
@@ -116,23 +119,29 @@ export class SessionChangeCollector {
   }
 
   async flush(): Promise<void> {
+    let failure: PromiseRejectedResult | undefined;
     for (;;) {
       const work = this.pendingWork();
       if (!work.length) break;
-      await Promise.all(work);
+      for (const result of await Promise.allSettled(work))
+        if (result.status === "rejected") failure ??= result;
     }
+    if (failure) throw failure.reason;
     if (this.captureErrors.size) throw new AggregateError([...this.captureErrors.values()], "文件改动捕获失败");
   }
 
   async flushTask(memberId: string, taskId?: string): Promise<void> {
     const key = JSON.stringify([memberId, taskId ?? null]);
     const metadataKeys = this.metadataKeys(memberId, taskId);
+    let failure: PromiseRejectedResult | undefined;
     for (;;) {
       const work = [...metadataKeys.flatMap(value => this.metadataWrites.get(value) ?? []),
         ...(this.captures.get(key) ?? []), ...(this.pending.has(key) ? [this.pending.get(key)!] : [])];
       if (!work.length) break;
-      await Promise.all(work);
+      for (const result of await Promise.allSettled(work))
+        if (result.status === "rejected") failure ??= result;
     }
+    if (failure) throw failure.reason;
     const error = this.captureErrors.get(key);
     if (error) throw error;
   }
@@ -187,13 +196,10 @@ export class SessionChangeCollector {
         await this.ensureBaselineNow(member, [], nested.gitRoot, taskId);
         continue;
       }
-      const content = await readFile(absolute).catch((error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return null;
-        throw error;
-      });
-      const contentRef = await this.writeEvidence(member, `baseline-${digest(absolute)}`, content, taskId);
-      files.push({ path: relativePath, existed: content !== null,
-        binary: content !== null && content.includes(0), contentRef });
+      const observed = await readFileContent(absolute, evidenceDirectory(this.stateDir, this.sessionIdFor(member.id), member.id, taskId));
+      const contentRef = observed.state.contentRef ?? await this.writeEvidence(member, `baseline-${digest(absolute)}`,
+        observed.state.exists ? Buffer.from(observed.state.content!, "base64") : null, taskId);
+      files.push({ path: relativePath, existed: observed.state.exists, binary: observed.binary, contentRef });
     }
     await mkdir(dirname(baselinePath), { recursive: true, mode: 0o700 });
     const pending = `${baselinePath}.pending-${process.pid}-${Date.now()}`;
@@ -238,21 +244,29 @@ export class SessionChangeCollector {
     // Older in-process callers observe the batch through flush()/close().
     // Their ignored admission promise must not create an unhandled rejection.
     void admission.catch(() => {});
+    const token = Symbol();
+    const previousToken = this.captureTokens.get(key);
+    let started = false;
     const capture = Promise.resolve().then(() => this.withCaptureWork(taskId, async () => {
+      started = true;
+      this.captureTokens.set(key, token);
       admitted();
       try {
         while (this.dirty.has(key)) {
           const paths = this.dirty.get(key);
           this.dirty.delete(key);
-          await this.captureTracked(memberId, taskId, paths ? [...paths] : undefined);
+          await this.captureTracked(memberId, taskId, paths ? [...paths] : undefined, false, token);
         }
       } finally { this.settlingBatches.add(key); }
     })).catch(error => {
       rejected(error);
-      this.captureErrors.set(key, error instanceof Error ? error : new Error(String(error)));
+      if (this.captureTokens.get(key) === token || !started && !this.captures.get(key)?.size
+        && this.captureTokens.get(key) === previousToken)
+        this.captureErrors.set(key, error instanceof Error ? error : new Error(String(error)));
       throw error;
     }).finally(() => {
       this.pending.delete(key); this.admissions.delete(key); this.settlingBatches.delete(key);
+      if (!this.captures.get(key)?.size) this.captureTokens.delete(key);
       this.readClock.touch(memberId, taskId);
     });
     this.pending.set(key, capture);
@@ -270,20 +284,22 @@ export class SessionChangeCollector {
     return this.execution ? this.execution.withWork({ kind: "capture", taskId }, action) : action();
   }
 
-  private captureTracked(memberId: string, taskId?: string, changedPaths?: string[], admit = false): Promise<void> {
+  private captureTracked(memberId: string, taskId?: string, changedPaths?: string[], admit = false, token = Symbol()): Promise<void> {
     this.readClock.touch(memberId, taskId);
     const key = JSON.stringify([memberId, taskId ?? null]);
     const active = this.captures.get(key) ?? new Set<Promise<void>>();
     // An older publication can settle after a newer capture. Only the newest
     // capture's result may replace the observation for this member and Task.
-    const token = Symbol();
     const collect = () => {
+      // 未发布或失败的上一轮可能改了其它路径；重叠时重新观察完整 Git 工作树。
+      const fullGit = active.size > 1 || this.captureErrors.has(key);
       // A pause-rejected independent caller never began capture and must not
       // replace the result token of an already accepted, still draining batch.
       this.captureTokens.set(key, token);
-      return this.captureNow(memberId, taskId, changedPaths);
+      return this.captureNow(memberId, taskId, changedPaths, () => this.captureTokens.get(key) === token, fullGit);
     };
-    const work = (admit ? this.withCaptureWork(taskId, collect) : collect()).then(() => {
+    // 先登记本轮，再开始观察；active 的其余成员才代表真实重叠。
+    const work = Promise.resolve().then(() => admit ? this.withCaptureWork(taskId, collect) : collect()).then(() => {
       if (this.captureTokens.get(key) === token) this.captureErrors.delete(key);
     }, error => {
       if (this.captureTokens.get(key) === token) {
@@ -295,7 +311,7 @@ export class SessionChangeCollector {
       active.delete(work);
       if (!active.size) {
         this.captures.delete(key);
-        this.captureTokens.delete(key);
+        if (!this.pending.has(key)) this.captureTokens.delete(key);
       }
     });
     active.add(work);
@@ -303,7 +319,7 @@ export class SessionChangeCollector {
     return work;
   }
 
-  private async captureNow(memberId: string, taskId?: string, changedPaths?: string[]): Promise<void> {
+  private async captureNow(memberId: string, taskId?: string, changedPaths?: string[], isCurrent?: () => boolean, fullGit = false): Promise<void> {
     const { sessionId, member } = this.store.memberOwner(memberId);
     const baselines = this.store.changeBaselines(sessionId, memberId, taskId);
     if (baselines.length === 0) return;
@@ -313,10 +329,10 @@ export class SessionChangeCollector {
     const memberRoot = resolvePhysicalPath(member.root);
     for (const baseline of baselines) {
       if (baseline.baseline_ref.startsWith("ordinary:") && samePhysicalPath(baseline.repo_root, member.root)) {
-        captures.push(await this.captureOrdinary(sessionId, member, baseline.baseline_ref, previousByPath, taskId));
+        captures.push(await this.captureOrdinary(sessionId, member, baseline.baseline_ref, previousByPath, taskId, changedPaths));
       } else {
         const repoRoot = resolvePhysicalPath(baseline.repo_root);
-        const scoped = changedPaths?.map(path => resolvePhysicalPath(resolve(memberRoot, path)))
+        const scoped = fullGit ? undefined : changedPaths?.map(path => resolvePhysicalPath(resolve(memberRoot, path)))
           .filter(path => isPathInsideRoot(path, repoRoot))
           .map(path => relative(repoRoot, path).replaceAll("\\", "/"));
         if (scoped && !scoped.length) continue;
@@ -324,20 +340,20 @@ export class SessionChangeCollector {
           baseline.baseline_ref, baseline.latest_ref, previousByPath, taskId, scoped));
       }
     }
-    const changed = await this.store.publishChangeCaptureAsync(sessionId, memberId, captures, taskId);
+    const changed = await this.store.publishChangeCaptureAsync(sessionId, memberId, captures, taskId, isCurrent);
     if (changed) await this.onCaptured?.(sessionId, memberId, taskId);
   }
 
-  async fileDiff(sessionId: SessionId, fileId: string, hash: string, taskId?: string): Promise<{ file: FileSummary; patch: string }> {
+  async fileDiff(sessionId: SessionId, fileId: string, hash: string, taskId?: string): Promise<{ file: FileSummary; patch: string; previewOmitted?: PreviewOmission }> {
     const records = this.store.fileSummariesForSession(sessionId, taskId);
     const record = records.find((entry) => entry.id === fileId);
     if (!record) throw new Error(`FILE_NOT_FOUND: ${fileId}`);
     if (record.hash !== hash) throw new Error(`FILE_VERSION_STALE: ${fileId}`);
     const { patchRef: _patchRef, versionRef: _versionRef, ...file } = record;
-    return { file, patch: await readFile(record.patchRef, "utf8") };
+    return { file, ...(textPatchWasOmitted(file) ? { patch: "", previewOmitted: "not_generated" as const } : await readPatchPreview(record.patchRef)) };
   }
 
-  async fileDiffForTask(taskId: string, sessionId: SessionId, fileId: string, hash: string): Promise<{ file: FileSummary; patch: string }> {
+  async fileDiffForTask(taskId: string, sessionId: SessionId, fileId: string, hash: string): Promise<{ file: FileSummary; patch: string; previewOmitted?: PreviewOmission }> {
     const task = this.store.getTask(taskId);
     if (task.session_id !== sessionId) throw new Error(`TASK_SESSION_MISMATCH: ${taskId}`);
     if (task.state === "active") return this.fileDiff(sessionId, fileId, hash, taskId);
@@ -346,18 +362,17 @@ export class SessionChangeCollector {
     if (!record) throw new Error(`FILE_NOT_FOUND: ${fileId}`);
     if (record.hash !== hash) throw new Error(`FILE_VERSION_STALE: ${fileId}`);
     const { patchRef: _patchRef, versionRef: _versionRef, ...file } = record;
-    return { file, patch: await readFile(record.patchRef, "utf8") };
+    return { file, ...(textPatchWasOmitted(file) ? { patch: "", previewOmitted: "not_generated" as const } : await readPatchPreview(record.patchRef)) };
   }
 
   async patch(sessionId: SessionId, memberId: string, cursor?: string, taskId?: string): Promise<{ patch: string; nextCursor: string | null }> {
     const files = this.store.fileSummaries(sessionId, memberId, taskId);
-    const sections = await Promise.all(files.map(async (file) => {
-      const content = await readFile(file.patchRef, "utf8");
-      return `# ${file.path}\n${content}`;
-    }));
-    const combined = sections.join("\n");
+    await requireCompletePatches(files);
+    const pieces: PatchPiece[] = files.flatMap((file, index) => [
+      { text: `${index ? "\n" : ""}# ${file.path}\n` }, { path: file.patchRef },
+    ]);
     const offset = cursor ? Number(cursor) : 0;
-    const page = textPage(combined, offset);
+    const page = await readPatchTextPage(pieces, offset);
     return { patch: page.text, nextCursor: page.nextOffset === null ? null : String(page.nextOffset) };
   }
 
@@ -367,8 +382,11 @@ export class SessionChangeCollector {
     if (task.state === "active") return this.patch(sessionId, memberId, cursor, taskId);
     const frozen = this.store.getTaskSnapshot(taskId, memberId);
     if (!frozen) throw new Error(`TASK_MEMBER_NOT_FOUND: ${memberId}`);
-    const sections = await Promise.all(frozen.files.map(async (file) => `# ${file.path}\n${await readFile(file.patchRef, "utf8")}`));
-    const page = textPage(sections.join("\n"), cursor ? Number(cursor) : 0);
+    await requireCompletePatches(frozen.files);
+    const pieces: PatchPiece[] = frozen.files.flatMap((file, index) => [
+      { text: `${index ? "\n" : ""}# ${file.path}\n` }, { path: file.patchRef },
+    ]);
+    const page = await readPatchTextPage(pieces, cursor ? Number(cursor) : 0);
     return { patch: page.text, nextCursor: page.nextOffset === null ? null : String(page.nextOffset) };
   }
 
@@ -393,6 +411,7 @@ export class SessionChangeCollector {
     }
     for(const error of errors)console.error(JSON.stringify({event:"session_change_flush_failed",error:error instanceof Error?error.message:String(error)}));
     this.captureErrors.clear();this.pending.clear();this.metadataWrites.clear();this.dirty.clear();this.onCaptured=undefined;
+    this.ordinaryObservations.clear(); this.ordinaryVersions.clear();
   }
 
   private async captureGit(
@@ -435,13 +454,16 @@ export class SessionChangeCollector {
       const proof = owned[displayPath];
       const fromPath = entry.from ? relative(memberRoot, resolve(physicalRepoRoot, entry.from)).replaceAll("\\", "/") : null;
       const fromProof = fromPath ? owned[fromPath] : undefined;
-      const canRevert = Boolean(proof?.safe && sameFileState(proof.after, await readFileState(absolute))
-        && (!fromPath || fromProof?.safe && sameFileState(fromProof.after, await readFileState(resolve(member.root, fromPath)))));
+      const canRevert = Boolean(proof?.safe && await hasRestorableState(proof.before) && sameFileState(proof.after, await readFileState(absolute))
+        && (!fromPath || fromProof?.safe && await hasRestorableState(fromProof.before)
+          && sameFileState(fromProof.after, await readFileState(resolve(member.root, fromPath)))));
       const patchArgs = ["diff", "--binary", "--no-color", baselineRef, current, "--", entry.path];
       if (entry.from) patchArgs.push(entry.from);
-      const patch = (await git(repoRoot, patchArgs, { maxBuffer: 50 * 1024 * 1024 })).stdout;
-      const binary = entry.additions === null || entry.removals === null || patch.includes("GIT binary patch");
-      const patchRef = await this.writeEvidence(member, `patch-${current}-${digest(entry.path)}`, Buffer.from(patch, "utf8"), taskId);
+      const previous = previousFiles.get(displayPath);
+      const saved = await captureGitPatch({ repoRoot, args: patchArgs,
+        destination: join(evidenceDirectory(this.stateDir, sessionId, member.id, taskId), `patch-${current}-${digest(entry.path)}.bin`),
+        currentRef: current, previousRef: previous?.versionRef ?? current, path: entry.path });
+      const binary = entry.additions === null || entry.removals === null || saved.binary;
       const file: CapturedFile = {
         id: `file_${digest([sessionId, member.id, displayPath]).slice(0, 24)}`,
         member_id: member.id,
@@ -450,20 +472,19 @@ export class SessionChangeCollector {
         from: fromPath,
         additions: entry.additions,
         removals: entry.removals,
-        hash: digest([current, entry.path, patch]),
-        large: Buffer.byteLength(patch) > 1024 * 1024,
+        hash: saved.hash,
+        large: saved.bytes > INLINE_FILE_BYTES,
         binary,
         coverage: canRevert ? "session_owned" : "partial",
         revertible: canRevert,
-        patchRef,
+        patchRef: saved.patchRef,
         versionRef: current,
       };
-      const previous = previousFiles.get(displayPath);
       // The public hash deliberately includes the whole tree for version checks.
       // Recompute its old form using this file's full binary-capable patch: a
       // different file changing the tree must not reset this evidence's time.
       const unchanged = previous && sameFileIdentity(previous, file)
-        && previous.hash === (previous.versionRef === current ? file.hash : digest([previous.versionRef, entry.path, patch]));
+        && previous.hash === saved.previousHash;
       files.push({ ...file, recordedAt: unchanged ? previous.recordedAt ?? null : Date.now() });
     }
     return { baseline: {
@@ -476,51 +497,81 @@ export class SessionChangeCollector {
     }, files };
   }
 
-  private async captureOrdinary(sessionId: SessionId, member: SessionMember, baselineRef: string, previousFiles: ReadonlyMap<string, CapturedFile>, taskId?: string): Promise<CapturedChangeSet> {
+  private async observeOrdinaryFile(path: string, force = false): Promise<FileContent> {
+    const identity = await fileIdentity(path), previous = this.ordinaryObservations.get(path);
+    if (!force && previous?.identity === identity) return previous;
+    const observed = await readFileContent(path);
+    const { content: _content, ...state } = observed.state;
+    this.ordinaryObservations.set(path, { ...observed, state });
+    return observed;
+  }
+
+  private async captureOrdinary(sessionId: SessionId, member: SessionMember, baselineRef: string, previousFiles: ReadonlyMap<string, CapturedFile>, taskId?: string, changedPaths?: string[]): Promise<CapturedChangeSet> {
     const baseline = JSON.parse(await readFile(this.ordinaryBaselinePath(member, taskId), "utf8")) as OrdinaryBaseline;
-    const files: Array<FileSummary & { patchRef: string; versionRef: string }> = [];
+    const files: CapturedFile[] = [];
     const owned = await readOwnedFiles(ownershipPath(this.stateDir, sessionId, member.id, taskId));
+    const explicit = new Set(changedPaths?.map(path => memberFile(member.root, path).absolute));
     for (const before of baseline.files) {
       const absolute = memberFile(member.root, before.path).absolute;
-      const current = await readFile(absolute).catch((error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return null;
-        throw error;
-      });
-      const previous = before.existed ? await readFile(before.contentRef) : null;
-      if (previous === null && current === null) continue;
-      if (previous !== null && current !== null && previous.equals(current)) continue;
-      const version = digest([previous?.toString("base64") ?? null, current?.toString("base64") ?? null]);
+      // 全量观察仍核对所有登记路径；已知写入强制读取，外部改动由文件身份使缓存失效。
+      const current = await this.observeOrdinaryFile(absolute, explicit.has(absolute));
+      const previous: FileContent = before.existed ? await this.observeOrdinaryFile(before.contentRef)
+        : { state: { exists: false, content: "", bytes: 0, mode: null }, identity: "missing", binary: false };
+      if (before.existed && !previous.state.exists) throw new Error("FILE_BASELINE_MISSING: " + before.path);
+      const previousDigest = contentDigest(previous.state), currentDigest = contentDigest(current.state);
+      if (previousDigest === currentDigest) continue;
+      const cacheKey = before.contentRef + "\0" + absolute, content = JSON.stringify([previousDigest, currentDigest]);
+      const cachedVersion = this.ordinaryVersions.get(cacheKey);
+      const version = cachedVersion?.content === content ? cachedVersion.version
+        : await ordinaryVersion(before.existed ? before.contentRef : null, current.state.exists ? absolute : null);
+      if (await fileIdentity(absolute) !== current.identity
+        || before.existed && await fileIdentity(before.contentRef) !== previous.identity)
+        throw new Error("FILE_CHANGED_DURING_CAPTURE: " + before.path);
+      this.ordinaryVersions.set(cacheKey, { content, version });
       const proof = owned[before.path];
-      const canRevert = Boolean(proof?.safe && sameFileState(proof.after, await readFileState(absolute)));
-      const binary = before.binary || (current?.includes(0) ?? false);
-      const oldText = previous?.toString("utf8") ?? "";
-      const newText = current?.toString("utf8") ?? "";
-      const patch = binary ? "" : createPatch(before.path, oldText, newText, "baseline", "current");
-      const additions = binary ? null : countPatchLines(patch, "+");
-      const removals = binary ? null : countPatchLines(patch, "-");
-      const patchRef = await this.writeEvidence(member, `ordinary-patch-${digest(before.path)}-${version}`, Buffer.from(patch, "utf8"), taskId);
+      const canRevert = Boolean(proof?.safe && await hasRestorableState(proof.before) && sameFileState(proof.after, current.state));
+      const binary = before.binary || previous.binary || current.binary;
+      let large = Math.max(previous.state.bytes ?? 0, current.state.bytes ?? 0) > INLINE_FILE_BYTES;
+      const last = previousFiles.get(before.path);
+      let patchRef: string, additions: number | null, removals: number | null;
+      if (last?.hash === version && last.binary === binary) {
+        ({ patchRef, additions, removals } = last); large ||= last.large;
+      } else {
+        let patch = "";
+        if (!binary && !large) {
+          const oldText = before.existed ? await readFile(before.contentRef, "utf8") : "";
+          const newText = current.state.exists ? await readFile(absolute, "utf8") : "";
+          if (await fileIdentity(absolute) !== current.identity
+            || before.existed && await fileIdentity(before.contentRef) !== previous.identity)
+            throw new Error("FILE_CHANGED_DURING_CAPTURE: " + before.path);
+          const bounded = createPatch(before.path, oldText, newText, "baseline", "current", { timeout: 50 });
+          if (bounded === undefined) large = true;
+          else patch = bounded;
+        }
+        additions = binary || large ? null : countPatchLines(patch, "+");
+        removals = binary || large ? null : countPatchLines(patch, "-");
+        patchRef = await this.writeEvidence(member, "ordinary-patch-" + digest(before.path) + "-" + version, Buffer.from(patch, "utf8"), taskId);
+      }
       const file: CapturedFile = {
-        id: `file_${digest([sessionId, member.id, before.path]).slice(0, 24)}`,
+        id: "file_" + digest([sessionId, member.id, before.path]).slice(0, 24),
         member_id: member.id,
-        status: previous === null ? "A" : current === null ? "D" : "M",
+        status: !previous.state.exists ? "A" : !current.state.exists ? "D" : "M",
         path: before.path,
         from: null,
         additions,
         removals,
         hash: version,
-        large: (current?.length ?? 0) > 1024 * 1024,
+        large,
         binary,
         coverage: canRevert ? "session_owned" : "partial",
         revertible: canRevert,
         patchRef,
-        versionRef: `ordinary:${member.root}:${version}`,
+        versionRef: "ordinary:" + member.root + ":" + version,
       };
-      const last = previousFiles.get(before.path);
       const unchanged = last && sameFileIdentity(last, file) && last.hash === file.hash;
       files.push({ ...file, recordedAt: unchanged ? last.recordedAt ?? null : Date.now() });
     }
-    // Recording metadata is not part of the content/version identity.
-    const versionRef = `ordinary:${digest(files.map(({ recordedAt: _recordedAt, ...file }) => file))}`;
+    const versionRef = "ordinary:" + digest(files.map(({ recordedAt: _recordedAt, ...file }) => file));
     return { baseline: {
       session_id: sessionId,
       member_id: member.id,

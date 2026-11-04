@@ -156,7 +156,7 @@ export function createCardController(state:CardState,renderer:CardView,source:Se
     const key=diffCacheKey(file),loading=`diff:${key}`;
     if(state.loading.has(loading)||state.diffCache.has(key))return;
     state.loading.add(loading);
-    try{const page=await source.fileDiff(file.id,file.hash);state.diffCache.set(key,page.patch?{rows:parseFilePatch(page.patch)}:{note:page.note??"无文本差异"});}
+    try{const page=await source.fileDiff(file.id,file.hash);state.diffCache.set(key,page.note?{note:page.note}:page.patch?{rows:parseFilePatch(page.patch)}:{note:"无文本差异"});}
     catch(error){state.diffCache.set(key,{error:messageOf(error)});}
     finally{state.loading.delete(loading);view.renderPanel();}
   }

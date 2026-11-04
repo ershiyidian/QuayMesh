@@ -46,7 +46,7 @@
 .evidence-actions { grid-column:2/-1;display:flex;gap:6px;align-items:center; }
 .receipt-row { border-width:0 0 1px;border-radius:0; }
 .receipt-row pre { max-height:360px;overflow:auto; }
-.file-source { display:block;color:var(--muted);font-size:10px;overflow-wrap:anywhere;white-space:normal; }
+.file-source { display:block;color:var(--muted);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
 .task-state .badge { display:block;width:fit-content;margin-top:4px;font-size:9px; }
 .task-state .state { white-space:normal; }
 .result-heading,.card-footer-state { flex-wrap:wrap; }

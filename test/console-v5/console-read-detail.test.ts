@@ -1,6 +1,6 @@
 import test,{after} from 'node:test';
 import assert from 'node:assert/strict';
-import {readIsolatedRunDetail,readIsolatedArtifact} from '../../src/console-workbench/read-detail.js';
+import {readIsolatedRunDetail,readIsolatedArtifact,observeCachedLocalDetail} from '../../src/console-workbench/read-detail.js';
 import {closeConsoleReaders,readLocalProjectSessions} from '../../src/console-workbench/isolated-queries.js';
 import {readonlyDetailFixture} from './readonly-detail-fixture.js';
 
@@ -30,11 +30,21 @@ test('compiled detail worker uses the live capture fence, keeps SQL readonly and
       {code:'task_scope',status:403});
     const reading=readIsolatedRunDetail(f.config,f.run.id,source);
     f.changes.markDirty(f.member.id,[],f.task.id);
+    const cachedPending=observeCachedLocalDetail(first,source);
+    assert.equal(cachedPending.changed,true);
+    assert.equal(cachedPending.value.changeCaptures[0]?.state,'pending');
+    assert.equal(cachedPending.value.complete,false);
+    assert.equal(cachedPending.value.run.actions.complete,false);
     const changed=await reading;
     assert.equal(changed.complete,false);
     assert.equal(changed.missingPhases[0]?.pending,true);
     assert.equal(changed.run.actions.complete,false);
     await f.changes.flush();
+    const cachedIdle=observeCachedLocalDetail(first,source);
+    assert.equal(cachedIdle.changed,true);
+    assert.equal(cachedIdle.value.changeCaptures[0]?.state,'idle');
+    assert.equal(cachedIdle.value.complete,false,'current idle cannot authorize file evidence read before the capture');
+    assert.equal(cachedIdle.value.run.actions.complete,false);
     assert.equal((await readIsolatedRunDetail(f.config,f.run.id,source)).complete,true);
   }finally{await f.close();}
 });

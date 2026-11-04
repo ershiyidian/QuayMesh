@@ -7,6 +7,7 @@ import type { SessionChangeCollector } from "./changes.js";
 import type { SessionStore } from "./store.js";
 import type { FileSummary, SessionMember } from "./types.js";
 import { memberFile, ownershipPath, readFileState, readOwnedFiles, restoreFileState, sameFileState, writeOwnedFiles } from "./write-evidence.js";
+import { assertRestorableState } from "./file-content.js";
 
 export type { RevertEligibility } from "./revert-read.js";
 import { readRevertEligibility, type RevertEligibility } from "./revert-read.js";
@@ -69,6 +70,7 @@ export class SessionReverter {
       for (const file of eligibility.paths) {
         const proof = owned[file];
         if (!proof?.safe) throw new Error(`REVERT_EVIDENCE_MISSING: ${file}`);
+        await assertRestorableState(proof.before);
         const current = await readFileState(memberFile(member.root, file).absolute);
         if (!sameFileState(current, proof.after)) throw new Error(`REVERT_CONFLICT: ${file}`);
       }

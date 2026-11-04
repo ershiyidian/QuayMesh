@@ -156,3 +156,75 @@ test("failed capture publication rolls back baseline, files and event together, 
   assert.equal(changed, 1); assert.equal(captured, 1);
   assert.equal(f.collector.captureObservation(f.member.id, f.taskId).state, "idle");
 });
+
+test("newer successful capture keeps its real baseline and files when an older publication resumes later", { timeout: 20_000 }, async t => {
+  const f = await fixture(t, true);
+  const original = f.store.publishChangeCaptureAsync;
+  let release!: () => void, entered = false, first = true;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  f.store.publishChangeCaptureAsync = async (...args) => {
+    if (first) { first = false; entered = true; await gate; }
+    return original.apply(f.store, args);
+  };
+  let older: Promise<void> | undefined;
+  try {
+    await writeFile(join(f.root, "tracked.txt"), "base\nfirst change\nolder A\n");
+    older = f.collector.capture(f.member.id, f.taskId);
+    void older.catch(() => {});
+    await until(() => entered, "the older real capture has finished evidence collection and is waiting to publish");
+    await writeFile(join(f.root, "tracked.txt"), "base\nfirst change\nnewer B\n");
+    await f.collector.capture(f.member.id, f.taskId);
+    const newer = f.snapshot();
+    assert.match(await readFile(newer.files[0]!.patchRef, "utf8"), /\+newer B/);
+    release(); await older;
+    const after = f.snapshot(), patch = await readFile(after.files[0]!.patchRef, "utf8");
+    t.diagnostic(JSON.stringify({ newerVersion: newer.baseline!.latest_ref, visibleVersion: after.baseline!.latest_ref,
+      newerHash: newer.files[0]!.hash, visibleHash: after.files[0]!.hash,
+      newerEvents: newer.events, visibleEvents: after.events }));
+    assert.equal(await readFile(join(f.root, "tracked.txt"), "utf8"), "base\nfirst change\nnewer B\n");
+    assert.match(patch, /\+newer B/, "a late older success must not replace the latest observed file content");
+    assert.deepEqual(after, newer, "baseline, summaries and published event must keep the same successful generation");
+    assert.equal(f.collector.captureObservation(f.member.id, f.taskId).state, "idle");
+  } finally {
+    release(); f.store.publishChangeCaptureAsync = original;
+    await older;
+  }
+});
+
+test("overlapping incremental captures retain both real paths when their publications finish out of order", { timeout: 20_000 }, async t => {
+  const f = await fixture(t, true);
+  const original = f.store.publishChangeCaptureAsync;
+  let release!: () => void, entered = false, first = true;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  f.store.publishChangeCaptureAsync = async (...args) => {
+    if (first) { first = false; entered = true; await gate; }
+    return original.apply(f.store, args);
+  };
+  let older: Promise<void> | undefined;
+  try {
+    await writeFile(join(f.root, "x.txt"), "independent real change X\n");
+    older = f.collector.capture(f.member.id, f.taskId, ["x.txt"]);
+    void older.catch(() => {});
+    await until(() => entered, "incremental X has saved its Git evidence and is waiting to publish");
+    await writeFile(join(f.root, "y.txt"), "independent real change Y\n");
+    await f.collector.capture(f.member.id, f.taskId, ["y.txt"]);
+    const newer = f.snapshot();
+    release(); await older;
+    const after = f.snapshot();
+    t.diagnostic(JSON.stringify({ newerPaths: newer.files.map(file => file.path), visiblePaths: after.files.map(file => file.path),
+      newerVersion: newer.baseline!.latest_ref, visibleVersion: after.baseline!.latest_ref,
+      newerEvents: newer.events, visibleEvents: after.events }));
+    assert.deepEqual(after.files.map(file => file.path).sort(), ["tracked.txt", "x.txt", "y.txt"],
+      "a newer incremental capture must include the still-unpublished paths of the older capture");
+    assert.deepEqual(after, newer, "late publication must not roll back either path's hash, current baseline or event sequence");
+    for (const [path, content] of [["x.txt", "independent real change X"], ["y.txt", "independent real change Y"]] as const) {
+      const file = after.files.find(file => file.path === path)!;
+      assert.ok((await readFile(file.patchRef, "utf8")).includes("+" + content));
+      assert.equal(await readFile(join(f.root, path), "utf8"), content + "\n");
+    }
+    assert.equal(f.collector.captureObservation(f.member.id, f.taskId).state, "idle");
+  } finally {
+    release(); f.store.publishChangeCaptureAsync = original;
+    await older;
+  }
+});

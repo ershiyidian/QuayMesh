@@ -1951,7 +1951,7 @@ export class SessionStore {
   /** Evidence files must already be complete. Publish their versions, visible
    * summaries and event in one transaction, then notify committed readers. */
   async publishChangeCaptureAsync(sessionId: SessionId, memberId: string,
-    captures: CapturedChangeSet[], taskId?: string): Promise<boolean> {
+    captures: CapturedChangeSet[], taskId?: string, isCurrent?: () => boolean): Promise<boolean> {
     if (!captures.length) return false;
     const versions = new Map<string, CapturedChangeSet["files"]>();
     for (const { baseline, files } of captures) {
@@ -1971,6 +1971,8 @@ export class SessionStore {
     const visible = () => JSON.stringify(this.fileSummaries(sessionId, memberId, taskId)
       .map(({ patchRef: _patchRef, versionRef: _versionRef, ...file }) => file));
     const saved = await this.writeAsync(() => {
+      // 获取写事务后再核对采集归属，锁等待期间完成的新结果不能被旧批次覆盖。
+      if (isCurrent && !isCurrent()) return null;
       const before = visible();
       for (const capture of captures) this.putChangeBaseline(capture.baseline, taskId);
       for (const [version, files] of versions) this.replaceFileSummaries(sessionId, memberId, version, files, taskId);

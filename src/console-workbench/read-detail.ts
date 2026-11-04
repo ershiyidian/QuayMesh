@@ -1,7 +1,7 @@
 import type {ServerConfig} from '../config.js';
 import type {SessionRuntime} from '../session/runtime.js';
 import type {CaptureReadFence} from '../session/capture-read-observation.js';
-import type {DetailReadEvidence} from './detail-read-model.js';
+import type {ConsoleDetailRead,DetailReadEvidence} from './detail-read-model.js';
 import type {ConsoleArtifactRequest,ConsoleArtifactRead} from './detail-read-artifacts.js';
 import {readLocalDetail,readLocalArtifact} from './isolated-queries.js';
 import {applyDetailReadObservation,applyArtifactReadObservation} from './detail-read-observation.js';
@@ -9,6 +9,15 @@ import {WorkbenchError} from './types.js';
 
 export interface DetailCaptureSource {
   changes:Pick<SessionRuntime['changes'],'captureReadFence'|'captureReadObservation'>;
+}
+
+const detailEvidence=new WeakMap<object,ConsoleDetailRead>();
+
+export function observeCachedLocalDetail<T extends object>(value:T,runtime:DetailCaptureSource):{value:T;changed:boolean}{
+  const saved=detailEvidence.get(value),read=saved?.read;
+  if(!saved||read?.kind!=='live'||!read.scope||!read.fence)return {value,changed:false};
+  const observation=runtime.changes.captureReadObservation(read.scope,read.fence);
+  return {value:{...value,...applyDetailReadObservation(saved,observation)},changed:!observation.unchanged};
 }
 
 function validateRead(read:DetailReadEvidence,config:ServerConfig,runId:string,before?:CaptureReadFence):void {
@@ -30,7 +39,9 @@ export async function readIsolatedRunDetail(config:ServerConfig,runId:string,run
     throw new WorkbenchError('详情读取结果与请求范围不一致',409,'snapshot_scope','none');
   const scope=result.read.scope;
   const observation=runtime&&scope&&before?runtime.changes.captureReadObservation(scope,before):undefined;
-  return applyDetailReadObservation(result,observation);
+  const value=applyDetailReadObservation(result,observation);
+  detailEvidence.set(value,result);
+  return value;
 }
 
 type ArtifactRequestOf<K extends ConsoleArtifactRequest['kind']>=Extract<ConsoleArtifactRequest,{kind:K}>;

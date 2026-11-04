@@ -1018,8 +1018,7 @@ test('任务详情保留交付总结、各工作区阶段入口和文件来源',
   await expect(page.locator('.phase-card')).toHaveCount(0);
   await page.goto(f.server.baseUrl+'/console/#/tasks?days=0&scope=all&run='+encodeURIComponent(reference)+'&tab=diff');
   await expect.poll(async()=>{
-    const source=(await page.locator('.file-source').first().textContent())||'';
-    const root=source.split(' · ').slice(2).join(' · ');
+    const root=(await page.locator('.file-source').first().getAttribute('title'))||'';
     return root?canonicalWorkspaceRoot(root):'';
   }).toBe(canonicalWorkspaceRoot(f.server.secondRoot));
   await page.goto(f.server.baseUrl+'/console/#/tasks?days=0&scope=all&run='+encodeURIComponent('qmtask:'+f.waiting.task_id));
@@ -1029,24 +1028,66 @@ test('任务详情保留交付总结、各工作区阶段入口和文件来源',
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
 });
 
+test('大文本真实采集后明确显示未生成预览，不显示零行或空白成功',async({page})=>{
+  const isolated=await consoleExperienceFixture(),errors:string[]=[];
+  page.on('pageerror',error=>errors.push(error.message));
+  await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
+  try {
+    const capture=await liveCaptureFixture(isolated),name='large-preview.txt';
+    const evidence=await capture.collector.prepareWrite(capture.member,[name],capture.member.root,capture.taskId);
+    await writeFile(join(capture.member.root,name),'large preview line\n'.repeat(60_000),'utf8');
+    await capture.collector.recordWrite(capture.member,evidence,capture.taskId);
+    await capture.collector.capture(capture.member.id,capture.taskId,[name]);
+    const detail=await isolated.get('runs/'+encodeURIComponent(capture.reference)+'?fresh=1');
+    const file=detail.files.find((value:any)=>value.path===name);
+    expect(file).toMatchObject({generated:true,add:null,del:null});
+    const preview=await isolated.get('runs/'+encodeURIComponent(capture.reference)+'/files/'+encodeURIComponent(file.id));
+    expect(preview.file).toMatchObject({previewOmitted:'not_generated',binary:false,rows:[]});
+    await login(page,isolated.server.baseUrl);
+    await page.goto(isolated.server.baseUrl+'/console/#/tasks?days=0&scope=all&tab=diff&run='+encodeURIComponent(capture.reference));
+    const card=page.locator('.file-section').filter({hasText:name});
+    await expect(card.getByRole('button',{name:'查看差异',exact:true})).toBeVisible();
+    await expect(card).not.toContainText('0 行变化');
+    await expect(card.locator('.file-toggle')).toContainText('较大文件');
+    await expect(page.locator('#inspector')).not.toContainText('+未知');
+    await expect(page.locator('#inspector')).not.toContainText('−未知');
+    await expect(card.locator('.file-source')).toHaveAttribute('title',file.source.root);
+    await expect(card.locator('.file-source')).not.toContainText(file.source.root);
+    await card.getByRole('button',{name:'查看差异',exact:true}).click();
+    await expect(card).toContainText('此文件未生成文本差异');
+    await expect(card.getByRole('button',{name:'复制路径',exact:true})).toBeVisible();
+    await expect(card.getByRole('button',{name:'下载完整补丁',exact:true})).toHaveCount(0);
+    await expect(card.locator('.diff-table')).toHaveCount(0);
+    await expect(card).not.toContainText('无文本差异');
+    await page.screenshot({path:screenshots+'/large-text-preview-omitted.png',fullPage:true});
+    await page.setViewportSize({width:390,height:844});
+    await expect(card).toContainText('此文件未生成文本差异');
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+    await page.screenshot({path:screenshots+'/large-text-preview-omitted-narrow.png',fullPage:true});
+    expect(errors).toEqual([]);
+  } finally {await isolated.server.dispose();}
+});
+
 test('真实文件采集显示在途与失败证据，保留旧文件并隔离历史检查点',async({page})=>{
   await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
   const capture=await liveCaptureFixture(f),collector=capture.collector;
-  const original=collector.capture,descriptor=Object.getOwnPropertyDescriptor(collector,'capture');
+  const original=SessionStore.prototype.publishChangeCaptureAsync;
+  const descriptor=Object.getOwnPropertyDescriptor(SessionStore.prototype,'publishChangeCaptureAsync');
   const name='capture-state.txt',path=join(capture.member.root,name),backup=path+'.test-backup';
   let release:(()=>void)|undefined,hasBackup=false;
   const hold=()=>{
     let entered!:()=>void;
     const started=new Promise<void>(resolve=>{entered=resolve;});
     const gate=new Promise<void>(resolve=>{release=resolve;});
-    collector.capture=async function(memberId,taskId,paths){
+    SessionStore.prototype.publishChangeCaptureAsync=async function(...args){
+      const [,memberId,,taskId]=args;
       if(memberId===capture.member.id&&taskId===capture.taskId){entered();await gate;}
-      return original.call(this,memberId,taskId,paths);
+      return original.apply(this,args);
     };
     collector.markDirty(capture.member.id,[name],capture.taskId);
     return started;
   };
-  const finish=async()=>{release?.();release=undefined;await collector.flushTask(capture.member.id,capture.taskId);collector.capture=original;};
+  const finish=async()=>{release?.();release=undefined;await collector.flushTask(capture.member.id,capture.taskId);SessionStore.prototype.publishChangeCaptureAsync=original;};
   const show=async(reference:string)=>page.goto(f.server.baseUrl+'/console/#/tasks?days=0&scope=all&tab=diff&run='+encodeURIComponent(reference));
   const noUnsafeActions=async()=>expect(page.locator('#inspector [data-action=patch]:enabled,#inspector [data-action=single-accept]:enabled,#inspector [data-action=single-reject]:enabled,#inspector [data-action=revert]:enabled')).toHaveCount(0);
   try {
@@ -1120,12 +1161,13 @@ test('真实文件采集显示在途与失败证据，保留旧文件并隔离�
     await expect(page.locator('.file-section')).toHaveCount(1);await expect(page.locator('#inspector [data-action=patch]')).toBeEnabled();
   } finally {
     try {
-      release?.();collector.capture=original;
+      release?.();SessionStore.prototype.publishChangeCaptureAsync=original;
       if(hasBackup){await rm(path,{recursive:true,force:true});await rename(backup,path);}
       collector.markDirty(capture.member.id,[name],capture.taskId);
       await collector.flushTask(capture.member.id,capture.taskId);
     } finally {
-      if(descriptor)Object.defineProperty(collector,'capture',descriptor);else Reflect.deleteProperty(collector,'capture');
+      if(descriptor)Object.defineProperty(SessionStore.prototype,'publishChangeCaptureAsync',descriptor);
+      else Reflect.deleteProperty(SessionStore.prototype,'publishChangeCaptureAsync');
     }
   }
 });
