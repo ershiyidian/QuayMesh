@@ -9,7 +9,6 @@ $ErrorActionPreference = 'Stop'
 $global:FixtureMode = $Mode
 $global:FixtureMarker = $Marker
 $global:FixtureEnginePid = $EnginePid
-$global:FixtureExecutable = $EngineExecutable
 $global:FixtureExpectedImage = if ($Mode -eq 'engine-mismatch') { Join-Path $env:SystemRoot 'System32\cmd.exe' } else { $EngineExecutable }
 $global:FixtureExitRequests = 0
 $global:FixtureForceStops = 0
@@ -50,18 +49,6 @@ function New-Object {
     if ($ComObject -cne 'Schedule.Service') { throw 'Unexpected COM boundary' }
     return $global:FixtureScheduler
 }
-function Start-Process {
-    param([string]$FilePath, [string]$ArgumentList, [switch]$PassThru, [switch]$NoNewWindow)
-    if ($FilePath -cne $global:FixtureExecutable -or $ArgumentList -cne '--exit') { throw 'Unexpected exit request' }
-    $global:FixtureExitRequests++
-    [IO.File]::WriteAllText($global:FixtureMarker, 'requested')
-    $info = [Diagnostics.ProcessStartInfo]::new($global:FixtureExecutable, '-e "process.exit(0)"')
-    $info.UseShellExecute = $false
-    $info.CreateNoWindow = $true
-    $info.RedirectStandardOutput = $true
-    $info.RedirectStandardError = $true
-    return [Diagnostics.Process]::Start($info)
-}
 function Get-ScheduledTask {
     param($TaskName, $TaskPath, $ErrorAction)
     if ($global:FixtureMode -ne 'explicit') { throw 'Graceful mode reached explicit Task stop' }
@@ -85,6 +72,23 @@ try {
     }
 }
 catch { $failure = $_.Exception.Message }
+if (Test-Path -LiteralPath $Marker) {
+    $requests = @(Get-Content -LiteralPath $Marker)
+    $global:FixtureExitRequests = $requests.Count
+    if ($Mode -eq 'client-timeout') {
+        $client = $null
+        try {
+            $client = [Diagnostics.Process]::GetProcessById([int]$requests[0])
+            $null = $client.Handle
+            if (-not $client.HasExited -and $client.MainModule.FileName -eq $EngineExecutable) {
+                $client.Kill()
+                $client.WaitForExit()
+            }
+        }
+        catch [ArgumentException] {}
+        finally { if ($client) { $client.Dispose() } }
+    }
+}
 $engineAlive = $false
 if ($EnginePid -gt 0) {
     try {
