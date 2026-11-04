@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { createHash } from "node:crypto";
 import { REPLY_BYTES } from "../../src/bounded-reply.js";
+import { createInlineBase64ArtifactAdapter } from "../../src/incoming-artifacts.js";
 import { readFileTool } from "../../src/pi-tools.js";
 import { fixture } from "./fixture.js";
 
@@ -74,3 +75,78 @@ for (const sample of [
     assert.equal(parts.join(""), expected);
   });
 }
+
+test("read encoding=base64 paginates binary files within REPLY_BYTES budget and restores exact bytes", async (t) => {
+  const f = await fixture(t, {
+    git: false,
+    incomingArtifactAdapters: [createInlineBase64ArtifactAdapter()],
+    configure: async (config) => ({ ...config, artifactsEnabled: true }),
+  });
+  const path = "binary-sample.bin";
+  const rawBytes = Buffer.alloc(60_000);
+  for (let i = 0; i < rawBytes.length; i++) {
+    rawBytes[i] = (i * 73 + 19) & 0xff;
+  }
+  const expectedSha256 = createHash("sha256").update(rawBytes).digest("hex");
+
+  // 通过真实 MCP 入口写入，再按字节分页取回。
+  const downloaded = await f.raw("download_artifact", {
+    ...f.scope,
+    path,
+    file: {
+      content_base64: rawBytes.toString("base64"),
+      file_name: path,
+      mime_type: "application/octet-stream",
+      size: rawBytes.length,
+      sha256: expectedSha256,
+    },
+  });
+  assert.notEqual(downloaded.isError, true, JSON.stringify(downloaded));
+  assert.deepEqual(downloaded.structuredContent, { path });
+
+  const chunks: Buffer[] = [];
+  let offset = 0;
+  let pages = 0;
+  while (true) {
+    const reply = await f.raw("read", {
+      ...f.scope,
+      path,
+      encoding: "base64",
+      response_offset: offset,
+      limit: 16_384,
+    });
+    assert.notEqual(reply.isError, true, JSON.stringify(reply));
+    assert.ok(Buffer.byteLength(JSON.stringify(reply), "utf8") <= REPLY_BYTES);
+    const body = reply.structuredContent as {
+      result: string;
+      result_sha256: string;
+      response_page: { offset: number; next_offset: number | null; total_code_points: number };
+    };
+    const chunk = Buffer.from(body.result, "base64");
+    assert.equal(body.result_sha256, createHash("sha256").update(chunk).digest("hex"));
+    assert.equal(body.response_page.offset, offset);
+    assert.equal(body.response_page.total_code_points, rawBytes.length);
+    chunks.push(chunk);
+    pages++;
+    if (body.response_page.next_offset === null) break;
+    offset = body.response_page.next_offset;
+  }
+  assert.equal(pages, 4);
+  assert.deepEqual(Buffer.concat(chunks), rawBytes);
+
+  for (const limit of [1, 2]) {
+    const reply = await f.raw("read", { ...f.scope, path, encoding: "base64", response_offset: 7, limit });
+    assert.notEqual(reply.isError, true, JSON.stringify(reply));
+    const body = reply.structuredContent as { result: string; response_page: { next_offset: number } };
+    assert.deepEqual(Buffer.from(body.result, "base64"), rawBytes.subarray(7, 7 + limit));
+    assert.equal(body.response_page.next_offset, 7 + limit);
+  }
+
+  const maxInline = Buffer.alloc(1024 * 1024, 0xa5);
+  const maxReply = await f.raw("download_artifact", {
+    ...f.scope, path: "inline-limit.bin",
+    file: { content_base64: maxInline.toString("base64"), size: maxInline.length },
+  });
+  assert.notEqual(maxReply.isError, true, JSON.stringify(maxReply));
+  assert.deepEqual(await readFile(join(f.project, "inline-limit.bin")), maxInline);
+});

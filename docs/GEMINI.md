@@ -71,3 +71,54 @@ Verify the retained Tailscale device identity, public OAuth metadata, and a real
 Inspect `public-mcp` and `funnel` separately in component status. Their readiness observation time and probe errors describe the local adapter and tunnel state. Logs are stored in `stateDir/logs/public-mcp.log` and `stateDir/logs/funnel.log`.
 
 For an end-to-end check, read the public OAuth metadata and retry a Gemini MCP call. An anonymous `/mcp` request normally receives the OAuth `401` challenge; the adapter's request log records the subsequent authenticated client response. Request logs omit query strings, authorization values, and cookies.
+
+## Files between a Gemini VM, Library, and workers
+
+The MCP tools carry file bytes across the VM boundary. Gemini's native file tools read a Library file into its VM, or save a reconstructed VM file to Library. QuayMesh writes and reads the selected worker workspace.
+
+| Direction | Method | Limit |
+| --- | --- | --- |
+| VM or Library to worker | Read the file in the VM, base64 encode it, and call `download_artifact` with `file.content_base64` | 1 MiB of decoded bytes per file |
+| Worker to VM or Library | Call `read` with `encoding: "base64"`, decode each page, and append its bytes to the VM file | Up to 16,384 bytes per page |
+| Larger files | Upload to an explicitly selected Google Drive folder, then use its file ID with `download_artifact` or the bundled Drive CLI | MCP: the worker's artifact size limit and a five-minute download budget; CLI: streamed files |
+
+A complete MCP JSON request is limited to 2 MiB. Base64 expands the file, so inline reception deliberately stops at 1 MiB. `download_artifact` creates a new path and verifies the supplied `size` and `sha256` when present. The existing destination is preserved on failure.
+
+Example inline input:
+
+```json
+{
+  "workspace_id": "the-selected-workspace",
+  "path": "input/example.bin",
+  "file": {
+    "content_base64": "AP8BAg==",
+    "file_name": "example.bin",
+    "size": 4
+  }
+}
+```
+
+For binary reads, start `response_offset` at zero and use the returned `response_page.next_offset` until it is null. Offsets and `response_page.total_code_points` are byte counts in base64 mode. `result_sha256` describes that page's decoded bytes. Decode each page separately before appending; base64 pages may contain padding. Keep the source file stable during the transfer.
+
+For Drive reception, pass `file: { "gdrive_file_id": "the-drive-file-id", "file_name": "archive.zip" }`. Public link sharing works without a token. Private downloads use `GDRIVE_ACCESS_TOKEN` from the destination worker's service environment, with permission to read that file. Tokens stay out of MCP arguments. Default file downloads use the worker's dynamic QuayMesh egress when enabled; otherwise they honor its HTTP proxy environment. Redirected content requests do not receive the Google API bearer token.
+
+A Google Drive download through MCP has one five-minute network deadline, including redirects and the response body. For a large file or a slow connection, run the bundled `pull` command on the destination worker with a suitable `--timeout-ms`, for example `--timeout-ms 1800000` for thirty minutes. The CLI streams the file directly to its selected new path; its pull command restarts a failed download from the beginning.
+
+### Bundled Drive CLI
+
+Run the CLI with the release's pinned Node runtime:
+
+```bash
+./runtime/node scripts/gdrive-bridge.mjs pull --file-id DRIVE_FILE_ID --out archive.zip
+./runtime/node scripts/gdrive-bridge.mjs push --file archive.zip --folder-id DRIVE_FOLDER_ID
+./runtime/node scripts/gdrive-bridge.mjs encode --file small.bin
+./runtime/node scripts/gdrive-bridge.mjs decode --base64 AP8BAg== --out example.bin
+```
+
+For an installed worker, add `GDRIVE_ACCESS_TOKEN` to the file selected by `node.json` → `secretsFile`. Node loads that file into the Core environment; installation preserves the configured secrets file across upgrades. Keep its existing access restrictions and other entries. Standalone CLI commands use the local process environment for private downloads and uploads. Push requires an explicit `--folder-id` or `GDRIVE_FOLDER_ID`; there is no built-in personal folder. Missing authorization is reported before uploading. Credentials are never accepted as CLI arguments.
+
+Push uses Google's resumable upload protocol with 8 MiB file-backed chunks. A lost response triggers a status query, then resumes from the server's confirmed offset, with a bounded retry count. Pull streams into a temporary file and publishes a new output only after completion and any requested SHA-256 check. `--timeout-ms` sets each network request's deadline (default 300,000 ms). `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` are honored; `--proxy` selects an explicit HTTP proxy. Commands launched through QuayMesh inherit its managed proxy when configured.
+
+`encode` and `decode` handle files up to 1 MiB. Larger VM transfers use the paged MCP read or Drive flow above. Google authorization and Library publication remain native host actions; the CLI does not create Google consent or publish a Library file.
+
+Upgrade the coordinator and every worker that will read or receive these files. The earlier `584819d` tool schema lacks binary read and the new artifact references. The existing Gemini HTTPS ingress URL and retained Tailscale identity continue to be used.

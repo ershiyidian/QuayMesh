@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { basename, isAbsolute } from "node:path";
 import { Readable } from "node:stream";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
@@ -19,7 +20,149 @@ const OPENAI_FILE_KEYS = new Set([
   "name",
   "size",
 ]);
+const INLINE_ARTIFACT_KEYS = new Set([
+  "content_base64",
+  "file_name",
+  "name",
+  "mime_type",
+  "size",
+  "sha256",
+]);
+const BASE64_CONTENT_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
+const BASE64URL_CONTENT_PATTERN = /^(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-]{2}(?:==)?|[A-Za-z0-9_-]{3}=?)?$/u;
+const INLINE_ARTIFACT_MAX_BYTES = 1024 * 1024;
+const SHA256_DIGEST_PATTERN = /^(?:sha256:)?([a-fA-F0-9]{64})$/u;
+const GOOGLE_DRIVE_FILE_KEYS = new Set([
+  "gdrive_file_id",
+  "download_url",
+  "file_name",
+  "name",
+  "mime_type",
+  "size",
+  "sha256",
+]);
+const GOOGLE_DRIVE_FILE_ID_PATTERN = /^[A-Za-z0-9_-]{10,128}$/u;
+const GOOGLE_DRIVE_TRUSTED_HOSTS = new Set([
+  "drive.google.com",
+  "drive.usercontent.google.com",
+  "docs.google.com",
+  "www.googleapis.com",
+]);
 const OPENAI_FILE_REDIRECT_LIMIT = 3;
+const GOOGLE_DRIVE_REDIRECT_LIMIT = 6;
+export interface GoogleDriveIncomingArtifactAdapterOptions {
+  fetch?: typeof fetch;
+  timeoutMs?: number;
+  accessToken?: () => string | undefined;
+}
+
+export function createGoogleDriveIncomingArtifactAdapter(
+  options: GoogleDriveIncomingArtifactAdapterOptions = {},
+): IncomingArtifactAdapter {
+  const fetchFile = options.fetch ?? globalThis.fetch;
+  const timeoutMs = options.timeoutMs ?? OPENAI_FILE_DOWNLOAD_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new ArtifactError(
+      "invalid_google_drive_adapter",
+      "Google Drive download timeout must be a positive integer.",
+    );
+  }
+
+  return {
+    id: "google-drive",
+    canHandle: isGoogleDriveArtifactCandidate,
+    async open(value: unknown): Promise<IncomingArtifactSource> {
+      const reference = normalizeGoogleDriveArtifactReference(value);
+      const accessToken = options.accessToken?.()?.trim();
+      const initialUrl = reference.download_url
+        ?? (accessToken
+          ? `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(reference.gdrive_file_id)}?alt=media`
+          : `https://drive.usercontent.google.com/download?id=${encodeURIComponent(reference.gdrive_file_id)}&export=download&confirm=t`);
+      let currentUrl = validateGoogleDriveUrl(initialUrl);
+      const signal = AbortSignal.timeout(timeoutMs);
+      let response: Response | undefined;
+      for (let redirect = 0; redirect <= GOOGLE_DRIVE_REDIRECT_LIMIT; redirect += 1) {
+        try {
+          response = await fetchFile(currentUrl, {
+            redirect: "manual",
+            signal,
+            ...(accessToken && new URL(currentUrl).hostname === "www.googleapis.com"
+              ? { headers: { Authorization: `Bearer ${accessToken}` } } : {}),
+          });
+        } catch {
+          throw new ArtifactError(
+            "google_drive_download_failed",
+            "Google Drive file could not be downloaded.",
+          );
+        }
+        if (!isRedirectStatus(response.status)) break;
+        const location = response.headers.get("location");
+        await response.body?.cancel().catch(() => undefined);
+        if (!location || redirect === GOOGLE_DRIVE_REDIRECT_LIMIT) {
+          throw new ArtifactError(
+            "google_drive_download_failed",
+            "Google Drive download returned an invalid redirect.",
+          );
+        }
+        currentUrl = validateGoogleDriveUrl(new URL(location, currentUrl).toString());
+      }
+
+      if (!response?.ok || !response.body) {
+        await response?.body?.cancel().catch(() => undefined);
+        throw new ArtifactError(
+          "google_drive_download_failed",
+          "Google Drive file download did not return file content.",
+        );
+      }
+      const contentType = responseMimeType(response);
+      if (contentType === "text/html" && reference.mime_type !== "text/html") {
+        await response.body.cancel().catch(() => undefined);
+        throw new ArtifactError(
+          "google_drive_auth_required",
+          "Google Drive returned an HTML sign-in or confirmation page; use a shared file, configure GDRIVE_ACCESS_TOKEN on the destination worker, or use inline base64.",
+        );
+      }
+      const responseSize = responseContentLength(response);
+      if (
+        reference.size !== undefined
+        && responseSize !== undefined
+        && reference.size !== responseSize
+      ) {
+        await response.body.cancel().catch(() => undefined);
+        throw new ArtifactError(
+          "google_drive_size_mismatch",
+          "Google Drive file metadata did not match the downloaded content.",
+        );
+      }
+      const mimeType = reference.mime_type ?? contentType;
+      const baseStream = Readable.fromWeb(response.body as unknown as NodeReadableStream);
+      const expectedSha256 = reference.sha256;
+      const stream = expectedSha256
+        ? Readable.from((async function* () {
+            const hash = createHash("sha256");
+            for await (const chunk of baseStream) {
+              const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+              hash.update(bytes);
+              yield bytes;
+            }
+            if (hash.digest("hex") !== expectedSha256) {
+              throw new ArtifactError(
+                "google_drive_sha256_mismatch",
+                "Google Drive downloaded content did not match expected sha256.",
+              );
+            }
+          })())
+        : baseStream;
+
+      return {
+        name: reference.file_name ?? `gdrive-${reference.gdrive_file_id}${extensionForMimeType(mimeType) ?? ".bin"}`,
+        mimeType,
+        size: responseSize ?? reference.size,
+        stream,
+      };
+    },
+  };
+}
 // Applied to each bounded range request, not the entire multi-gigabyte file.
 const OPENAI_FILE_DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
 const OPENAI_FILE_RANGE_BYTES = 8 * 1024 * 1024;
@@ -269,6 +412,44 @@ export function createOpenAIIncomingArtifactAdapter(
   };
 }
 
+export interface InlineBase64ArtifactReference {
+  content_base64: string;
+  file_name?: string;
+  mime_type?: string;
+  size?: number;
+  sha256?: string;
+}
+
+export interface InlineIncomingArtifactAdapterOptions {
+  maxInlineBytes?: number;
+}
+
+export function createInlineBase64ArtifactAdapter(
+  options: InlineIncomingArtifactAdapterOptions = {},
+): IncomingArtifactAdapter {
+  const maxInlineBytes = options.maxInlineBytes ?? INLINE_ARTIFACT_MAX_BYTES;
+  if (!Number.isSafeInteger(maxInlineBytes) || maxInlineBytes <= 0) {
+    throw new ArtifactError(
+      "invalid_inline_artifact_adapter",
+      "Inline artifact byte limit must be a positive integer.",
+    );
+  }
+
+  return {
+    id: "inline-base64",
+    canHandle: isInlineBase64ArtifactCandidate,
+    async open(value: unknown): Promise<IncomingArtifactSource> {
+      const reference = normalizeInlineBase64ArtifactReference(value, maxInlineBytes);
+      return {
+        name: reference.file_name,
+        mimeType: reference.mime_type,
+        size: reference.bytes.length,
+        stream: Readable.from([reference.bytes]),
+      };
+    },
+  };
+}
+
 export type IncomingArtifactValueShape =
   | { type: "null" }
   | { type: "undefined" }
@@ -398,6 +579,239 @@ function isOpenAIFileReferenceCandidate(value: unknown): value is Record<string,
     && keys.every((key) => OPENAI_FILE_KEYS.has(key))
     && Object.hasOwn(value, "download_url")
     && Object.hasOwn(value, "file_id");
+}
+
+function isInlineBase64ArtifactCandidate(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length >= 1
+    && keys.every((key) => INLINE_ARTIFACT_KEYS.has(key))
+    && Object.hasOwn(value, "content_base64")
+    && !Object.hasOwn(value, "download_url");
+}
+
+function isGoogleDriveArtifactCandidate(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length >= 1
+    && keys.every((key) => GOOGLE_DRIVE_FILE_KEYS.has(key))
+    && Object.hasOwn(value, "gdrive_file_id")
+    && !Object.hasOwn(value, "content_base64")
+    && !Object.hasOwn(value, "file_id");
+}
+
+function normalizeGoogleDriveArtifactReference(value: unknown): {
+  gdrive_file_id: string;
+  download_url?: string;
+  file_name?: string;
+  mime_type?: string;
+  size?: number;
+  sha256?: string;
+} {
+  if (!isGoogleDriveArtifactCandidate(value)) {
+    throw new ArtifactError(
+      "invalid_google_drive_reference",
+      "Google Drive file reference is malformed.",
+    );
+  }
+  const gdriveFileId = value.gdrive_file_id;
+  if (typeof gdriveFileId !== "string" || !GOOGLE_DRIVE_FILE_ID_PATTERN.test(gdriveFileId)) {
+    throw new ArtifactError(
+      "invalid_google_drive_reference",
+      "Google Drive file ID is invalid.",
+    );
+  }
+  const downloadUrl = nullableString(value.download_url);
+  const mimeType = nullableString(value.mime_type);
+  const fileName = nullableString(value.file_name);
+  const nameAlias = nullableString(value.name);
+  const rawSha256 = nullableString(value.sha256);
+  if (
+    downloadUrl === null
+    || mimeType === null
+    || fileName === null
+    || nameAlias === null
+    || rawSha256 === null
+  ) {
+    throw new ArtifactError(
+      "invalid_google_drive_reference",
+      "Google Drive file metadata is malformed.",
+    );
+  }
+  const normalizedFileName = normalizeSuppliedOpenAIFileName(fileName);
+  const normalizedNameAlias = normalizeSuppliedOpenAIFileName(nameAlias);
+  if (
+    normalizedFileName
+    && normalizedNameAlias
+    && normalizedFileName !== normalizedNameAlias
+  ) {
+    throw new ArtifactError(
+      "ambiguous_google_drive_file_name",
+      "Google Drive file reference contained conflicting filenames.",
+    );
+  }
+  let size: number | undefined;
+  const rawSize = value.size;
+  if (rawSize !== undefined && rawSize !== null) {
+    if (typeof rawSize !== "number" || !Number.isSafeInteger(rawSize) || rawSize < 0) {
+      throw new ArtifactError(
+        "invalid_google_drive_reference",
+        "Google Drive file size must be a non-negative integer.",
+      );
+    }
+    size = rawSize;
+  }
+  let sha256: string | undefined;
+  if (rawSha256 !== undefined) {
+    const match = SHA256_DIGEST_PATTERN.exec(rawSha256.trim());
+    if (!match) {
+      throw new ArtifactError(
+        "invalid_google_drive_reference",
+        "Google Drive sha256 must be a 64-character hex digest.",
+      );
+    }
+    sha256 = match[1]!.toLowerCase();
+  }
+  return {
+    gdrive_file_id: gdriveFileId,
+    download_url: downloadUrl,
+    file_name: normalizedFileName ?? normalizedNameAlias,
+    mime_type: mimeType,
+    size,
+    sha256,
+  };
+}
+
+function validateGoogleDriveUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new ArtifactError(
+      "unsafe_google_drive_reference",
+      "Google Drive download URL is invalid.",
+    );
+  }
+  const host = url.hostname.toLowerCase();
+  const isTrusted = GOOGLE_DRIVE_TRUSTED_HOSTS.has(host)
+    || host.endsWith(".googleusercontent.com")
+    || host.endsWith(".googlevideo.com");
+  if (
+    url.protocol !== "https:"
+    || !isTrusted
+    || (url.port !== "" && url.port !== "443")
+    || url.username !== ""
+    || url.password !== ""
+    || url.hash !== ""
+  ) {
+    throw new ArtifactError(
+      "unsafe_google_drive_reference",
+      "Google Drive download URL is outside the trusted Google Drive hosts.",
+    );
+  }
+  return url.toString();
+}
+
+function normalizeInlineBase64ArtifactReference(
+  value: unknown,
+  maxInlineBytes: number,
+): {
+  bytes: Buffer;
+  file_name: string;
+  mime_type?: string;
+} {
+  if (!isInlineBase64ArtifactCandidate(value)) {
+    throw new ArtifactError(
+      "invalid_inline_artifact_reference",
+      "Inline base64 artifact reference is malformed.",
+    );
+  }
+  const rawBase64 = value.content_base64;
+  if (typeof rawBase64 !== "string") {
+    throw new ArtifactError(
+      "invalid_inline_artifact_reference",
+      "Inline base64 content must be a string.",
+    );
+  }
+  const trimmed = rawBase64.replace(/\s+/gu, "");
+  if (
+    trimmed.length > 0
+    && !BASE64_CONTENT_PATTERN.test(trimmed)
+    && !BASE64URL_CONTENT_PATTERN.test(trimmed)
+  ) {
+    throw new ArtifactError(
+      "invalid_inline_artifact_reference",
+      "Inline artifact content is not valid base64.",
+    );
+  }
+  const encoding = trimmed.includes("-") || trimmed.includes("_") ? "base64url" : "base64";
+  const bytes = trimmed.length === 0 ? Buffer.alloc(0) : Buffer.from(trimmed, encoding);
+  if (bytes.length > maxInlineBytes) {
+    throw new ArtifactError(
+      "artifact_file_too_large",
+      "Inline artifact exceeds the configured inline limit.",
+    );
+  }
+
+  const mimeType = nullableString(value.mime_type);
+  const fileName = nullableString(value.file_name);
+  const nameAlias = nullableString(value.name);
+  const rawSha256 = nullableString(value.sha256);
+  if (mimeType === null || fileName === null || nameAlias === null || rawSha256 === null) {
+    throw new ArtifactError(
+      "invalid_inline_artifact_reference",
+      "Inline base64 artifact metadata is malformed.",
+    );
+  }
+  const normalizedFileName = normalizeSuppliedOpenAIFileName(fileName);
+  const normalizedNameAlias = normalizeSuppliedOpenAIFileName(nameAlias);
+  if (
+    normalizedFileName
+    && normalizedNameAlias
+    && normalizedFileName !== normalizedNameAlias
+  ) {
+    throw new ArtifactError(
+      "ambiguous_inline_artifact_name",
+      "Inline artifact reference contained conflicting filenames.",
+    );
+  }
+  const rawSize = value.size;
+  if (rawSize !== undefined && rawSize !== null) {
+    if (typeof rawSize !== "number" || !Number.isSafeInteger(rawSize) || rawSize < 0) {
+      throw new ArtifactError(
+        "invalid_inline_artifact_reference",
+        "Inline artifact size must be a non-negative integer.",
+      );
+    }
+    if (rawSize !== bytes.length) {
+      throw new ArtifactError(
+        "inline_artifact_size_mismatch",
+        "Inline artifact size did not match decoded base64 content.",
+      );
+    }
+  }
+  if (rawSha256 !== undefined) {
+    const match = SHA256_DIGEST_PATTERN.exec(rawSha256.trim());
+    if (!match) {
+      throw new ArtifactError(
+        "invalid_inline_artifact_reference",
+        "Inline artifact sha256 must be a 64-character hex digest.",
+      );
+    }
+    const actual = createHash("sha256").update(bytes).digest("hex");
+    if (actual !== match[1]!.toLowerCase()) {
+      throw new ArtifactError(
+        "inline_artifact_sha256_mismatch",
+        "Inline artifact sha256 did not match decoded base64 content.",
+      );
+    }
+  }
+
+  return {
+    bytes,
+    file_name: normalizedFileName ?? normalizedNameAlias ?? `inline-artifact${extensionForMimeType(mimeType) ?? ".bin"}`,
+    mime_type: mimeType,
+  };
 }
 
 function normalizeOpenAIFileReference(value: unknown): OpenAIFileReference {

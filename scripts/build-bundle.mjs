@@ -72,6 +72,7 @@ for(const name of ["bin","node","dist","schema","components","package.json","pnp
 await mkdir(join(output,"scripts"),{recursive:true});
 await cp(join(root,"scripts","analysis"),join(output,"scripts","analysis"),{recursive:true,dereference:true});
 await cp(join(root,"scripts","recover-workspace-roots.mjs"),join(output,"scripts","recover-workspace-roots.mjs"));
+await cp(join(root,"scripts","gdrive-bridge.mjs"),join(output,"scripts","gdrive-bridge.mjs"));
 if(process.platform==="win32")await cp(join(root,"scripts","windows-easytier-cutover.ps1"),join(output,"scripts","windows-easytier-cutover.ps1"));
 await mkdir(join(output,"runtime"),{recursive:true});
 await cp(process.execPath,join(output,"runtime",exe("node")));

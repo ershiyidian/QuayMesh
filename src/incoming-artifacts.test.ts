@@ -3,6 +3,8 @@ import { Readable } from "node:stream";
 import { ArtifactError } from "./artifact-error.js";
 import {
   IncomingArtifactAdapterRegistry,
+  createGoogleDriveIncomingArtifactAdapter,
+  createInlineBase64ArtifactAdapter,
   createOpenAIIncomingArtifactAdapter,
   describeIncomingArtifactValue,
   type IncomingArtifactAdapter,
@@ -10,6 +12,8 @@ import {
 
 await testRegistryFailsClosed();
 await testOpenAIFileAdapter();
+await testInlineBase64Adapter();
+await testGoogleDriveAdapter();
 testLogShapeRedaction();
 
 async function testRegistryFailsClosed(): Promise<void> {
@@ -234,6 +238,118 @@ async function testOpenAIFileAdapter(): Promise<void> {
     failedDownloadRegistry.open(reference),
     "openai_file_download_failed",
   );
+}
+
+async function testInlineBase64Adapter(): Promise<void> {
+  const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff]);
+  const registry = new IncomingArtifactAdapterRegistry([
+    createOpenAIIncomingArtifactAdapter(),
+    createInlineBase64ArtifactAdapter({ maxInlineBytes: 1024 }),
+  ]);
+  const opened = await registry.open({
+    content_base64: bytes.toString("base64"),
+    file_name: "sample.png",
+    mime_type: "image/png",
+    size: bytes.length,
+  });
+  assert.equal(opened.adapterId, "inline-base64");
+  assert.equal(opened.name, "sample.png");
+  assert.equal(opened.mimeType, "image/png");
+  assert.equal(opened.size, bytes.length);
+  assert.deepEqual(await collect(opened.stream), bytes);
+
+  await expectArtifactError(
+    registry.open({
+      content_base64: bytes.toString("base64"),
+      size: bytes.length + 1,
+    }),
+    "inline_artifact_size_mismatch",
+  );
+  await expectArtifactError(
+    registry.open({
+      content_base64: bytes.toString("base64"),
+      sha256: "0".repeat(64),
+    }),
+    "inline_artifact_sha256_mismatch",
+  );
+  await expectArtifactError(
+    registry.open({
+      content_base64: "not-valid-base64!!!",
+    }),
+    "invalid_inline_artifact_reference",
+  );
+  for (const content_base64 of ["A", "Y==", "YQ=", "YQ==="]) {
+    await expectArtifactError(registry.open({ content_base64 }), "invalid_inline_artifact_reference");
+  }
+  const urlEncoded = await registry.open({ content_base64: bytes.toString("base64url") });
+  assert.deepEqual(await collect(urlEncoded.stream), bytes);
+  await expectArtifactError(
+    new IncomingArtifactAdapterRegistry([createInlineBase64ArtifactAdapter()]).open({
+      content_base64: Buffer.alloc(1024 * 1024 + 1).toString("base64"),
+    }),
+    "artifact_file_too_large",
+  );
+}
+
+async function testGoogleDriveAdapter(): Promise<void> {
+  const bytes = Buffer.from("google drive bridge payload");
+  const requested: string[] = [];
+  const registry = new IncomingArtifactAdapterRegistry([
+    createOpenAIIncomingArtifactAdapter(),
+    createInlineBase64ArtifactAdapter(),
+    createGoogleDriveIncomingArtifactAdapter({
+      fetch: async (input) => {
+        requested.push(String(input));
+        if (String(input).includes("drive.usercontent.google.com")) {
+          return new Response(null, {
+            status: 302,
+            headers: {
+              location: "https://doc-00-00-docs.googleusercontent.com/docs/securesc/payload",
+            },
+          });
+        }
+        return new Response(bytes, {
+          status: 200,
+          headers: {
+            "content-type": "application/octet-stream",
+            "content-length": String(bytes.length),
+          },
+        });
+      },
+    }),
+  ]);
+
+  const opened = await registry.open({
+    gdrive_file_id: "test_drive_file_123",
+    file_name: "bridge.bin",
+    size: bytes.length,
+  });
+  assert.equal(opened.adapterId, "google-drive");
+  assert.equal(opened.name, "bridge.bin");
+  assert.deepEqual(await collect(opened.stream), bytes);
+  assert.equal(requested.length, 2);
+
+  await expectArtifactError(
+    registry.open({
+      gdrive_file_id: "test_drive_file_123",
+      download_url: "https://evil.example.com/download",
+    }),
+    "unsafe_google_drive_reference",
+  );
+  const headers: Headers[] = [];
+  const privateAdapter = createGoogleDriveIncomingArtifactAdapter({
+    accessToken: () => "test-private-token",
+    fetch: async (url, init) => {
+      headers.push(new Headers(init?.headers));
+      return new URL(String(url)).hostname === "www.googleapis.com"
+        ? new Response(null, { status: 302, headers: { location: "https://content.googleusercontent.com/file" } })
+        : new Response(bytes);
+    },
+  });
+  const privateFile = await privateAdapter.open({ gdrive_file_id: "test_private_123" });
+  assert.deepEqual(await collect(privateFile.stream), bytes);
+  assert.equal(headers[0]!.get("authorization"), "Bearer test-private-token");
+  assert.equal(headers[1]!.has("authorization"), false);
 }
 
 function testLogShapeRedaction(): void {

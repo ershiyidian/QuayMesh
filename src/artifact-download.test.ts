@@ -87,6 +87,13 @@ function testOneToolContract(): void {
     file_name: "generated.png",
   };
   assert.deepEqual(fileSchema.parse(valid), valid);
+  const validInline = {
+    content_base64: Buffer.from("gemini cloud vm bytes").toString("base64"),
+    file_name: "from-gemini.bin",
+    mime_type: "application/octet-stream",
+    size: 21,
+  };
+  assert.deepEqual(fileSchema.parse(validInline), validInline);
   assert.throws(() => fileSchema.parse({ file_id: "file_123" }));
 
   const sensitiveExtraValue = "Bearer should-not-leak";

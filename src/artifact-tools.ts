@@ -50,6 +50,31 @@ const openAIFileReferenceInputSchema = z.strictObject({
   size: z.number().int().nonnegative().nullable().optional(),
 });
 
+const inlineBase64ArtifactInputSchema = z.strictObject({
+  content_base64: z.string(),
+  file_name: z.string().nullable().optional(),
+  name: z.string().nullable().optional(),
+  mime_type: z.string().nullable().optional(),
+  size: z.number().int().nonnegative().nullable().optional(),
+  sha256: z.string().nullable().optional(),
+});
+
+const googleDriveArtifactInputSchema = z.strictObject({
+  gdrive_file_id: z.string(),
+  download_url: z.string().nullable().optional(),
+  file_name: z.string().nullable().optional(),
+  name: z.string().nullable().optional(),
+  mime_type: z.string().nullable().optional(),
+  size: z.number().int().nonnegative().nullable().optional(),
+  sha256: z.string().nullable().optional(),
+});
+
+const incomingArtifactFileInputSchema = z.union([
+  openAIFileReferenceInputSchema,
+  inlineBase64ArtifactInputSchema,
+  googleDriveArtifactInputSchema,
+]);
+
 export interface ArtifactToolRegistrationOptions {
   config: ServerConfig;
   workspaces: WorkspaceRegistry;
@@ -111,8 +136,8 @@ export function registerArtifactTools(
       description:
         "Save an attached file to a new workspace path.",
       inputSchema: {
-        file: openAIFileReferenceInputSchema.describe(
-          "Attached file.",
+        file: incomingArtifactFileInputSchema.describe(
+          "Attached file, inline content_base64 (up to 1 MiB decoded), or gdrive_file_id.",
         ),
         workspace_id: z.string().min(1).describe(
           "Workspace handle.",

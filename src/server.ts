@@ -29,6 +29,7 @@ import { installationTransitionPending, installationBackgroundMaintenanceAllowed
 import { isAdmissionPrecondition, sameAdmissionInstance } from "./admission-state.js";
 import { processOwner } from "./process-identity.js";
 import { realpath } from "node:fs/promises";
+import { open as openFileHandle } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { relative, resolve as resolveSessionPath } from "node:path";
 import { parsePatch as parseMutationPaths } from "./apply-patch.js";
@@ -48,6 +49,7 @@ import {
   RESOURCE_MIME_TYPE,
 } from "@modelcontextprotocol/ext-apps/server";
 import express from "express";
+import { EnvHttpProxyAgent, ProxyAgent, fetch as undiciFetch } from "undici";
 import type { Request, Response } from "express";
 import * as z from "zod/v4";
 import { executionContract } from "./process-platform.js";
@@ -58,6 +60,8 @@ import {
 } from "./artifact-tools.js";
 import { loadConfig, type ServerConfig } from "./config.js";
 import {
+  createGoogleDriveIncomingArtifactAdapter,
+  createInlineBase64ArtifactAdapter,
   createOpenAIIncomingArtifactAdapter,
   type IncomingArtifactAdapter,
 } from "./incoming-artifacts.js";
@@ -772,9 +776,9 @@ function registerMcpSurface(
     toolNames.read,
     {
       title: "Read file",
-      description: "Read text ranges or an image. Continue a truncated response with response_offset.",
+      description: "Read text, an image, or base64 binary slices. Continue with response_offset.",
       inputSchema: {
-        response_offset: z.number().int().nonnegative().optional().describe("Code-point cursor; keep path and line selection unchanged."),
+        response_offset: z.number().int().nonnegative().optional().describe("Code-point cursor for text, byte offset for base64; keep path and selection unchanged."),
         workspace_id: z
           .string()
           .describe("Workspace handle."),
@@ -794,18 +798,85 @@ function registerMcpSurface(
           .int()
           .positive()
           .optional()
-          .describe("Maximum lines."),
+          .describe("Maximum lines, or bytes with encoding=base64."),
+        encoding: z
+          .enum(["utf8", "base64"])
+          .optional()
+          .describe("Set to base64 to read raw binary byte slices via response_offset (0-based byte offset) and limit (max bytes, default 16384)."),
       },
       outputSchema: resultOutputSchema({result_sha256: z.string().optional(),
         response_page: z.object({offset:z.number(),next_offset:z.number().nullable(),total_code_points:z.number()}).optional()}),
       annotations: { readOnlyHint:true, destructiveHint:false, openWorldHint:false },
     },
-    async ({ workspace_id, response_offset, ...input }) => {
+    async ({ workspace_id, response_offset, encoding, ...input }) => {
       const startedAt = performance.now();
       const workspaceId = workspace_id;
       const responseOffset = response_offset;
       const workspace = await workspaces.getWorkspace(workspaceId);
       const readPath = await workspaces.resolveReadPath(workspace, input.path);
+      if (encoding === "base64") {
+        const byteOffset = responseOffset ?? 0;
+        const maxBytes = Math.min(16_384, input.limit ?? 16_384);
+        const binaryPage = await processSessions.readWorkspace(workspace.root, async () => {
+          const handle = await openFileHandle(readPath.absolutePath, "r");
+          try {
+            const info = await handle.stat();
+            if (!info.isFile()) {
+              throw new Error(`NOT_A_REGULAR_FILE: ${input.path}`);
+            }
+            if (byteOffset > info.size) {
+              throw new Error(`Invalid response offset: ${byteOffset} exceeds ${info.size}`);
+            }
+            const sliceLen = Math.min(maxBytes, info.size - byteOffset);
+            const buffer = Buffer.allocUnsafe(sliceLen);
+            let readBytes = 0;
+            while (readBytes < sliceLen) {
+              const { bytesRead } = await handle.read(buffer, readBytes, sliceLen - readBytes, byteOffset + readBytes);
+              if (bytesRead <= 0) throw new Error(`FILE_CHANGED_DURING_READ: ${input.path}`);
+              readBytes += bytesRead;
+            }
+            return {
+              buffer: buffer.subarray(0, readBytes),
+              offset: byteOffset,
+              totalBytes: info.size,
+            };
+          } finally {
+            await handle.close();
+          }
+        });
+        logToolCall(config, {
+          tool: toolNames.read,
+          workspaceId,
+          path: input.path,
+          success: true,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+        let candidateLen = binaryPage.buffer.length;
+        const buildBinaryReply = (len: number) => {
+          const slice = binaryPage.buffer.subarray(0, len);
+          const nextOffset = binaryPage.offset + len < binaryPage.totalBytes ? binaryPage.offset + len : null;
+          return {
+            content: [{ type: "text" as const, text: `已读取 ${input.path} 的二进制分片（base64），内容见 result。` }],
+            _meta: { quaymesh: { argument_fingerprint: argumentFingerprint({ action: "read", encoding: "base64", ...input }) } },
+            structuredContent: {
+              result: slice.toString("base64"),
+              operation_id: currentInvocation()?.operation_id,
+              result_sha256: createHash("sha256").update(slice).digest("hex"),
+              response_page: {
+                offset: binaryPage.offset,
+                next_offset: nextOffset,
+                total_code_points: binaryPage.totalBytes,
+              },
+            },
+          };
+        };
+        let replyObj = buildBinaryReply(candidateLen);
+        while (toolResultBytes(replyObj) > REPLY_BYTES - 512 && candidateLen > 1) {
+          candidateLen = Math.max(1, Math.floor(candidateLen * 3 / 4));
+          replyObj = buildBinaryReply(candidateLen);
+        }
+        return replyObj;
+      }
       const response = await processSessions.readWorkspace(workspace.root, () => readFileTool(
         { ...input, path: readPath.absolutePath },
         {
@@ -1020,9 +1091,19 @@ function withSessionToolRecording(
         // digest for exact retries, while only the live handler sees the URL.
         let recordedInput = input;
         if (name === "download_artifact" && input.file && typeof input.file === "object") {
-          const { download_url, ...file } = input.file;
-          recordedInput = { ...input, file: { ...file,
-            download_url_sha256: createHash("sha256").update(String(download_url)).digest("hex") } };
+          const { download_url, content_base64, ...file } = input.file;
+          recordedInput = {
+            ...input,
+            file: {
+              ...file,
+              ...(download_url !== undefined
+                ? { download_url_sha256: createHash("sha256").update(String(download_url)).digest("hex") }
+                : {}),
+              ...(content_base64 !== undefined
+                ? { content_base64_sha256: createHash("sha256").update(String(content_base64)).digest("hex") }
+                : {}),
+            },
+          };
         }
         const record = forwarded ? runtime.recorder.recordForwarded.bind(runtime.recorder) : runtime.recorder.record.bind(runtime.recorder);
         return record({
@@ -1151,8 +1232,23 @@ export function createServer(
   config = loadConfig(),
   options: CreateServerOptions = {},
 ): RunningServer {
+  const artifactDispatcher = options.incomingArtifactAdapters ? undefined
+    : config.federation?.enabled && config.federation.egress.enabled
+      ? new ProxyAgent(`http://127.0.0.1:${config.federation.egress.listenPort}`)
+      : new EnvHttpProxyAgent();
+  const artifactRequest: typeof undiciFetch = (input, init) => undiciFetch(input, {
+    ...init, dispatcher: artifactDispatcher,
+  });
+  const fetchArtifact = artifactRequest as unknown as typeof fetch;
   const incomingArtifactAdapters = options.incomingArtifactAdapters
-    ?? [createOpenAIIncomingArtifactAdapter()];
+    ?? [
+      createOpenAIIncomingArtifactAdapter({ fetch: fetchArtifact }),
+      createInlineBase64ArtifactAdapter(),
+      createGoogleDriveIncomingArtifactAdapter({
+        fetch: fetchArtifact,
+        accessToken: () => process.env.GDRIVE_ACCESS_TOKEN,
+      }),
+    ];
   const allowedHosts = config.allowedHosts.includes("*")
     ? undefined
     : Array.from(new Set([config.host, ...config.allowedHosts]));
@@ -1516,7 +1612,7 @@ export function createServer(
         } finally {
           // A failed business close must still restore automatic checkpoints
           // on any surviving writers and release this Core's maintenance owner.
-          await databaseCheckpoints.close();
+          await Promise.all([artifactDispatcher?.destroy(), databaseCheckpoints.close()]);
         }
       })();
       return closePromise;
