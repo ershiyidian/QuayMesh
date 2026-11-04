@@ -56,6 +56,10 @@ Resource coordination handles overlapping operations. Independent project scopes
 
 EasyTier supplies the optional node network. QuayMesh can also operate over existing network addresses. Worker communication uses HTTP/2.
 
+Each peer connection carries a control stream and independent streams for large RPC frames. Peers advertise `frame-ack-v1` through the existing feature negotiation. When both peers support it, the receiver returns a single `0x01` byte after receiving and parsing the complete frame. This acknowledges frame admission; the original RPC reply remains the evidence of the business operation's result. Older `frame-stream-v1` peers retain their empty acknowledgement.
+
+The sender holds a large-frame slot until delivery is acknowledged. An unexpected frame-delivery failure retires that specific peer connection, and the existing reconnect path replaces it. The receiver also retires its connection on an HTTP/2 body reset with a nonzero error code other than `CANCEL`, including when an older sender has already finished its local write. Request cancellation, ordinary RPC timeouts, and busy admission retain the shared connection. Only eligible reads are retried within their existing budget; writes retain their original operation identity and are never replayed by transport recovery.
+
 Discovery nodes forward an OpenAI tunnel to the same coordinator. A local relay supplies a stable MCP and Console entry on each configured node.
 
 Network-exit selection considers node availability, configured priorities, and proxy health. Each established connection keeps the exit chosen when it was created.

@@ -59,7 +59,6 @@ for (const brokenBody of ["request", "reply"] as const) {
         return link && { get connected() { return link.connected; },
           call: timeout => link.call<{ status: number; body: string }>("console", params, timeout).catch(error => {
             failures.push(error);
-            assert.equal(link.connected, true, "正文建流失败时控制流仍在线");
             throw error;
           }),
           close: () => link.close() };
@@ -72,7 +71,7 @@ for (const brokenBody of ["request", "reply"] as const) {
       assert.equal(resets, 1);
       assert.equal(failures.length, 1);
       assert.equal((failures[0] as { code: string }).code, "RPC_INTERRUPTED");
-      assert.equal(failures[0] instanceof PeerApplicationError, brokenBody === "reply");
+      assert.equal(failures[0] instanceof PeerApplicationError, false, "大正文发送者直接使故障连接失效");
       assert.equal(reads, brokenBody === "reply" ? 2 : 1);
       assert.equal(old.connected, false);
       assert.notEqual(caller.links.get("target"), old);

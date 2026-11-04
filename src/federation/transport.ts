@@ -29,6 +29,8 @@ export class PeerApplicationError extends Error {
 }
 export class RpcInterruptedError extends Error {
   readonly code: string = "RPC_INTERRUPTED";
+  readonly effect = "unknown";
+  readonly retryHint = "query_original";
   constructor(readonly nodeId: string, readonly requestId: string, detail: string) {
     super(`${nodeId}: ${detail}。调用可能已在目标节点执行；使用原工作区查询进程或任务状态。`);
   }
@@ -61,7 +63,11 @@ const MAX_PENDING_CALLS = 256;
 const MAX_LARGE_FRAMES = 8;
 const FRAME_TRANSFER_TIMEOUT_MS = 30_000;
 const FRAME_SERVICE = "$frame.v1";
-const FEATURES = "frame-stream-v1";
+const FRAME_STREAM_FEATURE = "frame-stream-v1";
+const FRAME_ACK_FEATURE = "frame-ack-v1";
+const FEATURES = `${FRAME_STREAM_FEATURE},${FRAME_ACK_FEATURE}`;
+// ACK 仅确认完整帧已解析并接纳；业务执行结果仍由原 RPC 回执确认。
+const FRAME_ACK = Buffer.from([1]);
 const STREAM_ERROR_HEADER = "x-quaymesh-stream-error";
 
 function progressNotification(value: unknown): PeerProgressNotification | undefined {
@@ -184,6 +190,7 @@ export class PeerLink extends EventEmitter {
     readonly client: ClientHttp2Session | undefined,
     private readonly owner: PeerTransport,
     readonly frameStreams = false,
+    readonly frameAcknowledgements = false,
   ) {
     super();
     control.setEncoding("utf8");
@@ -239,6 +246,7 @@ export class PeerLink extends EventEmitter {
       direction: this.client ? "outgoing" : "incoming", pendingRpc: this.pending.size,
       incomingRpc: this.incoming.size, queuedControlBytes: this.queuedControlBytes,
       outgoingLargeFrames: this.outgoingLargeFrames, frameStreams: this.frameStreams,
+      frameAcknowledgements: this.frameAcknowledgements,
       oldestRpcMs: this.pending.size ? Math.round(Math.max(...[...this.pending.values()].map(value => now - value.startedAt))) : 0,
       pingOutstandingMs: this.pingOutstanding ? Math.round(now - this.pingSentAt) : 0 };
   }
@@ -329,6 +337,12 @@ export class PeerLink extends EventEmitter {
       if (this.outgoingLargeFrames >= MAX_LARGE_FRAMES) throw unsentError("PEER_BUSY", "节点大正文传输已满，请稍后重试。");
       this.outgoingLargeFrames++;
       try { await this.owner.sendFrameStream(this, text, signal); }
+      catch (error) {
+        // 正文是这条连接的交付通道；请求取消和接收繁忙不改变共享连接的健康状态。
+        if (!signal?.aborted && (error as { code?: string })?.code !== "PEER_BUSY")
+          this.close(`frame_delivery_error: ${error instanceof Error ? error.message : String(error)}`);
+        throw error;
+      }
       finally { this.outgoingLargeFrames--; }
       return;
     }
@@ -463,7 +477,10 @@ export class PeerTransport extends EventEmitter {
       }
       existing?.close("replaced_by_incoming_control");
       stream.respond({ ":status": 200, "x-quaymesh-node": this.config.nodeId, "x-quaymesh-features": FEATURES });
-      this.install(new PeerLink(peerId, stream.session!, stream, undefined, this, String(headers["x-quaymesh-features"] ?? "").split(",").includes(FEATURES)));
+      const features = String(headers["x-quaymesh-features"] ?? "").split(",");
+      const frameStreams = features.includes(FRAME_STREAM_FEATURE);
+      this.install(new PeerLink(peerId, stream.session!, stream, undefined, this, frameStreams,
+        frameStreams && features.includes(FRAME_ACK_FEATURE)));
       return;
     }
     if (headers[":path"] !== "/stream") { stream.respond({ ":status": 404 }); stream.end(); return; }
@@ -568,7 +585,10 @@ export class PeerTransport extends EventEmitter {
         const existing = this.links.get(peer.id);
         if (existing?.connected && this.config.nodeId > peer.id) { session.destroy(); return; }
         existing?.close("replaced_by_outgoing_control"); installed = true;
-        this.install(new PeerLink(peer.id, session, stream, session, this, String(headers["x-quaymesh-features"] ?? "").split(",").includes(FEATURES)));
+        const features = String(headers["x-quaymesh-features"] ?? "").split(",");
+        const frameStreams = features.includes(FRAME_STREAM_FEATURE);
+        this.install(new PeerLink(peer.id, session, stream, session, this, frameStreams,
+          frameStreams && features.includes(FRAME_ACK_FEATURE)));
       });
     });
   }
@@ -667,6 +687,7 @@ export class PeerTransport extends EventEmitter {
     const active = this.incomingFrameCounts.get(link.id) ?? 0;
     if (active >= MAX_LARGE_FRAMES) throw new Error("节点正文流接收数量已达上限");
     this.incomingFrameCounts.set(link.id, active + 1);
+    const h2 = stream as H2Stream;
     const timer = setTimeout(() => stream.destroy(new Error("节点正文流接收超时")), FRAME_TRANSFER_TIMEOUT_MS);
     timer.unref();
     try {
@@ -677,8 +698,14 @@ export class PeerTransport extends EventEmitter {
         if (bytes > MAX_STREAM_FRAME) throw new Error("节点正文流超过 16 MiB");
         chunks.push(buffer);
       }
+      if (h2.aborted || h2.rstCode) throw interruptedStream("节点正文流接收未完整结束");
       link.receiveFrame(Buffer.concat(chunks, bytes).toString("utf8"));
-      stream.end();
+      if (link.connected) stream.end(link.frameAcknowledgements ? FRAME_ACK : undefined);
+    } catch (error) {
+      // 旧发送者可能已结束本地写入；接收端也负责处理明确的非取消重置。
+      if (h2.rstCode && h2.rstCode !== constants.NGHTTP2_CANCEL)
+        link.close(`frame_receive_error: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
     } finally {
       clearTimeout(timer);
       const count = (this.incomingFrameCounts.get(link.id) ?? 1) - 1;
@@ -689,25 +716,43 @@ export class PeerTransport extends EventEmitter {
     const stream = await this.openStream(link, FRAME_SERVICE, {}, signal);
     await new Promise<void>((resolve, reject) => {
       let settled = false;
+      let unwatch: (() => void) | undefined;
+      let receivedAcknowledgement = false;
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true; clearTimeout(timer);
         signal?.removeEventListener("abort", aborted);
-        stream.off("error", failed); stream.off("close", closed);
+        stream.off("data", receiveAcknowledgement); stream.off("end", acknowledged);
+        unwatch?.();
         if (error) { stream.destroy(); reject(error); } else resolve();
       };
-      const failed = (error: Error) => finish(interruptedStream("节点正文流传输中断", error));
-      const closed = () => finish(interruptedStream("节点正文流在发送完成前关闭"));
+      const receiveAcknowledgement = (chunk: Buffer) => {
+        if (!chunk.length) return;
+        if (!link.frameAcknowledgements || receivedAcknowledgement || chunk.length !== 1 || chunk[0] !== FRAME_ACK[0])
+          finish(interruptedStream("节点正文流确认包含意外数据"));
+        else if (!stream.writableFinished) finish(interruptedStream("节点正文尚未发送完即收到确认"));
+        else receivedAcknowledgement = true;
+      };
+      const acknowledged = () => {
+        if (!stream.writableFinished) finish(interruptedStream("节点正文尚未发送完即收到确认"));
+        else if (link.frameAcknowledgements && !receivedAcknowledgement) finish(interruptedStream("节点正文流结束前未收到接纳确认"));
+      };
       const aborted = () => finish(interruptedStream("节点正文交付已取消"));
       const timer = setTimeout(() => finish(interruptedStream("节点正文流发送超时")), FRAME_TRANSFER_TIMEOUT_MS);
       timer.unref();
-      stream.once("error", failed); stream.once("close", closed);
+      stream.on("data", receiveAcknowledgement); stream.once("end", acknowledged);
+      unwatch = finished(stream, { readable: true, writable: true }, error => {
+        const h2 = stream as H2Stream;
+        if (error) finish(interruptedStream("节点正文流传输中断", error));
+        else if (h2.aborted || h2.rstCode) finish(interruptedStream("节点正文流确认前被重置"));
+        else { acknowledged(); if (!settled) finish(); }
+      });
       signal?.addEventListener("abort", aborted, {once:true});
       if (signal?.aborted) { aborted(); return; }
-      // Consume the peer's empty acknowledgement so both HTTP/2 halves close.
+      if (stream.readableEnded) { acknowledged(); if (settled) return; }
+      // 新节点必须返回接纳标记；旧节点保留空确认。两者都须等完整交付后再释放名额。
       stream.resume();
-      // 数据流按 HTTP/2 帧调度，小控制消息无需排在整段 JSON 正文之后。
-      stream.end(text, () => finish());
+      stream.end(text);
     });
   }
   waitForLink(peerId: string, timeoutMs: number): Promise<PeerLink | undefined> {
