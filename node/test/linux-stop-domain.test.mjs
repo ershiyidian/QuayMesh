@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { mkdir, writeFile, readFile, symlink, rm } from "node:fs/promises";
+import { mkdir, writeFile, readFile, realpath, symlink, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
@@ -169,6 +169,130 @@ async function guardedFixture(t, { ingress = false } = {}) {
   const expectedPause = { instance: idle.instance, accepting: idle.accepting, reason: idle.reason, changedAt: idle.changedAt };
   return { ...f, options, guard, expectedPause, idle, status, unit, requests, ingressProcesses };
 }
+
+async function discoveryFixture(t, { vendored = false } = {}) {
+  const f = await guardedFixture(t), configuration = cluster({ discovery: { resourceUrl: "https://fixture.example.test/mcp" } });
+  const bin = join(f.root, "installed-bin"), packageRoot = join(f.root, "node_modules/@openai/codex");
+  await mkdir(bin); await mkdir(join(packageRoot, "bin"), { recursive: true });
+  const entry = join(packageRoot, "bin/codex.js"), command = join(bin, "codex");
+  await writeFile(entry, "#!/usr/bin/env node\n", { mode: 0o755 });
+  await writeFile(join(packageRoot, "package.json"), JSON.stringify({ name: "@openai/codex", version: "0.144.1", bin: { codex: "bin/codex.js" } }));
+  await symlink(entry, command); await symlink(process.execPath, join(bin, "node"));
+  const platformPackage = join(packageRoot, "node_modules/@openai/codex-linux-" + process.arch);
+  const vendorRoot = join(vendored ? packageRoot : platformPackage, "vendor");
+  if (!vendored) {
+    await mkdir(platformPackage, { recursive: true });
+    await writeFile(join(platformPackage, "package.json"), JSON.stringify({ name: "@openai/codex", version: "0.144.1-linux-" + process.arch }));
+  }
+  const target = process.arch === "arm64" ? "aarch64-unknown-linux-musl" : "x86_64-unknown-linux-musl";
+  const native = join(vendorRoot, target, "bin/codex");
+  await mkdir(join(vendorRoot, target, "bin"), { recursive: true }); await symlink(process.execPath, native);
+  const discovery = 10005, wrapper = 10008, child = 10007;
+  const environment = "PATH=" + bin + "\0";
+  await f.add(discovery, { parentPid: f.manager.pid, args: [process.execPath, "run"] });
+  await f.add(wrapper, { parentPid: discovery, pgid: discovery, sid: discovery, args: ["node", command, "app-server"] });
+  await f.add(child, { parentPid: wrapper, pgid: discovery, sid: discovery, ticks: "10009", args: [native, "app-server"] });
+  for (const pid of [discovery, wrapper, child]) await symlink(await realpath(releaseRoot), join(f.procRoot, String(pid), "cwd"));
+  await writeFile(join(f.procRoot, String(discovery), "environ"), environment);
+  await f.members([f.manager.pid, f.core.pid, discovery, wrapper, child]);
+  f.status.components.push({ id: "discovery", pid: discovery, state: "ready", startedAt: 100, restarts: 0 });
+  f.options.manifest.config = join(f.root, "node.json");
+  await writeFile(join(f.root, "cluster.json"), JSON.stringify(configuration));
+  await writeFile(join(f.root, "secrets.env"), [
+    "QUAYMESH_CLUSTER_TOKEN=" + f.options.token,
+    configuration.discovery.tunnelIdEnv + "=fixture-tunnel",
+    configuration.discovery.apiKeyEnv + "=" + makeToken(),
+  ].join("\n") + "\n");
+  await writeFile(f.options.manifest.config, JSON.stringify({
+    schemaVersion: 1, id: "edge", stateDir: f.root, capabilities: { worker: true, discovery: true },
+    mesh: { enabled: false, address: "127.0.0.2" }, network: { externalAccess: true },
+    secretsFile: "./secrets.env", nodeRuntime: process.execPath,
+    components: { tunnel: { executable: process.execPath, args: ["run"], environment: { PATH: bin } } },
+  }));
+  const guard = await createLinuxInstallationGuard(f.options);
+  return { ...f, guard, discovery, wrapper, child, command, native, environment };
+}
+
+test("standard discovery Codex launcher and native package are precisely identified in both official layouts", linux, async t => {
+  for (const vendored of [false, true]) {
+    const f = await discoveryFixture(t, { vendored });
+    const result = await f.guard.assertHeld("before_backup", { expectedPause: f.expectedPause });
+    assert.equal(result.count, 5); assert.equal(result.unapprovedCount, 0);
+    assert.equal(result.outsideCount, 0); assert.equal(f.idle.accepting, false);
+  }
+});
+
+test("discovery helper classification rejects changed argv, entry, executable, parent, group and generation", linux, async t => {
+  const f = await discoveryFixture(t);
+  const setArgs = (pid, args) => writeFile(join(f.procRoot, String(pid), "cmdline"), args.join("\0") + "\0");
+  for (const [pid, original, changed] of [
+    [f.wrapper, ["node", f.command, "app-server"], ["node", f.command, "exec", "sensitive-sentinel"]],
+    [f.wrapper, ["node", f.command, "app-server"], ["node", join(f.root, "other-codex.js"), "app-server"]],
+    [f.child, [f.native, "app-server"], [f.native, "app-server", "--listen", "sensitive-sentinel"]],
+  ]) {
+    await setArgs(pid, changed);
+    await assert.rejects(f.guard.assertHeld("before_stop", { expectedPause: f.expectedPause }), error => {
+      assert.equal(error.code, "LINUX_STOP_DOMAIN_UNTRACKED_PROCESSES");
+      assert.equal(JSON.stringify(error).includes("sensitive-sentinel"), false); return true;
+    });
+    await setArgs(pid, original);
+  }
+  const executable = join(f.procRoot, String(f.child), "exe");
+  await rm(executable); await symlink("/bin/false", executable);
+  await assert.rejects(f.guard.assertHeld("before_stop", { expectedPause: f.expectedPause }), code("UNTRACKED_PROCESSES"));
+  await rm(executable); await symlink(process.execPath, executable);
+  for (const changed of [{ parentPid: f.core.pid }, { pgid: f.child }, { sid: f.child }]) {
+    await writeFile(join(f.procRoot, String(f.child), "stat"), statText(f.child,
+      { parentPid: f.wrapper, pgid: f.discovery, sid: f.discovery, ticks: "10009", ...changed }));
+    await assert.rejects(f.guard.assertHeld("before_stop", { expectedPause: f.expectedPause }), code("UNTRACKED_PROCESSES"));
+  }
+  await writeFile(join(f.procRoot, String(f.child), "stat"), statText(f.child,
+    { parentPid: f.wrapper, pgid: f.discovery, sid: f.discovery, ticks: "10009" }));
+  await setArgs(f.discovery, [process.execPath, "other-run"]);
+  await assert.rejects(f.guard.assertHeld("before_stop", { expectedPause: f.expectedPause }), code("MANAGED_PROCESS_COMMAND_CHANGED"));
+  await setArgs(f.discovery, [process.execPath, "run"]);
+  await writeFile(join(f.procRoot, String(f.discovery), "stat"), statText(f.discovery, { parentPid: f.manager.pid, ticks: "20005" }));
+  await assert.rejects(f.guard.assertHeld("before_stop", { expectedPause: f.expectedPause }), code("MANAGED_PROCESS_GENERATION_CHANGED"));
+});
+
+test("discovery shell and nonstandard arguments remain unapproved with a bounded reason", linux, async t => {
+  const f = await discoveryFixture(t);
+  for (const [field, value, reason] of [
+    ["TUNNEL_CLIENT_CODEX_APP_SERVER_COMMAND", "sensitive-shell-sentinel", "nonstandard_discovery_shell_command"],
+    ["TUNNEL_CLIENT_CODEX_APP_SERVER_ARGS", "exec sensitive-argument-sentinel", "nonstandard_discovery_app_server_arguments"],
+  ]) {
+    await writeFile(join(f.procRoot, String(f.discovery), "environ"), f.environment + field + "=" + value + "\0");
+    await assert.rejects(f.guard.assertHeld("before_stop", { expectedPause: f.expectedPause }), error => {
+      assert.equal(error.code, "LINUX_STOP_DOMAIN_UNTRACKED_PROCESSES");
+      assert.equal(error.details.discoveryHelperReason, reason);
+      assert.equal(JSON.stringify(error).includes(value), false); return true;
+    });
+  }
+});
+
+test("idle ledger and a standard helper never authorize reparented experiment groups or helper business descendants", linux, async t => {
+  const f = await discoveryFixture(t);
+  const extra = [
+    [11001, { parentPid: 1, args: ["python3", "supervisor.py", "--timeout-seconds", "0"] }],
+    [11002, { parentPid: 11001, args: ["python3", "experiment.py"] }],
+    [11003, { parentPid: 11002, pgid: 11002, sid: 11002, args: ["node", "playwright/driver.js"] }],
+    [11004, { parentPid: 11003, args: ["chrome", "--headless"] }],
+    [11005, { parentPid: f.child, pgid: f.discovery, sid: f.discovery,
+      args: [process.execPath, "--max-old-space-size=192", join(releaseRoot, "dist/session/projection-read-worker.js")] }],
+  ];
+  for (const [pid, options] of extra) await f.add(pid, options);
+  await f.members([f.manager.pid, f.core.pid, f.discovery, f.wrapper, f.child, ...extra.map(([pid]) => pid)]);
+  let signalled = false;
+  await assert.rejects(async () => {
+    await f.guard.assertHeld("before_stop", { expectedPause: f.expectedPause }); signalled = true;
+  }, error => {
+    assert.equal(error.code, "LINUX_STOP_DOMAIN_UNTRACKED_PROCESSES");
+    assert.deepEqual(error.details.unapproved.map(row => row.pid), extra.map(([pid]) => pid));
+    return true;
+  });
+  assert.equal(signalled, false);
+  assert.equal(f.idle.accepting, false);
+});
 
 test("managed public MCP and Funnel retain exact command identities without approving their descendants", linux, async t => {
   const f = await guardedFixture(t, { ingress: true });

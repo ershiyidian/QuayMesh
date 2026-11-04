@@ -1,7 +1,9 @@
-import { open, readdir, readlink, lstat, realpath } from "node:fs/promises";
+import { access, open, readdir, readlink, lstat, realpath } from "node:fs/promises";
+import { constants } from "node:fs";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { posix, resolve, basename } from "node:path";
+import { createRequire } from "node:module";
+import { posix, resolve, basename, dirname } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { requestJson } from "./network.mjs";
 import { loadNodeConfig } from "./config.mjs";
@@ -13,11 +15,11 @@ const positive = value => Number.isSafeInteger(value) && value > 0;
 const within = (path, root) => path === root || path.startsWith(root === "/" ? "/" : root + "/");
 const decodeMount = value => value.replace(/\\(040|011|012|134)/gu, (_all, octal) => String.fromCharCode(parseInt(octal, 8)));
 const workers = ["dist/console-workbench/read-worker.js", "dist/session/status-read-worker.js", "dist/session/projection-read-worker.js"];
-const ingressComponents = new Set(["public-mcp", "funnel"]);
+const commandComponents = new Set(["public-mcp", "funnel", "discovery"]);
 const activity = ["claims", "waiting", "operations", "executions", "queuedOperations", "queuedExecutions", "activeWork", "allRuntimeWork", "persistedRuntimeWork"];
 
 export function stopDomainError(reason, details) {
-  const summary = details ? Object.fromEntries(["stage", "property", "readError", "count", "unapprovedCount", "outsideCount", "pid"]
+  const summary = details ? Object.fromEntries(["stage", "property", "readError", "count", "unapprovedCount", "outsideCount", "pid", "discoveryHelperReason"]
     .filter(key => details[key] !== undefined).map(key => [key, details[key]])) : {};
   if (details?.unapproved?.length) summary.unapprovedPids = details.unapproved.slice(0, 20).map(row => row.pid);
   if (details?.outside?.length) summary.outsidePids = details.outside.slice(0, 20).map(row => row.pid);
@@ -40,6 +42,66 @@ export async function readLinuxBounded(file, maximum = 65536) {
     }
     throw stopDomainError("READ_BOUND_EXCEEDED");
   } finally { await handle.close(); }
+}
+
+async function executableOnPath(command, path, cwd) {
+  const candidates = command.includes("/") ? [command] : (path ?? "").split(":").map(part => posix.join(part || ".", command));
+  for (const candidate of candidates) {
+    const absolute = resolve(cwd, candidate);
+    try {
+      await access(absolute, constants.X_OK);
+      if (!(await lstat(await realpath(absolute))).isFile()) continue;
+      // Go LookPath 拒绝从相对 PATH 命中命令；不在安装检查中猜另一条启动路径。
+      if (!posix.isAbsolute(candidate)) return undefined;
+      return absolute;
+    } catch (error) {
+      if (!["ENOENT", "ENOTDIR", "EACCES"].includes(error.code)) throw error;
+    }
+  }
+}
+
+async function discoveryHelperCommands(environment, cwd) {
+  const fields = new Set(["PATH", "TUNNEL_CLIENT_CODEX_APP_SERVER_COMMAND", "TUNNEL_CLIENT_CODEX_APP_SERVER_CMD",
+    "TUNNEL_CLIENT_CODEX_APP_SERVER_ARGS", "TUNNEL_CLIENT_CODEX_APP_SERVER_CWD"]);
+  const env = {};
+  for (const item of environment.split("\0")) {
+    const at = item.indexOf("="), key = item.slice(0, at);
+    if (at > 0 && fields.has(key)) env[key] = item.slice(at + 1);
+  }
+  if (env.TUNNEL_CLIENT_CODEX_APP_SERVER_COMMAND?.trim()) return { reason: "nonstandard_discovery_shell_command" };
+  const args = env.TUNNEL_CLIENT_CODEX_APP_SERVER_ARGS?.trim().split(/\s+/u).filter(Boolean) ?? [];
+  if (args.length && !same(args, ["app-server"])) return { reason: "nonstandard_discovery_app_server_arguments" };
+  const targets = { x64: ["x86_64-unknown-linux-musl", "@openai/codex-linux-x64"],
+    arm64: ["aarch64-unknown-linux-musl", "@openai/codex-linux-arm64"] };
+  const target = targets[process.arch];
+  if (!target) return { reason: "discovery_codex_platform_unconfirmed" };
+  try {
+    const command = await executableOnPath(env.TUNNEL_CLIENT_CODEX_APP_SERVER_CMD?.trim() || "codex", env.PATH, cwd);
+    const node = await executableOnPath("node", env.PATH, cwd);
+    if (!command || !node) return { reason: "discovery_codex_launcher_unresolved" };
+    const entry = await realpath(command), packageRoot = dirname(dirname(entry));
+    const metadata = JSON.parse(await readLinuxBounded(resolve(packageRoot, "package.json")));
+    if (metadata.name !== "@openai/codex" || metadata.bin?.codex !== "bin/codex.js"
+      || await realpath(resolve(packageRoot, metadata.bin.codex)) !== entry
+      || !(await readLinuxBounded(entry, 262144)).startsWith("#!/usr/bin/env node\n"))
+      return { reason: "discovery_codex_launcher_unconfirmed" };
+    let vendorRoot;
+    try { vendorRoot = resolve(dirname(createRequire(entry).resolve(target[1] + "/package.json")), "vendor"); }
+    catch (error) {
+      if (error.code !== "MODULE_NOT_FOUND") throw error;
+      vendorRoot = resolve(packageRoot, "vendor");
+    }
+    const binary = resolve(vendorRoot, target[0], "bin/codex");
+    await access(binary, constants.X_OK);
+    const workingDirectory = await realpath(resolve(cwd, env.TUNNEL_CLIENT_CODEX_APP_SERVER_CWD?.trim() || "."));
+    return {
+      wrapper: { executable: await realpath(node), args: ["node", command, "app-server"], cwd: workingDirectory },
+      native: { executable: await realpath(binary), args: [binary, "app-server"], cwd: workingDirectory },
+    };
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error.code)) return { reason: "discovery_codex_launcher_unresolved" };
+    throw error;
+  }
 }
 
 export function parseLinuxStat(text, pid, boot) {
@@ -175,6 +237,33 @@ export function createLinuxKernelReader({ procRoot = "/proc", cgroupRoot = "/sys
       check(same(row, await identity(pid, hierarchy, boot)), "PROCESS_CHANGED_DURING_READ", { pid });
       rows.push({ ...row, classification });
     }
+    const discovery = approved.find(row => row.classification === "discovery");
+    let discoveryHelperReason;
+    if (discovery && rows.some(row => row.parentPid === discovery.pid)) {
+      let helper = { reason: "discovery_command_unconfirmed" };
+      if (discovery.command) {
+        const cwd = await readlink(processFile(discovery.pid, "cwd"));
+        check(cwd === await realpath(directory), "DISCOVERY_WORKING_DIRECTORY_CHANGED", { pid: discovery.pid });
+        helper = await discoveryHelperCommands(await readLinuxBounded(processFile(discovery.pid, "environ")), cwd);
+      }
+      discoveryHelperReason = helper.reason;
+      if (helper.wrapper) {
+        const matches = async (row, expected) => {
+          if (!["pgid", "sid", "group"].every(key => row[key] === discovery[key])) return false;
+          const args = (await readLinuxBounded(processFile(row.pid, "cmdline"))).split("\0");
+          if (args.at(-1) === "") args.pop();
+          return same(args, expected.args) && await readlink(processFile(row.pid, "exe")) === expected.executable
+            && await readlink(processFile(row.pid, "cwd")) === expected.cwd;
+        };
+        // 按真实父链分两层识别，PID 顺序不承担进程先后关系；业务后代不继承资格。
+        for (const row of rows.filter(row => row.classification === "unapproved" && row.parentPid === discovery.pid)) {
+          if (!(await matches(row, helper.wrapper))) continue;
+          row.classification = "discovery_codex_launcher";
+          for (const child of rows.filter(child => child.classification === "unapproved" && child.parentPid === row.pid))
+            if (await matches(child, helper.native)) child.classification = "discovery_codex_app_server";
+        }
+      }
+    }
     const outside = await outsideGroups(hierarchy, boot, approved, deadline);
     check(same(before, await collect(hierarchy)), "CGROUP_MEMBERSHIP_CHANGED");
     for (const row of rows) {
@@ -183,7 +272,8 @@ export function createLinuxKernelReader({ procRoot = "/proc", cgroupRoot = "/sys
     }
     for (const expected of approved) check(rows.some(row => row.pid === expected.pid && row.start === expected.start), "MANAGED_PROCESS_MISSING", { pid: expected.pid });
     budget(deadline);
-    const value = { kind: hierarchy.kind, group: hierarchy.group, directories: before.directories, rows, outside };
+    const value = { kind: hierarchy.kind, group: hierarchy.group, directories: before.directories, rows, outside,
+      ...(discoveryHelperReason ? { discoveryHelperReason } : {}) };
     return { ...value, observedAt: new Date().toISOString(), digest: digest(value),
       accepted: outside.length === 0 && rows.every(row => row.classification !== "unapproved") };
   };
@@ -252,6 +342,7 @@ export async function inspectLinuxUnit(manifest, { deadline = performance.now() 
 
 function compactCensus(value) {
   return { digest: value.digest, observedAt: value.observedAt, count: value.rows.length,
+    ...(value.discoveryHelperReason ? { discoveryHelperReason: value.discoveryHelperReason } : {}),
     unapproved: value.rows.filter(row => row.classification === "unapproved").slice(0, 20).map(({ pid, start, parentPid, pgid, sid }) => ({ pid, start, parentPid, pgid, sid })),
     unapprovedCount: value.rows.filter(row => row.classification === "unapproved").length,
     outside: value.outside.slice(0, 20).map(({ pid, start, pgid }) => ({ pid, start, pgid })), outsideCount: value.outside.length };
@@ -265,12 +356,12 @@ function componentIdentity(status) {
   return active.map(({ id, pid, startedAt, restarts }) => ({ id, pid, startedAt, restarts })).sort((a, b) => a.id.localeCompare(b.id));
 }
 
-async function ingressCommandIdentities(manifest, components) {
-  const active = components.filter(row => ingressComponents.has(row.id));
+async function configuredCommandIdentities(manifest, components) {
+  const active = components.filter(row => commandComponents.has(row.id));
   if (!active.length) return new Map();
   check(typeof manifest.config === "string", "COMPONENT_COMMAND_UNCONFIRMED");
   const loaded = await loadNodeConfig(manifest.config);
-  check(loaded.node.id === manifest.nodeId && loaded.node.publicMcp?.funnel, "COMPONENT_COMMAND_UNCONFIRMED");
+  check(loaded.node.id === manifest.nodeId, "COMPONENT_COMMAND_UNCONFIRMED");
   const plans = componentPlans(loaded.node, loaded.cluster, loaded.env, {
     root: await realpath(manifest.directory), generatedDir: resolve(loaded.node.stateDir, "generated"),
     configDir: resolve(loaded.node.stateDir, "core"), release: manifest.sourceCommit,
@@ -291,7 +382,7 @@ export async function createLinuxInstallationGuard({ manifest, status, token, co
   const deadline = performance.now() + 10000;
   check(manifest.platform === "linux" && status.nodeId === manifest.nodeId && status.release === manifest.sourceCommit, "RELEASE_IDENTITY_CHANGED");
   const components = componentIdentity(status), coreComponent = components.find(row => row.id === "core");
-  const ingressCommands = await ingressCommandIdentities(manifest, components);
+  const commands = await configuredCommandIdentities(manifest, components);
   const unit = await inspectUnit(manifest, { deadline, expectedUnitText });
   const health = await http(`http://127.0.0.1:${manifest.adminPort}/healthz`, { timeoutMs: 2500 });
   check(health.pid === unit.mainPid, "MANAGER_IDENTITY_CHANGED");
@@ -303,7 +394,7 @@ export async function createLinuxInstallationGuard({ manifest, status, token, co
   for (const component of components) {
     const row = await kernel.identity(component.pid, hierarchy, boot);
     check(row.parentPid === manager.pid && row.pgid === row.pid && row.sid === row.pid && row.uids.every(value => value === uid), "COMPONENT_PARENT_CHANGED", { pid: row.pid });
-    approved.push({ ...row, classification: component.id, ...(ingressCommands.has(component.id) ? { command: ingressCommands.get(component.id) } : {}) });
+    approved.push({ ...row, classification: component.id, ...(commands.has(component.id) ? { command: commands.get(component.id) } : {}) });
   }
   const core = approved.find(row => row.pid === coreComponent.pid);
   budget(deadline);
