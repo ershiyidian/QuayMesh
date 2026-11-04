@@ -21,7 +21,7 @@ function phase(taskId:string,nodeId='a',status='waiting',tokens=1):Run {
 function index(run:Run):TaskPhaseIndex {
   return {...run,tokens:run.usage.total,changed:Boolean(run.diff),currentPhase:run.currentPhase!==false,actionableInterruption:run.actionableInterruption===true};
 }
-function fixture(runs:Run[],tasks?:TaskLifecycle[]) {
+function fixture(runs:Run[],tasks?:TaskLifecycle[],replicas:Record<string,TaskLifecycle[]>={}) {
   const nodes=[{id:'a',nickname:'A',online:true,capabilities:{coordinator:true}},{id:'b',nickname:'B',online:true},{id:'c',nickname:'C',online:false}];
   const calls:Array<{node:string;path:string}>=[];
   const usageIds=new Set<string>();
@@ -34,7 +34,7 @@ function fixture(runs:Run[],tasks?:TaskLifecycle[]) {
     const own=runs.filter(run=>run.nodeId===node&&matches(run));
     const lifecycles=tasks??[...new Set(runs.map(run=>run.taskId!))].map(id=>lifecycle(id,[...new Set(runs.filter(run=>run.taskId===id).map(run=>run.nodeId))]));
     const titles={items:[{id:'session',title:'conversation',revision:1,lastActivityAt:Date.now()}],
-      tasks:node==='a'?lifecycles.filter(task=>matches({taskId:task.id,sessionId:task.sessionId})):[],authoritative:node==='a'};
+      tasks:(node==='a'?lifecycles:replicas[node]??[]).filter(task=>matches({taskId:task.id,sessionId:task.sessionId})),authoritative:node==='a'};
     let body:unknown;
     if(['/workbench/task-index','/workbench/task-index-scoped'].includes(url.pathname))body={items:own.map(index),observedAt:Date.now()};
     else if(['/workbench/session-titles','/workbench/session-titles-scoped'].includes(url.pathname))body=titles;
@@ -191,6 +191,55 @@ test('a selected Task without authority or with a missing member remains incompl
   const partial=await missing.feed.runs({project,days:'0'});
   assert.equal(partial.coverage.tasks,false);assert.equal(partial.complete,false);
   assert.equal(partial.sources.find(source=>source.nodeId==='removed-node')?.state,'offline');
+});
+
+test('global coverage and pagination complete while unregistered worker records retain history without a confirmed lifecycle',async()=>{
+  const at=Date.now();
+  const closed={...lifecycle('closed'),state:'closed',resultStatus:'completed',finishedAt:at};
+  const orphanClosed={...lifecycle('orphan-closed',['b']),nodeId:'b',state:'closed',resultStatus:'completed',finishedAt:at};
+  const orphanEmpty={...lifecycle('orphan-empty',['b']),nodeId:'b'};
+  const orphanLive={...lifecycle('orphan-live',['b']),nodeId:'b'};
+  const orphanPhase={...phase('orphan-closed','b','completed'),requestState:'closed',resultStatus:'completed',finishedAt:at,
+    taskRevision:42,finalization:{status:'failed' as const,requestedAt:at,error:'old worker finalization'}};
+  const f=fixture([phase('open'),{...phase('closed','a','completed'),finishedAt:at},orphanPhase,phase('orphan-live','b','running')],
+    [lifecycle('open'),closed],{b:[orphanClosed,orphanEmpty,orphanLive]});
+  f.nodes[2]!.online=true;
+  const overview=await f.feed.overview('UTC');
+  assert.equal(overview.complete,true);assert.equal(overview.coverage.tasks,true);assert.equal(overview.missingAuthorityCount,3);
+  assert.equal(overview.currentCount,1);assert.equal(overview.olderOpenCount,0);assert.equal(overview.completedToday,1);
+  assert.deepEqual(overview.current.map(task=>task.taskId),['open']);
+  assert.deepEqual(overview.recent.map(task=>task.taskId),['closed']);
+  assert.equal(overview.activeCount,1);assert.equal(overview.active[0]?.taskId,'orphan-live');
+  assert.equal(overview.active[0]?.executionStatus,'running');
+  const page=await f.feed.runs({days:'0',limit:'100'});
+  assert.equal(page.complete,true);assert.equal(page.coverage.tasks,true);assert.equal(page.total,5);
+  assert.equal(page.missingAuthorityCount,3);assert.equal(page.counts.scopeOpen,1);assert.equal(page.counts.scopeClosed,1);
+  assert.equal(page.items.find(task=>task.taskId==='open')?.actions.complete,true);
+  assert.equal(page.items.find(task=>task.taskId==='closed')?.actions.review,true);
+  for(const id of ['orphan-closed','orphan-empty','orphan-live']){
+    const task=page.items.find(item=>item.taskId===id)!;
+    assert.ok(task);assert.equal(task.requestState,undefined);assert.equal(task.resultStatus,null);
+    assert.equal(task.finalization,null);assert.equal(task.taskRevision,undefined);
+    assert.equal(task.actions.complete,false);assert.equal(task.actions.review,false);
+    assert.ok(task.workspaces?.some(workspace=>workspace.nodeId==='b'));
+    const selected=await f.feed.taskRuns(id);
+    assert.equal(selected.complete,false);assert.equal(selected.task?.requestState,undefined);
+    assert.equal(selected.task?.actions.complete,false);assert.equal(selected.task?.actions.review,false);
+  }
+  const history=page.items.find(task=>task.taskId==='orphan-closed')!;
+  assert.equal(history.executionStatus,'unknown');assert.equal(history.phaseExecutionStatus,'completed');
+  assert.deepEqual(history.phaseRefs,[orphanPhase.id]);assert.equal(history.finishedAt,at);
+  const empty=page.items.find(task=>task.taskId==='orphan-empty')!;
+  assert.equal(empty.executionStatus,'unknown');assert.deepEqual(empty.phaseRefs,[]);assert.equal(empty.finishedAt,null);
+  const first=await f.feed.runs({days:'0',limit:'2'});
+  assert.ok(first.nextCursor);
+  const second=await f.feed.runs({days:'0',limit:'2',cursor:first.nextCursor});
+  assert.equal(second.total,5);assert.equal(second.items.length,2);assert.ok(second.nextCursor);
+  assert.ok(second.items.every(task=>!first.items.some(previous=>previous.id===task.id)));
+  const scoped=await f.feed.runs({project:workspaceHandle('b','project'),days:'0'});
+  assert.equal(scoped.complete,false);assert.equal(scoped.coverage.tasks,false);
+  f.nodes[2]!.online=false;f.feed.invalidate();
+  assert.equal((await f.feed.overview('UTC')).coverage.tasks,false);
 });
 
 test('navigation groups use request execution facts while review remains an independent facet',async()=>{

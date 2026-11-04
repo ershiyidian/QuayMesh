@@ -25,7 +25,7 @@ interface CachedResource { data: unknown; loadedAt: number; error: string | null
 interface PageSnapshot { keys: string[]; counts: Record<string, number>; at: number; query: string; expiresAt: number }
 interface NodeResource<T> { source: SourceState; data: T | null }
 type NodeIdentity = { id: string; nickname: string; online: boolean };
-interface TaskTitles {map:Map<string,string>;tasks:Map<string,TaskLifecycle>;sources?:SourceState[]}
+interface TaskTitles {map:Map<string,string>;tasks:Map<string,TaskLifecycle>;authority:ReadonlySet<string>;sources?:SourceState[]}
 const SOURCE_FRESHNESS_MS = 30_000;
 
 export class WorkbenchFeed {
@@ -190,11 +190,29 @@ export class WorkbenchFeed {
   }
 
   private taskIndex(phases: Parameters<typeof aggregateTaskIndex>[0], titles:TaskTitles, sources:SourceState[]) {
-    return this.completeTaskIndex(aggregateTaskIndex(observeSourceStates(phases,sources)),titles,sources,taskOnlyIndex);
+    return this.completeTaskIndex(aggregateTaskIndex(this.observeTaskPhases(phases,titles,sources)),titles,sources,taskOnlyIndex);
   }
 
   private taskStateIndex(phases:Parameters<typeof aggregateTaskStateIndex>[0],titles:TaskTitles,sources:SourceState[]) {
-    return this.completeTaskIndex(aggregateTaskStateIndex(observeSourceStates(phases,sources)),titles,sources,taskOnlyStateIndex);
+    return this.completeTaskIndex(aggregateTaskStateIndex(this.observeTaskPhases(phases,titles,sources)),titles,sources,taskOnlyStateIndex);
+  }
+
+  private observeTaskPhases<T extends {taskId:string|null;nodeId:string;executionStatus:string;executionObservedAt?:number|null}>(phases:T[],titles:TaskTitles,sources:SourceState[]) {
+    // 在聚合前去掉未经确认的生命周期，避免旧交付状态改变真实阶段的执行结果。
+    return observeSourceStates(phases.map(phase=>phase.taskId&&!titles.authority.has(phase.taskId)
+      ?{...phase,requestState:undefined,resultStatus:null,finalization:null,taskRevision:undefined}:phase),sources);
+  }
+
+  private confirmedTask<T extends TaskStateIndex>(task:T,titles:TaskTitles):T {
+    const lifecycle=titles.tasks.get(task.taskId??'');
+    if(!task.taskId||titles.authority.has(task.taskId))return withTaskMembership(withTaskLifecycle(task,lifecycle),lifecycle);
+    // 节点副本和阶段都可能携带旧生命周期；保留执行记录，单独等待权威登记。
+    return {...withTaskMembership(task,lifecycle),title:lifecycle?.title??task.title,titleSource:lifecycle?.titleSource??task.titleSource,
+      requestState:undefined,resultStatus:null,taskRevision:undefined,finalization:null,
+      executionStatus:activeExecution(task.executionStatus)?task.executionStatus:'unknown',
+      phaseExecutionStatus:task.phaseRefs.length?task.phaseExecutionStatus??task.executionStatus:undefined,
+      finishedAt:task.phaseRefs.length?task.finishedAt:null,
+      reason:'任务记录尚未关联到任务目录，节点上的执行历史已保留'};
   }
 
   private completeTaskIndex<T extends TaskStateIndex>(initial:T[],titles:TaskTitles,sources:SourceState[],taskOnly:(task:TaskLifecycle)=>T):T[] {
@@ -210,8 +228,8 @@ export class WorkbenchFeed {
     })),titles.sources).map(source=>[source.nodeId,source])) : null;
     return tasks.map(task=>{
       const lifecycle=titles.tasks.get(task.taskId ?? '');
-      const resolved=withTaskMembership(withTaskLifecycle(task,lifecycle),lifecycle);
-      if(!authorityObservations||!lifecycle?.nodeId)return resolved;
+      const resolved=this.confirmedTask(task,titles);
+      if(!authorityObservations||!lifecycle?.nodeId||!titles.authority.has(lifecycle.id))return resolved;
       const authority=authorityObservations.get(lifecycle.nodeId);
       const observedAt=!task.phaseRefs.length ? authority?.observedAt ?? null
         : resolved.observedAt == null || authority?.observedAt == null ? null : Math.min(resolved.observedAt,authority.observedAt);
@@ -268,6 +286,7 @@ export class WorkbenchFeed {
     })).toString('base64url');
     const taskCoverage=index.complete&&titles.complete&&(!usage||usage.complete);
     return {projection,items,total:snapshot.keys.length,counts,offset,limit,snapshotAt:snapshot.at,coverage:{tasks:taskCoverage,details:summaries.complete},
+      missingAuthorityCount:titles.missingAuthorityCount,
       nextCursor:taskCoverage&&items.length&&offset+keys.length<snapshot.keys.length?cursor(items.at(-1)!,offset+keys.length,'next'):null,
       previousCursor:items.length&&offset>0?cursor(items[0],Math.max(0,offset-limit),'previous'):null,
       sources:mergeSources(mergeSources(mergeSources(index.sources,summaries.sources),titles.sources),usage?.sources??[]),
@@ -314,10 +333,10 @@ export class WorkbenchFeed {
     const extra=await this.collect(path,local,{},1000,additional,fresh,deadline);
     const state={...initial,values:[...initial.values,...extra.values],sources:[...initial.sources,...extra.sources],complete:initial.complete&&extra.complete};
     const merged=merge(state);
-    // A worker replica can supply useful provisional rows, but cannot prove
-    // that a Task is closed, complete, or has no other registered members.
-    const titles={...merged,complete:merged.complete&&state.values.some(value=>value.authoritative)
-      &&[...taskIds].every(id=>merged.authority.has(id))};
+    const missingAuthorityCount=[...taskIds].filter(id=>!merged.authority.has(id)).length;
+    // 全局读取已覆盖所有来源，历史登记缺项单独展示；局部读取仍须由权威登记确认成员范围。
+    const titles={...merged,missingAuthorityCount,complete:merged.complete&&state.values.some(value=>value.authoritative)
+      &&(!scoped||missingAuthorityCount===0)};
     if(query.changed||query.sort==='tokens'){
       const index=await this.collect('/workbench/task-index',()=>readLocalTaskIndex(this.config),{},1000,required,fresh,deadline);
       return {projection:'full' as const,index,titles,tasks:this.taskIndex(index.values.flatMap(value=>value.items),titles,index.sources)};
@@ -344,7 +363,7 @@ export class WorkbenchFeed {
       phaseRefs:task.phaseRefs,currentPhaseRefs:task.currentPhaseRefs,
       observedAt:task.observedAt===undefined ? run.observedAt : task.observedAt,
       stale:task.stale===true||run.stale===true,
-      actions:{...run.actions,complete:canComplete,review:task.acceptanceStatus==='pending'&&run.actions.review}};
+      actions:{...run.actions,complete:canComplete,review:(!task.taskId||Boolean(task.requestState))&&task.acceptanceStatus==='pending'&&run.actions.review}};
   }
 
   async projectConversations(data:ReturnType<LocalActions['sessions']>,fresh=false) {
@@ -489,11 +508,12 @@ export class WorkbenchFeed {
     const complete=(authoritative?required.size>0&&[...required].every(node=>sources.some(source=>source.nodeId===node&&source.online&&source.observedAt!==null
       &&['ready','refreshing'].includes(source.state)&&!source.error))
       :!identity.taskId&&index.complete&&titles.complete)&&summaries.complete;
-    const runs=applyRunTitles(observeSourceStates(summaries.values.filter(matches),sources),titles.map).map(run=>withTaskLifecycle(run,titles.tasks.get(run.taskId??'')));
-    const indexed=aggregateTaskIndex(observeSourceStates(phases,sources));
+    const runs=applyRunTitles(this.observeTaskPhases(summaries.values.filter(matches),titles,sources),titles.map)
+      .map(run=>withTaskLifecycle(run,titles.authority.has(run.taskId??'')?titles.tasks.get(run.taskId??''):undefined));
+    const indexed=aggregateTaskIndex(this.observeTaskPhases(phases,titles,sources));
     const seed=lifecycle?indexed.find(task=>task.taskId===lifecycle.id)??taskOnlyIndex(lifecycle)
       :identity.sessionId?indexed.find(task=>task.taskId===null&&task.sessionId===identity.sessionId)??indexed[0]:indexed[0];
-    const task=seed?this.resolvedRun(withTaskMembership(withTaskLifecycle(seed,lifecycle),lifecycle),
+    const task=seed?this.resolvedRun(this.confirmedTask(seed,titles),
       aggregateTasks(runs).find(run=>taskKey(run)===seed.key)):undefined;
     return {runs,task,lifecycle,complete,sources,missingNodes:[...required].filter(node=>!sources.some(source=>source.nodeId===node&&source.online&&!source.error&&source.observedAt!==null))};
   }
@@ -547,7 +567,7 @@ export class WorkbenchFeed {
       olderOpenCount:taskCoverage ? taskGroups.olderOpen.length : null,
       knownCounts:{active:activeIndex.length,current:taskGroups.current.length,olderOpen:taskGroups.olderOpen.length,
         waiting:waitingIndex.length,attention:attentionIndex.length,completedToday:taskGroups.completedToday},
-      coverage:{tasks:taskCoverage,usage:false,changes:false},
+      coverage:{tasks:taskCoverage,usage:false,changes:false},missingAuthorityCount:titles.missingAuthorityCount,
       // Already-open Console bundles still validate these former overview
       // fields. Preserve their shape without doing unrelated usage queries.
       todayUsage:{available:false,total:null,input:null,cached:null,output:null,reasoning:null},

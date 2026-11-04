@@ -644,6 +644,39 @@ test('首页只观察任务来源，命令面板按需读取完整工作区目�
   expect(usageRequests).toHaveLength(0);
 });
 
+test('历史登记缺项独立提示，已读取统计和任务记录仍可使用',async({page})=>{
+  await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
+  const snapshot=await f.get('overview?fresh=1'),records=await f.get('runs?days=0&limit=100');
+  snapshot.missingAuthorityCount=1;snapshot.complete=true;snapshot.coverage.tasks=true;
+  snapshot.currentCount=snapshot.current.length;snapshot.olderOpen=[];snapshot.olderOpenCount=80;
+  snapshot.taskSources=snapshot.taskSources.map((source:any)=>({...source,state:'ready',stale:false,observedAt:Date.now(),error:null}));
+  const orphan={...records.items[0],id:'qmtask:unregistered-record',localId:'unregistered-record',taskId:'unregistered-record',
+    title:'保留的历史任务记录',requestState:undefined,resultStatus:null,finalization:null,taskRevision:undefined,
+    executionStatus:'unknown',phaseExecutionStatus:'completed',actions:{interrupt:false,resume:false,review:false,revert:false,complete:false}};
+  records.items.push(orphan);records.total=records.items.length;records.counts.all=records.total;records.counts.scopeAll=records.total;
+  records.missingAuthorityCount=1;records.complete=true;records.coverage.tasks=true;
+  await page.route(url=>url.pathname.endsWith('/api/v4/overview'),route=>route.fulfill({json:snapshot}));
+  await page.route(url=>url.pathname.endsWith('/api/v4/runs'),route=>route.fulfill({json:records}));
+  await login(page);
+  await expect(page.locator('[data-task-record-issues]')).toContainText('1 条记录尚未关联到任务目录');
+  await expect(page.locator('.overview-summary>div strong')).toHaveText(String(snapshot.currentCount));
+  await expect(page.locator('.overview-summary')).not.toContainText('项已读取');
+  await expect(page.locator('[data-key=overview-current-panel]')).not.toContainText('完整数量待更新');
+  await expect(page.locator('[data-key=overview-current-panel]')).toContainText('首页展示');
+  await expect(page.locator('#global-notice')).not.toContainText('更新延迟');
+  await page.screenshot({path:screenshots+'/overview-record-issues.png',fullPage:true});
+  await page.setViewportSize({width:390,height:844});
+  expect(await page.locator('#view').evaluate(el=>el.scrollWidth<=el.clientWidth)).toBe(true);
+  await page.screenshot({path:screenshots+'/overview-record-issues-narrow.png',fullPage:true});
+  await page.getByRole('button',{name:'查看任务记录',exact:true}).click();
+  await expect(page.locator('[data-task-record-issues]')).toContainText('任务记录需核对');
+  const row=page.locator('.run-table tbody tr').filter({hasText:orphan.title});
+  await expect(row).toContainText('任务归属待核对');
+  await expect(row).not.toContainText('已完成');
+  await row.getByRole('checkbox').check();
+  await expect(page.locator('[data-action=bulk-accept]')).toBeDisabled();
+});
+
 test('当前任务失效后保留记录，空态紧凑且今日完成按Task结果查询',async({page})=>{
   await page.addInitScript(()=>localStorage.setItem('quaymesh.workbench.v5',JSON.stringify({poll:0})));
   const snapshot=await f.get('overview?fresh=1'),current=snapshot.current[0],observedAt=Date.now()-60_000;
