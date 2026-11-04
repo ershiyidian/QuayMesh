@@ -676,6 +676,10 @@ test('历史登记缺项独立提示，已读取统计和任务记录仍可使�
   await notice.locator('summary>.small').click();
   await expect(notice.locator('p')).not.toBeVisible();
   await expect(page.locator('.overview-summary>div strong')).toHaveText(String(snapshot.currentCount));
+  await expect(page.locator('.overview-summary>div>span')).toHaveText('当前任务');
+  await expect(page.locator('[data-key=overview-current-panel]>.panel-head .badge')).toHaveText(String(snapshot.currentCount));
+  await expect(page.locator('#overview-older-open>summary .badge')).toHaveText('80');
+  await expect(page.locator('#sidebar [data-view=tasks] .nav-count')).toHaveText(String(snapshot.currentCount));
   await expect(page.locator('.overview-summary')).not.toContainText('项已读取');
   await expect(page.locator('[data-key=overview-current-panel]')).not.toContainText('完整数量待更新');
   await expect(page.getByRole('button',{name:'查看全部当前任务',exact:true})).toBeVisible();

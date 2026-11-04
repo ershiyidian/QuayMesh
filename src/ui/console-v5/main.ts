@@ -220,7 +220,11 @@ function overviewTaskGroups(value: Overview) {
     // The overview arrays are capped. Recount only when the entire open set was read.
     const complete = Boolean(value.coverage.tasks && value.currentCount === value.current.length
         && value.olderOpenCount === value.olderOpen.length && rows.size === value.current.length + value.olderOpen.length);
-    return {current, olderOpen, complete, currentCount:complete ? current.length : value.currentCount,
+    const regrouped = value.current.some(run => !current.some(row => row.id === run.id))
+        || value.olderOpen.some(run => !olderOpen.some(row => row.id === run.id));
+    const countsCurrent = value.coverage.tasks && overviewObservation().current
+        && !sourceWarnings([observedResourceEntry(overviewPath())]).length && (complete || !regrouped);
+    return {current, olderOpen, complete, countsCurrent, currentCount:complete ? current.length : value.currentCount,
         olderOpenCount:complete ? olderOpen.length : value.olderOpenCount};
 }
 function taskPageProjection(page?: RunPage) {
@@ -444,7 +448,7 @@ function chrome() {
     const observationExpired = activePaths.has(overviewPath()) && taskObservationWarnings.length > 0 && !health.errors && !health.stale;
     const connectionLabel = health.errors || health.stale || observationExpired ? (health.confirmedAt ? '页面读取 ' + tm(health.confirmedAt) : '等待数据') : health.label;
     const groups = ov ? overviewTaskGroups(ov) : undefined;
-    const currentCount = overviewObservation().current && !taskObservationWarnings.length && groups?.complete ? groups.currentCount : null;
+    const currentCount = groups?.countsCurrent ? groups.currentCount : null;
     const nav = NAV.map(([v, t, i], index) => `${index === 4 ? '<div class="nav-label">基础设施</div>' : ''}${index === 8 ? '<div class="nav-divider"></div>' : ''}<button type="button" class="nav-item ${route.view === v ? 'active' : ''}" data-action="nav" data-view="${v}" ${route.view === v ? 'aria-current="page"' : ''} title="${t}">${icon(i, 16)}<span class="label">${t}</span>${v === 'tasks' && currentCount ? `<span class="nav-count" title="${currentCount} 项当前任务">${currentCount}</span>` : ''}</button>`).join('');
     updateHTML($('#sidebar'), `<div class="brand">${brand()}<span class="brand-text">QuayMesh</span>${ib('panel', 'sidebar', '折叠侧栏')}</div><div class="nav-label">工作台</div><nav aria-label="主导航">${nav}</nav><div class="sidebar-bottom"><button class="nav-item" data-action="palette" title="搜索与命令">${icon('terminal')}<span class="label">命令面板</span><kbd class="nav-count">${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'} K</kbd></button><div class="profile"><span class="avatar">W</span><div class="profile-text"><b>${esc(API.session?.user?.name || 'Owner')}</b><small>${canWrite() ? '管理员' : '只读'}</small></div>${ib('settings', 'nav', '设置', 'data-view="settings"')}</div></div>`);
     updateHTML($('#topbar'), `<button class="collapsed-toggle icon-btn" data-action="sidebar" aria-label="展开侧栏">${icon('panel')}</button><div class="breadcrumb"><span class="workspace-label">个人工作区</span><span class="slash">/</span><b>${esc(titleOf(route.view))}</b></div><button class="top-search" data-action="palette" aria-label="搜索与命令面板">${icon('search', 14)}<span>搜索任务或命令</span><kbd>${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'} K</kbd></button><button class="demo-tag" data-action="diagnostics">诊断</button>${desktopActions()}${ib('refresh', 'refresh', refreshInFlight ? '重新发起当前页面读取' : '刷新当前页面')}${ib(document.documentElement.dataset.theme === 'dark' ? 'sun' : 'moon', 'theme', '切换主题', '', 'theme-top')}`);
@@ -586,7 +590,7 @@ function overviewPage() {
     const summaryValue = (value: number | null | undefined, known: number | undefined) => value == null
         && typeof known === 'number' && (known > 0 || hasTaskObservation)
         ? `<strong>${fmt(known)}</strong><span>项已读取</span>` : `<strong>${shown(value)}</strong>`;
-    const groupCount = (value: number | null | undefined) => (groups.complete || value == null ? '' : '上次读取 ') + shown(value);
+    const groupCount = (value: number | null | undefined) => (groups.countsCurrent || value == null ? '' : '上次读取 ') + shown(value);
     const compactEmpty = (title: string) => `<div class="overview-empty">${icon('tasks',18)}<p>${esc(title)}</p></div>`;
     const currentEmpty = groups.complete || o.coverage.tasks && groups.currentCount === 0 ? '暂无当前任务'
         : o.coverage.tasks ? '本页暂无仍符合条件的记录，可查看全部当前任务' : '已读记录中暂无当前任务，完整结果待更新';
@@ -598,7 +602,9 @@ function overviewPage() {
     const fleetBody = f ? `<div class="fleet-labels"><span>节点</span><span>CPU</span><span>内存</span></div>${f.nodes.map(n => `<div class="fleet-row" data-key="fleet-${esc(n.id)}"><button class="run-title" data-action="node" data-id="${esc(n.id)}">${nodeTag(n.id)}<span class="small muted fleet-description">${n.id === f.gatewayId ? fleetObservation().current ? '当前出口' : '上次出口' : n.online ? n.gpuSampled === false ? 'GPU 尚未采集' : n.gpus.length + ' GPU' : '离线'}</span></button><div class="reading">${n.online && n.cpu != null ? fmt(n.cpu) + '%' : '—'}${meter(n.online ? n.cpu : null)}</div><div class="reading">${n.online && percent(n.memoryUsed,n.memoryTotal) !== null ? Math.round(percent(n.memoryUsed,n.memoryTotal)!) + '%' : '—'}${meter(n.online ? percent(n.memoryUsed,n.memoryTotal) : null)}</div></div>`).join('')}` : resourceState('fleet/status');
     const machines = panel('机器', fleetBody, f ? `<button class="link-btn small" data-action="nav" data-view="machines">${fleetOnlineLabel()} ${icon('chevron', 12)}</button>` : '', '', 'overview-machines-panel');
     const gateway = f ? panel('连接', `<div class="connection-grid"><span class="muted">入口</span><span>${esc(node(f.ingressNodeId)?.short || '尚未配置')}</span>${f.ingressNodeId ? badge((fleetObservation().current ? '' : '上次确认') + (node(f.ingressNodeId)?.online ? '在线' : '未连接'), fleetObservation().current ? node(f.ingressNodeId)?.online ? 'good' : 'warn' : '') : badge('入口未配置')}<span class="muted">出网</span><span>${esc(node(f.gatewayId)?.short || '—')} · ${esc(node(f.gatewayId)?.egress?.region || '—')}</span><span class="num small">${node(f.gatewayId)?.egress?.latency ?? '—'} ms</span></div><div class="endpoint"><code>${esc(f.mcpUrl || f.ingressLabel || (f.ingressNodeId ? '由该节点的托管 MCP 隧道提供' : '尚未配置 MCP 入口'))}</code>${ib('copy', 'copy', '复制 MCP 地址', `data-text="${esc(f.mcpUrl || '')}" ${f.mcpUrl ? '' : 'disabled'}`)}</div>`, '', '', 'overview-connection-panel') : '';
-    const summary = `<section class="overview-summary" aria-label="任务统计"><div><span>当前任务${groups.complete || groups.currentCount == null ? '' : ' · <span class="overview-observation">上次读取</span>'}</span>${summaryValue(groups.currentCount,o.knownCounts.current)}</div><button type="button" data-action="attention-queue"><span>需要处理</span>${summaryValue(o.attentionCount,o.knownCounts.attention)}</button><button type="button" data-action="completed-queue"><span>今日完成</span>${summaryValue(o.completedToday,o.knownCounts.completedToday)}</button></section>`;
+    const countTimes = o.taskSources.flatMap(source => source.observedAt === null ? [] : [source.observedAt]);
+    const countTitle = countTimes.length ? `任务记录读取于 ${fullTime(Math.min(...countTimes))}` : '任务记录尚未读取完整';
+    const summary = `<section class="overview-summary" aria-label="任务统计"><div title="${esc(countTitle)}"><span>当前任务${groups.countsCurrent || groups.currentCount == null ? '' : ' · <span class="overview-observation">上次读取</span>'}</span>${summaryValue(groups.currentCount,o.knownCounts.current)}</div><button type="button" data-action="attention-queue"><span>需要处理</span>${summaryValue(o.attentionCount,o.knownCounts.attention)}</button><button type="button" data-action="completed-queue"><span>今日完成</span>${summaryValue(o.completedToday,o.knownCounts.completedToday)}</button></section>`;
     return `<div class="page overview-page">${pageHead('任务总览', day(Date.now()), btn(icon('tasks',14)+'全部任务','all-task-queue','','small'))}${staleNotice(overviewPath())}${summary}${missingTaskAuthorityNotice(o.coverage.tasks?o.missingAuthorityCount:0)}<div class="overview-grid"><div class="stack overview-primary">${current}${older}${recent}</div><aside class="stack overview-secondary" aria-label="待办与节点">${attention}${machines}${gateway}</aside></div></div>`;
 }
 function taskRow(r: Run) {
