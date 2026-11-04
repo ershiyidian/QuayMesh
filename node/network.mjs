@@ -17,6 +17,39 @@ export async function connectSocket(host, port, { socksUrl, timeoutMs = 8000, si
       command: "connect", destination: { host, port }, timeout: timeoutMs,
     });
     socket = connection.socket;
+    // socks 延迟重放握手附带的数据；先放回可读缓冲，再交给 HTTP/2 等原生消费者。
+    const chunks = [];
+    const collect = chunk => chunks.push(Buffer.from(chunk));
+    let immediate, failed, closed, aborted;
+    try {
+      await new Promise((resolve, reject) => {
+        failed = reject;
+        closed = () => reject(new Error("SOCKS 连接在交接前关闭"));
+        aborted = () => reject(signal.reason);
+        socket.on("data", collect);
+        socket.once("error", failed);
+        socket.once("close", closed);
+        socket.once("end", closed);
+        signal?.addEventListener("abort", aborted, { once: true });
+        immediate = setImmediate(resolve);
+        if (socket.destroyed || socket.readableEnded) closed();
+        else if (signal?.aborted) aborted();
+      });
+      signal?.throwIfAborted();
+      if (socket.destroyed || socket.readableEnded) throw new Error("SOCKS 连接在交接前关闭");
+    } catch (error) {
+      socket.destroy();
+      throw error;
+    } finally {
+      clearImmediate(immediate);
+      socket.pause();
+      socket.off("data", collect);
+      socket.off("error", failed);
+      socket.off("close", closed);
+      socket.off("end", closed);
+      signal?.removeEventListener("abort", aborted);
+    }
+    for (let index = chunks.length - 1; index >= 0; index--) socket.unshift(chunks[index]);
   } else {
     socket = net.connect({ host, port });
     const timer = setTimeout(() => socket.destroy(new Error(`连接 ${host}:${port} 超时`)), timeoutMs);
@@ -39,7 +72,7 @@ export function createAgent(url, { socksUrl, timeoutMs = 8000 } = {}) {
     const host = options.hostname || options.host;
     const port = Number(options.port || (secure ? 443 : 80));
     void connectSocket(host, port, { socksUrl, timeoutMs }).then((socket) => {
-      if (!secure) { callback(null, socket); return; }
+      if (!secure) { callback(null, socket); socket.resume(); return; }
       const encrypted = tls.connect({ socket, servername: net.isIP(host) ? undefined : host,
         rejectUnauthorized: true, ALPNProtocols: ["http/1.1"] });
       encrypted.once("secureConnect", () => callback(null, encrypted));
