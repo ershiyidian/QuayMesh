@@ -188,11 +188,12 @@ async function registeredService(manifest,start) {
       ...(manifest.desktopUi?["-DesktopUi"]:[]),...(start?["-Start"]:[])]);
   }
 }
-async function stopService(manifest) {
-  if (manifest.platform === "linux") await run("systemctl",[...(manifest.user?["--user"]:[]),"stop",installationServiceName(manifest)]);
+export async function stopService(manifest,{runCommand=run}={}) {
+  if (manifest.platform === "linux") await runCommand("systemctl",[...(manifest.user?["--user"]:[]),"stop",installationServiceName(manifest)]);
   else {
-    if (manifest.desktopUi) await run(join(manifest.directory,"components","windows-x64","QuayMesh.Host.exe"),["--exit"]);
-    await run("powershell.exe",["-NoProfile","-ExecutionPolicy","Bypass","-File",join(manifest.directory,"node","windows-stop.ps1")]);
+    await runCommand("powershell.exe",["-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File",
+      fileURLToPath(new URL("./windows-stop.ps1",import.meta.url)),
+      ...(manifest.desktopUi?["-HostExecutable",join(manifest.directory,"components","windows-x64","QuayMesh.Host.exe")]:[])]);
   }
 }
 async function runningStatus(port) {
@@ -380,11 +381,11 @@ export function databaseMigration(manifest,{apply=false,timeoutMs=180000,killGra
  * recovered automatically; a previous binary requires an explicit new review. */
 export async function enforceInstallationRollbackBoundary({manifest,previous,transition,snapshot,current,error,historyPolicy="prove"}) {
   const policy=installationHistoryPolicy(historyPolicy);
-  const schemaChanged=snapshot&&current.version!==snapshot.version;
+  const schemaChanged=snapshot&&current&&current.version!==snapshot.version;
   if(!schemaChanged&&policy!=="preserve")return;
   await writeJson(join(manifest.stateDir,"installation-transition.json"),{
     ...transition,sourceCommit:manifest.sourceCommit,previousCommit:previous?.sourceCommit??null,
-    database:snapshot,currentDatabaseVersion:current.version,phase:"recovery_required",error:String(error),
+    database:snapshot,...(current?{currentDatabaseVersion:current.version}:{}),phase:"recovery_required",error:String(error),
   });
   if(schemaChanged)
     throw new Error(`数据库已从 ${snapshot.version} 升级到 ${current.version}，保留新版数据${snapshot.backup?`和备份 ${snapshot.backup}`:"（本次未创建备份）"}；旧版本无法自动启动，请完成升级恢复。`);
@@ -506,21 +507,24 @@ export async function activateInstallation(manifestFile,{timeoutMs=180000,mainte
         retainedClaims:(externalLease.lease.claims??[]).length}: {})};
   } catch (error) {
     if(activationCommitted)throw new Error("发行已经验证并提交，恢复准入尚待确认；保留当前服务，请查询管理端状态。",{cause:error});
+    if(historyPolicy==="preserve"&&(stopAttempted||stopped))
+      await enforceInstallationRollbackBoundary({manifest,previous,transition,snapshot,error,historyPolicy});
     if (stopAttempted || stopped || (!running && snapshot)) {
       try {
         const active = await runningStatus(manifest.adminPort);
         if (active?.nodeId === manifest.nodeId) {
-          let stopManifest=manifest;
+          const stopManifest=active.release===manifest.sourceCommit?manifest:
+            active.release===previous?.sourceCommit?previous:null;
+          if(!stopManifest){
+            if(manifest.platform==="linux")throw stopDomainError("ROLLBACK_RELEASE_UNCONFIRMED");
+            throw new Error("Windows active release is not covered by the installation rollback records.");
+          }
           if(manifest.platform==="linux"){
             // Rollback is another real stop. Neither the previous generation's
             // census nor its external lease can authorize stopping a new one.
-            const activeManifest=active.release===manifest.sourceCommit?manifest:
-              active.release===previous?.sourceCommit?previous:null;
-            if(!activeManifest)throw stopDomainError("ROLLBACK_RELEASE_UNCONFIRMED");
-            const rollbackGuard=await createLinuxInstallationGuard({manifest:activeManifest,status:active,token,corePort:loaded.node.corePort,
-              expectedUnitText:systemdUnit({...activeManifest,configFile:activeManifest.config})});
+            const rollbackGuard=await createLinuxInstallationGuard({manifest:stopManifest,status:active,token,corePort:loaded.node.corePort,
+              expectedUnitText:systemdUnit({...stopManifest,configFile:stopManifest.config})});
             await rollbackGuard.assertHeld("rollback_before_stop",{retainedClaims:externalLease?.lease.claims?.length??0});
-            stopManifest=activeManifest;
           }
           await stopService(stopManifest);
         }
