@@ -8,7 +8,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
-import { createPublicMcpIngress } from "../public-mcp.mjs";
+import { createPublicMcpIngress, PUBLIC_MCP_PROBE_USER_AGENT } from "../public-mcp.mjs";
+import { QuayMeshNode } from "../app.mjs";
 
 const entry = fileURLToPath(new URL("../public-mcp.mjs", import.meta.url));
 
@@ -222,6 +223,7 @@ test("正式组件与旧配置均可启动真实入口，并通过 IPC 上报请
     const { base, child, observed } = await startCli(t, [...args, "--port", "0"]);
     const meta = await (await fetch(base+"/.well-known/oauth-protected-resource")).json();
     assert.equal(meta.resource, "https://gemini.example");
+    const startedAt = Date.now();
     const response = await fetch(base+"/mcp?state=query-private", { method: "POST",
       headers: { authorization: "Bearer header-private", "user-agent": "Google" }, body: "body-private" });
     assert.deepEqual(await response.json(), { ok: true });
@@ -229,6 +231,10 @@ test("正式组件与旧配置均可启动真实入口，并通过 IPC 上报请
     assert.equal(event.outcome, "completed");
     assert.equal(event.status, 200);
     assert.equal(event.agent, "Google");
+    assert.ok(Date.parse(event.startedAt) >= startedAt);
+    assert.ok(Date.parse(event.finishedAt) >= Date.parse(event.startedAt));
+    assert.ok(Date.parse(event.finishedAt) <= Date.now());
+    assert.ok(event.ms >= 0);
     assert.doesNotMatch(JSON.stringify(event), /query-private|header-private|body-private/);
     const disconnected = once(child, "disconnect"); child.disconnect(); await disconnected;
     const afterDisconnect = await fetch(base+"/mcp", { method: "POST", body: "{}" });
@@ -302,4 +308,99 @@ test("上游在响应中途断开时记录真实中断，finish 和 close 不重
   assert.equal(event.outcome, "upstream_closed");
   assert.equal(event.status, 200);
   assert.doesNotMatch(JSON.stringify(event), /upstream-private-detail/);
+});
+
+test("仅省略明确的本机成功探测，空客户端标识和经过代理的发现请求仍留痕", async t => {
+  const events = [];
+  const { base } = await fixture(t, (req, res) => {
+    req.resume(); res.writeHead(200).end("ok");
+  }, { onRequest: event => events.push(event) });
+  const path = "/.well-known/oauth-protected-resource";
+  const probeHeaders = { "user-agent": PUBLIC_MCP_PROBE_USER_AGENT };
+  const probe = await fetch(base+path, { headers: probeHeaders });
+  assert.equal(probe.status, 200); await probe.text();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(events.length, 0);
+  for (const [url, headers] of [
+    [path, { "user-agent": "" }],
+    [path, { ...probeHeaders, "x-forwarded-for": "203.0.113.1" }],
+    [path+"?state=query-private", probeHeaders],
+    ["/mcp", probeHeaders],
+  ]) {
+    const response = await fetch(base+url, { headers });
+    assert.equal(response.status, 200); await response.text();
+  }
+  assert.equal(events.length, 4);
+  assert.equal(events[0].agent, "");
+  assert.equal(events[3].path, "/mcp");
+  assert.doesNotMatch(JSON.stringify(events), /query-private/);
+});
+
+test("授权错误只记录标准代码，有限解析不改变响应内容和其他流量", async t => {
+  for (const [name, path, status, contentType, body, expected] of [
+    ["refresh failure", "/token", 400, "application/json; charset=utf-8",
+      JSON.stringify({error:"invalid_grant",error_description:"description-private",refresh_token:"refresh-private"}), "invalid_grant"],
+    ["unknown error", "/token", 400, "application/json", '{"error":"code-private"}', undefined],
+    ["malformed json", "/token", 400, "application/json", '{"error":"invalid_grant",broken-private', undefined],
+    ["bounded capture", "/token", 400, "application/json",
+      JSON.stringify({error:"invalid_grant",error_description:"large-private".repeat(500)}), undefined],
+    ["non json", "/token", 502, "text/plain", '{"error":"invalid_grant"}', undefined],
+    ["successful token", "/token", 200, "application/json", '{"access_token":"access-private"}', undefined],
+    ["MCP response", "/mcp", 400, "application/json", '{"error":"invalid_grant","body":"mcp-private"}', undefined],
+  ]) await t.test(name, async t => {
+    const logged = Promise.withResolvers();
+    const { base } = await fixture(t, (req, res) => {
+      req.resume(); res.writeHead(status, { "content-type": contentType });
+      res.write(body.slice(0, 12));
+      setImmediate(() => res.end(body.slice(12)));
+    }, { onRequest: logged.resolve });
+    const response = await fetch(base+path, {method:"POST",body:"request-private"});
+    assert.equal(response.status, status);
+    assert.equal(await response.text(), body);
+    const event = await logged.promise;
+    assert.equal(event.oauthError, expected);
+    assert.equal(event.outcome, "completed");
+    assert.doesNotMatch(JSON.stringify(event), /description-private|refresh-private|code-private|broken-private|large-private|access-private|mcp-private|request-private/);
+  });
+});
+
+test("入口状态保留授权失败时间，后续成功清除当前授权错误且不改变组件就绪", async t => {
+  const stateDir = await mkdtemp(join(tmpdir(), "quaymesh-token-status-"));
+  t.after(() => rm(stateDir, {recursive:true,force:true}));
+  const node = new QuayMeshNode({revision:1,node:{stateDir,corePort:0,
+    publicMcp:{url:"https://gemini.example/mcp",funnel:{}}}});
+  node.supervisor = {snapshot:()=>[
+    {id:"public-mcp",state:"ready",lastReadyAt:1}, {id:"funnel",state:"ready",lastReadyAt:1},
+  ]};
+  let tokenStatus = 400, lastEvent;
+  const { base } = await fixture(t, (req, res) => {
+    req.resume();
+    const status = req.url === "/token" ? tokenStatus : 200;
+    res.writeHead(status, {"content-type":"application/json"})
+      .end(status === 400 ? '{"error":"invalid_grant"}' : '{"ok":true}');
+  }, {onRequest:event=>{
+    lastEvent = event;
+    node.recordPublicMcpRequest({type:"public-mcp-request",...event});
+  }});
+  await (await fetch(base+"/token", {method:"POST",body:"refresh-private"})).text();
+  const failed = node.publicMcpStatus();
+  assert.equal(failed.ready, true);
+  assert.equal(failed.lastTokenStatus, 400);
+  assert.equal(failed.lastTokenError, "invalid_grant");
+  assert.equal(failed.lastTokenRequestAt, Date.parse(lastEvent.finishedAt));
+  assert.equal(failed.lastTokenFailureAt, failed.lastTokenRequestAt);
+  assert.equal(failed.lastTokenSuccessAt, null);
+
+  await (await fetch(base+"/mcp", {method:"POST",body:"{}"})).text();
+  assert.equal(node.publicMcpStatus().lastTokenError, "invalid_grant");
+  assert.equal(node.publicMcpStatus().lastStatus, 200);
+  tokenStatus = 200;
+  await (await fetch(base+"/token", {method:"POST",body:"refresh-private"})).text();
+  const recovered = node.publicMcpStatus();
+  assert.equal(recovered.ready, true);
+  assert.equal(recovered.lastTokenStatus, 200);
+  assert.equal(recovered.lastTokenError, null);
+  assert.equal(recovered.lastTokenSuccessAt, Date.parse(lastEvent.finishedAt));
+  assert.equal(recovered.lastTokenRequestAt, recovered.lastTokenSuccessAt);
+  assert.equal(recovered.lastTokenFailureAt, failed.lastTokenFailureAt);
 });

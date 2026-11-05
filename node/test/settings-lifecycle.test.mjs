@@ -116,7 +116,9 @@ test("CF09：公网请求观测随入口地址隔离，同地址配置确认保�
   await writeFile(f.config,JSON.stringify(raw));
   const config=await loadSettingsAuthority(f.config),node=new QuayMeshNode(config);
   node.token=f.key;node.supervisor={snapshot:()=>[],close:async()=>{}};
-  const history={lastRequestAt:Date.now()-100,lastSuccessAt:Date.now()-200,lastStatus:200};
+  const history={...node.publicMcpRequests,lastRequestAt:Date.now()-100,lastSuccessAt:Date.now()-200,lastStatus:200,
+    lastTokenRequestAt:Date.now()-300,lastTokenSuccessAt:Date.now()-400,lastTokenFailureAt:Date.now()-300,
+    lastTokenStatus:400,lastTokenError:"invalid_grant"};
   node.publicMcpRequests={...history};
   await node.startAdmin();t.after(()=>node.close());
   const status=async()=> (await (await fetch(`http://127.0.0.1:${port}/status`)).json()).publicMcp;
@@ -130,6 +132,7 @@ test("CF09：公网请求观测随入口地址隔离，同地址配置确认保�
   const changed=await loadSettingsAuthority(f.config);
   await node.confirmConfiguration({configuration:changed,revision:3});
   assert.deepEqual(await status(),{url:raw.publicMcp.url,ready:false,state:"starting",
-    lastReadyAt:null,lastRequestAt:null,lastSuccessAt:null,lastStatus:null,lastError:null});
+    lastReadyAt:null,lastRequestAt:null,lastSuccessAt:null,lastStatus:null,lastError:null,
+    lastTokenRequestAt:null,lastTokenSuccessAt:null,lastTokenFailureAt:null,lastTokenStatus:null,lastTokenError:null});
   assert.equal(JSON.parse(await readFile(join(config.node.stateDir,"cluster.snapshot.json"),"utf8")).revision,3);
 });

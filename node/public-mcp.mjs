@@ -15,6 +15,10 @@ const METADATA_PATHS = new Set([
 const BROWSER_ORIGINS = new Set(["https://gemini.google.com", "https://www.google.com"]);
 const HOP_HEADERS = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
   "te", "trailer", "transfer-encoding", "upgrade", "proxy-connection"]);
+const OAUTH_ERROR_CODES = new Set(["invalid_request", "invalid_client", "invalid_grant",
+  "unauthorized_client", "unsupported_grant_type", "invalid_scope", "invalid_target",
+  "server_error", "temporarily_unavailable"]);
+export const PUBLIC_MCP_PROBE_USER_AGENT = "QuayMesh-Public-Mcp-Probe/1";
 
 function htmlEscape(text) {
   return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
@@ -84,6 +88,7 @@ export function createPublicMcpIngress({
 
   const server = createServer((req, res) => {
     const started = Date.now();
+    const startedClock = performance.now();
     const method = req.method ?? "GET";
     const origin = typeof req.headers.origin === "string" && BROWSER_ORIGINS.has(req.headers.origin)
       ? req.headers.origin : null;
@@ -99,14 +104,24 @@ export function createPublicMcpIngress({
     }
     const url = new URL(raw, base);
     const pathname = url.pathname;
+    const localProbe = method === "GET" && raw === "/.well-known/oauth-protected-resource"
+      && req.headers["user-agent"] === PUBLIC_MCP_PROBE_USER_AGENT
+      && req.headers["x-forwarded-for"] === undefined && req.headers.forwarded === undefined
+      && ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress);
     let recorded = false;
     let failure;
+    let oauthError = null;
     const record = outcome => {
       if (recorded) return;
       recorded = true;
+      // 只省略本机探测的成功记录，真实请求与探测失败继续保留。
+      if (localProbe && outcome === "completed" && res.statusCode === 200 && !failure) return;
+      const finished = Date.now();
       onRequest({
+        startedAt: new Date(started).toISOString(), finishedAt: new Date(finished).toISOString(),
         method, path: pathname, status: res.headersSent ? res.statusCode : null,
-        ms: Date.now()-started, outcome: failure ?? outcome,
+        ms: Math.round(performance.now()-startedClock), outcome: failure ?? outcome,
+        ...(oauthError ? { oauthError } : {}),
         // 不记录查询参数、凭据或原始错误文本；中途断开也只写一条结果。
         origin: typeof req.headers.origin === "string" ? req.headers.origin.slice(0, 100) : null,
         agent: String(req.headers["user-agent"] ?? "").slice(0, 120),
@@ -164,6 +179,25 @@ export function createPublicMcpIngress({
       const status = reply.statusCode ?? 502;
       const replyHeaders = Object.fromEntries(Object.entries(reply.headers)
         .filter(([name]) => !HOP_HEADERS.has(name.toLowerCase())));
+      if (pathname === "/token" && method === "POST" && status >= 400
+          && /^application\/json(?:;|$)/i.test(String(reply.headers["content-type"] ?? ""))
+          && !reply.headers["content-encoding"]) {
+        let errorChunks = [], errorBytes = 0;
+        // 旁路读取有限的错误内容；原响应保持流式转发，凭据和错误说明不进入日志。
+        reply.on("data", chunk => {
+          if (errorChunks === null) return;
+          errorBytes += chunk.length;
+          if (errorBytes > 4096) { errorChunks = null; return; }
+          errorChunks.push(chunk);
+        });
+        reply.once("end", () => {
+          if (errorChunks === null) return;
+          try {
+            const body = JSON.parse(Buffer.concat(errorChunks, errorBytes).toString("utf8"));
+            if (OAUTH_ERROR_CODES.has(body?.error)) oauthError = body.error;
+          } catch { oauthError = null; }
+        });
+      }
       if (status === 401 && MCP_PATHS.has(pathname)) {
         const original = String(replyHeaders["www-authenticate"] ?? 'Bearer error="invalid_token"');
         const marker = 'resource_metadata="' + base + '/.well-known/oauth-protected-resource"';

@@ -14,7 +14,10 @@ function nodeStatus() {
     discovery: { ready: true, lastSuccessAt: Date.now(), lastError: null },
     publicMcp: { url: publicUrl, ready: true, state: 'ready', lastReadyAt: Date.now(),
       lastRequestAt: null as number | null, lastSuccessAt: null as number | null,
-      lastStatus: null as number | null, lastError: null as string | null },
+      lastStatus: null as number | null, lastError: null as string | null,
+      lastTokenRequestAt: null as number | null, lastTokenSuccessAt: null as number | null,
+      lastTokenFailureAt: null as number | null, lastTokenStatus: null as number | null,
+      lastTokenError: null as string | null },
     components: [{ id: 'discovery', state: 'ready', observedAt: Date.now() },
       { id: 'public-mcp', state: 'ready', observedAt: Date.now() },
       { id: 'funnel', state: 'ready', observedAt: Date.now() }],
@@ -188,6 +191,40 @@ test('Gemini 入口独立展示健康、真实请求和重连记录，节点离�
   expect(response.status()).toBe(200);
   expect((await response.json()).nodes[0].publicMcp).toMatchObject({ url: publicUrl, ready: true,
     lastRequestAt: null, lastSuccessAt: null });
+
+  const tokenFailureAt=Date.now()-1_000;
+  const authorization=nodeStatus();
+  Object.assign(authorization.publicMcp, { lastTokenRequestAt: tokenFailureAt,
+    lastTokenSuccessAt: tokenFailureAt-60_000, lastTokenFailureAt: tokenFailureAt,
+    lastTokenStatus: 400, lastTokenError: 'invalid_grant' });
+  await writeFile(statusFile, JSON.stringify(authorization));
+  await expect.poll(async () => {
+    await page.locator('#topbar [data-action=refresh]').click();
+    return card.locator('.badge.warn').textContent();
+  }).toBe('授权续期失败');
+  await expect(card.locator('.badge.good')).toHaveCount(0);
+  await expect(card.locator('[data-public-mcp-time=authorization] time')).toHaveAttribute('datetime', new Date(tokenFailureAt).toISOString());
+  await expect(card.locator('[data-public-mcp-auth-error]')).toContainText('invalid_grant');
+  await expect(card.locator('[data-public-mcp-auth-error]')).toContainText('请在 Gemini 中重新连接 QuayMesh');
+  const authResponse=await page.request.get(server.baseUrl + '/console/api/v4/fleet/status');
+  expect((await authResponse.json()).nodes[0].publicMcp).toMatchObject({ ready: true,
+    lastTokenRequestAt: tokenFailureAt, lastTokenFailureAt: tokenFailureAt,
+    lastTokenStatus: 400, lastTokenError: 'invalid_grant' });
+  await page.screenshot({ path: screenshots + '/fleet-gemini-authorization-failed.png', fullPage: true });
+  await page.setViewportSize({ width: 760, height: 900 });
+  await page.screenshot({ path: screenshots + '/fleet-gemini-authorization-narrow.png', fullPage: true });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.setViewportSize({ width: 1400, height: 950 });
+
+  Object.assign(authorization.publicMcp, { lastTokenRequestAt: Date.now(),
+    lastTokenSuccessAt: Date.now(), lastTokenStatus: 200, lastTokenError: null });
+  await writeFile(statusFile, JSON.stringify(authorization));
+  await expect.poll(async () => {
+    await page.locator('#topbar [data-action=refresh]').click();
+    return card.locator('.badge.good').count();
+  }).toBe(1);
+  await expect(card.locator('[data-public-mcp-auth-error]')).toHaveCount(0);
+  await expect(card.locator('[data-public-mcp-time=authorization]')).toContainText('HTTP 200');
 
   const lastRequestAt = Date.now() - 5_000, lastSuccessAt = Date.now() - 60_000, lastRecoveryAt = Date.now() - 2_000;
   const degraded = nodeStatus();

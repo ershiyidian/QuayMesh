@@ -17,10 +17,13 @@ import { assertMeshPortFree, assertManagedMeshListener } from "./easytier-health
 import { SourceErrors } from "./source-errors.mjs";
 import { resumeAdmissionWithRetry } from "./maintenance-recovery.mjs";
 import { createTailscaleProbe } from "./tailscale.mjs";
+import { PUBLIC_MCP_PROBE_USER_AGENT } from "./public-mcp.mjs";
 
 export const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const admissionExpectation=state=>state?.instance?{instance:state.instance,accepting:state.accepting,reason:state.reason,changedAt:state.changedAt}:undefined;
+const emptyPublicMcpRequests=()=>({lastRequestAt:null,lastSuccessAt:null,lastStatus:null,
+  lastTokenRequestAt:null,lastTokenSuccessAt:null,lastTokenFailureAt:null,lastTokenStatus:null,lastTokenError:null});
 
 export async function installationStartupBudget(root,transition,sourceCommit,readinessMs=30000) {
   const ordinary={coreReadinessMs:readinessMs};
@@ -52,7 +55,7 @@ export class QuayMeshNode {
     this.config = configuration; this.root = root; this.intervalMs = intervalMs; this.readinessMs = readinessMs;
     this.stopped = false; this.configRevision = configuration.revision;
     this.discovery = { ready:false, lastSuccessAt:null, lastError:null };
-    this.publicMcpRequests = {lastRequestAt:null,lastSuccessAt:null,lastStatus:null};
+    this.publicMcpRequests = emptyPublicMcpRequests();
     this.pendingConfiguration = null; this.errors = new SourceErrors();
     this.componentObservations=new Map();
     this.settingsQueue = Promise.resolve(); this.settingsApply = null; this.pendingSettingsRevision = null;
@@ -158,17 +161,11 @@ export class QuayMeshNode {
             if (ready?.ok !== true) throw new Error("公网 MCP 的 Coordinator 尚未就绪");
           };
           plan.beforeStart = upstreamReady;
-          plan.onMessage = event => {
-            if (event?.type !== "public-mcp-request" || event.method !== "POST" ||
-                !["/mcp","/mcp/"].includes(event.path) || (event.status !== null && !Number.isInteger(event.status))) return;
-            this.publicMcpRequests.lastRequestAt = Date.now();
-            this.publicMcpRequests.lastStatus = event.status;
-            if (event.status >= 200 && event.status < 300 && event.outcome === "completed")
-              this.publicMcpRequests.lastSuccessAt = this.publicMcpRequests.lastRequestAt;
-          };
+          plan.onMessage = event => this.recordPublicMcpRequest(event);
           plan.ready = async () => {
             await upstreamReady();
-            const metadata = await requestJson(`http://127.0.0.1:${node.publicMcp.listenPort}/.well-known/oauth-protected-resource`,{timeoutMs:2500});
+            const metadata = await requestJson(`http://127.0.0.1:${node.publicMcp.listenPort}/.well-known/oauth-protected-resource`,
+              {timeoutMs:2500,headers:{"user-agent":PUBLIC_MCP_PROBE_USER_AGENT}});
             if (metadata?.resource !== new URL(node.publicMcp.url).origin) throw new Error("公网 MCP 资源发现与配置不一致");
           };
         }
@@ -354,10 +351,33 @@ export class QuayMeshNode {
       revision:generation.revision, cluster:generation.configuration.cluster,
     });
     if (this.config.node.publicMcp?.url !== generation.configuration.node.publicMcp?.url)
-      this.publicMcpRequests = {lastRequestAt:null,lastSuccessAt:null,lastStatus:null};
+      this.publicMcpRequests = emptyPublicMcpRequests();
     this.config = generation.configuration; this.configRevision = generation.revision;
     this.generation = generation; this.corePort = this.config.node.corePort;
     if (this.membership) { this.membership.node = this.config.node; this.membership.cluster = this.config.cluster; }
+  }
+  recordPublicMcpRequest(event) {
+    if (event?.type !== "public-mcp-request" || event.method !== "POST" ||
+        (event.status !== null && !Number.isInteger(event.status))) return;
+    const finishedAt = Date.parse(event.finishedAt);
+    const at = Number.isFinite(finishedAt) ? finishedAt : Date.now();
+    const success = event.status >= 200 && event.status < 300 && event.outcome === "completed";
+    if (["/mcp","/mcp/"].includes(event.path)) {
+      this.publicMcpRequests.lastRequestAt = at;
+      this.publicMcpRequests.lastStatus = event.status;
+      if (success) this.publicMcpRequests.lastSuccessAt = at;
+    } else if (event.path === "/token") {
+      this.publicMcpRequests.lastTokenRequestAt = at;
+      this.publicMcpRequests.lastTokenStatus = event.status;
+      if (success) {
+        this.publicMcpRequests.lastTokenSuccessAt = at;
+        this.publicMcpRequests.lastTokenError = null;
+      } else {
+        this.publicMcpRequests.lastTokenFailureAt = at;
+        this.publicMcpRequests.lastTokenError = event.oauthError
+          ?? (event.outcome === "completed" ? `HTTP_${event.status}` : event.outcome ?? "request_failed");
+      }
+    }
   }
   publicMcpStatus() {
     if (!this.config.node.publicMcp?.funnel) return null;

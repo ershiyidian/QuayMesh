@@ -49,6 +49,8 @@ export interface NodeManifest {
   discovery?: { ready: boolean; lastSuccessAt?: number | null; lastError?: string | null };
   publicMcp?: { url: string; ready: boolean; state: string; lastReadyAt?: number | null;
     lastRequestAt?: number | null; lastSuccessAt?: number | null; lastStatus?: number | null;
+    lastTokenRequestAt?: number | null; lastTokenSuccessAt?: number | null; lastTokenFailureAt?: number | null;
+    lastTokenStatus?: number | null; lastTokenError?: string | null;
     lastError?: string | null } | null;
   components?: { id: string; state: string; pid?: number | null; restarts?: number; error?: string | null;
     startedAt?: number | null; stableSince?: number | null; crashLoop?: boolean; observedAt?: number | null;
