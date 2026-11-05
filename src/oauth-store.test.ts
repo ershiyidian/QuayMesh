@@ -3,11 +3,12 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import { AccessDeniedError, InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import type { OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { databasePath, openDatabase } from "./db/client.js";
 import { LATEST_DATABASE_VERSION } from "./db/migrations.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
-import { createRegisteredOAuthClient, SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
+import { createRegisteredOAuthClient, SqliteOAuthClientsStore, SqliteOAuthStore, usesGooglePersistentLinking } from "./oauth-store.js";
 
 const root = await mkdtemp(join(tmpdir(), "quaymesh-oauth-test-"));
 const oauthConfig = {
@@ -53,6 +54,8 @@ try {
   testExpiredTokenCleanup(join(root, "expiration"));
   testTransactionalTokenRotation(join(root, "rotation"));
   await testProviderRestartRotationAndRevocation(join(root, "provider"));
+  testGoogleClientRecognition();
+  await testGooglePersistentLinking(join(root, "google-linking"));
   await testResourceAliases(join(root, "aliases"));
   await testRefreshResourcePolicy(join(root, "refresh-policy"));
 } finally {
@@ -301,6 +304,127 @@ async function testProviderRestartRotationAndRevocation(stateDir: string): Promi
     );
   } finally {
     secondProvider.close();
+  }
+}
+
+
+function testGoogleClientRecognition(): void {
+  const googleClient = createRegisteredOAuthClient({
+    client_name: "Account linking",
+    redirect_uris: geminiCallbacks,
+    token_endpoint_auth_method: "client_secret_post",
+  }, ["oauth-redirect.googleusercontent.com"]);
+  assert.equal(usesGooglePersistentLinking(googleClient), true);
+  assert.equal(usesGooglePersistentLinking({ ...googleClient, token_endpoint_auth_method: "client_secret_basic" }), true);
+  for (const method of [undefined, "none"] as const) {
+    assert.equal(usesGooglePersistentLinking({ ...googleClient, token_endpoint_auth_method: method }), false);
+  }
+  for (const redirects of [
+    [],
+    [redirectUri],
+    [...geminiCallbacks, redirectUri],
+    ["https://oauth-redirect.googleusercontent.com/r/other-product"],
+    [geminiCallbacks[0]! + "?other=1"],
+  ]) {
+    assert.equal(usesGooglePersistentLinking({
+      ...googleClient, client_name: "Google", redirect_uris: redirects,
+    }), false);
+  }
+}
+
+async function testGooglePersistentLinking(stateDir: string): Promise<void> {
+  const config = {
+    ...oauthConfig,
+    scopes: ["quaymesh", "files"],
+    allowedRedirectHosts: ["chatgpt.com", "oauth-redirect.googleusercontent.com"],
+  };
+  for (const method of ["client_secret_post", "client_secret_basic"] as const) {
+    const directory = join(stateDir, method);
+    const store = new SqliteOAuthStore(directory);
+    try {
+      const client = store.registerClient({
+        client_name: "Account linking", redirect_uris: geminiCallbacks,
+        token_endpoint_auth_method: method, client_secret: "test-google-client-secret",
+      }, config.allowedRedirectHosts);
+      const firstProvider = new SingleUserOAuthProvider(config, mcpUrl, directory);
+      let issued: OAuthTokens | undefined;
+      try {
+        const code = "code-google-linking";
+        firstProvider["codes"].set(code, {
+          clientId: client.client_id,
+          params: { redirectUri: geminiCallbacks[0]!, codeChallenge: "challenge", scopes: config.scopes, resource: mcpUrl },
+          expiresAtMs: Date.now() + 60_000,
+        });
+        issued = await firstProvider.exchangeAuthorizationCode(client, code, undefined, geminiCallbacks[0], mcpUrl);
+      } finally {
+        firstProvider.close();
+      }
+      assert.ok(issued?.refresh_token);
+      const refreshToken = issued.refresh_token;
+      const refreshHash = hashToken(refreshToken);
+      const grant = store.getRefreshToken(refreshHash);
+      const access = store.getAccessToken(hashToken(issued.access_token));
+      assert.ok(grant && access);
+      const originalExpiry = Math.floor(Date.now() / 1000) + 60;
+      store.saveRefreshToken(refreshHash, { ...grant, expiresAt: originalExpiry });
+      store.saveAccessToken(hashToken(issued.access_token), { ...access, expiresAt: Math.floor(Date.now() / 1000) - 1 });
+
+      const provider = new SingleUserOAuthProvider(config, mcpUrl, directory);
+      const peer = new SingleUserOAuthProvider(config, mcpUrl, directory);
+      try {
+        await assert.rejects(provider.verifyAccessToken(issued.access_token), InvalidTokenError);
+        // 丢弃首次续期响应，再从两个连接重发原凭据。
+        await provider.exchangeRefreshToken(client, refreshToken);
+        const [first, second] = await Promise.all([
+          provider.exchangeRefreshToken(client, refreshToken, ["quaymesh"]),
+          peer.exchangeRefreshToken(client, refreshToken, ["files"]),
+        ]);
+        assert.equal(first.refresh_token, refreshToken);
+        assert.equal(second.refresh_token, refreshToken);
+        assert.notEqual(first.access_token, second.access_token);
+        assert.deepEqual((await provider.verifyAccessToken(first.access_token)).scopes, ["quaymesh"]);
+        assert.deepEqual((await peer.verifyAccessToken(second.access_token)).scopes, ["files"]);
+        const renewed = store.getRefreshToken(refreshHash);
+        assert.ok(renewed && renewed.expiresAt > originalExpiry);
+        assert.deepEqual(renewed.scopes, config.scopes);
+        assert.equal(renewed.resource, mcpUrl.href);
+
+        const otherClient = store.registerClient({
+          redirect_uris: geminiCallbacks, token_endpoint_auth_method: method,
+          client_secret: "test-other-client-secret",
+        }, config.allowedRedirectHosts);
+        await assert.rejects(provider.exchangeRefreshToken(otherClient, refreshToken), InvalidGrantError);
+        await assert.rejects(provider.exchangeRefreshToken(client, refreshToken, ["admin"]), AccessDeniedError);
+        await assert.rejects(provider.exchangeRefreshToken(client, refreshToken, undefined, tunnelUrl), InvalidGrantError);
+      } finally {
+        peer.close();
+        provider.close();
+      }
+
+      const restarted = new SingleUserOAuthProvider(config, mcpUrl, directory);
+      try {
+        const restoredClient = await restarted.clientsStore.getClient(client.client_id);
+        assert.ok(restoredClient);
+        const resumed = await restarted.exchangeRefreshToken(restoredClient, refreshToken);
+        assert.equal(resumed.refresh_token, refreshToken);
+        assert.deepEqual((await restarted.verifyAccessToken(resumed.access_token)).scopes, config.scopes);
+        await restarted.revokeToken(restoredClient, { token: refreshToken });
+        await assert.rejects(restarted.exchangeRefreshToken(restoredClient, refreshToken), InvalidGrantError);
+        // 撤销先提交后，已读取旧授权的请求也不能重新写回凭据。
+        assert.equal(store.saveTokenPair({
+          accessTokenHash: "revoked-access",
+          accessToken: grant,
+          refreshTokenHash: refreshHash,
+          refreshToken: grant,
+        }, refreshHash), false);
+        assert.equal(store.getAccessToken("revoked-access"), undefined);
+        assert.equal(store.getRefreshToken(refreshHash), undefined);
+      } finally {
+        restarted.close();
+      }
+    } finally {
+      store.close();
+    }
   }
 }
 

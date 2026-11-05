@@ -40,6 +40,12 @@ QuayMesh 可以在 Linux 节点上管理供 Gemini 使用的固定 HTTPS MCP 地
 
 Linux 发行包可以在 `components/<platform>/` 中包含配套的 `tailscaled` 和 `tailscale`。已有相同版本的程序也可以通过 `components.tailscale.executable` 指向 `tailscaled`，CLI 必须放在同一目录。版本和官方下载地址记录在 `components.lock.json` 中，构建方法见[组件打包](CONTRIBUTING.md#构建平台安装包)。
 
+## 授权续期
+
+对于采用 `client_secret_post` 或 `client_secret_basic` 认证、且全部已登记回调地址均符合 Google MCP 规则的客户端，QuayMesh 按照 Google 的[持久连接要求](https://developers.google.com/connected-apps/mcp/oauth)处理续期。每次成功刷新都会返回原刷新令牌，并按配置的刷新令牌有效期延长到期时间，同时签发新的访问令牌。单次请求缩小访问范围时，刷新令牌仍保留原授权范围，多个请求可以分别续期。
+
+刷新凭据以哈希形式保存在协调节点的持久数据库中，正常重启和升级后继续有效。刷新响应丢失后，客户端可以用原凭据重试；解除连接或令牌过期仍会使凭据失效。无需添加配置。如果旧版本已经使 Gemini 持有的刷新令牌失效，升级后重新连接一次；新的续期方式会应用于仍有效的凭据。
+
 ## 动态出口与恢复
 
 启用 QuayMesh 动态出口时，受管 Funnel 使用独立的回环控制入口，默认为 `127.0.0.1:17889`，由 `publicMcp.funnel.controlProxyPort` 配置。这个入口复用普通流量的动态出口选择和路由。普通业务仍使用 `127.0.0.1:17890`，或 `consoleSettings.egress.listenPort` 指定的端口。新连接使用当前选中的健康出口节点，已有健康连接沿原路径继续运行。

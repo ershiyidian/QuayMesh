@@ -10,7 +10,7 @@ import type {
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
-import { SqliteOAuthClientsStore, SqliteOAuthStore, type OAuthDataStore } from "./oauth-store.js";
+import { SqliteOAuthClientsStore, SqliteOAuthStore, usesGooglePersistentLinking, type OAuthDataStore } from "./oauth-store.js";
 
 export interface OAuthConfig {
   resourceAliases?: string[];
@@ -252,6 +252,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       requestedScopes,
       resource ?? recordedResource,
       refreshTokenHash,
+      usesGooglePersistentLinking(client) ? { token: refreshToken, scopes: record.scopes } : undefined,
     );
   }
 
@@ -313,10 +314,11 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     scopes: string[],
     resource?: URL,
     consumedRefreshTokenHash?: string,
+    retainedRefreshToken?: { token: string; scopes: string[] },
   ): Promise<OAuthTokens> {
     const now = Math.floor(Date.now() / 1000);
     const accessToken = randomToken();
-    const refreshToken = randomToken();
+    const refreshToken = retainedRefreshToken?.token ?? randomToken();
     const accessExpiresAt = now + this.config.accessTokenTtlSeconds;
     const refreshExpiresAt = now + this.config.refreshTokenTtlSeconds;
 
@@ -332,7 +334,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
         refreshTokenHash: hashToken(refreshToken),
         refreshToken: {
           clientId,
-          scopes,
+          scopes: retainedRefreshToken?.scopes ?? scopes,
           expiresAt: refreshExpiresAt,
           resource: resource?.href,
         },

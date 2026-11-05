@@ -25,6 +25,27 @@ export interface PersistedTokenPair {
   refreshToken: PersistedRefreshTokenRecord;
 }
 
+const GOOGLE_MCP_REDIRECT_HOST = /^oauth-redirect(?:-sandbox|-test|[1-9][0-9]?)?\.googleusercontent\.com$/u;
+
+function isGoogleMcpRedirect(parsed: URL): boolean {
+  return GOOGLE_MCP_REDIRECT_HOST.test(parsed.hostname)
+    && parsed.protocol === "https:"
+    && !parsed.username && !parsed.password && !parsed.hash && !parsed.search
+    && /^\/(?:r|a)\/user_bound_custom-mcp-[a-zA-Z0-9_.-]+$/u.test(parsed.pathname);
+}
+
+export function usesGooglePersistentLinking(client: OAuthClientInformationFull): boolean {
+  if (client.token_endpoint_auth_method !== "client_secret_post"
+      && client.token_endpoint_auth_method !== "client_secret_basic") return false;
+  return client.redirect_uris.length > 0 && client.redirect_uris.every((uri) => {
+    try {
+      return isGoogleMcpRedirect(new URL(uri));
+    } catch {
+      return false;
+    }
+  });
+}
+
 function redirectHostAllowed(redirectUri: string, allowedHosts: string[]): boolean {
   let parsed: URL;
   try {
@@ -37,10 +58,8 @@ function redirectHostAllowed(redirectUri: string, allowedHosts: string[]): boole
   // Gemini Web 注册的六个地址来自 production/test/sandbox 三个域，
   // 每个域都同时使用 /r/ 与 /a/。保持显式授权和固定回调用途。
   if (allowedHosts.includes("oauth-redirect.googleusercontent.com")
-      && /^oauth-redirect(?:-sandbox|-test|[1-9][0-9]?)?\.googleusercontent\.com$/u.test(parsed.hostname)) {
-    return parsed.protocol === "https:"
-      && !parsed.username && !parsed.password && !parsed.hash && !parsed.search
-      && /^\/(?:r|a)\/user_bound_custom-mcp-[a-zA-Z0-9_.-]+$/u.test(parsed.pathname);
+      && GOOGLE_MCP_REDIRECT_HOST.test(parsed.hostname)) {
+    return isGoogleMcpRedirect(parsed);
   }
   return allowedHosts.includes(parsed.hostname);
 }

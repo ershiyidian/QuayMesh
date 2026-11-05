@@ -40,6 +40,12 @@ The ingress node needs external network access. A worker forwards requests throu
 
 Linux packages can include the paired `tailscaled` and `tailscale` programs in `components/<platform>/`. An existing matching pair can instead be selected with `components.tailscale.executable` pointing to `tailscaled`; the CLI must be beside it. The selected version and official download URLs are recorded in `components.lock.json`. See [component packaging](../CONTRIBUTING.md#build-platform-packages).
 
+## Authorization renewal
+
+QuayMesh follows Google's [Persistent Linking guidance](https://developers.google.com/connected-apps/mcp/oauth) for registered clients that use `client_secret_post` or `client_secret_basic` and whose callback addresses all match the supported Google MCP redirects. Each successful refresh returns the same refresh token and extends its expiry by the configured refresh-token lifetime. The access token is replaced. Requesting fewer access scopes preserves the refresh grant's original scopes, so concurrent requests can refresh independently.
+
+Refresh credentials are stored as hashes in the coordinator's persistent database and survive normal restarts and upgrades. Clients can retry a refresh after losing its response. Unlinking or token expiration still invalidates the credential. No additional setting is required. If an earlier release already invalidated the refresh token held by Gemini, reconnect once after upgrading; the new refresh behavior applies to valid credentials.
+
 ## Dynamic egress and recovery
 
 When dynamic QuayMesh egress is enabled, the managed Funnel uses a dedicated loopback control listener, normally `127.0.0.1:17889`, configured by `publicMcp.funnel.controlProxyPort`. This listener uses the same dynamic egress selection and routes as ordinary traffic. The ordinary workload listener remains `127.0.0.1:17890`, or the configured `consoleSettings.egress.listenPort`. New connections follow the currently selected healthy egress node; existing healthy connections continue on their original route.
