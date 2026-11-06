@@ -1314,7 +1314,11 @@ export function createServer(
   const federation = createFederation(config, workspaces, resolveLocalAgentProviders,
     (method, path, body) => projectConsole.dispatch(method, path, body), sessionRuntime, processSessions.executionCoordinator,
     (event,fields,level)=>options.diagnostics ? options.diagnostics.record(event,fields,level) : logEvent(config.logging,level??"info",event,fields));
-  const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
+  const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir, (fields) => {
+    const level = fields.outcome === "succeeded" ? "info" : "warn";
+    if (options.diagnostics) options.diagnostics.record("oauth_refresh", fields, level);
+    else logEvent(config.logging, level, "oauth_refresh", fields);
+  });
   localUserApi = new LocalUserApiService(config, sessionLedger.db, federation);
   federation?.setLocalUserApi(localUserApi);
   const bearerAuth = requireBearerAuth({

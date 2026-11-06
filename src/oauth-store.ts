@@ -82,6 +82,10 @@ export function createRegisteredOAuthClient(
       response_types: client.response_types ?? ["code"],
     };
 
+    if (registered.client_secret && usesGooglePersistentLinking(registered)) {
+      registered.client_secret_expires_at = 0;
+    }
+
     return registered;
 }
 
@@ -92,7 +96,9 @@ export class SqliteOAuthStore {
 
   constructor(stateDir: string) {
     this.database = openDatabase(stateDir);
-    this.deleteExpiredTokens(Math.floor(Date.now() / 1000));
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    this.deleteExpiredTokens(nowSeconds);
+    this.retainGoogleClientSecrets(nowSeconds);
   }
 
   getClient(clientId: string): OAuthClientInformationFull | undefined {
@@ -218,6 +224,25 @@ export class SqliteOAuthStore {
 
   close(): void {
     this.database.close();
+  }
+
+  private retainGoogleClientSecrets(nowSeconds: number): void {
+    const retain = this.database.sqlite.transaction(() => {
+      const clients = this.database.sqlite
+        .prepare("select client_id, client_json from oauth_clients")
+        .all() as Array<{ client_id: string; client_json: string }>;
+      const update = this.database.sqlite.prepare(
+        "update oauth_clients set client_json = json_set(client_json, '$.client_secret_expires_at', 0) where client_id = ?",
+      );
+      for (const row of clients) {
+        const client = JSON.parse(row.client_json) as OAuthClientInformationFull;
+        const expiresAt = client.client_secret_expires_at;
+        if (!client.client_secret || typeof expiresAt !== "number" || !Number.isFinite(expiresAt)
+            || expiresAt <= nowSeconds || !usesGooglePersistentLinking(client)) continue;
+        update.run(row.client_id);
+      }
+    });
+    retain.immediate();
   }
 
   private deleteExpiredTokens(nowSeconds: number): void {

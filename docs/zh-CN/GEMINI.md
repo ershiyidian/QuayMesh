@@ -46,6 +46,10 @@ Linux 发行包可以在 `components/<platform>/` 中包含配套的 `tailscaled
 
 刷新凭据以哈希形式保存在协调节点的持久数据库中，正常重启和升级后继续有效。刷新响应丢失后，客户端可以用原凭据重试；解除连接或令牌过期仍会使凭据失效。无需添加配置。如果旧版本已经使 Gemini 持有的刷新令牌失效，升级后重新连接一次；新的续期方式会应用于仍有效的凭据。
 
+这些 Google 客户端使用持续有效的应用密钥（`client_secret_expires_at: 0`，见 [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591.html#section-3.2.1)）。读取已有注册信息时，尚未过期的 Google 客户端采用同一策略。客户端 ID、密钥本身、已授权范围、访问与刷新令牌的有效期和撤销能力均予以保留；已经过期的客户端需要正常重新连接。其他客户端保留登记的密钥到期时间。
+
+当公网根地址和它的 `/mcp` 入口同时明确列入 `oauth.resourceAliases` 时，两者代表同一资源。授权码交换和续期接受同一域名下这两种写法，并保留授权记录原有的资源地址。受管入口自动声明这对地址，已有凭据可以直接续期，无需数据库迁移。其他域名、路径、查询参数，以及仅列入 `allowedResourceUrls` 的地址仍分别校验。
+
 ## 动态出口与恢复
 
 启用 QuayMesh 动态出口时，受管 Funnel 使用独立的回环控制入口，默认为 `127.0.0.1:17889`，由 `publicMcp.funnel.controlProxyPort` 配置。这个入口复用普通流量的动态出口选择和路由。普通业务仍使用 `127.0.0.1:17890`，或 `consoleSettings.egress.listenPort` 指定的端口。新连接使用当前选中的健康出口节点，已有健康连接沿原路径继续运行。
@@ -77,6 +81,8 @@ Linux 发行包可以在 `components/<platform>/` 中包含配套的 `tailscaled
 分别查看 `public-mcp` 和 `funnel` 的组件状态。最近就绪检查时间和探测错误对应本地适配器、隧道的实际状态。日志位于 `stateDir/logs/public-mcp.log` 和 `stateDir/logs/funnel.log`。
 
 完整调用验证包括读取公网 OAuth 元数据，以及重新发起 Gemini MCP 请求。匿名访问 `/mcp` 通常得到 OAuth `401` 授权提示；后续带授权的客户端响应会记录在适配器请求日志中。日志省略查询参数、授权值和 Cookie。
+
+修复授权后，应确认 Google 的 `OpenAuth` 客户端完成一次 `/token` 续期，随后 Google 的 `/mcp` 调用成功。尚未过期的访问令牌可以直接调用 MCP，这一步没有执行续期流程。协调节点的 `oauth_refresh` 事件记录客户端 ID、续期策略、结果，以及 `unknown_grant`、`resource_mismatch` 等固定原因，不记录凭据或请求表单。根据原因恢复：已存在且使用上述根地址与入口地址的授权可直接续期；缺失或已撤销的授权需要在 Gemini 中正常重新连接。
 
 ## Gemini 虚拟机、Library 与工作节点之间传文件
 

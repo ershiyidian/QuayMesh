@@ -46,6 +46,10 @@ QuayMesh follows Google's [Persistent Linking guidance](https://developers.googl
 
 Refresh credentials are stored as hashes in the coordinator's persistent database and survive normal restarts and upgrades. Clients can retry a refresh after losing its response. Unlinking or token expiration still invalidates the credential. No additional setting is required. If an earlier release already invalidated the refresh token held by Gemini, reconnect once after upgrading; the new refresh behavior applies to valid credentials.
 
+These Google clients use a persistent client secret (`client_secret_expires_at: 0`, as defined by [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591.html#section-3.2.1)). Existing unexpired Google client registrations adopt the same policy when opened. Client IDs, secrets, granted scopes, token lifetimes, and revocation remain intact; expired client registrations require normal reconnection. Other clients retain their registered secret expiry.
+
+The public origin and its `/mcp` endpoint identify the same resource when both are explicitly listed in `oauth.resourceAliases`. Authorization-code exchange and refresh accept either spelling on that same origin and preserve the resource recorded in the grant. Managed ingress configuration declares this pair automatically. Existing grants continue to work without a database migration. Other origins, paths, query strings, and URLs listed only in `allowedResourceUrls` remain distinct.
+
 ## Dynamic egress and recovery
 
 When dynamic QuayMesh egress is enabled, the managed Funnel uses a dedicated loopback control listener, normally `127.0.0.1:17889`, configured by `publicMcp.funnel.controlProxyPort`. This listener uses the same dynamic egress selection and routes as ordinary traffic. The ordinary workload listener remains `127.0.0.1:17890`, or the configured `consoleSettings.egress.listenPort`. New connections follow the currently selected healthy egress node; existing healthy connections continue on their original route.
@@ -77,6 +81,8 @@ Verify the retained Tailscale device identity, public OAuth metadata, and a real
 Inspect `public-mcp` and `funnel` separately in component status. Their readiness observation time and probe errors describe the local adapter and tunnel state. Logs are stored in `stateDir/logs/public-mcp.log` and `stateDir/logs/funnel.log`.
 
 For an end-to-end check, read the public OAuth metadata and retry a Gemini MCP call. An anonymous `/mcp` request normally receives the OAuth `401` challenge; the adapter's request log records the subsequent authenticated client response. Request logs omit query strings, authorization values, and cookies.
+
+After an authorization repair, confirm a successful `/token` refresh from Google's `OpenAuth` client followed by a Google `/mcp` call. An MCP call made with an access token that has not expired does not exercise refresh. The coordinator records `oauth_refresh` events with the client ID, refresh policy, outcome, and a bounded reason such as `unknown_grant` or `resource_mismatch`; credentials and request forms stay out of these events. Use that reason to select recovery: an existing grant with the configured origin/endpoint pair renews directly, while a missing or revoked grant needs a normal Gemini reconnect.
 
 ## Files between a Gemini VM, Library, and workers
 

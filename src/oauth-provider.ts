@@ -28,6 +28,16 @@ interface AuthorizationCodeRecord {
   expiresAtMs: number;
 }
 
+type OAuthRefreshRejectionReason = "unknown_grant" | "client_mismatch" | "expired_grant"
+  | "missing_resource" | "resource_not_allowed" | "resource_mismatch" | "scope_not_allowed"
+  | "grant_unavailable";
+
+export type OAuthRefreshDiagnostic = {
+  clientId: string;
+  refreshPolicy: "google_persistent" | "rotating";
+} & ({ outcome: "succeeded"; reason: "renewed" | "renewed_resource_alias" }
+  | { outcome: "rejected"; reason: OAuthRefreshRejectionReason });
+
 const CODE_TTL_MS = 5 * 60 * 1000;
 export const LOCAL_OWNER_ID = "local-owner";
 
@@ -123,16 +133,19 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   private readonly oauthStore: OAuthDataStore;
   private readonly resourceServerUrl: URL;
   private readonly allowedResourceUrls: Set<string>;
+  private readonly resourceAliases: Set<string>;
 
   constructor(
     private readonly config: OAuthConfig,
     resourceServerUrl: URL,
     stateDir: string,
+    private readonly reportRefresh?: (diagnostic: OAuthRefreshDiagnostic) => void,
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
     this.allowedResourceUrls = new Set(
       config.allowedResourceUrls.map((url) => resourceUrlFromServerUrl(url).href),
     );
+    this.resourceAliases = new Set((config.resourceAliases ?? []).map((url) => new URL(url).href));
     this.oauthStore = new SqliteOAuthStore(stateDir);
     const clients = new SqliteOAuthClientsStore(this.oauthStore, config.allowedRedirectHosts);
     this.clientsStore = clients;
@@ -212,13 +225,13 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     if (redirectUri && redirectUri !== record.params.redirectUri) {
       throw new InvalidGrantError("redirect_uri does not match the authorization request");
     }
-    if (resource && record.params.resource && !sameResource(resource, record.params.resource)) {
+    if (resource && record.params.resource && !sameResource(resource, record.params.resource, this.resourceAliases)) {
       throw new InvalidGrantError("Invalid resource");
     }
     if (resource && !this.isResourceAllowed(resource)) throw new InvalidGrantError("Invalid resource");
 
     this.codes.delete(authorizationCode);
-    const tokenResource = resource ?? record.params.resource ?? this.resourceServerUrl;
+    const tokenResource = record.params.resource ?? resource ?? this.resourceServerUrl;
     return this.issueTokens(client.client_id, record.params.scopes ?? this.config.scopes, tokenResource);
   }
 
@@ -228,32 +241,51 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     scopes?: string[],
     resource?: URL,
   ): Promise<OAuthTokens> {
+    const persistent = usesGooglePersistentLinking(client);
+    const identity = {
+      clientId: client.client_id,
+      refreshPolicy: persistent ? "google_persistent" as const : "rotating" as const,
+    };
+    const reject: (reason: OAuthRefreshRejectionReason, error: InvalidGrantError | AccessDeniedError) => never = (reason, error) => {
+      this.reportRefresh?.({ ...identity, outcome: "rejected", reason });
+      throw error;
+    };
     const refreshTokenHash = hashToken(refreshToken);
     const record = this.oauthStore.getRefreshToken(refreshTokenHash);
-    if (!record || record.clientId !== client.client_id || record.expiresAt < Math.floor(Date.now() / 1000)) {
-      throw new InvalidGrantError("Invalid refresh token");
-    }
-    if (!record.resource) throw new InvalidGrantError("Invalid resource");
+    if (!record) reject("unknown_grant", new InvalidGrantError("Invalid refresh token"));
+    if (record.clientId !== client.client_id) reject("client_mismatch", new InvalidGrantError("Invalid refresh token"));
+    if (record.expiresAt < Math.floor(Date.now() / 1000)) reject("expired_grant", new InvalidGrantError("Invalid refresh token"));
+    if (!record.resource) reject("missing_resource", new InvalidGrantError("Invalid resource"));
     const recordedResource = new URL(record.resource);
-    if (recordedResource && !this.isResourceAllowed(recordedResource)) {
-      throw new InvalidGrantError("Invalid resource");
+    if (!this.isResourceAllowed(recordedResource)) {
+      reject("resource_not_allowed", new InvalidGrantError("Invalid resource"));
     }
-    if (resource && !sameResource(resource, recordedResource)) {
-      throw new InvalidGrantError("Invalid resource");
+    if (resource && !sameResource(resource, recordedResource, this.resourceAliases)) {
+      reject("resource_mismatch", new InvalidGrantError("Invalid resource"));
     }
 
     const requestedScopes = scopes ?? record.scopes;
     if (!requestedScopes.every((scope) => record.scopes.includes(scope))) {
-      throw new AccessDeniedError("Refresh token cannot grant requested scopes");
+      reject("scope_not_allowed", new AccessDeniedError("Refresh token cannot grant requested scopes"));
     }
 
-    return this.issueTokens(
-      client.client_id,
-      requestedScopes,
-      resource ?? recordedResource,
-      refreshTokenHash,
-      usesGooglePersistentLinking(client) ? { token: refreshToken, scopes: record.scopes } : undefined,
-    );
+    let tokens: OAuthTokens;
+    try {
+      tokens = await this.issueTokens(
+        client.client_id,
+        requestedScopes,
+        recordedResource,
+        refreshTokenHash,
+        persistent ? { token: refreshToken, scopes: record.scopes } : undefined,
+      );
+    } catch (error) {
+      if (error instanceof InvalidGrantError) reject("grant_unavailable", error);
+      throw error;
+    }
+    const reason = resource && resourceUrlFromServerUrl(resource).href !== resourceUrlFromServerUrl(recordedResource).href
+      ? "renewed_resource_alias" : "renewed";
+    this.reportRefresh?.({ ...identity, outcome: "succeeded", reason });
+    return tokens;
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
@@ -289,13 +321,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       configuredResource: this.resourceServerUrl,
     }) || this.allowedResourceUrls.has(resourceUrlFromServerUrl(resource).href)
       || this.allowedResourceUrls.has(resource.href)
-      || (this.config.resourceAliases ?? []).some((alias) => {
-        try {
-          return new URL(alias).href === resource.href;
-        } catch {
-          return false;
-        }
-      });
+      || this.resourceAliases.has(resource.href);
   }
 
   private validCodeRecord(
@@ -375,6 +401,14 @@ function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("base64url");
 }
 
-function sameResource(left: URL, right: URL): boolean {
-  return resourceUrlFromServerUrl(left).href === resourceUrlFromServerUrl(right).href;
+function sameResource(left: URL, right: URL, aliases: Set<string>): boolean {
+  if (resourceUrlFromServerUrl(left).href === resourceUrlFromServerUrl(right).href) return true;
+  if (left.origin !== right.origin || left.search || right.search || left.hash || right.hash
+      || left.username || left.password || right.username || right.password) return false;
+  const root = new URL("/", left.origin).href;
+  const endpoint = new URL("/mcp", left.origin).href;
+  // 托管入口显式公布这两个地址；其他已允许的资源仍保留独立授权。
+  return aliases.has(root) && aliases.has(endpoint)
+    && (left.href === root || left.href === endpoint)
+    && (right.href === root || right.href === endpoint);
 }
