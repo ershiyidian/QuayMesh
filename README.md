@@ -156,3 +156,18 @@ Read more about [tasks and agents](docs/TASKS.md), [file changes and concurrency
 QuayMesh is licensed under [MIT](LICENSE). It builds on [DevSpace](https://github.com/Waishnav/devspace) and includes adaptations from OpenAI Codex and Pi.
 
 EasyTier and OpenAI tunnel-client provide the bundled network components. Their source archives and licenses are included under `third_party/`. See [NOTICE](NOTICE) and [third-party notices](THIRD_PARTY_NOTICES.md) for attribution and component licenses.
+
+## Hot-reload MCP tool annotations
+
+The authoritative metadata overrides for all MCP tools are in `config/tool-annotations.json`.
+After installing a release with this feature, edit that file on the Desktop source checkout and run:
+
+```sh
+pnpm annotations:apply
+```
+
+The command sends the file through the existing QuayMesh federation to the Coordinator and workers,
+and reports the `updated` nodes and any `failed` nodes. Rerun it to retry failed nodes.
+No rebuild or service restart is required for subsequent changes; reconnect or refresh the MCP
+client's tool list to observe the new descriptions. The file changes published metadata only,
+without modifying tool execution behavior.

@@ -33,6 +33,7 @@
     "app.ico"
   ],
   "scripts": {
+    "annotations:apply": "node scripts/apply-tool-annotations.mjs",
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "gdrive": "node scripts/gdrive-bridge.mjs",
     "build": "node scripts/build.mjs",

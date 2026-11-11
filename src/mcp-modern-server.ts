@@ -1,5 +1,6 @@
 import { toolDeadline, TOOL_DEADLINE_META } from "./tool-request-budget.js";
 import { toolResultForTextClients } from "./mcp-tool-result.js";
+import type { ToolAnnotationDocument } from "./tool-annotations.js";
 import * as z from "zod/v4";
 import {
   McpServer,
@@ -102,16 +103,17 @@ function wireToolOutputSchema(value: unknown): StandardSchemaWithJSON {
   }};
 }
 
-function wireAnnotations(value: unknown): Record<string, unknown> {
+function wireAnnotations(name: string, value: unknown, overrides: ToolAnnotationDocument): Record<string, unknown> {
   const annotations = value && typeof value === "object" ? value as Record<string,unknown> : {};
   // 宿主按实际 tools/list 读取能力声明，不能为了压缩报文删掉风险字段。
   return {readOnlyHint:false, destructiveHint:annotations.readOnlyHint === true ? false : true,
-    openWorldHint:true, ...annotations};
+    openWorldHint:true, ...annotations, ...overrides[name]};
 }
 
 export function createModernMcpServerAdapter(
   serverInfo: LegacyImplementation,
   options?: ServerOptions,
+  annotationOverrides: ToolAnnotationDocument = {},
 ): ModernMcpServerAdapter {
   const server = new McpServer(serverInfo, options);
   const registerModernTool = server.registerTool.bind(server) as unknown as ModernRegisterTool;
@@ -123,7 +125,7 @@ export function createModernMcpServerAdapter(
       handler: (input: unknown, extra: Record<string, unknown>) => unknown,
     ) => registerModernTool(
       name,
-      {...definition,annotations:wireAnnotations(definition.annotations),
+      {...definition,annotations:wireAnnotations(name, definition.annotations, annotationOverrides),
         ...(definition.inputSchema ? {inputSchema: wireSchema(definition.inputSchema)} : {}),
         ...(definition.outputSchema ? {outputSchema: wireToolOutputSchema(definition.outputSchema)} : {}),
       },

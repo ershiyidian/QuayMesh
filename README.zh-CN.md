@@ -156,3 +156,17 @@ flowchart LR
 QuayMesh 使用 [MIT 许可证](LICENSE)，基于 [DevSpace](https://github.com/Waishnav/devspace) 开发，并包含对 OpenAI Codex 与 Pi 的适配。
 
 内置网络组件由 EasyTier 和 OpenAI tunnel-client 提供，对应源码包和许可证保存在 `third_party/`。版权来源与组件许可见 [NOTICE](NOTICE) 和[第三方说明](THIRD_PARTY_NOTICES.md)。
+
+## MCP 工具标识热更新
+
+所有工具在 MCP `tools/list` 中使用的标识，由项目根目录 `config/tool-annotations.json` 统一覆盖。
+首次升级到支持热更新的版本后，在 Desktop 项目中编辑该文件，运行：
+
+```powershell
+pnpm annotations:apply
+```
+
+命令通过 QuayMesh 已建立的节点连接将同一份配置分发到 Coordinator 和其他节点。
+输出中的 `updated` 是已完成的节点；`failed` 会指出未完成的节点，再执行同一命令即可重试。
+后续无需编译、重装或重启。Gemini 等客户端重新连接或刷新工具列表，就会读取新的声明。
+配置只修改 MCP 工具元数据，不改变工具本身执行代码。

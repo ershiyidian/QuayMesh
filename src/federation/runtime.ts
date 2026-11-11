@@ -28,6 +28,7 @@ import { toolDeadline, remainingToolTime, TOOL_DEADLINE_META } from "../tool-req
 import { jsonReply } from "../bounded-reply.js";
 import { currentInvocation } from "../session/invocations.js";
 import { errorCode, toolErrorResult } from "../session/outcome.js";
+import { writeToolAnnotations, type ToolAnnotationDocument } from "../tool-annotations.js";
 import { WorkspaceAccessError } from "../workspaces.js";
 import { dispatchPeerRequest, isTransientPeerFailure, isIdempotentPeerRequest, isCancellableToolObservation } from "./read-retry.js";
 import { dispatchConsoleRequest } from "./console-request.js";
@@ -364,6 +365,8 @@ export class FederationRuntime extends EventEmitter {
       throw Object.assign(new Error("TASK_BINDING_COORDINATOR_REQUIRED"), { code: "TASK_BINDING_COORDINATOR_REQUIRED", effect: "not_started" });
     }
     switch (method) {
+      case "annotations.publish": return this.publishToolAnnotations(params.document);
+      case "annotations.apply": await writeToolAnnotations(this.hooks.stateDir, params.document); return { node_id:this.localId };
       case "local-user.call": case "local-user.terminal": case "local-user.install": case "local-user.describe": {
         if (!this.localUserApi) throw Object.assign(new Error("LOCAL_API_UNAVAILABLE"), {code: "LOCAL_API_UNAVAILABLE", effect: "not_started"});
         return this.localUserApi.receive(peer, method.slice("local-user.".length) as "call" | "terminal" | "install" | "describe", params, signal);
@@ -505,6 +508,23 @@ export class FederationRuntime extends EventEmitter {
       else this.notePeerFailure(node, error);
       throw error;
     }
+  }
+  async publishToolAnnotations(document: ToolAnnotationDocument): Promise<{updated:string[];failed:Record<string,string>}> {
+    if (!this.config.capabilities.coordinator) {
+      return this.request(this.config.coordinatorId, "annotations.publish", {document});
+    }
+    await writeToolAnnotations(this.hooks.stateDir, document);
+    const updated = [this.localId];
+    const failed: Record<string,string> = {};
+    await Promise.all(this.nodes().filter(node=>node.id!==this.localId).map(async node=>{
+      try {
+        await this.request(node.id, "annotations.apply", {document}, 10_000);
+        updated.push(node.id);
+      } catch (error) {
+        failed[node.id] = error instanceof Error ? error.message : String(error);
+      }
+    }));
+    return {updated:updated.sort(),failed};
   }
   async invokeLocal(name: string, input: JsonRecord, extra: JsonRecord = {}): Promise<unknown> {
     // 历史观察仍经过身份准备与原 handler，不为读取另建持久执行租约。

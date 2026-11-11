@@ -26,6 +26,7 @@ import { localAgentProviderEnvironment } from "./local-agent-config.js";
 import type { ExecutionCoordinator, RuntimeWorkLease } from "./execution-coordinator.js";
 import { readFileSync } from "node:fs";
 import { installationTransitionPending, installationBackgroundMaintenanceAllowed } from "./installation-transition.js";
+import { readToolAnnotations, writeToolAnnotations, type ToolAnnotationDocument } from "./tool-annotations.js";
 import { isAdmissionPrecondition, sameAdmissionInstance } from "./admission-state.js";
 import { processOwner } from "./process-identity.js";
 import { realpath } from "node:fs/promises";
@@ -1352,6 +1353,7 @@ export function createServer(
     const adapter = createModernMcpServerAdapter(
       mcpServerInfo(),
       { instructions: serverInstructions(config) },
+      readToolAnnotations(config.stateDir),
     );
     bindModernMcpSurface(adapter.registrationTarget);
     return adapter.server;
@@ -1425,6 +1427,20 @@ export function createServer(
     const token = process.env[config.federation?.tokenEnv || "QUAYMESH_CLUSTER_TOKEN"];
     if (!token || req.headers.authorization !== `Bearer ${token}`) { res.status(401).json({error:"unauthorized"}); return; }
     res.json({ ok: true, ...processSessions.executionCoordinator!.admissionStatus(), instance: admissionInstance });
+  });
+
+  app.post("/internal/quaymesh/tool-annotations", express.json({limit:"128kb"}), async (req, res) => {
+    const token = process.env[config.federation?.tokenEnv || "QUAYMESH_CLUSTER_TOKEN"];
+    if (!token || req.headers.authorization !== `Bearer ${token}`) { res.status(401).json({error:"unauthorized"}); return; }
+    try {
+      const document = req.body as ToolAnnotationDocument;
+      const result = federation
+        ? await federation.publishToolAnnotations(document)
+        : (await writeToolAnnotations(config.stateDir, document), { updated:["local"], failed:{} });
+      res.status(Object.keys(result.failed).length === 0 ? 200 : 207).json(result);
+    } catch (error) {
+      res.status(500).json({error:error instanceof Error ? error.message : String(error)});
+    }
   });
 
   app.post("/internal/quaymesh/admission", express.json({ limit: "4kb" }), (req, res) => {
