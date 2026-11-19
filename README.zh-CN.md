@@ -14,6 +14,13 @@
   <a href="docs/zh-CN/CONTRIBUTING.md">参与开发</a>
 </p>
 
+<p align="center">
+  <a href="https://github.com/ershiyidian/QuayMesh/releases/latest"><img src="https://img.shields.io/badge/release-v0.1.0-0969da.svg" alt="Release v0.1.0"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/MCP-Model%20Context%20Protocol-0f766e.svg" alt="MCP">
+  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-475569.svg" alt="Windows | Linux">
+</p>
+
 QuayMesh 通过 MCP（模型上下文协议），将 AI 助手连接到 Windows 和 Linux 上的工作区。你可以在同一个对话中修改文件、执行命令、调用编程代理，并查看各台机器上的执行结果。
 
 每个任务集中保存工作区、命令输出、文件变更和代理线程。浏览器控制台与 Windows 桌面应用展示同一份任务记录。
@@ -123,12 +130,14 @@ mkdir -p ~/quaymesh-projects
 例如，让助手在 Linux 节点构建项目、查看日志，再将生成的安装包复制到 Windows 工作区。这些操作会归入同一个任务，每项操作都保留所属机器与输出记录。
 
 ```mermaid
-flowchart LR
-    A["AI 助手<br/>MCP 客户端"] --> C["QuayMesh<br/>协调节点"]
-    C --> L["Linux 执行节点<br/>构建与运行"]
-    C --> W["Windows 执行节点<br/>编辑与检查"]
-    L <-->|"文件传输"| W
+flowchart TB
+    A["AI 助手<br/>MCP 客户端"] --> C["QuayMesh 协调节点"]
     U["控制台<br/>浏览器或桌面应用"] --> C
+    C --> F
+    subgraph F["执行节点集群"]
+      direction LR
+      L["Linux 执行节点<br/>构建与运行"] <-->|"文件传输"| W["Windows 执行节点<br/>编辑与检查"]
+    end
 ```
 
 同一个节点可以承担多项职责。协调节点提供统一连接和任务目录，执行节点处理本机项目；发现服务和网络出口可以按需开启。
@@ -146,7 +155,7 @@ flowchart LR
 | 指南 | 内容 |
 | --- | --- |
 | [安装](docs/zh-CN/INSTALL.md) | 单机使用、后台服务、多机器部署、MCP 连接 |
-| [配置](docs/zh-CN/CONFIGURATION.md) | 节点能力、项目目录、网络、存储 |
+| [配置](docs/zh-CN/CONFIGURATION.md) | 节点能力、项目目录、网络、存储、工具元数据 |
 | [任务与代理](docs/zh-CN/TASKS.md) | 命令、文件传输、检查点、代理线程 |
 | [架构](docs/zh-CN/ARCHITECTURE.md) | 组件分工、数据归属、请求过程 |
 | [参与开发](docs/zh-CN/CONTRIBUTING.md) | 源码构建、目录结构、提交修改 |
@@ -156,17 +165,3 @@ flowchart LR
 QuayMesh 使用 [MIT 许可证](LICENSE)，基于 [DevSpace](https://github.com/Waishnav/devspace) 开发，并包含对 OpenAI Codex 与 Pi 的适配。
 
 内置网络组件由 EasyTier 和 OpenAI tunnel-client 提供，对应源码包和许可证保存在 `third_party/`。版权来源与组件许可见 [NOTICE](NOTICE) 和[第三方说明](THIRD_PARTY_NOTICES.md)。
-
-## MCP 工具标识热更新
-
-所有工具在 MCP `tools/list` 中使用的标识，由项目根目录 `config/tool-annotations.json` 统一覆盖。
-首次升级到支持热更新的版本后，在 Desktop 项目中编辑该文件，运行：
-
-```powershell
-pnpm annotations:apply
-```
-
-命令通过 QuayMesh 已建立的节点连接将同一份配置分发到 Coordinator 和其他节点。
-输出中的 `updated` 是已完成的节点；`failed` 会指出未完成的节点，再执行同一命令即可重试。
-后续无需编译、重装或重启。Gemini 等客户端重新连接或刷新工具列表，就会读取新的声明。
-配置只修改 MCP 工具元数据，不改变工具本身执行代码。

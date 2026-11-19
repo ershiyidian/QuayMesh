@@ -14,6 +14,13 @@
   <a href="CONTRIBUTING.md">Contribute</a>
 </p>
 
+<p align="center">
+  <a href="https://github.com/ershiyidian/QuayMesh/releases/latest"><img src="https://img.shields.io/badge/release-v0.1.0-0969da.svg" alt="Release v0.1.0"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/MCP-Model%20Context%20Protocol-0f766e.svg" alt="MCP">
+  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-475569.svg" alt="Windows | Linux">
+</p>
+
 QuayMesh connects AI assistants to workspaces on Windows and Linux through the Model Context Protocol (MCP). From one conversation, you can edit files, run commands, delegate work to coding agents, and follow the results across machines.
 
 A task keeps its workspaces, command output, file changes, and agent threads together. The browser console and Windows desktop app give you the same view of that work.
@@ -123,12 +130,14 @@ The [installation guide](docs/INSTALL.md) covers background services, the Window
 Ask your assistant to build a project on a Linux worker, inspect its logs, and copy the resulting package to a Windows workspace. QuayMesh keeps those operations under one task, with each operation linked to its machine and output.
 
 ```mermaid
-flowchart LR
-    A["AI assistant<br/>MCP client"] --> C["QuayMesh<br/>Coordinator"]
-    C --> L["Linux worker<br/>Build and run"]
-    C --> W["Windows worker<br/>Edit and inspect"]
-    L <-->|"Artifact transfer"| W
+flowchart TB
+    A["AI assistant<br/>MCP client"] --> C["QuayMesh Coordinator"]
     U["Console<br/>Browser or desktop"] --> C
+    C --> F
+    subgraph F["Worker Fleet"]
+      direction LR
+      L["Linux worker<br/>Build & run"] <-->|"Artifact transfer"| W["Windows worker<br/>Edit & inspect"]
+    end
 ```
 
 A node can combine several roles. The coordinator provides the shared connection and task directory; workers operate on local projects. Discovery and network-exit capabilities can be enabled where needed.
@@ -146,7 +155,7 @@ Read more about [tasks and agents](docs/TASKS.md), [file changes and concurrency
 | Guide | Contents |
 | --- | --- |
 | [Installation](docs/INSTALL.md) | Local setup, services, multiple machines, MCP connections |
-| [Configuration](docs/CONFIGURATION.md) | Node capabilities, project roots, networking, storage |
+| [Configuration](docs/CONFIGURATION.md) | Node capabilities, project roots, networking, storage, tool metadata |
 | [Tasks and agents](docs/TASKS.md) | Commands, artifacts, checkpoints, agent threads |
 | [Architecture](docs/ARCHITECTURE.md) | Components, data ownership, request flow |
 | [Development](CONTRIBUTING.md) | Source builds, project layout, contributions |
@@ -156,18 +165,3 @@ Read more about [tasks and agents](docs/TASKS.md), [file changes and concurrency
 QuayMesh is licensed under [MIT](LICENSE). It builds on [DevSpace](https://github.com/Waishnav/devspace) and includes adaptations from OpenAI Codex and Pi.
 
 EasyTier and OpenAI tunnel-client provide the bundled network components. Their source archives and licenses are included under `third_party/`. See [NOTICE](NOTICE) and [third-party notices](THIRD_PARTY_NOTICES.md) for attribution and component licenses.
-
-## Hot-reload MCP tool annotations
-
-The authoritative metadata overrides for all MCP tools are in `config/tool-annotations.json`.
-After installing a release with this feature, edit that file on the Desktop source checkout and run:
-
-```sh
-pnpm annotations:apply
-```
-
-The command sends the file through the existing QuayMesh federation to the Coordinator and workers,
-and reports the `updated` nodes and any `failed` nodes. Rerun it to retry failed nodes.
-No rebuild or service restart is required for subsequent changes; reconnect or refresh the MCP
-client's tool list to observe the new descriptions. The file changes published metadata only,
-without modifying tool execution behavior.
